@@ -33,17 +33,29 @@
     // args: { name, blob, args: string[] } -> Blob (mp4)
     let _ffmpeg = null;
     window.pesVideoTranscode = async function (name, blob, args, onProgress) {
-      const { createFFmpeg, fetchFile } = FFmpeg;
-      if (!_ffmpeg) {
-        _ffmpeg = createFFmpeg({ log: false, progress: (p) => onProgress(p.ratio || 0) });
-        await _ffmpeg.load();
+      try {
+        const { createFFmpeg, fetchFile } = FFmpeg;
+        if (!_ffmpeg) {
+          // Single-threaded core: no SharedArrayBuffer, works on GitHub Pages
+          // (no COOP/COEP headers needed).
+          _ffmpeg = createFFmpeg({
+            log: false,
+            corePath: 'https://unpkg.com/@ffmpeg/core-st@0.11.1/dist/ffmpeg-core.js',
+            mainName: 'main',
+            progress: (p) => onProgress(p.ratio || 0),
+          });
+          await _ffmpeg.load();
+        }
+        _ffmpeg.FS('writeFile', name, await fetchFile(blob));
+        await _ffmpeg.run(...args);
+        const data = _ffmpeg.FS('readFile', 'pes-out.mp4');
+        _ffmpeg.FS('unlink', name);
+        _ffmpeg.FS('unlink', 'pes-out.mp4');
+        return new Blob([data.buffer], { type: 'video/mp4' });
+      } catch (e) {
+        console.error('pesVideoTranscode failed:', e && e.message ? e.message : String(e), args);
+        throw e;
       }
-      _ffmpeg.FS('writeFile', name, await fetchFile(blob));
-      await _ffmpeg.run(...args);
-      const data = _ffmpeg.FS('readFile', 'pes-out.mp4');
-      _ffmpeg.FS('unlink', name);
-      _ffmpeg.FS('unlink', 'pes-out.mp4');
-      return new Blob([data.buffer], { type: 'video/mp4' });
     };
   </script>
 </body>

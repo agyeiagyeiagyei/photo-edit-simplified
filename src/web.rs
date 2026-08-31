@@ -154,3 +154,7 @@ pub async fn canvas_to_jpeg_blob(canvas: &HtmlCanvasElement, quality: f64) -> Re
 pub fn log(msg: &str) {
     web_sys::console::log_1(&JsValue::from_str(msg));
 }
+
+pub fn log_err(msg: &str) {
+    web_sys::console::error_1(&JsValue::from_str(msg));
+}

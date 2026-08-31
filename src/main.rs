@@ -281,7 +281,7 @@ fn export_video(state: AppState, item: MediaItem) {
                 let base = item.name.rsplitn(2, '.').last().unwrap_or("video");
                 web::download_blob(&out, &format!("edited-{}.mp4", base));
             }
-            Err(e) => web::log(&format!("transcode failed: {e:?}")),
+            Err(e) => web::log_err(&format!("transcode failed: {e:?}")),
         }
         state.busy.set(None);
         state.progress.set(0.0);
@@ -593,9 +593,11 @@ fn CropOverlay(state: AppState, working: RwSignal<(usize, usize)>) -> impl IntoV
     };
 
     window_event_listener(leptos::ev::pointermove, move |ev| {
-        let Some((handle, sx, sy, orig)) = drag.get() else { return };
+        // Signals are disposed when the Crop tab unmounts, but this window
+        // listener outlives them — bail out instead of touching dead signals.
+        let Some(Some((handle, sx, sy, orig))) = drag.try_get() else { return };
         let Some(item) = state.current() else { return };
-        let (ww, wh) = working.get();
+        let Some((ww, wh)) = working.try_get() else { return };
         let Some((nx, ny)) = norm_pos(&ev) else { return };
         let dx = nx - sx;
         let dy = ny - sy;
@@ -647,7 +649,7 @@ fn CropOverlay(state: AppState, working: RwSignal<(usize, usize)>) -> impl IntoV
     });
 
     window_event_listener(leptos::ev::pointerup, move |_| {
-        drag.set(None);
+        let _ = drag.try_set(None);
     });
 
     view! {
