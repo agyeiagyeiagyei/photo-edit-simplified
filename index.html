@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+  <meta name="theme-color" content="#111111"/>
+  <title>photo-edit-simplified</title>
+  <link rel="manifest" href="manifest.webmanifest"/>
+  <link rel="icon" href="icon-192.png"/>
+  <link rel="apple-touch-icon" href="icon-192.png"/>
+  <link data-trunk rel="css" href="style.css"/>
+  <link data-trunk rel="copy-file" href="public/manifest.webmanifest"/>
+  <link data-trunk rel="copy-file" href="public/sw.js"/>
+  <link data-trunk rel="copy-file" href="public/icon-192.png"/>
+  <link data-trunk rel="copy-file" href="public/icon-512.png"/>
+  <link data-trunk rel="rust" data-wasm-opt="2"/>
+  <script src="https://unpkg.com/heic2any@0.0.4/dist/heic2any.min.js"></script>
+  <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
+</head>
+<body>
+  <script>
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('sw.js').catch(() => {});
+    }
+
+    // HEIC -> JPEG blob. Called from Rust.
+    window.pesHeicToJpeg = async function (blob) {
+      const out = await window.heic2any({ blob, toType: 'image/jpeg', quality: 0.92 });
+      return Array.isArray(out) ? out[0] : out;
+    };
+
+    // Video transcode via ffmpeg.wasm. Called from Rust.
+    // args: { name, blob, args: string[] } -> Blob (mp4)
+    let _ffmpeg = null;
+    window.pesVideoTranscode = async function (name, blob, args, onProgress) {
+      const { createFFmpeg, fetchFile } = FFmpeg;
+      if (!_ffmpeg) {
+        _ffmpeg = createFFmpeg({ log: false, progress: (p) => onProgress(p.ratio || 0) });
+        await _ffmpeg.load();
+      }
+      _ffmpeg.FS('writeFile', name, await fetchFile(blob));
+      await _ffmpeg.run(...args);
+      const data = _ffmpeg.FS('readFile', 'pes-out.mp4');
+      _ffmpeg.FS('unlink', name);
+      _ffmpeg.FS('unlink', 'pes-out.mp4');
+      return new Blob([data.buffer], { type: 'video/mp4' });
+    };
+  </script>
+</body>
+</html>

@@ -1,0 +1,197 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #111111;
+  --panel: #1c1c1e;
+  --text: #f2f2f7;
+  --dim: #8e8e93;
+  --accent: #0a84ff;
+  --border: #2c2c2e;
+}
+
+html, body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  min-height: 100%;
+}
+
+.app {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 0 12px calc(24px + env(safe-area-inset-bottom));
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 4px 6px;
+}
+
+h1 { font-size: 17px; font-weight: 600; }
+
+.btn {
+  display: inline-block;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 10px;
+  padding: 9px 14px;
+  font-size: 14px;
+  cursor: pointer;
+  user-select: none;
+}
+.btn:active { opacity: 0.7; }
+.btn.primary { background: var(--accent); border-color: var(--accent); }
+.dim-btn { margin-top: 8px; }
+
+.dropzone {
+  border: 2px dashed var(--border);
+  border-radius: 14px;
+  padding: 60px 20px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.dim { color: var(--dim); font-size: 13px; }
+
+.filmstrip {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 4px 2px;
+}
+
+.thumb {
+  position: relative;
+  flex: 0 0 64px;
+  height: 64px;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 2px solid transparent;
+  cursor: pointer;
+}
+.thumb.selected { border-color: var(--accent); }
+.thumb img { width: 100%; height: 100%; object-fit: cover; }
+.thumb .badge {
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  font-size: 10px;
+  background: rgba(0,0,0,0.6);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+
+.editor { display: flex; flex-direction: column; gap: 10px; }
+
+.preview { display: flex; justify-content: center; }
+
+.canvas-wrap {
+  position: relative;
+  width: 100%;
+  max-width: min(100%, 60vh);
+  margin: 0 auto;
+}
+.canvas-wrap canvas, .canvas-wrap video {
+  width: 100%;
+  display: block;
+  border-radius: 10px;
+  background: #000;
+}
+
+.crop-overlay { position: absolute; inset: 0; }
+
+.crop-rect {
+  position: absolute;
+  border: 2px solid #fff;
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.45);
+  cursor: move;
+  touch-action: none;
+}
+
+.handle {
+  position: absolute;
+  width: 26px;
+  height: 26px;
+  background: #fff;
+  border-radius: 50%;
+  touch-action: none;
+}
+.handle.nw { left: -13px; top: -13px; cursor: nwse-resize; }
+.handle.ne { right: -13px; top: -13px; cursor: nesw-resize; }
+.handle.sw { left: -13px; bottom: -13px; cursor: nesw-resize; }
+.handle.se { right: -13px; bottom: -13px; cursor: nwse-resize; }
+
+.tabs {
+  display: flex;
+  gap: 6px;
+  background: var(--panel);
+  border-radius: 12px;
+  padding: 4px;
+}
+
+.tab {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--dim);
+  padding: 8px 4px;
+  font-size: 14px;
+  border-radius: 9px;
+  cursor: pointer;
+}
+.tab.active { background: var(--border); color: var(--text); }
+
+.panel {
+  background: var(--panel);
+  border-radius: 12px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.chips { display: flex; gap: 8px; flex-wrap: wrap; }
+.chip {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 8px 16px;
+  font-size: 14px;
+  cursor: pointer;
+}
+.chip.active { background: var(--accent); border-color: var(--accent); }
+
+.row { display: flex; gap: 10px; }
+
+.slider { display: flex; flex-direction: column; gap: 6px; font-size: 14px; }
+.slider input[type="range"] { width: 100%; accent-color: var(--accent); }
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+}
+.overlay .card {
+  background: var(--panel);
+  border-radius: 14px;
+  padding: 22px 26px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 240px;
+  text-align: center;
+}
+.overlay progress { width: 100%; }
