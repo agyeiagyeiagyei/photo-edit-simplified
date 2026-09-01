@@ -13,7 +13,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{Blob, File, Url};
 
-use state::{AppState, Aspect, EditParams, Layer, LayerKind, MediaItem, MediaKind, TextAlign};
+use state::{AppState, Aspect, BrushStroke, EditParams, Layer, LayerKind, MediaItem, MediaKind, PathPoint, TextAlign, Tool};
 
 // --- media cache (non-reactive) ---------------------------------------------
 
@@ -229,7 +229,7 @@ fn default_crop(w: usize, h: usize, aspect: Aspect) -> state::CropRect {
 // --- layer compositing ---------------------------------------------------------
 
 fn draw_text_layer(ctx: &web_sys::CanvasRenderingContext2d, layer: &state::Layer, w: f64, h: f64) {
-    let state::LayerKind::Text(t) = &layer.kind;
+    let LayerKind::Text(t) = &layer.kind else { return; };
     let px = (t.font_size * h as f32) as f64;
     ctx.set_font(&format!(
         "{} {}px \"{}\", sans-serif",
@@ -261,6 +261,71 @@ fn draw_text_layer(ctx: &web_sys::CanvasRenderingContext2d, layer: &state::Layer
     ctx.set_shadow_offset_y(0.0);
 }
 
+fn draw_path_layer(ctx: &web_sys::CanvasRenderingContext2d, layer: &state::Layer, w: f64, h: f64) {
+    let LayerKind::Path(p) = &layer.kind else { return; };
+    if p.points.len() < 2 {
+        return;
+    }
+    ctx.begin_path();
+    let first = &p.points[0];
+    ctx.move_to((first.x * w as f32) as f64, (first.y * h as f32) as f64);
+    for i in 1..p.points.len() {
+        let prev = &p.points[i - 1];
+        let curr = &p.points[i];
+        let c1x = (prev.x + prev.out_x) * w as f32;
+        let c1y = (prev.y + prev.out_y) * h as f32;
+        let c2x = (curr.x + curr.in_x) * w as f32;
+        let c2y = (curr.y + curr.in_y) * h as f32;
+        let x = curr.x * w as f32;
+        let y = curr.y * h as f32;
+        ctx.bezier_curve_to(c1x as f64, c1y as f64, c2x as f64, c2y as f64, x as f64, y as f64);
+    }
+    if p.closed && p.points.len() > 2 {
+        let last = p.points.last().unwrap();
+        let first = &p.points[0];
+        let c1x = (last.x + last.out_x) * w as f32;
+        let c1y = (last.y + last.out_y) * h as f32;
+        let c2x = (first.x + first.in_x) * w as f32;
+        let c2y = (first.y + first.in_y) * h as f32;
+        let x = first.x * w as f32;
+        let y = first.y * h as f32;
+        ctx.bezier_curve_to(c1x as f64, c1y as f64, c2x as f64, c2y as f64, x as f64, y as f64);
+        ctx.close_path();
+    }
+
+    let stroke_px = (p.stroke_width * h as f32) as f64;
+    if !p.fill_color.is_empty() && p.fill_color != "none" {
+        ctx.set_fill_style_str(&p.fill_color);
+        let _ = ctx.fill();
+    }
+    if stroke_px > 0.0 {
+        ctx.set_line_width(stroke_px);
+        ctx.set_stroke_style_str(&p.stroke_color);
+        ctx.set_line_join("round");
+        let _ = ctx.stroke();
+    }
+}
+
+fn draw_brush_layer(ctx: &web_sys::CanvasRenderingContext2d, layer: &state::Layer, w: f64, h: f64) {
+    let LayerKind::Brush(b) = &layer.kind else { return; };
+    ctx.set_stroke_style_str(&b.color);
+    ctx.set_line_width((b.width * h as f32) as f64);
+    ctx.set_line_cap("round");
+    ctx.set_line_join("round");
+    for stroke in &b.strokes {
+        if stroke.points.len() < 2 {
+            continue;
+        }
+        ctx.begin_path();
+        let (x0, y0) = stroke.points[0];
+        ctx.move_to((x0 * w as f32) as f64, (y0 * h as f32) as f64);
+        for &(x, y) in &stroke.points[1..] {
+            ctx.line_to((x * w as f32) as f64, (y * h as f32) as f64);
+        }
+        let _ = ctx.stroke();
+    }
+}
+
 fn composite_layers(canvas: &web_sys::HtmlCanvasElement, layers: &[state::Layer], w: usize, h: usize) {
     let ctx = web::ctx2d(canvas);
     for layer in layers {
@@ -269,7 +334,9 @@ fn composite_layers(canvas: &web_sys::HtmlCanvasElement, layers: &[state::Layer]
         }
         ctx.set_global_alpha(layer.opacity as f64);
         match &layer.kind {
-            state::LayerKind::Text(_) => draw_text_layer(&ctx, layer, w as f64, h as f64),
+            LayerKind::Text(_) => draw_text_layer(&ctx, layer, w as f64, h as f64),
+            LayerKind::Path(_) => draw_path_layer(&ctx, layer, w as f64, h as f64),
+            LayerKind::Brush(_) => draw_brush_layer(&ctx, layer, w as f64, h as f64),
         }
         ctx.set_global_alpha(1.0);
     }
@@ -374,8 +441,9 @@ fn export_video(state: AppState, item: MediaItem) {
             if !layer.visible || layer.opacity <= 0.01 {
                 continue;
             }
-            let t = match &layer.kind {
-                state::LayerKind::Text(t) => t,
+            let state::LayerKind::Text(t) = &layer.kind else {
+                // Path/brush layers are photo-only for now.
+                continue;
             };
             match render_text_overlay(t, ew, eh).await {
                 Ok(blob) => overlays.push((format!("overlay-{i}.png"), blob)),
@@ -649,20 +717,110 @@ fn Editor(state: AppState) -> impl IntoView {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PenHandle {
+    Point,
+    Out,
+    In,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PenDrag {
+    MovePoint(usize),
+    MoveOut(usize),
+    MoveIn(usize),
+}
+
+fn layer_norm_pos(ev: &web_sys::MouseEvent) -> Option<(f32, f32)> {
+    let el = web::document().query_selector(".canvas-wrap").ok().flatten()?;
+    let rect = el.get_bounding_client_rect();
+    let nx = ((ev.client_x() as f32 - rect.left() as f32) / rect.width() as f32).clamp(0.0, 1.0);
+    let ny = ((ev.client_y() as f32 - rect.top() as f32) / rect.height() as f32).clamp(0.0, 1.0);
+    Some((nx, ny))
+}
+
+fn dist2(a: (f32, f32), b: (f32, f32)) -> f32 {
+    let dx = a.0 - b.0;
+    let dy = a.1 - b.1;
+    dx * dx + dy * dy
+}
+
+fn hit_test_path(points: &[PathPoint], nx: f32, ny: f32) -> Option<(usize, PenHandle)> {
+    let point_r2 = 0.03_f32 * 0.03;
+    let handle_r2 = 0.025_f32 * 0.025;
+    // Points take priority over handles.
+    for (i, p) in points.iter().enumerate().rev() {
+        if dist2((p.x, p.y), (nx, ny)) < point_r2 {
+            return Some((i, PenHandle::Point));
+        }
+    }
+    for (i, p) in points.iter().enumerate().rev() {
+        if dist2((p.x + p.out_x, p.y + p.out_y), (nx, ny)) < handle_r2 {
+            return Some((i, PenHandle::Out));
+        }
+        if dist2((p.x + p.in_x, p.y + p.in_y), (nx, ny)) < handle_r2 {
+            return Some((i, PenHandle::In));
+        }
+    }
+    None
+}
+
+fn push_path_history(layer: &mut state::PathLayer) {
+    if layer.history.len() >= 50 {
+        layer.history.remove(0);
+    }
+    layer.history.push(layer.points.clone());
+}
+
+fn push_brush_history(layer: &mut state::BrushLayer) {
+    if layer.history.len() >= 50 {
+        layer.history.remove(0);
+    }
+    layer.history.push(layer.strokes.clone());
+}
+
+fn draw_path_edit_handles(ctx: &web_sys::CanvasRenderingContext2d, layer: &state::Layer, w: f64, h: f64) {
+    let LayerKind::Path(p) = &layer.kind else { return };
+    for pt in &p.points {
+        let px = (pt.x * w as f32) as f64;
+        let py = (pt.y * h as f32) as f64;
+        let ox = ((pt.x + pt.out_x) * w as f32) as f64;
+        let oy = ((pt.y + pt.out_y) * h as f32) as f64;
+        let ix = ((pt.x + pt.in_x) * w as f32) as f64;
+        let iy = ((pt.y + pt.in_y) * h as f32) as f64;
+
+        ctx.set_stroke_style_str("rgba(255,255,255,0.6)");
+        ctx.set_line_width(1.0);
+        ctx.begin_path();
+        ctx.move_to(px, py);
+        ctx.line_to(ox, oy);
+        ctx.move_to(px, py);
+        ctx.line_to(ix, iy);
+        let _ = ctx.stroke();
+
+        ctx.set_fill_style_str(pt.smooth.then_some("#0a84ff").unwrap_or("#ffcc00"));
+        ctx.begin_path();
+        ctx.arc(px, py, 6.0, 0.0, std::f64::consts::PI * 2.0).unwrap();
+        let _ = ctx.fill();
+
+        ctx.set_fill_style_str("#fff");
+        for (hx, hy) in [(ox, oy), (ix, iy)] {
+            ctx.begin_path();
+            ctx.arc(hx, hy, 4.0, 0.0, std::f64::consts::PI * 2.0).unwrap();
+            let _ = ctx.fill();
+        }
+    }
+}
+
 #[component]
 fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     let canvas_ref = create_node_ref::<html::Canvas>();
     let working = create_rw_signal((1usize, 1usize));
     let layer_drag = create_rw_signal(None::<(usize, f32, f32, f32, f32)>);
+    let pen_drag = create_rw_signal(None::<(usize, PenDrag, f32, f32)>);
+    let brush_draw = create_rw_signal(None::<usize>);
 
-    let layer_norm_pos = |ev: &web_sys::PointerEvent| -> Option<(f32, f32)> {
-        let el = web::document().query_selector(".canvas-wrap").ok().flatten()?;
-        let rect = el.get_bounding_client_rect();
-        let nx = ((ev.client_x() as f32 - rect.left() as f32) / rect.width() as f32).clamp(0.0, 1.0);
-        let ny = ((ev.client_y() as f32 - rect.top() as f32) / rect.height() as f32).clamp(0.0, 1.0);
-        Some((nx, ny))
-    };
-
+    // --- text layer drag -------------------------------------------------------
     window_event_listener(leptos::ev::pointermove, move |ev| {
         let Some(Some((id, nx0, ny0, x0, y0))) = layer_drag.try_get() else { return };
         let Some((nx, ny)) = layer_norm_pos(&ev) else { return };
@@ -670,7 +828,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         let dy = ny - ny0;
         state.update_current_item(|m| {
             if let Some(l) = m.layers.iter_mut().find(|l| l.id == id) {
-                let LayerKind::Text(t) = &mut l.kind;
+                let LayerKind::Text(t) = &mut l.kind else { return };
                 t.x = (x0 + dx).clamp(0.0, 1.0);
                 t.y = (y0 + dy).clamp(0.0, 1.0);
             }
@@ -681,9 +839,75 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         let _ = layer_drag.try_set(None);
     });
 
+    // --- pen tool drag ---------------------------------------------------------
+    window_event_listener(leptos::ev::pointermove, move |ev| {
+        let Some(Some((id, drag, nx0, ny0))) = pen_drag.try_get() else { return };
+        let Some((nx, ny)) = layer_norm_pos(&ev) else { return };
+        let dx = nx - nx0;
+        let dy = ny - ny0;
+        state.update_current_item(|m| {
+            let Some(l) = m.layers.iter_mut().find(|l| l.id == id) else { return };
+            let LayerKind::Path(p) = &mut l.kind else { return };
+            match drag {
+                PenDrag::MovePoint(i) => {
+                    let Some(pt) = p.points.get_mut(i) else { return };
+                    let new_x = (pt.x + dx).clamp(0.0, 1.0);
+                    let new_y = (pt.y + dy).clamp(0.0, 1.0);
+                    pt.in_x -= new_x - pt.x;
+                    pt.in_y -= new_y - pt.y;
+                    pt.out_x -= new_x - pt.x;
+                    pt.out_y -= new_y - pt.y;
+                    pt.x = new_x;
+                    pt.y = new_y;
+                }
+                PenDrag::MoveOut(i) => {
+                    let Some(pt) = p.points.get_mut(i) else { return };
+                    pt.out_x = (pt.out_x + dx).clamp(-1.0, 1.0);
+                    pt.out_y = (pt.out_y + dy).clamp(-1.0, 1.0);
+                    if pt.smooth {
+                        pt.in_x = -pt.out_x;
+                        pt.in_y = -pt.out_y;
+                    }
+                }
+                PenDrag::MoveIn(i) => {
+                    let Some(pt) = p.points.get_mut(i) else { return };
+                    pt.in_x = (pt.in_x + dx).clamp(-1.0, 1.0);
+                    pt.in_y = (pt.in_y + dy).clamp(-1.0, 1.0);
+                    if pt.smooth {
+                        pt.out_x = -pt.in_x;
+                        pt.out_y = -pt.in_y;
+                    }
+                }
+            }
+        });
+    });
+
+    window_event_listener(leptos::ev::pointerup, move |_| {
+        let _ = pen_drag.try_set(None);
+    });
+
+    // --- brush tool drawing ----------------------------------------------------
+    window_event_listener(leptos::ev::pointermove, move |ev| {
+        let Some(id) = brush_draw.try_get().flatten() else { return };
+        let Some((nx, ny)) = layer_norm_pos(&ev) else { return };
+        state.update_current_item(|m| {
+            let Some(l) = m.layers.iter_mut().find(|l| l.id == id) else { return };
+            let LayerKind::Brush(b) = &mut l.kind else { return };
+            if let Some(stroke) = b.strokes.last_mut() {
+                stroke.points.push((nx, ny));
+            }
+        });
+    });
+
+    window_event_listener(leptos::ev::pointerup, move |_| {
+        let _ = brush_draw.try_set(None);
+    });
+
     create_effect(move |_| {
         state.items.track();
         state.selected.track();
+        state.selected_layer.track();
+        state.selected_tool.track();
         let Some(item) = state.current() else { return };
         if item.kind != MediaKind::Photo {
             return;
@@ -705,6 +929,15 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         }
         web::put_pixels(&canvas, &p, w as u32, h as u32);
         composite_layers(&canvas, &item.layers, w, h);
+
+        // Draw editing handles on top for the selected path layer.
+        if tab.get() == Tab::Layers && state.selected_tool.get() == Tool::Pen {
+            if let Some(sel) = state.selected_layer.get() {
+                if let Some(layer) = item.layers.iter().find(|l| l.id == sel) {
+                    draw_path_edit_handles(&web::ctx2d(&canvas), layer, w as f64, h as f64);
+                }
+            }
+        }
     });
 
     view! {
@@ -732,12 +965,79 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                         class="canvas-wrap"
                         on:pointerdown=move |ev: web_sys::PointerEvent| {
                             if tab.get() != Tab::Layers { return; }
-                            let Some(id) = state.selected_layer.get() else { return };
-                            let Some(item) = state.current() else { return };
+                            let Some(id) = state.selected_layer.get() else { return; };
+                            let Some(item) = state.current() else { return; };
                             let Some(layer) = item.layers.iter().find(|l| l.id == id) else { return };
-                            let LayerKind::Text(t) = &layer.kind;
                             let Some((nx, ny)) = layer_norm_pos(&ev) else { return };
-                            layer_drag.set(Some((id, nx, ny, t.x, t.y)));
+
+                            match state.selected_tool.get() {
+                                Tool::Select => {
+                                    let LayerKind::Text(t) = &layer.kind else { return };
+                                    layer_drag.set(Some((id, nx, ny, t.x, t.y)));
+                                }
+                                Tool::Pen => {
+                                    let LayerKind::Path(ref p) = layer.kind else { return };
+                                    if let Some((idx, handle)) = hit_test_path(&p.points, nx, ny) {
+                                        if handle == PenHandle::Point && idx == 0 && p.points.len() >= 3 && !p.closed {
+                                            state.update_current_item(|m| {
+                                                if let Some(l) = m.layers.iter_mut().find(|l| l.id == id) {
+                                                    if let LayerKind::Path(p) = &mut l.kind {
+                                                        push_path_history(p);
+                                                        p.closed = true;
+                                                    }
+                                                }
+                                            });
+                                        } else {
+                                            let drag = match handle {
+                                                PenHandle::Point => PenDrag::MovePoint(idx),
+                                                PenHandle::Out => PenDrag::MoveOut(idx),
+                                                PenHandle::In => PenDrag::MoveIn(idx),
+                                            };
+                                            pen_drag.set(Some((id, drag, nx, ny)));
+                                        }
+                                    } else {
+                                        state.update_current_item(|m| {
+                                            if let Some(l) = m.layers.iter_mut().find(|l| l.id == id) {
+                                                if let LayerKind::Path(p) = &mut l.kind {
+                                                    push_path_history(p);
+                                                    p.points.push(PathPoint::new(nx, ny));
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
+                                Tool::Brush => {
+                                    let LayerKind::Brush(_) = &layer.kind else { return };
+                                    state.update_current_item(|m| {
+                                        if let Some(l) = m.layers.iter_mut().find(|l| l.id == id) {
+                                            if let LayerKind::Brush(b) = &mut l.kind {
+                                                push_brush_history(b);
+                                                b.strokes.push(BrushStroke { points: vec![(nx, ny)] });
+                                            }
+                                        }
+                                    });
+                                    brush_draw.set(Some(id));
+                                }
+                            }
+                        }
+                        on:dblclick=move |ev: web_sys::MouseEvent| {
+                            if tab.get() != Tab::Layers || state.selected_tool.get() != Tool::Pen { return; }
+                            let Some(id) = state.selected_layer.get() else { return; };
+                            let Some((nx, ny)) = layer_norm_pos(&ev) else { return; };
+                            state.update_current_item(|m| {
+                                if let Some(l) = m.layers.iter_mut().find(|l| l.id == id) {
+                                    if let LayerKind::Path(p) = &mut l.kind {
+                                        if let Some((idx, PenHandle::Point)) = hit_test_path(&p.points, nx, ny) {
+                                            push_path_history(p);
+                                            p.points[idx].smooth = !p.points[idx].smooth;
+                                            if p.points[idx].smooth {
+                                                p.points[idx].in_x = -p.points[idx].out_x;
+                                                p.points[idx].in_y = -p.points[idx].out_y;
+                                            }
+                                        }
+                                    }
+                                }
+                            });
                         }
                     >
                         <canvas node_ref=canvas_ref></canvas>
@@ -758,7 +1058,7 @@ fn VideoOverlays(state: AppState, item: MediaItem) -> impl IntoView {
         <div class="video-overlays" style="pointer-events:none">
             {item.layers.iter().filter_map(|l| {
                 if !l.visible { return None; }
-                let LayerKind::Text(t) = &l.kind;
+                let LayerKind::Text(t) = &l.kind else { return None; };
                 let px = format!("{:.2}%", t.font_size * 100.0);
                 let left = format!("{:.2}%", t.x * 100.0);
                 let top = format!("{:.2}%", t.y * 100.0);
@@ -986,16 +1286,27 @@ fn ColorTab(state: AppState) -> impl IntoView {
 
 #[component]
 fn LayersTab(state: AppState) -> impl IntoView {
-    let add_text = move |_| {
+    let add_layer = move |kind: &str| {
         let mut new_id = None;
         state.update_current_item(|m| {
             let id = m.next_layer_id;
             m.next_layer_id += 1;
-            m.layers.push(Layer::new_text(id));
+            let layer = match kind {
+                "text" => Layer::new_text(id),
+                "path" => Layer::new_path(id),
+                "brush" => Layer::new_brush(id),
+                _ => Layer::new_text(id),
+            };
+            m.layers.push(layer);
             new_id = Some(id);
         });
         if let Some(id) = new_id {
             state.selected_layer.set(Some(id));
+            state.selected_tool.set(match kind {
+                "path" => Tool::Pen,
+                "brush" => Tool::Brush,
+                _ => Tool::Select,
+            });
         }
     };
 
@@ -1045,7 +1356,11 @@ fn LayersTab(state: AppState) -> impl IntoView {
 
     view! {
         <div class="layers-tab">
-            <button class="btn" on:click=add_text>"＋ Text layer"</button>
+            <div class="row layer-add-row">
+                <button class="btn" on:click=move |_| add_layer("text")>"＋ Text"</button>
+                <button class="btn" on:click=move |_| add_layer("path")>"＋ Path"</button>
+                <button class="btn" on:click=move |_| add_layer("brush")>"＋ Brush"</button>
+            </div>
             <div class="layer-list">
                 <For
                     each=move || layers.get()
@@ -1126,7 +1441,29 @@ fn LayersTab(state: AppState) -> impl IntoView {
                     }
                 />
             </div>
+            <ToolBar state=state/>
             <TextLayerEditor state=state/>
+            <PathLayerEditor state=state/>
+            <BrushLayerEditor state=state/>
+        </div>
+    }
+}
+
+#[component]
+fn ToolBar(state: AppState) -> impl IntoView {
+    view! {
+        <div class="toolbar">
+            {Tool::ALL.map(|t| {
+                view! {
+                    <button
+                        class="chip"
+                        class:active=move || state.selected_tool.get() == t
+                        on:click=move |_| state.selected_tool.set(t)
+                    >
+                        {t.label()}
+                    </button>
+                }
+            })}
         </div>
     }
 }
@@ -1135,7 +1472,7 @@ fn with_text_layer(state: AppState, f: impl FnOnce(&mut state::TextLayer)) {
     let Some(sel) = state.selected_layer.get_untracked() else { return };
     state.update_current_item(|m| {
         if let Some(l) = m.layers.iter_mut().find(|l| l.id == sel) {
-            let LayerKind::Text(t) = &mut l.kind;
+            let LayerKind::Text(t) = &mut l.kind else { return };
             f(t);
         }
     });
@@ -1143,9 +1480,51 @@ fn with_text_layer(state: AppState, f: impl FnOnce(&mut state::TextLayer)) {
 
 fn selected_text_layer(state: AppState) -> Option<state::TextLayer> {
     let sel = state.selected_layer.get()?;
-    state.current()?.layers.iter().find(|l| l.id == sel).map(|l| {
-        let LayerKind::Text(t) = &l.kind;
-        t.clone()
+    state.current()?.layers.iter().find(|l| l.id == sel).and_then(|l| {
+        match &l.kind {
+            LayerKind::Text(t) => Some(t.clone()),
+            _ => None,
+        }
+    })
+}
+
+fn with_path_layer(state: AppState, f: impl FnOnce(&mut state::PathLayer)) {
+    let Some(sel) = state.selected_layer.get_untracked() else { return };
+    state.update_current_item(|m| {
+        if let Some(l) = m.layers.iter_mut().find(|l| l.id == sel) {
+            let LayerKind::Path(p) = &mut l.kind else { return };
+            f(p);
+        }
+    });
+}
+
+fn selected_path_layer(state: AppState) -> Option<state::PathLayer> {
+    let sel = state.selected_layer.get()?;
+    state.current()?.layers.iter().find(|l| l.id == sel).and_then(|l| {
+        match &l.kind {
+            LayerKind::Path(p) => Some(p.clone()),
+            _ => None,
+        }
+    })
+}
+
+fn with_brush_layer(state: AppState, f: impl FnOnce(&mut state::BrushLayer)) {
+    let Some(sel) = state.selected_layer.get_untracked() else { return };
+    state.update_current_item(|m| {
+        if let Some(l) = m.layers.iter_mut().find(|l| l.id == sel) {
+            let LayerKind::Brush(b) = &mut l.kind else { return };
+            f(b);
+        }
+    });
+}
+
+fn selected_brush_layer(state: AppState) -> Option<state::BrushLayer> {
+    let sel = state.selected_layer.get()?;
+    state.current()?.layers.iter().find(|l| l.id == sel).and_then(|l| {
+        match &l.kind {
+            LayerKind::Brush(b) => Some(b.clone()),
+            _ => None,
+        }
     })
 }
 
@@ -1306,6 +1685,146 @@ fn TextLayerEditor(state: AppState) -> impl IntoView {
                         />
                     </label>
                 </div>
+            </div>
+        </Show>
+    }
+}
+
+#[component]
+fn PathLayerEditor(state: AppState) -> impl IntoView {
+    let path_layer = move || selected_path_layer(state);
+
+    let undo = move |_| {
+        with_path_layer(state, |p| {
+            if let Some(prev) = p.history.pop() {
+                p.points = prev;
+            }
+        });
+    };
+
+    let clear = move |_| {
+        with_path_layer(state, |p| {
+            push_path_history(p);
+            p.points.clear();
+            p.closed = false;
+        });
+    };
+
+    view! {
+        <Show when=move || path_layer().is_some() fallback=|| ()>
+            <div class="path-editor">
+                <div class="row">
+                    <label>
+                        "Fill"
+                        <input
+                            type="color"
+                            prop:value=move || path_layer().map(|p| p.fill_color).unwrap_or_default()
+                            on:input=move |ev| {
+                                let v = event_target_value(&ev);
+                                with_path_layer(state, |p| p.fill_color = v);
+                            }
+                        />
+                    </label>
+                    <label>
+                        "Stroke"
+                        <input
+                            type="color"
+                            prop:value=move || path_layer().map(|p| p.stroke_color).unwrap_or_default()
+                            on:input=move |ev| {
+                                let v = event_target_value(&ev);
+                                with_path_layer(state, |p| p.stroke_color = v);
+                            }
+                        />
+                    </label>
+                    <label class="slider compact">
+                        "W"
+                        <input
+                            type="range"
+                            min="0"
+                            max="0.1"
+                            step="0.001"
+                            prop:value=move || path_layer().map(|p| p.stroke_width).unwrap_or_default().to_string()
+                            on:input=move |ev| {
+                                let v: f32 = event_target_value(&ev).parse().unwrap_or(0.01);
+                                with_path_layer(state, |p| p.stroke_width = v);
+                            }
+                        />
+                    </label>
+                </div>
+                <div class="row">
+                    <button class="btn" on:click=undo>"Undo"
+                        {move || path_layer().map(|p| format!(" ({})", p.history.len())).unwrap_or_default()}
+                    </button>
+                    <button class="btn" on:click=clear>"Clear"
+                        {move || path_layer().map(|p| format!(" ({} pts)", p.points.len())).unwrap_or_default()}
+                    </button>
+                </div>
+                <p class="dim">
+                    "Pen: click to add anchors, drag handles, double-tap point for smooth↔corner, tap first point to close."
+                </p>
+            </div>
+        </Show>
+    }
+}
+
+#[component]
+fn BrushLayerEditor(state: AppState) -> impl IntoView {
+    let brush_layer = move || selected_brush_layer(state);
+
+    let undo = move |_| {
+        with_brush_layer(state, |b| {
+            if let Some(prev) = b.history.pop() {
+                b.strokes = prev;
+            }
+        });
+    };
+
+    let clear = move |_| {
+        with_brush_layer(state, |b| {
+            push_brush_history(b);
+            b.strokes.clear();
+        });
+    };
+
+    view! {
+        <Show when=move || brush_layer().is_some() fallback=|| ()>
+            <div class="brush-editor">
+                <div class="row">
+                    <label>
+                        "Color"
+                        <input
+                            type="color"
+                            prop:value=move || brush_layer().map(|b| b.color).unwrap_or_default()
+                            on:input=move |ev| {
+                                let v = event_target_value(&ev);
+                                with_brush_layer(state, |b| b.color = v);
+                            }
+                        />
+                    </label>
+                    <label class="slider compact">
+                        "Size"
+                        <input
+                            type="range"
+                            min="0.005"
+                            max="0.1"
+                            step="0.001"
+                            prop:value=move || brush_layer().map(|b| b.width).unwrap_or_default().to_string()
+                            on:input=move |ev| {
+                                let v: f32 = event_target_value(&ev).parse().unwrap_or(0.015);
+                                with_brush_layer(state, |b| b.width = v);
+                            }
+                        />
+                    </label>
+                </div>
+                <div class="row">
+                    <button class="btn" on:click=undo>"Undo"
+                        {move || brush_layer().map(|b| format!(" ({})", b.history.len())).unwrap_or_default()}
+                    </button>
+                    <button class="btn" on:click=clear>"Clear"
+                        {move || brush_layer().map(|b| format!(" ({} strokes)", b.strokes.len())).unwrap_or_default()}
+                    </button>
+                </div>
+                <p class="dim">"Brush: drag on the photo to draw freehand strokes."</p>
             </div>
         </Show>
     }

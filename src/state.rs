@@ -30,6 +30,25 @@ impl TextAlign {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Tool {
+    Select,
+    Pen,
+    Brush,
+}
+
+impl Tool {
+    pub const ALL: [Tool; 3] = [Tool::Select, Tool::Pen, Tool::Brush];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Tool::Select => "Select",
+            Tool::Pen => "Pen",
+            Tool::Brush => "Brush",
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct TextLayer {
     pub text: String,
@@ -71,8 +90,83 @@ impl Default for TextLayer {
 }
 
 #[derive(Clone, PartialEq, Debug)]
+pub struct PathPoint {
+    pub x: f32,
+    pub y: f32,
+    /// Incoming control handle (relative to point).
+    pub in_x: f32,
+    pub in_y: f32,
+    /// Outgoing control handle (relative to point).
+    pub out_x: f32,
+    pub out_y: f32,
+    /// True for smooth (collinear mirrored handles), false for corner.
+    pub smooth: bool,
+}
+
+impl PathPoint {
+    pub fn new(x: f32, y: f32) -> Self {
+        PathPoint { x, y, in_x: 0.0, in_y: 0.0, out_x: 0.0, out_y: 0.0, smooth: true }
+    }
+
+    pub fn corner(x: f32, y: f32) -> Self {
+        PathPoint { x, y, in_x: 0.0, in_y: 0.0, out_x: 0.0, out_y: 0.0, smooth: false }
+    }
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct PathLayer {
+    pub points: Vec<PathPoint>,
+    pub closed: bool,
+    pub fill_color: String,
+    pub stroke_color: String,
+    pub stroke_width: f32,
+    /// Per-path undo stack of point states.
+    pub history: Vec<Vec<PathPoint>>,
+}
+
+impl Default for PathLayer {
+    fn default() -> Self {
+        PathLayer {
+            points: Vec::new(),
+            closed: false,
+            fill_color: "#ff3b30".into(),
+            stroke_color: "#000000".into(),
+            stroke_width: 0.01,
+            history: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct BrushStroke {
+    pub points: Vec<(f32, f32)>,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct BrushLayer {
+    pub strokes: Vec<BrushStroke>,
+    pub color: String,
+    pub width: f32,
+    /// Per-layer undo stack of stroke states.
+    pub history: Vec<Vec<BrushStroke>>,
+}
+
+impl Default for BrushLayer {
+    fn default() -> Self {
+        BrushLayer {
+            strokes: Vec::new(),
+            color: "#0a84ff".into(),
+            width: 0.015,
+            history: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Debug)]
 pub enum LayerKind {
     Text(TextLayer),
+    Path(PathLayer),
+    Brush(BrushLayer),
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -93,9 +187,29 @@ impl Layer {
         }
     }
 
+    pub fn new_path(id: usize) -> Self {
+        Layer {
+            id,
+            visible: true,
+            opacity: 1.0,
+            kind: LayerKind::Path(PathLayer::default()),
+        }
+    }
+
+    pub fn new_brush(id: usize) -> Self {
+        Layer {
+            id,
+            visible: true,
+            opacity: 1.0,
+            kind: LayerKind::Brush(BrushLayer::default()),
+        }
+    }
+
     pub fn label(&self) -> String {
         match &self.kind {
             LayerKind::Text(t) => format!("T: {}", t.text),
+            LayerKind::Path(_) => "Path".into(),
+            LayerKind::Brush(_) => "Brush".into(),
         }
     }
 }
@@ -236,6 +350,7 @@ pub struct AppState {
     pub items: RwSignal<Vec<MediaItem>>,
     pub selected: RwSignal<Option<usize>>,
     pub selected_layer: RwSignal<Option<usize>>,
+    pub selected_tool: RwSignal<Tool>,
     pub busy: RwSignal<Option<String>>,
     /// 0.0..1.0 while a video transcode runs.
     pub progress: RwSignal<f32>,
@@ -250,6 +365,7 @@ impl AppState {
             items: create_rw_signal(Vec::new()),
             selected: create_rw_signal(None),
             selected_layer: create_rw_signal(None),
+            selected_tool: create_rw_signal(Tool::Select),
             busy: create_rw_signal(None),
             progress: create_rw_signal(0.0),
             next_id: create_rw_signal(0),

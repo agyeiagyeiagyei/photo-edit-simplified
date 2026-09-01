@@ -293,6 +293,43 @@ h1 { font-size: 17px; font-weight: 600; }
   font-size: 13px;
 }
 
+.layer-add-row { flex-wrap: wrap; }
+.layer-add-row .btn { flex: 1; min-width: 70px; }
+
+.toolbar {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+
+.path-editor, .brush-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+.path-editor .row, .brush-editor .row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.path-editor label, .brush-editor label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+.path-editor input[type="color"], .brush-editor input[type="color"] {
+  width: 36px;
+  height: 28px;
+  border: none;
+  background: transparent;
+}
+
 .video-wrap { position: relative; }
 .video-overlays {
   position: absolute;
