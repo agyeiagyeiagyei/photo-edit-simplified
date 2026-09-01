@@ -101,7 +101,7 @@ first**; drawing, text, and isolated subjects all live as layers.
 1. **Layers** — ordered stack above the base photo. Per layer: type
    (raster/drawing/text), visibility toggle, opacity, reorder,
    delete, drag-to-position. Composite via canvas at preview and
-   export; export flattens to JPEG. Photos only, not video.
+   export; export flattens to JPEG.
 2. **Marquee selection + background isolation** — rect and free-form
    (lasso) marquee for manual regions. Plus one-tap **subject
    isolation**: client-side person/subject segmentation (MediaPipe
@@ -111,17 +111,33 @@ first**; drawing, text, and isolated subjects all live as layers.
    subject. Feathered edges by default; marquee ops (cut/copy to
    layer, delete, adjust-within-selection) apply to both manual and
    ML selections.
-3. **Pen tool + drawing** — freehand strokes on a drawing layer:
-   color picker, stroke width, opacity, edge smoothing. Touch- and
-   stylus-first. Undo = per-stroke, not global. Keep it a drawing
-   tool, not a paint suite — no brushes marketplace, no blend modes
-   in the first cut.
+3. **Pen tool (vector) + drawing** — the pen is a *vector* pen in
+   the Illustrator/Fontra sense: click to place anchor points, drag
+   out Bézier handles for curves, close the path, then fill and/or
+   stroke it. Paths stay editable after placement (move points,
+   adjust handles, add/delete anchors) and live as vector path
+   layers — rasterized at export resolution, so they stay crisp at
+   any output size. Plus a simple freehand brush mode for casual
+   markup. Path editing must be touch-friendly (big handles,
+   double-tap to convert smooth ↔ corner). Undo = per-path
+   operation, not global. Not a full vector editor: no pathfinder
+   boolean ops, no blend modes in the first cut.
 4. **Font upload + text** — user uploads .ttf/.otf/.woff2, loaded
    via the FontFace API (stays on-device). Text layers: drag
    placement, size, color, weight where the font provides it,
    stroke/outline + shadow for legibility over photos, alignment.
    Ship a few bundled open-license defaults (e.g. Inter, Oswald) so
    it works without an upload.
+   **Text layers also work on video.** Preview = CSS/canvas overlay
+   on the video element (no re-render). Export: render each text
+   layer to a transparent PNG at export resolution and burn it in
+   during the ffmpeg.wasm transcode with the `overlay` filter —
+   avoids needing a libfreetype-enabled ffmpeg.wasm build for
+   `drawtext`. Static overlay for the whole clip in the first cut;
+   timed in/out per text layer is a later refinement.
+   (Marquee/isolation and pen drawing stay photo-only for now —
+   per-frame segmentation and stroke rasterization on video are a
+   bigger lift; revisit after text-on-video ships.)
 
 ## UX sketch
 Grid of uploaded items → tap to edit one → bottom tool tabs
