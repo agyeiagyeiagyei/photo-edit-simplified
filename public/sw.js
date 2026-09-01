@@ -1,5 +1,13 @@
 const CACHE = 'pes-v1';
-const SHELL = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
+const SHELL = [
+  './', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png',
+  './vendor/mediapipe-tasks-vision/vision_bundle.mjs',
+  './vendor/mediapipe-tasks-vision/wasm/vision_wasm_internal.js',
+  './vendor/mediapipe-tasks-vision/wasm/vision_wasm_internal.wasm',
+  './vendor/mediapipe-tasks-vision/wasm/vision_wasm_nosimd_internal.js',
+  './vendor/mediapipe-tasks-vision/wasm/vision_wasm_nosimd_internal.wasm',
+  './vendor/mediapipe-selfie-segmenter/selfie_segmenter.tflite',
+];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

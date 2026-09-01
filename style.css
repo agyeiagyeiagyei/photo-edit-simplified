@@ -337,3 +337,24 @@ h1 { font-size: 17px; font-weight: 600; }
   pointer-events: none;
   overflow: hidden;
 }
+
+.select-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.select-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.select-row .btn {
+  flex: 1;
+  min-width: 80px;
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}

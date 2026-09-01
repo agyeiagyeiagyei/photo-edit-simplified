@@ -17,9 +17,14 @@
   <link data-trunk rel="copy-file" href="public/fonts/inter-700.woff2"/>
   <link data-trunk rel="copy-file" href="public/fonts/oswald-400.woff2"/>
   <link data-trunk rel="copy-file" href="public/fonts/oswald-700.woff2"/>
+  <link data-trunk rel="copy-dir" href="public/vendor"/>
   <link data-trunk rel="rust" data-wasm-opt="2"/>
   <script src="https://unpkg.com/heic2any@0.0.4/dist/heic2any.min.js"></script>
   <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
+  <script type="module">
+    import { FilesetResolver, ImageSegmenter } from "./vendor/mediapipe-tasks-vision/vision_bundle.mjs";
+    window.PES = { FilesetResolver, ImageSegmenter };
+  </script>
 </head>
 <body>
   <script>
@@ -31,6 +36,35 @@
     window.pesHeicToJpeg = async function (blob) {
       const out = await window.heic2any({ blob, toType: 'image/jpeg', quality: 0.92 });
       return Array.isArray(out) ? out[0] : out;
+    };
+
+    // MediaPipe Selfie Segmentation via Tasks Vision ImageSegmenter. Called from Rust.
+    let _imageSegmenter = null;
+    window.pesSegmentSelfie = async function (image) {
+      const { FilesetResolver, ImageSegmenter } = window.PES;
+      if (!_imageSegmenter) {
+        const vision = await FilesetResolver.forVisionTasks(
+          './vendor/mediapipe-tasks-vision/wasm'
+        );
+        _imageSegmenter = await ImageSegmenter.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath:
+              './vendor/mediapipe-selfie-segmenter/selfie_segmenter.tflite',
+            delegate: 'GPU',
+          },
+          runningMode: 'IMAGE',
+          outputCategoryMask: true,
+        });
+      }
+      const result = await _imageSegmenter.segment(image);
+      const mask = result.categoryMask;
+      // categoryMask is 0/1 per pixel; scale to 0..255.
+      const data = mask.getAsUint8Array();
+      const out = new Uint8Array(data.length);
+      for (let i = 0; i < data.length; i++) {
+        out[i] = data[i] > 0 ? 255 : 0;
+      }
+      return out;
     };
 
     // Video transcode via ffmpeg.wasm. Called from Rust.

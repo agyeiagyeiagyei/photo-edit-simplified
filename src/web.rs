@@ -85,6 +85,17 @@ fn call_global(name: &str, args: &Array) -> Result<JsValue, JsValue> {
     f.apply(&JsValue::NULL, args)
 }
 
+/// Segment a person/selfie in an image via MediaPipe Selfie Segmentation.
+/// Returns a grayscale mask (0..255) with the same dimensions as `image`.
+pub async fn segment_selfie(image: &HtmlImageElement) -> Result<Vec<u8>, JsValue> {
+    let args = Array::new();
+    args.push(image);
+    let out = call_global("pesSegmentSelfie", &args)?;
+    let result = JsFuture::from(Promise::from(out)).await?;
+    let arr = js_sys::Uint8Array::from(result);
+    Ok(arr.to_vec())
+}
+
 /// HEIC blob -> JPEG blob via window.pesHeicToJpeg (heic2any CDN script).
 pub async fn heic_to_jpeg(blob: Blob) -> Result<Blob, JsValue> {
     let args = Array::new();

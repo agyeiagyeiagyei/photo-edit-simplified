@@ -1,5 +1,7 @@
 //! Pure-Rust pixel operations on RGBA buffers.
 
+use crate::state::{Selection, SelectionKind};
+
 /// Apply brightness / contrast / saturation / warmth in place.
 /// All parameters in [-1.0, 1.0].
 pub fn adjust(data: &mut [u8], brightness: f32, contrast: f32, saturation: f32, warmth: f32) {
@@ -133,6 +135,254 @@ pub fn crop(src: &[u8], w: usize, x: usize, y: usize, cw: usize, ch: usize) -> V
         out[row * cw * 4..(row + 1) * cw * 4].copy_from_slice(&src[s..s + cw * 4]);
     }
     out
+}
+
+// --- selection / mask ops -----------------------------------------------------
+
+/// Generate an 8-bit alpha mask from a normalized selection.
+/// Result has length w*h; 255 = fully selected, 0 = unselected.
+pub fn selection_mask(sel: &Selection, w: usize, h: usize) -> Vec<u8> {
+    let mut mask = vec![0u8; w * h];
+    match &sel.kind {
+        SelectionKind::Rect { x, y, w: rw, h: rh } => {
+            let x0 = (x * w as f32).floor().max(0.0) as usize;
+            let y0 = (y * h as f32).floor().max(0.0) as usize;
+            let x1 = ((x + rw) * w as f32).ceil().min(w as f32) as usize;
+            let y1 = ((y + rh) * h as f32).ceil().min(h as f32) as usize;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    mask[y * w + x] = 255;
+                }
+            }
+        }
+        SelectionKind::Lasso(poly) => {
+            if poly.len() < 3 {
+                return mask;
+            }
+            for y in 0..h {
+                for x in 0..w {
+                    let nx = (x as f32 + 0.5) / w as f32;
+                    let ny = (y as f32 + 0.5) / h as f32;
+                    if point_in_polygon(nx, ny, poly) {
+                        mask[y * w + x] = 255;
+                    }
+                }
+            }
+        }
+    }
+    if sel.feather > 0.001 {
+        feather_mask(&mut mask, w, h, sel.feather);
+    }
+    mask
+}
+
+fn point_in_polygon(x: f32, y: f32, poly: &[(f32, f32)]) -> bool {
+    let mut inside = false;
+    let mut j = poly.len() - 1;
+    for i in 0..poly.len() {
+        let (xi, yi) = poly[i];
+        let (xj, yj) = poly[j];
+        if ((yi > y) != (yj > y))
+            && (x < (xj - xi) * (y - yi) / (yj - yi).max(f32::EPSILON) + xi)
+        {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Approximate gaussian feather on a grayscale mask. radius is a fraction of
+/// the image diagonal and is clamped to a reasonable pixel range.
+pub fn feather_mask(mask: &mut [u8], w: usize, h: usize, radius: f32) {
+    let diag = ((w * w + h * h) as f32).sqrt();
+    let r = (radius * diag * 0.5).max(1.0).min(64.0) as usize;
+    if r <= 1 {
+        return;
+    }
+    let mut tmp = mask.to_vec();
+    box_blur_gray(&mut tmp, mask, w, h, r);
+}
+
+fn box_blur_gray(src: &[u8], dst: &mut [u8], w: usize, h: usize, radius: usize) {
+    let mut temp = vec![0u32; w * h];
+    let r = radius as i32;
+    // horizontal pass
+    for y in 0..h {
+        let mut sum = 0u32;
+        for x in 0..(r + 1).min(w as i32) {
+            sum += src[y * w + x as usize] as u32;
+        }
+        for x in 0..w {
+            let left = (x as i32 - r - 1).max(0) as usize;
+            let right = (x as i32 + r).min(w as i32 - 1) as usize;
+            if x as i32 - r - 1 >= 0 {
+                sum -= src[y * w + left] as u32;
+            }
+            if x as i32 + r < w as i32 {
+                sum += src[y * w + right] as u32;
+            }
+            let count = (right - left + 1) as u32;
+            temp[y * w + x] = sum / count.max(1);
+        }
+    }
+    // vertical pass
+    for x in 0..w {
+        let mut sum = 0u32;
+        for y in 0..(r + 1).min(h as i32) {
+            sum += temp[(y as usize) * w + x];
+        }
+        for y in 0..h {
+            let top = (y as i32 - r - 1).max(0) as usize;
+            let bot = (y as i32 + r).min(h as i32 - 1) as usize;
+            if y as i32 - r - 1 >= 0 {
+                sum -= temp[top * w + x];
+            }
+            if y as i32 + r < h as i32 {
+                sum += temp[bot * w + x];
+            }
+            let count = (bot - top + 1) as u32;
+            dst[y * w + x] = (sum / count.max(1)).min(255) as u8;
+        }
+    }
+}
+
+/// Apply color adjustments only where mask > 0. mask length must equal w*h.
+pub fn adjust_masked(
+    data: &mut [u8],
+    mask: &[u8],
+    brightness: f32,
+    contrast: f32,
+    saturation: f32,
+    warmth: f32,
+) {
+    let b = brightness * 255.0;
+    let c = contrast;
+    let s = 1.0 + saturation;
+    let wr = warmth * 40.0;
+    let wb = -warmth * 40.0;
+    for (px, m) in data.chunks_exact_mut(4).zip(mask.iter()) {
+        if *m == 0 {
+            continue;
+        }
+        let a = *m as f32 / 255.0;
+        let r = px[0] as f32;
+        let g = px[1] as f32;
+        let bl = px[2] as f32;
+
+        let mut r = (r - 128.0) * (1.0 + c) + 128.0 + b;
+        let mut g = (g - 128.0) * (1.0 + c) + 128.0 + b;
+        let mut bl = (bl - 128.0) * (1.0 + c) + 128.0 + b;
+
+        let luma = 0.299 * r + 0.587 * g + 0.114 * bl;
+        r = luma + (r - luma) * s;
+        g = luma + (g - luma) * s;
+        bl = luma + (bl - luma) * s;
+
+        r += wr;
+        bl += wb;
+
+        px[0] = lerp(px[0] as f32, r.clamp(0.0, 255.0), a) as u8;
+        px[1] = lerp(px[1] as f32, g.clamp(0.0, 255.0), a) as u8;
+        px[2] = lerp(px[2] as f32, bl.clamp(0.0, 255.0), a) as u8;
+    }
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+/// Extract `src` RGBA multiplied by `mask` into a new RGBA buffer.
+/// Mask values 0..255 are treated as alpha. The returned buffer has the
+/// same dimensions as the input.
+pub fn extract_masked(src: &[u8], mask: &[u8]) -> Vec<u8> {
+    let mut out = src.to_vec();
+    for (px, m) in out.chunks_exact_mut(4).zip(mask.iter()) {
+        let a = *m as f32 / 255.0;
+        px[3] = (px[3] as f32 * a).min(255.0) as u8;
+    }
+    out
+}
+
+/// Simple box blur on RGBA (used for background blur behind isolated subject).
+pub fn box_blur_rgba(data: &mut [u8], w: usize, h: usize, radius: usize) {
+    if radius == 0 {
+        return;
+    }
+    let mut temp = vec![0u32; w * h * 4];
+    let r = radius as i32;
+    // horizontal
+    for y in 0..h {
+        let mut sums = [0u32; 4];
+        for x in 0..(r + 1).min(w as i32) {
+            let i = (y * w + x as usize) * 4;
+            for c in 0..4 {
+                sums[c] += data[i + c] as u32;
+            }
+        }
+        for x in 0..w {
+            let left = (x as i32 - r - 1).max(0) as usize;
+            let right = (x as i32 + r).min(w as i32 - 1) as usize;
+            let li = (y * w + left) * 4;
+            let ri = (y * w + right) * 4;
+            let oi = (y * w + x) * 4;
+            if x as i32 - r - 1 >= 0 {
+                for c in 0..4 {
+                    sums[c] -= data[li + c] as u32;
+                }
+            }
+            if x as i32 + r < w as i32 {
+                for c in 0..4 {
+                    sums[c] += data[ri + c] as u32;
+                }
+            }
+            let count = (right - left + 1) as u32;
+            for c in 0..4 {
+                temp[oi + c] = sums[c] / count.max(1);
+            }
+        }
+    }
+    // vertical
+    for x in 0..w {
+        let mut sums = [0u32; 4];
+        for y in 0..(r + 1).min(h as i32) {
+            let i = ((y as usize) * w + x) * 4;
+            for c in 0..4 {
+                sums[c] += temp[i + c];
+            }
+        }
+        for y in 0..h {
+            let top = (y as i32 - r - 1).max(0) as usize;
+            let bot = (y as i32 + r).min(h as i32 - 1) as usize;
+            let ti = (top * w + x) * 4;
+            let bi = (bot * w + x) * 4;
+            let oi = (y * w + x) * 4;
+            if y as i32 - r - 1 >= 0 {
+                for c in 0..4 {
+                    sums[c] -= temp[ti + c];
+                }
+            }
+            if y as i32 + r < h as i32 {
+                for c in 0..4 {
+                    sums[c] += temp[bi + c];
+                }
+            }
+            let count = (bot - top + 1) as u32;
+            for c in 0..4 {
+                data[oi + c] = (sums[c] / count.max(1)).min(255) as u8;
+            }
+        }
+    }
+}
+
+/// Darken an RGBA buffer in place.
+pub fn darken(data: &mut [u8], amount: f32) {
+    let factor = 1.0 - amount.clamp(0.0, 1.0);
+    for px in data.chunks_exact_mut(4) {
+        px[0] = (px[0] as f32 * factor).min(255.0) as u8;
+        px[1] = (px[1] as f32 * factor).min(255.0) as u8;
+        px[2] = (px[2] as f32 * factor).min(255.0) as u8;
+    }
 }
 
 #[cfg(test)]

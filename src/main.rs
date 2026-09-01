@@ -13,10 +13,11 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{Blob, File, Url};
 
-use state::{AppState, Aspect, BrushStroke, EditParams, Layer, LayerKind, MediaItem, MediaKind, PathPoint, TextAlign, Tool};
+use state::{AppState, Aspect, BrushStroke, EditParams, Layer, LayerKind, MediaItem, MediaKind, PathPoint, SelectTool, Selection, SelectionKind, TextAlign, Tool};
 
 // --- media cache (non-reactive) ---------------------------------------------
 
+#[derive(Clone)]
 struct PhotoData {
     full: (Vec<u8>, usize, usize),
     preview: (Vec<u8>, usize, usize),
@@ -326,6 +327,17 @@ fn draw_brush_layer(ctx: &web_sys::CanvasRenderingContext2d, layer: &state::Laye
     }
 }
 
+fn draw_raster_layer(ctx: &web_sys::CanvasRenderingContext2d, layer: &state::Layer, w: f64, h: f64) {
+    let LayerKind::Raster(r) = &layer.kind else { return };
+    if r.width == 0 || r.height == 0 {
+        return;
+    }
+    let canvas = web::create_canvas(r.width as u32, r.height as u32);
+    web::put_pixels(&canvas, &r.pixels, r.width as u32, r.height as u32);
+    let _ = ctx.draw_image_with_html_canvas_element_and_dw_and_dh(&canvas, 0.0, 0.0, w, h,
+    );
+}
+
 fn composite_layers(canvas: &web_sys::HtmlCanvasElement, layers: &[state::Layer], w: usize, h: usize) {
     let ctx = web::ctx2d(canvas);
     for layer in layers {
@@ -337,6 +349,7 @@ fn composite_layers(canvas: &web_sys::HtmlCanvasElement, layers: &[state::Layer]
             LayerKind::Text(_) => draw_text_layer(&ctx, layer, w as f64, h as f64),
             LayerKind::Path(_) => draw_path_layer(&ctx, layer, w as f64, h as f64),
             LayerKind::Brush(_) => draw_brush_layer(&ctx, layer, w as f64, h as f64),
+            LayerKind::Raster(_) => draw_raster_layer(&ctx, layer, w as f64, h as f64),
         }
         ctx.set_global_alpha(1.0);
     }
@@ -390,13 +403,25 @@ fn export_photo(state: AppState, item: MediaItem) {
         let (pix, w, h) = &photo.full;
         let (mut p, w, h) = geometry(pix, *w, *h, &item.edit);
         if item.edit.is_color_touched() {
-            ops::adjust(
-                &mut p,
-                item.edit.brightness,
-                item.edit.contrast,
-                item.edit.saturation,
-                item.edit.warmth,
-            );
+            if let Some(sel) = &item.edit.selection {
+                let mask = ops::selection_mask(sel, w, h);
+                ops::adjust_masked(
+                    &mut p,
+                    &mask,
+                    item.edit.brightness,
+                    item.edit.contrast,
+                    item.edit.saturation,
+                    item.edit.warmth,
+                );
+            } else {
+                ops::adjust(
+                    &mut p,
+                    item.edit.brightness,
+                    item.edit.contrast,
+                    item.edit.saturation,
+                    item.edit.warmth,
+                );
+            }
         }
 
         // Composite onto the full geometry-corrected canvas, then crop.
@@ -668,6 +693,7 @@ enum Tab {
     Crop,
     Rotate,
     Color,
+    Select,
     Layers,
     Trim,
     Export,
@@ -693,6 +719,7 @@ fn Editor(state: AppState) -> impl IntoView {
                     <TabBtn tab=tab t=Tab::Crop label="Crop"/>
                     <TabBtn tab=tab t=Tab::Rotate label="Rotate"/>
                     <TabBtn tab=tab t=Tab::Color label="Color"/>
+                    <TabBtn tab=tab t=Tab::Select label="Select"/>
                     <TabBtn tab=tab t=Tab::Layers label="Layers"/>
                     <Show
                         when=move || state.current().map(|m| m.kind == MediaKind::Video).unwrap_or(false)
@@ -707,6 +734,7 @@ fn Editor(state: AppState) -> impl IntoView {
                         Tab::Crop => view! { <CropTab state=state/> }.into_view(),
                         Tab::Rotate => view! { <RotateTab state=state/> }.into_view(),
                         Tab::Color => view! { <ColorTab state=state/> }.into_view(),
+                        Tab::Select => view! { <SelectTab state=state/> }.into_view(),
                         Tab::Layers => view! { <LayersTab state=state/> }.into_view(),
                         Tab::Trim => view! { <TrimTab state=state/> }.into_view(),
                         Tab::Export => view! { <ExportTab state=state/> }.into_view(),
@@ -729,6 +757,12 @@ enum PenDrag {
     MovePoint(usize),
     MoveOut(usize),
     MoveIn(usize),
+}
+
+#[derive(Clone, PartialEq, Debug)]
+enum SelectDrag {
+    Rect((f32, f32), (f32, f32)),
+    Lasso(Vec<(f32, f32)>),
 }
 
 fn layer_norm_pos(ev: &web_sys::MouseEvent) -> Option<(f32, f32)> {
@@ -812,6 +846,71 @@ fn draw_path_edit_handles(ctx: &web_sys::CanvasRenderingContext2d, layer: &state
     }
 }
 
+fn draw_selection_overlay(ctx: &web_sys::CanvasRenderingContext2d, sel: &Selection, w: f64, h: f64) {
+    ctx.save();
+    ctx.set_stroke_style_str("#0a84ff");
+    ctx.set_line_width(2.0);
+    match &sel.kind {
+        SelectionKind::Rect { x, y, w: rw, h: rh } => {
+            ctx.stroke_rect(
+                (*x * w as f32) as f64,
+                (*y * h as f32) as f64,
+                (*rw * w as f32) as f64,
+                (*rh * h as f32) as f64,
+            );
+        }
+        SelectionKind::Lasso(poly) => {
+            if poly.len() < 2 {
+                ctx.restore();
+                return;
+            }
+            ctx.begin_path();
+            let (x0, y0) = poly[0];
+            ctx.move_to((x0 * w as f32) as f64, (y0 * h as f32) as f64);
+            for &(x, y) in &poly[1..] {
+                ctx.line_to((x * w as f32) as f64, (y * h as f32) as f64);
+            }
+            ctx.close_path();
+            ctx.stroke();
+        }
+    }
+    ctx.restore();
+}
+
+fn draw_select_drag(ctx: &web_sys::CanvasRenderingContext2d, drag: &SelectDrag, w: f64, h: f64) {
+    ctx.save();
+    ctx.set_stroke_style_str("rgba(10,132,255,0.8)");
+    ctx.set_line_width(2.0);
+    match drag {
+        SelectDrag::Rect((x0, y0), (x1, y1)) => {
+            let x = x0.min(*x1);
+            let y = y0.min(*y1);
+            let rw = (x1 - x0).abs();
+            let rh = (y1 - y0).abs();
+            ctx.stroke_rect(
+                (x * w as f32) as f64,
+                (y * h as f32) as f64,
+                (rw * w as f32) as f64,
+                (rh * h as f32) as f64,
+            );
+        }
+        SelectDrag::Lasso(poly) => {
+            if poly.len() < 2 {
+                ctx.restore();
+                return;
+            }
+            ctx.begin_path();
+            let (x0, y0) = poly[0];
+            ctx.move_to((x0 * w as f32) as f64, (y0 * h as f32) as f64);
+            for &(x, y) in &poly[1..] {
+                ctx.line_to((x * w as f32) as f64, (y * h as f32) as f64);
+            }
+            ctx.stroke();
+        }
+    }
+    ctx.restore();
+}
+
 #[component]
 fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     let canvas_ref = create_node_ref::<html::Canvas>();
@@ -819,6 +918,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     let layer_drag = create_rw_signal(None::<(usize, f32, f32, f32, f32)>);
     let pen_drag = create_rw_signal(None::<(usize, PenDrag, f32, f32)>);
     let brush_draw = create_rw_signal(None::<usize>);
+    let select_drag = create_rw_signal(None::<SelectDrag>);
 
     // --- text layer drag -------------------------------------------------------
     window_event_listener(leptos::ev::pointermove, move |ev| {
@@ -903,11 +1003,63 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         let _ = brush_draw.try_set(None);
     });
 
+    // --- select tool drag --------------------------------------------------------
+    window_event_listener(leptos::ev::pointermove, move |ev| {
+        let Some((nx, ny)) = layer_norm_pos(&ev) else { return };
+        let Some(Some(drag)) = select_drag.try_get() else { return };
+        match drag {
+            SelectDrag::Rect(start, _) => {
+                select_drag.set(Some(SelectDrag::Rect(start, (nx, ny))));
+            }
+            SelectDrag::Lasso(mut pts) => {
+                if pts.last().map(|last| dist2(*last, (nx, ny)) > 0.00005).unwrap_or(true) {
+                    pts.push((nx, ny));
+                    select_drag.set(Some(SelectDrag::Lasso(pts)));
+                }
+            }
+        }
+    });
+
+    window_event_listener(leptos::ev::pointerup, move |_| {
+        let Some(drag) = select_drag.try_get().flatten() else { return };
+        let new_sel = match drag {
+            SelectDrag::Rect((x0, y0), (x1, y1)) => {
+                let x = x0.min(x1);
+                let y = y0.min(y1);
+                let w = (x1 - x0).abs();
+                let h = (y1 - y0).abs();
+                if w > 0.01 && h > 0.01 {
+                    Some(Selection {
+                        kind: SelectionKind::Rect { x, y, w, h },
+                        feather: 0.0,
+                    })
+                } else {
+                    None
+                }
+            }
+            SelectDrag::Lasso(pts) => {
+                if pts.len() >= 3 {
+                    Some(Selection {
+                        kind: SelectionKind::Lasso(pts),
+                        feather: 0.0,
+                    })
+                } else {
+                    None
+                }
+            }
+        };
+        state.update_current_item(|m| {
+            m.edit.selection = new_sel;
+        });
+        let _ = select_drag.try_set(None);
+    });
+
     create_effect(move |_| {
         state.items.track();
         state.selected.track();
         state.selected_layer.track();
         state.selected_tool.track();
+        state.selected_select_tool.track();
         let Some(item) = state.current() else { return };
         if item.kind != MediaKind::Photo {
             return;
@@ -919,13 +1071,25 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         let (mut p, w, h) = geometry(pix, *w, *h, &item.edit);
         working.set((w, h));
         if item.edit.is_color_touched() {
-            ops::adjust(
-                &mut p,
-                item.edit.brightness,
-                item.edit.contrast,
-                item.edit.saturation,
-                item.edit.warmth,
-            );
+            if let Some(sel) = &item.edit.selection {
+                let mask = ops::selection_mask(sel, w, h);
+                ops::adjust_masked(
+                    &mut p,
+                    &mask,
+                    item.edit.brightness,
+                    item.edit.contrast,
+                    item.edit.saturation,
+                    item.edit.warmth,
+                );
+            } else {
+                ops::adjust(
+                    &mut p,
+                    item.edit.brightness,
+                    item.edit.contrast,
+                    item.edit.saturation,
+                    item.edit.warmth,
+                );
+            }
         }
         web::put_pixels(&canvas, &p, w as u32, h as u32);
         composite_layers(&canvas, &item.layers, w, h);
@@ -938,13 +1102,24 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 }
             }
         }
+
+        // Draw selection overlay on the Select tab.
+        if tab.get() == Tab::Select {
+            let ctx = web::ctx2d(&canvas);
+            if let Some(sel) = &item.edit.selection {
+                draw_selection_overlay(&ctx, sel, w as f64, h as f64);
+            }
+            if let Some(drag) = select_drag.get() {
+                draw_select_drag(&ctx, &drag, w as f64, h as f64);
+            }
+        }
     });
 
     view! {
         <div class="preview">
             {move || match state.current() {
                 Some(m) if m.kind == MediaKind::Video => {
-                    let e = m.edit;
+                    let e = m.edit.clone();
                     let style = format!(
                         "filter: brightness({}) contrast({}) saturate({}); transform: rotate({}deg);",
                         1.0 + e.brightness,
@@ -964,6 +1139,18 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     <div
                         class="canvas-wrap"
                         on:pointerdown=move |ev: web_sys::PointerEvent| {
+                            if tab.get() == Tab::Select {
+                                let Some((nx, ny)) = layer_norm_pos(&ev) else { return; };
+                                match state.selected_select_tool.get() {
+                                    SelectTool::Rect => {
+                                        select_drag.set(Some(SelectDrag::Rect((nx, ny), (nx, ny))));
+                                    }
+                                    SelectTool::Lasso => {
+                                        select_drag.set(Some(SelectDrag::Lasso(vec![(nx, ny)])));
+                                    }
+                                }
+                                return;
+                            }
                             if tab.get() != Tab::Layers { return; }
                             let Some(id) = state.selected_layer.get() else { return; };
                             let Some(item) = state.current() else { return; };
@@ -1216,6 +1403,225 @@ fn CropTab(state: AppState) -> impl IntoView {
             })}
         </div>
         <p class="dim">"Drag the crop box on the image. Corners resize."</p>
+    }
+}
+
+fn downscale_pixels(pixels: &[u8], w: usize, h: usize, long_edge: u32) -> (Vec<u8>, usize, usize) {
+    let scale = (long_edge as f32 / w.max(h) as f32).min(1.0);
+    let pw = (w as f32 * scale).max(1.0) as u32;
+    let ph = (h as f32 * scale).max(1.0) as u32;
+    let src = web::create_canvas(w as u32, h as u32);
+    web::put_pixels(&src, pixels, w as u32, h as u32);
+    let dst = web::create_canvas(pw, ph);
+    let ctx = web::ctx2d(&dst);
+    ctx.draw_image_with_html_canvas_element_and_dw_and_dh(&src, 0.0, 0.0, pw as f64, ph as f64)
+        .unwrap();
+    web::image_data_from_ctx(&ctx, pw, ph)
+}
+
+fn selection_to_layer(state: AppState, cut: bool) {
+    let Some(item) = state.current() else { return; };
+    if item.kind != MediaKind::Photo {
+        return;
+    }
+    let Some(sel) = item.edit.selection.clone() else { return; };
+    let Some(photo) = get_photo(item.id) else { return; };
+    let (full, fw, fh) = photo.full.clone();
+    let (base, w, h) = geometry(&full, fw, fh, &item.edit);
+    let mask = ops::selection_mask(&sel, w, h);
+    let extracted = ops::extract_masked(&base, &mask);
+    let next_id = item.next_layer_id;
+    state.update_current_item(|m| {
+        m.next_layer_id += 1;
+        m.layers.push(Layer::new_raster(next_id, extracted, w, h));
+    });
+    if cut {
+        let mut cleared = base;
+        for (px, m) in cleared.chunks_exact_mut(4).zip(mask.iter()) {
+            let a = *m as f32 / 255.0;
+            px[3] = (px[3] as f32 * (1.0 - a)).min(255.0) as u8;
+        }
+        let preview = downscale_pixels(&cleared, w, h, 1024);
+        CACHE.with(|c| {
+            if let Some(pd) = c.borrow_mut().photos.get_mut(&item.id) {
+                let pd = Rc::make_mut(pd);
+                pd.full = (cleared, w, h);
+                pd.preview = preview;
+            }
+        });
+        state.update_current(|e| {
+            e.rot90 = 0;
+            e.fine_angle = 0.0;
+            e.crop = state::CropRect::default();
+            e.selection = None;
+        });
+    }
+}
+
+fn delete_selection(state: AppState) {
+    let Some(item) = state.current() else { return; };
+    if item.kind != MediaKind::Photo {
+        return;
+    }
+    let Some(sel) = item.edit.selection.clone() else { return; };
+    let Some(photo) = get_photo(item.id) else { return; };
+    let (full, fw, fh) = photo.full.clone();
+    let (mut base, w, h) = geometry(&full, fw, fh, &item.edit);
+    let mask = ops::selection_mask(&sel, w, h);
+    for (px, m) in base.chunks_exact_mut(4).zip(mask.iter()) {
+        let a = *m as f32 / 255.0;
+        px[3] = (px[3] as f32 * (1.0 - a)).min(255.0) as u8;
+    }
+    let preview = downscale_pixels(&base, w, h, 1024);
+    CACHE.with(|c| {
+        if let Some(pd) = c.borrow_mut().photos.get_mut(&item.id) {
+            let pd = Rc::make_mut(pd);
+            pd.full = (base, w, h);
+            pd.preview = preview;
+        }
+    });
+    state.update_current(|e| {
+        e.rot90 = 0;
+        e.fine_angle = 0.0;
+        e.crop = state::CropRect::default();
+        e.selection = None;
+    });
+}
+
+fn isolate_subject(state: AppState) {
+    let Some(item) = state.current() else { return; };
+    if item.kind != MediaKind::Photo {
+        return;
+    }
+    let Some(photo) = get_photo(item.id) else { return; };
+    let (pix, pw, ph) = photo.preview.clone();
+    state.busy.set(Some("Segmenting subject…".into()));
+    spawn_local(async move {
+        let canvas = web::create_canvas(pw as u32, ph as u32);
+        web::put_pixels(&canvas, &pix, pw as u32, ph as u32);
+        let Ok(blob) = web::canvas_to_blob(&canvas, "image/jpeg").await else {
+            state.busy.set(None);
+            return;
+        };
+        let Ok((img, url)) = web::load_image(&blob).await else {
+            state.busy.set(None);
+            return;
+        };
+        match web::segment_selfie(&img).await {
+            Ok(mask) => {
+                let _ = Url::revoke_object_url(&url);
+                if mask.len() != pw * ph {
+                    web::log("segmentation mask size mismatch");
+                    state.busy.set(None);
+                    return;
+                }
+                let mut bg = pix.clone();
+                ops::box_blur_rgba(&mut bg, pw, ph, 8);
+                ops::darken(&mut bg, 0.3);
+                let inv_mask: Vec<u8> = mask.iter().map(|m| 255 - m).collect();
+                let bg = ops::extract_masked(&bg, &inv_mask);
+                let subject = ops::extract_masked(&pix, &mask);
+                let mut next_id = 0;
+                state.update_current_item(|m| {
+                    let id0 = m.next_layer_id;
+                    m.next_layer_id += 1;
+                    let id1 = m.next_layer_id;
+                    m.next_layer_id += 1;
+                    m.layers.push(Layer::new_raster(id0, bg, pw, ph));
+                    m.layers.push(Layer::new_raster(id1, subject, pw, ph));
+                    next_id = id1;
+                });
+                state.selected_layer.set(Some(next_id));
+                state.busy.set(None);
+            }
+            Err(e) => {
+                let _ = Url::revoke_object_url(&url);
+                web::log_err(&format!("segmentation failed: {e:?}"));
+                state.busy.set(None);
+            }
+        }
+    });
+}
+
+#[component]
+fn SelectTab(state: AppState) -> impl IntoView {
+    let has_selection =
+        move || state.current().map(|m| m.edit.selection.is_some()).unwrap_or(false);
+    let feather = move || {
+        state
+            .current()
+            .and_then(|m| m.edit.selection)
+            .map(|s| s.feather)
+            .unwrap_or(0.0)
+    };
+    view! {
+        <div class="select-tab">
+            <div class="chips">
+                {SelectTool::ALL.map(|t| {
+                    let active = move || state.selected_select_tool.get() == t;
+                    view! {
+                        <button
+                            class="chip"
+                            class:active=active
+                            on:click=move |_| state.selected_select_tool.set(t)
+                        >
+                            {t.label()}
+                        </button>
+                    }
+                })}
+            </div>
+            <div class="row select-row">
+                <button
+                    class="btn"
+                    disabled=move || !has_selection()
+                    on:click=move |_| selection_to_layer(state, false)
+                >
+                    "Copy to layer"
+                </button>
+                <button
+                    class="btn"
+                    disabled=move || !has_selection()
+                    on:click=move |_| selection_to_layer(state, true)
+                >
+                    "Cut to layer"
+                </button>
+                <button
+                    class="btn"
+                    disabled=move || !has_selection()
+                    on:click=move |_| delete_selection(state)
+                >
+                    "Delete"
+                </button>
+                <button
+                    class="btn"
+                    on:click=move |_| state.update_current(|e| e.selection = None)
+                >
+                    "Clear"
+                </button>
+            </div>
+            <label class="slider">
+                <span>"Feather: " {move || format!("{:.0}%", feather() * 100.0)}</span>
+                <input
+                    type="range" min="0" max="0.25" step="0.01"
+                    prop:value=move || feather().to_string()
+                    on:input=move |ev| {
+                        let v: f32 = event_target_value(&ev).parse().unwrap_or(0.0);
+                        state.update_current(|e| {
+                            if let Some(ref mut s) = e.selection {
+                                s.feather = v.clamp(0.0, 0.25);
+                            }
+                        });
+                    }
+                />
+            </label>
+            <button class="btn primary" on:click=move |_| isolate_subject(state)>
+                "Isolate subject"
+            </button>
+            <p class="dim">
+                "Rect/Lasso selects a region. Cut/Copy lift it to a raster layer. \
+                 Isolate subject runs MediaPipe Selfie Segmentation (photo-only)."
+            </p>
+        </div>
     }
 }
 
@@ -1892,7 +2298,7 @@ fn ExportTab(state: AppState) -> impl IntoView {
                     state.items.update(|v| {
                         for m in v.iter_mut() {
                             if m.kind == cur.kind && m.id != cur.id {
-                                m.edit = cur.edit;
+                                m.edit = cur.edit.clone();
                             }
                         }
                     });

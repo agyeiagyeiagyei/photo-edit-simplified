@@ -49,6 +49,23 @@ impl Tool {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum SelectTool {
+    Rect,
+    Lasso,
+}
+
+impl SelectTool {
+    pub const ALL: [SelectTool; 2] = [SelectTool::Rect, SelectTool::Lasso];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SelectTool::Rect => "Rect",
+            SelectTool::Lasso => "Lasso",
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct TextLayer {
     pub text: String,
@@ -167,6 +184,27 @@ pub enum LayerKind {
     Text(TextLayer),
     Path(PathLayer),
     Brush(BrushLayer),
+    Raster(RasterLayer),
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct RasterLayer {
+    pub pixels: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum SelectionKind {
+    Rect { x: f32, y: f32, w: f32, h: f32 },
+    Lasso(Vec<(f32, f32)>),
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct Selection {
+    pub kind: SelectionKind,
+    /// Feather radius as a fraction of the image diagonal (0..0.25).
+    pub feather: f32,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -205,11 +243,21 @@ impl Layer {
         }
     }
 
+    pub fn new_raster(id: usize, pixels: Vec<u8>, width: usize, height: usize) -> Self {
+        Layer {
+            id,
+            visible: true,
+            opacity: 1.0,
+            kind: LayerKind::Raster(RasterLayer { pixels, width, height }),
+        }
+    }
+
     pub fn label(&self) -> String {
         match &self.kind {
             LayerKind::Text(t) => format!("T: {}", t.text),
             LayerKind::Path(_) => "Path".into(),
             LayerKind::Brush(_) => "Brush".into(),
+            LayerKind::Raster(_) => "Raster".into(),
         }
     }
 }
@@ -283,7 +331,7 @@ impl Default for CropRect {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct EditParams {
     pub aspect: Aspect,
     pub crop: CropRect,
@@ -295,6 +343,8 @@ pub struct EditParams {
     pub contrast: f32,
     pub saturation: f32,
     pub warmth: f32,
+    /// Active selection mask (rect, lasso, or derived from ML segmentation).
+    pub selection: Option<Selection>,
     /// Video trim (start_s, end_s); None = untrimmed.
     pub trim: Option<(f32, f32)>,
 }
@@ -310,6 +360,7 @@ impl Default for EditParams {
             contrast: 0.0,
             saturation: 0.0,
             warmth: 0.0,
+            selection: None,
             trim: None,
         }
     }
@@ -351,6 +402,7 @@ pub struct AppState {
     pub selected: RwSignal<Option<usize>>,
     pub selected_layer: RwSignal<Option<usize>>,
     pub selected_tool: RwSignal<Tool>,
+    pub selected_select_tool: RwSignal<SelectTool>,
     pub busy: RwSignal<Option<String>>,
     /// 0.0..1.0 while a video transcode runs.
     pub progress: RwSignal<f32>,
@@ -366,6 +418,7 @@ impl AppState {
             selected: create_rw_signal(None),
             selected_layer: create_rw_signal(None),
             selected_tool: create_rw_signal(Tool::Select),
+            selected_select_tool: create_rw_signal(SelectTool::Rect),
             busy: create_rw_signal(None),
             progress: create_rw_signal(0.0),
             next_id: create_rw_signal(0),
