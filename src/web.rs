@@ -95,20 +95,30 @@ pub async fn heic_to_jpeg(blob: Blob) -> Result<Blob, JsValue> {
 }
 
 /// Transcode a video via window.pesVideoTranscode (ffmpeg.wasm CDN script).
+/// overlays: input file name + blob pairs referenced by the filter graph.
 pub async fn video_transcode(
     name: &str,
     blob: Blob,
     args: Vec<String>,
+    overlays: Vec<(String, Blob)>,
     on_progress: Closure<dyn FnMut(f64)>,
 ) -> Result<Blob, JsValue> {
     let arr = Array::new();
     for a in &args {
         arr.push(&JsValue::from_str(a));
     }
+    let ov_arr = Array::new();
+    for (ov_name, ov_blob) in &overlays {
+        let obj = js_sys::Object::new();
+        Reflect::set(&obj, &JsValue::from_str("name"), &JsValue::from_str(ov_name))?;
+        Reflect::set(&obj, &JsValue::from_str("blob"), ov_blob)?;
+        ov_arr.push(&obj);
+    }
     let call_args = Array::new();
     call_args.push(&JsValue::from_str(name));
     call_args.push(&blob);
     call_args.push(&arr);
+    call_args.push(&ov_arr);
     call_args.push(on_progress.as_ref());
     let out = call_global("pesVideoTranscode", &call_args)?;
     let result = JsFuture::from(Promise::from(out)).await?;
@@ -149,6 +159,66 @@ pub async fn canvas_to_jpeg_blob(canvas: &HtmlCanvasElement, quality: f64) -> Re
     });
     let out = JsFuture::from(promise).await?;
     Ok(out.unchecked_into())
+}
+
+pub async fn canvas_to_blob(canvas: &HtmlCanvasElement, mime: &str) -> Result<Blob, JsValue> {
+    let promise = Promise::new(&mut |resolve, reject| {
+        let rej = reject.clone();
+        let cb = Closure::once(move |v: JsValue| {
+            if v.is_null() || v.is_undefined() {
+                let _ = rej.call1(&JsValue::NULL, &JsValue::from_str("to_blob failed"));
+            } else {
+                let _ = resolve.call1(&JsValue::NULL, &v);
+            }
+        });
+        canvas.to_blob_with_type(cb.as_ref().unchecked_ref(), mime).unwrap();
+        cb.forget();
+    });
+    let out = JsFuture::from(promise).await?;
+    Ok(out.unchecked_into())
+}
+
+pub async fn read_file_array_buffer(file: &web_sys::File) -> Result<js_sys::ArrayBuffer, JsValue> {
+    let reader = web_sys::FileReader::new()?;
+    let promise = Promise::new(&mut |resolve, reject| {
+        let r = reader.clone();
+        let onload = Closure::once(move |_: web_sys::Event| {
+            let _ = resolve.call1(&JsValue::NULL, &r.result().unwrap_or(JsValue::NULL));
+        });
+        let onerr = Closure::once(move |_: web_sys::Event| {
+            let _ = reject.call0(&JsValue::NULL);
+        });
+        reader.set_onload(Some(onload.as_ref().unchecked_ref()));
+        reader.set_onerror(Some(onerr.as_ref().unchecked_ref()));
+        onload.forget();
+        onerr.forget();
+    });
+    reader.read_as_array_buffer(file)?;
+    let result = JsFuture::from(promise).await?;
+    Ok(result.unchecked_into())
+}
+
+pub async fn load_font(family: &str, url: &str, weight: &str) -> Result<(), JsValue> {
+    let window = window();
+    let desc = web_sys::FontFaceDescriptors::new();
+    desc.set_weight(weight);
+    let source = format!("url('{}')", url);
+    let ff = web_sys::FontFace::new_with_str_and_descriptors(family, &source, &desc)?;
+    let loaded = ff.load()?;
+    JsFuture::from(loaded).await?;
+    window.document().unwrap().fonts().add(&ff)?;
+    Ok(())
+}
+
+pub async fn load_font_from_buffer(family: &str, buffer: &js_sys::ArrayBuffer, weight: &str) -> Result<(), JsValue> {
+    let window = window();
+    let desc = web_sys::FontFaceDescriptors::new();
+    desc.set_weight(weight);
+    let ff = web_sys::FontFace::new_with_array_buffer_and_descriptors(family, buffer, &desc)?;
+    let loaded = ff.load()?;
+    JsFuture::from(loaded).await?;
+    window.document().unwrap().fonts().add(&ff)?;
+    Ok(())
 }
 
 pub fn log(msg: &str) {

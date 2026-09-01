@@ -8,11 +8,12 @@ use std::rc::Rc;
 
 use leptos::leptos_dom::helpers::window_event_listener;
 use leptos::*;
+use leptos::batch;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{Blob, File, Url};
 
-use state::{AppState, Aspect, EditParams, MediaItem, MediaKind};
+use state::{AppState, Aspect, EditParams, Layer, LayerKind, MediaItem, MediaKind, TextAlign};
 
 // --- media cache (non-reactive) ---------------------------------------------
 
@@ -66,7 +67,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
     spawn_local(async move {
         for file in files {
             let name = file.name();
-            let id = state.next_id.get();
+            let id = state.next_id.get_untracked();
             state.next_id.set(id + 1);
 
             if file.type_().starts_with("video/") {
@@ -87,6 +88,8 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                         width: w as usize,
                         height: h as usize,
                         edit: EditParams::default(),
+                        layers: Vec::new(),
+                        next_layer_id: 0,
                     });
                 } else {
                     web::log("video probe failed");
@@ -122,6 +125,8 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                     width: fw,
                     height: fh,
                     edit: EditParams::default(),
+                    layers: Vec::new(),
+                    next_layer_id: 0,
                 });
             }
             state.busy.set(None);
@@ -131,10 +136,12 @@ fn ingest_files(state: AppState, files: Vec<File>) {
 
 fn push_item(state: AppState, item: MediaItem) {
     let id = item.id;
-    state.items.update(|v| v.push(item));
-    if state.selected.get().is_none() {
-        state.selected.set(Some(id));
-    }
+    batch(|| {
+        state.items.update(|v| v.push(item));
+        if state.selected.get_untracked().is_none() {
+            state.selected.set(Some(id));
+        }
+    });
 }
 
 async fn probe_video(url: &str) -> Option<(f64, u32, u32)> {
@@ -219,6 +226,82 @@ fn default_crop(w: usize, h: usize, aspect: Aspect) -> state::CropRect {
     }
 }
 
+// --- layer compositing ---------------------------------------------------------
+
+fn draw_text_layer(ctx: &web_sys::CanvasRenderingContext2d, layer: &state::Layer, w: f64, h: f64) {
+    let state::LayerKind::Text(t) = &layer.kind;
+    let px = (t.font_size * h as f32) as f64;
+    ctx.set_font(&format!(
+        "{} {}px \"{}\", sans-serif",
+        t.font_weight, px, t.font_family
+    ));
+    ctx.set_text_align(t.alignment.canvas_value());
+    ctx.set_text_baseline("middle");
+
+    let x = (t.x * w as f32) as f64;
+    let y = (t.y * h as f32) as f64;
+
+    ctx.set_shadow_color(&t.shadow_color);
+    ctx.set_shadow_blur(t.shadow_blur as f64);
+    ctx.set_shadow_offset_x(t.shadow_offset_x as f64);
+    ctx.set_shadow_offset_y(t.shadow_offset_y as f64);
+
+    if t.stroke_width > 0.0 {
+        ctx.set_line_width(t.stroke_width as f64 * px);
+        ctx.set_stroke_style_str(&t.stroke_color);
+        let _ = ctx.stroke_text(&t.text, x, y);
+    }
+
+    ctx.set_fill_style_str(&t.color);
+    let _ = ctx.fill_text(&t.text, x, y);
+
+    ctx.set_shadow_color("transparent");
+    ctx.set_shadow_blur(0.0);
+    ctx.set_shadow_offset_x(0.0);
+    ctx.set_shadow_offset_y(0.0);
+}
+
+fn composite_layers(canvas: &web_sys::HtmlCanvasElement, layers: &[state::Layer], w: usize, h: usize) {
+    let ctx = web::ctx2d(canvas);
+    for layer in layers {
+        if !layer.visible || layer.opacity <= 0.01 {
+            continue;
+        }
+        ctx.set_global_alpha(layer.opacity as f64);
+        match &layer.kind {
+            state::LayerKind::Text(_) => draw_text_layer(&ctx, layer, w as f64, h as f64),
+        }
+        ctx.set_global_alpha(1.0);
+    }
+}
+
+async fn render_text_overlay(t: &state::TextLayer, w: usize, h: usize) -> Result<web_sys::Blob, JsValue> {
+    let canvas = web::create_canvas(w as u32, h as u32);
+    let layer = state::Layer {
+        id: 0,
+        visible: true,
+        opacity: 1.0,
+        kind: state::LayerKind::Text(t.clone()),
+    };
+    draw_text_layer(&web::ctx2d(&canvas), &layer, w as f64, h as f64);
+    web::canvas_to_blob(&canvas, "image/png").await
+}
+
+fn video_export_dims(edit: &EditParams, w: usize, h: usize) -> (usize, usize, usize, usize, usize, usize) {
+    let (mut cw, mut ch) = (w, h);
+    if edit.rot90 % 2 == 1 {
+        std::mem::swap(&mut cw, &mut ch);
+    }
+    if edit.fine_angle.abs() > 0.01 {
+        let (iw, ih) = working_dims(w, h, edit);
+        cw = iw;
+        ch = ih;
+    }
+    let (_x, _y, px_w, px_h) = crop_px(edit, cw, ch);
+    let (ew, eh) = edit.aspect.export_dims(px_w, px_h);
+    (cw, ch, px_w, px_h, ew, eh)
+}
+
 // --- export --------------------------------------------------------------------
 
 fn crop_px(edit: &EditParams, w: usize, h: usize) -> (usize, usize, usize, usize) {
@@ -238,9 +321,7 @@ fn export_photo(state: AppState, item: MediaItem) {
             return;
         };
         let (pix, w, h) = &photo.full;
-        let (p, w, h) = geometry(pix, *w, *h, &item.edit);
-        let (cx, cy, cw, ch) = crop_px(&item.edit, w, h);
-        let mut p = ops::crop(&p, w, cx, cy, cw, ch);
+        let (mut p, w, h) = geometry(pix, *w, *h, &item.edit);
         if item.edit.is_color_touched() {
             ops::adjust(
                 &mut p,
@@ -250,8 +331,21 @@ fn export_photo(state: AppState, item: MediaItem) {
                 item.edit.warmth,
             );
         }
+
+        // Composite onto the full geometry-corrected canvas, then crop.
+        let base = web::create_canvas(w as u32, h as u32);
+        web::put_pixels(&base, &p, w as u32, h as u32);
+        composite_layers(&base, &item.layers, w, h);
+
+        let (cx, cy, cw, ch) = crop_px(&item.edit, w, h);
         let work = web::create_canvas(cw as u32, ch as u32);
-        web::put_pixels(&work, &p, cw as u32, ch as u32);
+        web::ctx2d(&work)
+            .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+                &base, cx as f64, cy as f64, cw as f64, ch as f64,
+                0.0, 0.0, cw as f64, ch as f64,
+            )
+            .unwrap();
+
         let (ew, eh) = item.edit.aspect.export_dims(cw, ch);
         let out = web::create_canvas(ew as u32, eh as u32);
         web::ctx2d(&out)
@@ -273,9 +367,26 @@ fn export_video(state: AppState, item: MediaItem) {
             state.busy.set(None);
             return;
         };
-        let args = build_ffmpeg_args(&item, w as usize, h as usize);
+        let (_, _, _, _, ew, eh) = video_export_dims(&item.edit, w as usize, h as usize);
+
+        let mut overlays: Vec<(String, Blob)> = Vec::new();
+        for (i, layer) in item.layers.iter().enumerate() {
+            if !layer.visible || layer.opacity <= 0.01 {
+                continue;
+            }
+            let t = match &layer.kind {
+                state::LayerKind::Text(t) => t,
+            };
+            match render_text_overlay(t, ew, eh).await {
+                Ok(blob) => overlays.push((format!("overlay-{i}.png"), blob)),
+                Err(_) => web::log("text overlay render failed"),
+            }
+        }
+
+        let overlay_names: Vec<String> = overlays.iter().map(|(n, _)| n.clone()).collect();
+        let args = build_ffmpeg_args(&item, w as usize, h as usize, &overlay_names);
         let on_progress = Closure::new(move |r: f64| state.progress.set(r as f32));
-        let result = web::video_transcode(&item.name, blob, args, on_progress).await;
+        let result = web::video_transcode(&item.name, blob, args, overlays, on_progress).await;
         match result {
             Ok(out) => {
                 let base = item.name.rsplitn(2, '.').last().unwrap_or("video");
@@ -288,8 +399,10 @@ fn export_video(state: AppState, item: MediaItem) {
     });
 }
 
-fn build_ffmpeg_args(item: &MediaItem, w: usize, h: usize) -> Vec<String> {
+fn build_ffmpeg_args(item: &MediaItem, w: usize, h: usize, overlays: &[String]) -> Vec<String> {
     let e = &item.edit;
+    let (_, _, px_w, px_h, ew, eh) = video_export_dims(e, w, h);
+
     let mut filters: Vec<String> = Vec::new();
 
     match e.rot90 % 4 {
@@ -302,26 +415,18 @@ fn build_ffmpeg_args(item: &MediaItem, w: usize, h: usize) -> Vec<String> {
         _ => {}
     }
 
-    let (mut cw, mut ch) = (w, h);
-    if e.rot90 % 2 == 1 {
-        std::mem::swap(&mut cw, &mut ch);
-    }
-
     if e.fine_angle.abs() > 0.01 {
         let rad = e.fine_angle as f64 * std::f64::consts::PI / 180.0;
         filters.push(format!("rotate={rad}:c=none:ow=rotw(iw):oh=roth(ih)"));
         let (iw, ih) = working_dims(w, h, e);
         filters.push(format!("crop={iw}:{ih}"));
-        cw = iw;
-        ch = ih;
     }
 
-    let (x, y, px_w, px_h) = crop_px(e, cw, ch);
-    if px_w != cw || px_h != ch {
-        filters.push(format!("crop={px_w}:{px_h}:{x}:{y}"));
+    let (x, y, cx, cy) = crop_px(e, px_w, px_h);
+    if cx != px_w || cy != px_h {
+        filters.push(format!("crop={cx}:{cy}:{x}:{y}"));
     }
 
-    let (ew, eh) = e.aspect.export_dims(px_w, px_h);
     filters.push(format!(
         "scale={ew}:{eh}:force_original_aspect_ratio=decrease,pad={ew}:{eh}:(ow-iw)/2:(oh-ih)/2"
     ));
@@ -340,14 +445,37 @@ fn build_ffmpeg_args(item: &MediaItem, w: usize, h: usize) -> Vec<String> {
     }
 
     let mut args: Vec<String> = vec!["-i".into(), item.name.clone()];
+    for ov in overlays {
+        args.push("-i".into());
+        args.push(ov.clone());
+    }
     if let Some((start, end)) = e.trim {
         args.push("-ss".into());
         args.push(format!("{start}"));
         args.push("-to".into());
         args.push(format!("{end}"));
     }
-    args.push("-vf".into());
-    args.push(filters.join(","));
+
+    if overlays.is_empty() {
+        args.push("-vf".into());
+        args.push(filters.join(","));
+    } else {
+        let mut graph = vec![format!("[0:v]{}[base]", filters.join(","))];
+        let mut last = "base".to_string();
+        for (i, _) in overlays.iter().enumerate() {
+            let input_idx = i + 1;
+            if i == overlays.len() - 1 {
+                graph.push(format!("[{}][{}:v]overlay=0:0", last, input_idx));
+            } else {
+                let next = format!("v{i}");
+                graph.push(format!("[{}][{}:v]overlay=0:0[{}]", last, input_idx, next));
+                last = next;
+            }
+        }
+        args.push("-filter_complex".into());
+        args.push(graph.join(";"));
+    }
+
     args.extend([
         "-c:v".into(), "libx264".into(),
         "-preset".into(), "veryfast".into(),
@@ -366,6 +494,13 @@ fn build_ffmpeg_args(item: &MediaItem, w: usize, h: usize) -> Vec<String> {
 fn App() -> impl IntoView {
     let state = AppState::new();
     provide_context(state);
+
+    spawn_local(async move {
+        let _ = web::load_font("Inter", "fonts/inter-400.woff2", "400").await;
+        let _ = web::load_font("Inter", "fonts/inter-700.woff2", "700").await;
+        let _ = web::load_font("Oswald", "fonts/oswald-400.woff2", "400").await;
+        let _ = web::load_font("Oswald", "fonts/oswald-700.woff2", "700").await;
+    });
 
     view! {
         <div class="app">
@@ -465,6 +600,7 @@ enum Tab {
     Crop,
     Rotate,
     Color,
+    Layers,
     Trim,
     Export,
 }
@@ -489,6 +625,7 @@ fn Editor(state: AppState) -> impl IntoView {
                     <TabBtn tab=tab t=Tab::Crop label="Crop"/>
                     <TabBtn tab=tab t=Tab::Rotate label="Rotate"/>
                     <TabBtn tab=tab t=Tab::Color label="Color"/>
+                    <TabBtn tab=tab t=Tab::Layers label="Layers"/>
                     <Show
                         when=move || state.current().map(|m| m.kind == MediaKind::Video).unwrap_or(false)
                         fallback=|| ()
@@ -502,6 +639,7 @@ fn Editor(state: AppState) -> impl IntoView {
                         Tab::Crop => view! { <CropTab state=state/> }.into_view(),
                         Tab::Rotate => view! { <RotateTab state=state/> }.into_view(),
                         Tab::Color => view! { <ColorTab state=state/> }.into_view(),
+                        Tab::Layers => view! { <LayersTab state=state/> }.into_view(),
                         Tab::Trim => view! { <TrimTab state=state/> }.into_view(),
                         Tab::Export => view! { <ExportTab state=state/> }.into_view(),
                     }}
@@ -515,6 +653,33 @@ fn Editor(state: AppState) -> impl IntoView {
 fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     let canvas_ref = create_node_ref::<html::Canvas>();
     let working = create_rw_signal((1usize, 1usize));
+    let layer_drag = create_rw_signal(None::<(usize, f32, f32, f32, f32)>);
+
+    let layer_norm_pos = |ev: &web_sys::PointerEvent| -> Option<(f32, f32)> {
+        let el = web::document().query_selector(".canvas-wrap").ok().flatten()?;
+        let rect = el.get_bounding_client_rect();
+        let nx = ((ev.client_x() as f32 - rect.left() as f32) / rect.width() as f32).clamp(0.0, 1.0);
+        let ny = ((ev.client_y() as f32 - rect.top() as f32) / rect.height() as f32).clamp(0.0, 1.0);
+        Some((nx, ny))
+    };
+
+    window_event_listener(leptos::ev::pointermove, move |ev| {
+        let Some(Some((id, nx0, ny0, x0, y0))) = layer_drag.try_get() else { return };
+        let Some((nx, ny)) = layer_norm_pos(&ev) else { return };
+        let dx = nx - nx0;
+        let dy = ny - ny0;
+        state.update_current_item(|m| {
+            if let Some(l) = m.layers.iter_mut().find(|l| l.id == id) {
+                let LayerKind::Text(t) = &mut l.kind;
+                t.x = (x0 + dx).clamp(0.0, 1.0);
+                t.y = (y0 + dy).clamp(0.0, 1.0);
+            }
+        });
+    });
+
+    window_event_listener(leptos::ev::pointerup, move |_| {
+        let _ = layer_drag.try_set(None);
+    });
 
     create_effect(move |_| {
         state.items.track();
@@ -539,6 +704,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             );
         }
         web::put_pixels(&canvas, &p, w as u32, h as u32);
+        composite_layers(&canvas, &item.layers, w, h);
     });
 
     view! {
@@ -554,14 +720,26 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                         e.fine_angle
                     );
                     view! {
-                        <div class="canvas-wrap">
+                        <div class="canvas-wrap video-wrap">
                             <video src=m.object_url.clone() controls style=style></video>
+                            <VideoOverlays state=state item=m.clone()/>
                             <p class="dim">"Preview is approximate — exact render happens at export."</p>
                         </div>
                     }.into_view()
                 }
                 _ => view! {
-                    <div class="canvas-wrap">
+                    <div
+                        class="canvas-wrap"
+                        on:pointerdown=move |ev: web_sys::PointerEvent| {
+                            if tab.get() != Tab::Layers { return; }
+                            let Some(id) = state.selected_layer.get() else { return };
+                            let Some(item) = state.current() else { return };
+                            let Some(layer) = item.layers.iter().find(|l| l.id == id) else { return };
+                            let LayerKind::Text(t) = &layer.kind;
+                            let Some((nx, ny)) = layer_norm_pos(&ev) else { return };
+                            layer_drag.set(Some((id, nx, ny, t.x, t.y)));
+                        }
+                    >
                         <canvas node_ref=canvas_ref></canvas>
                         <Show when=move || tab.get() == Tab::Crop fallback=|| ()>
                             <CropOverlay state=state working=working/>
@@ -569,6 +747,38 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     </div>
                 }.into_view(),
             }}
+        </div>
+    }
+}
+
+#[component]
+fn VideoOverlays(state: AppState, item: MediaItem) -> impl IntoView {
+    let _ = state;
+    view! {
+        <div class="video-overlays" style="pointer-events:none">
+            {item.layers.iter().filter_map(|l| {
+                if !l.visible { return None; }
+                let LayerKind::Text(t) = &l.kind;
+                let px = format!("{:.2}%", t.font_size * 100.0);
+                let left = format!("{:.2}%", t.x * 100.0);
+                let top = format!("{:.2}%", t.y * 100.0);
+                let align = t.alignment.canvas_value();
+                let shadow = format!(
+                    "{}px {}px {}px {}",
+                    t.shadow_offset_x, t.shadow_offset_y, t.shadow_blur, t.shadow_color
+                );
+                let stroke = if t.stroke_width > 0.0 {
+                    format!("-webkit-text-stroke: {}em {}", t.stroke_width, t.stroke_color)
+                } else {
+                    String::new()
+                };
+                let style = format!(
+                    "position:absolute;left:{};top:{};font-family:'{}',sans-serif;font-weight:{};\
+                     font-size:{};color:{};text-align:{};text-shadow:{};opacity:{};{}",
+                    left, top, t.font_family, t.font_weight, px, t.color, align, shadow, l.opacity, stroke
+                );
+                Some(view! { <div style=style>{t.text.clone()}</div> })
+            }).collect_view()}
         </div>
     }
 }
@@ -775,6 +985,333 @@ fn ColorTab(state: AppState) -> impl IntoView {
 }
 
 #[component]
+fn LayersTab(state: AppState) -> impl IntoView {
+    let add_text = move |_| {
+        let mut new_id = None;
+        state.update_current_item(|m| {
+            let id = m.next_layer_id;
+            m.next_layer_id += 1;
+            m.layers.push(Layer::new_text(id));
+            new_id = Some(id);
+        });
+        if let Some(id) = new_id {
+            state.selected_layer.set(Some(id));
+        }
+    };
+
+    let delete_layer = move |id: usize| {
+        state.update_current_item(|m| {
+            m.layers.retain(|l| l.id != id);
+        });
+        if state.selected_layer.get() == Some(id) {
+            state.selected_layer.set(None);
+        }
+    };
+
+    let move_layer = move |id: usize, delta: isize| {
+        state.update_current_item(|m| {
+            let idx = m.layers.iter().position(|l| l.id == id);
+            if let Some(i) = idx {
+                let new_i = (i as isize + delta)
+                    .clamp(0, m.layers.len() as isize - 1) as usize;
+                if new_i != i {
+                    m.layers.swap(i, new_i);
+                }
+            }
+        });
+    };
+
+    let set_visible = move |id: usize, visible: bool| {
+        state.update_current_item(|m| {
+            if let Some(l) = m.layers.iter_mut().find(|l| l.id == id) {
+                l.visible = visible;
+            }
+        });
+    };
+
+    let set_opacity = move |id: usize, opacity: f32| {
+        state.update_current_item(|m| {
+            if let Some(l) = m.layers.iter_mut().find(|l| l.id == id) {
+                l.opacity = opacity;
+            }
+        });
+    };
+
+    let select_layer = move |id: usize| {
+        state.selected_layer.set(Some(id));
+    };
+
+    let layers = create_memo(move |_| state.current_layers());
+
+    view! {
+        <div class="layers-tab">
+            <button class="btn" on:click=add_text>"＋ Text layer"</button>
+            <div class="layer-list">
+                <For
+                    each=move || layers.get()
+                    key=|l| l.id
+                    children=move |l: Layer| {
+                        let id = l.id;
+                        let layer = create_memo(move |_| {
+                            layers.get().into_iter().find(|l| l.id == id)
+                        });
+                        let is_selected = move || state.selected_layer.get() == Some(id);
+                        view! {
+                            <div
+                                class="layer-row"
+                                class:selected=is_selected
+                                on:click=move |_| select_layer(id)
+                            >
+                                <button
+                                    class="icon-btn"
+                                    on:click=move |ev| {
+                                        ev.stop_propagation();
+                                        let visible = layer.get().map(|l| l.visible).unwrap_or(true);
+                                        set_visible(id, !visible);
+                                    }
+                                >
+                                    {move || {
+                                        if layer.get().map(|l| l.visible).unwrap_or(true) {
+                                            "●"
+                                        } else {
+                                            "○"
+                                        }
+                                    }}
+                                </button>
+                                <span class="layer-label">
+                                    {move || layer.get().map(|l| l.label()).unwrap_or_default()}
+                                </span>
+                                <input
+                                    type="range"
+                                    min="0"
+                                    max="1"
+                                    step="0.01"
+                                    prop:value=move || {
+                                        layer.get().map(|l| l.opacity.to_string()).unwrap_or_else(|| "1".into())
+                                    }
+                                    on:input=move |ev| {
+                                        let v: f32 = event_target_value(&ev).parse().unwrap_or(1.0);
+                                        set_opacity(id, v.clamp(0.0, 1.0));
+                                    }
+                                />
+                                <button
+                                    class="icon-btn"
+                                    on:click=move |ev| {
+                                        ev.stop_propagation();
+                                        move_layer(id, -1);
+                                    }
+                                >
+                                    "↑"
+                                </button>
+                                <button
+                                    class="icon-btn"
+                                    on:click=move |ev| {
+                                        ev.stop_propagation();
+                                        move_layer(id, 1);
+                                    }
+                                >
+                                    "↓"
+                                </button>
+                                <button
+                                    class="icon-btn delete"
+                                    on:click=move |ev| {
+                                        ev.stop_propagation();
+                                        delete_layer(id);
+                                    }
+                                >
+                                    "✕"
+                                </button>
+                            </div>
+                        }
+                    }
+                />
+            </div>
+            <TextLayerEditor state=state/>
+        </div>
+    }
+}
+
+fn with_text_layer(state: AppState, f: impl FnOnce(&mut state::TextLayer)) {
+    let Some(sel) = state.selected_layer.get_untracked() else { return };
+    state.update_current_item(|m| {
+        if let Some(l) = m.layers.iter_mut().find(|l| l.id == sel) {
+            let LayerKind::Text(t) = &mut l.kind;
+            f(t);
+        }
+    });
+}
+
+fn selected_text_layer(state: AppState) -> Option<state::TextLayer> {
+    let sel = state.selected_layer.get()?;
+    state.current()?.layers.iter().find(|l| l.id == sel).map(|l| {
+        let LayerKind::Text(t) = &l.kind;
+        t.clone()
+    })
+}
+
+#[component]
+fn TextLayerEditor(state: AppState) -> impl IntoView {
+    let fonts = move || state.fonts.get();
+    let text_layer = move || selected_text_layer(state);
+    let font_input = create_node_ref::<html::Input>();
+
+    let upload_font = move |_| {
+        let Some(input) = font_input.get() else { return };
+        let Some(files) = input.files() else { return };
+        let Some(file) = files.item(0) else { return };
+        let name = file.name();
+        let base = name.rsplitn(2, '.').last().unwrap_or("custom").to_string();
+        spawn_local(async move {
+            let Ok(buf) = web::read_file_array_buffer(&file).await else { return };
+            let family = format!("custom-{}", base.replace(' ', "-"));
+            if web::load_font_from_buffer(&family, &buf, "400").await.is_ok() {
+                state.fonts.update(|v| {
+                    if !v.contains(&family) {
+                        v.push(family.clone());
+                    }
+                });
+                with_text_layer(state, |t| t.font_family = family);
+            }
+        });
+        input.set_value("");
+    };
+
+    view! {
+        <Show when=move || text_layer().is_some() fallback=|| ()>
+            <div class="text-editor">
+                <input
+                    type="text"
+                    prop:value=move || text_layer().map(|t| t.text).unwrap_or_default()
+                    on:input=move |ev| {
+                        let v = event_target_value(&ev);
+                        with_text_layer(state, |t| t.text = v);
+                    }
+                />
+                <div class="row">
+                    <label>
+                        "Font"
+                        <select
+                            prop:value=move || text_layer().map(|t| t.font_family).unwrap_or_default()
+                            on:change=move |ev| {
+                                let v = event_target_value(&ev);
+                                with_text_layer(state, |t| t.font_family = v);
+                            }
+                        >
+                            {move || fonts().into_iter().map(|f| {
+                                view! { <option value=f.clone()>{f}</option> }
+                            }).collect_view()}
+                        </select>
+                    </label>
+                    <label class="btn font-upload">
+                        "Upload font"
+                        <input
+                            node_ref=font_input
+                            type="file"
+                            accept=".ttf,.otf,.woff2"
+                            style="display:none"
+                            on:change=upload_font
+                        />
+                    </label>
+                    <label class="slider compact">
+                        "Size"
+                        <input
+                            type="range"
+                            min="0.01"
+                            max="0.3"
+                            step="0.005"
+                            prop:value=move || text_layer().map(|t| t.font_size).unwrap_or_default().to_string()
+                            on:input=move |ev| {
+                                let v: f32 = event_target_value(&ev).parse().unwrap_or(0.08);
+                                with_text_layer(state, |t| t.font_size = v);
+                            }
+                        />
+                    </label>
+                </div>
+                <div class="row">
+                    <label>
+                        "Color"
+                        <input
+                            type="color"
+                            prop:value=move || text_layer().map(|t| t.color).unwrap_or_default()
+                            on:input=move |ev| {
+                                let v = event_target_value(&ev);
+                                with_text_layer(state, |t| t.color = v);
+                            }
+                        />
+                    </label>
+                    <label>
+                        "Stroke"
+                        <input
+                            type="color"
+                            prop:value=move || text_layer().map(|t| t.stroke_color).unwrap_or_default()
+                            on:input=move |ev| {
+                                let v = event_target_value(&ev);
+                                with_text_layer(state, |t| t.stroke_color = v);
+                            }
+                        />
+                    </label>
+                    <label class="slider compact">
+                        "W"
+                        <input
+                            type="range"
+                            min="0"
+                            max="0.5"
+                            step="0.01"
+                            prop:value=move || text_layer().map(|t| t.stroke_width).unwrap_or_default().to_string()
+                            on:input=move |ev| {
+                                let v: f32 = event_target_value(&ev).parse().unwrap_or(0.0);
+                                with_text_layer(state, |t| t.stroke_width = v);
+                            }
+                        />
+                    </label>
+                </div>
+                <div class="row">
+                    {TextAlign::ALL.map(|a| {
+                        let active = move || text_layer().map(|t| t.alignment == a).unwrap_or(false);
+                        view! {
+                            <button
+                                class="chip"
+                                class:active=active
+                                on:click=move |_| with_text_layer(state, |t| t.alignment = a)
+                            >
+                                {a.label()}
+                            </button>
+                        }
+                    })}
+                </div>
+                <div class="row">
+                    <label class="slider compact">
+                        "Shadow"
+                        <input
+                            type="range"
+                            min="0"
+                            max="20"
+                            step="0.5"
+                            prop:value=move || text_layer().map(|t| t.shadow_blur).unwrap_or_default().to_string()
+                            on:input=move |ev| {
+                                let v: f32 = event_target_value(&ev).parse().unwrap_or(0.0);
+                                with_text_layer(state, |t| t.shadow_blur = v);
+                            }
+                        />
+                    </label>
+                    <label>
+                        "Shadow color"
+                        <input
+                            type="color"
+                            prop:value=move || text_layer().map(|t| t.shadow_color).unwrap_or_default()
+                            on:input=move |ev| {
+                                let v = event_target_value(&ev);
+                                with_text_layer(state, |t| t.shadow_color = v);
+                            }
+                        />
+                    </label>
+                </div>
+            </div>
+        </Show>
+    }
+}
+
+#[component]
 fn TrimTab(state: AppState) -> impl IntoView {
     let duration = move || {
         state
@@ -832,12 +1369,14 @@ fn ExportTab(state: AppState) -> impl IntoView {
         <Show when=multi fallback=|| ()>
             <button class="btn" on:click=move |_| {
                 let Some(cur) = state.current() else { return };
-                state.items.update(|v| {
-                    for m in v.iter_mut() {
-                        if m.kind == cur.kind && m.id != cur.id {
-                            m.edit = cur.edit;
+                batch(|| {
+                    state.items.update(|v| {
+                        for m in v.iter_mut() {
+                            if m.kind == cur.kind && m.id != cur.id {
+                                m.edit = cur.edit;
+                            }
                         }
-                    }
+                    });
                 });
             }>"Apply edits to all"</button>
             <button class="btn" on:click=move |_| {

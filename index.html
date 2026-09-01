@@ -13,6 +13,10 @@
   <link data-trunk rel="copy-file" href="public/sw.js"/>
   <link data-trunk rel="copy-file" href="public/icon-192.png"/>
   <link data-trunk rel="copy-file" href="public/icon-512.png"/>
+  <link data-trunk rel="copy-file" href="public/fonts/inter-400.woff2"/>
+  <link data-trunk rel="copy-file" href="public/fonts/inter-700.woff2"/>
+  <link data-trunk rel="copy-file" href="public/fonts/oswald-400.woff2"/>
+  <link data-trunk rel="copy-file" href="public/fonts/oswald-700.woff2"/>
   <link data-trunk rel="rust" data-wasm-opt="2"/>
   <script src="https://unpkg.com/heic2any@0.0.4/dist/heic2any.min.js"></script>
   <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
@@ -30,9 +34,9 @@
     };
 
     // Video transcode via ffmpeg.wasm. Called from Rust.
-    // args: { name, blob, args: string[] } -> Blob (mp4)
+    // overlays: [{ name, blob }] extra input files referenced in the filter graph.
     let _ffmpeg = null;
-    window.pesVideoTranscode = async function (name, blob, args, onProgress) {
+    window.pesVideoTranscode = async function (name, blob, args, overlays, onProgress) {
       try {
         const { createFFmpeg, fetchFile } = FFmpeg;
         if (!_ffmpeg) {
@@ -47,10 +51,16 @@
           await _ffmpeg.load();
         }
         _ffmpeg.FS('writeFile', name, await fetchFile(blob));
+        for (const ov of overlays || []) {
+          _ffmpeg.FS('writeFile', ov.name, await fetchFile(ov.blob));
+        }
         await _ffmpeg.run(...args);
         const data = _ffmpeg.FS('readFile', 'pes-out.mp4');
         _ffmpeg.FS('unlink', name);
         _ffmpeg.FS('unlink', 'pes-out.mp4');
+        for (const ov of overlays || []) {
+          _ffmpeg.FS('unlink', ov.name);
+        }
         return new Blob([data.buffer], { type: 'video/mp4' });
       } catch (e) {
         console.error('pesVideoTranscode failed:', e && e.message ? e.message : String(e), args);

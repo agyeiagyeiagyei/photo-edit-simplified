@@ -195,3 +195,108 @@ h1 { font-size: 17px; font-weight: 600; }
   text-align: center;
 }
 .overlay progress { width: 100%; }
+
+.layers-tab { display: flex; flex-direction: column; gap: 12px; }
+
+.layer-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.layer-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 10px;
+  cursor: pointer;
+  user-select: none;
+  touch-action: manipulation;
+}
+.layer-row.selected { border-color: var(--accent); }
+
+.layer-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+}
+
+.icon-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 4px 6px;
+  font-size: 12px;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.icon-btn.delete { color: #ff453a; border-color: #ff453a; }
+
+.layer-row input[type="range"] {
+  width: 60px;
+  accent-color: var(--accent);
+}
+
+.text-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+.text-editor input[type="text"] {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 14px;
+}
+.text-editor select {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 6px 8px;
+  font-size: 14px;
+}
+.text-editor .row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.text-editor label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+.text-editor .slider.compact { flex: 1; min-width: 80px; }
+.text-editor input[type="color"] {
+  width: 36px;
+  height: 28px;
+  border: none;
+  background: transparent;
+}
+.font-upload {
+  padding: 6px 10px;
+  font-size: 13px;
+}
+
+.video-wrap { position: relative; }
+.video-overlays {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
