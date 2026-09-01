@@ -916,6 +916,50 @@ fn draw_select_drag(ctx: &web_sys::CanvasRenderingContext2d, drag: &SelectDrag, 
     ctx.restore();
 }
 
+fn text_overlay_style(t: &state::TextLayer, opacity: f32) -> String {
+    let px = format!("{:.2}%", t.font_size * 100.0);
+    let left = format!("{:.2}%", t.x * 100.0);
+    let top = format!("{:.2}%", t.y * 100.0);
+    let align = t.alignment.canvas_value();
+    let translate = match t.alignment {
+        TextAlign::Left => "translate(0,-50%)",
+        TextAlign::Center => "translate(-50%,-50%)",
+        TextAlign::Right => "translate(-100%,-50%)",
+    };
+    let shadow = format!(
+        "{}px {}px {}px {}",
+        t.shadow_offset_x, t.shadow_offset_y, t.shadow_blur, t.shadow_color
+    );
+    let stroke = if t.stroke_width > 0.0 {
+        format!("-webkit-text-stroke: {}em {}", t.stroke_width, t.stroke_color)
+    } else {
+        String::new()
+    };
+    format!(
+        "position:absolute;left:{};top:{};transform:{};font-family:'{}',sans-serif;\
+         font-weight:{};font-size:{};color:{};text-align:{};text-shadow:{};opacity:{};white-space:nowrap;{}",
+        left, top, translate, t.font_family, t.font_weight, px, t.color, align, shadow, opacity, stroke
+    )
+}
+
+fn selected_text_overlay_style(t: &state::TextLayer, opacity: f32) -> String {
+    let px = format!("{:.2}%", t.font_size * 100.0);
+    let left = format!("{:.2}%", t.x * 100.0);
+    let top = format!("{:.2}%", t.y * 100.0);
+    let align = t.alignment.canvas_value();
+    let translate = match t.alignment {
+        TextAlign::Left => "translate(0,-50%)",
+        TextAlign::Center => "translate(-50%,-50%)",
+        TextAlign::Right => "translate(-100%,-50%)",
+    };
+    format!(
+        "position:absolute;left:{};top:{};transform:{};font-family:'{}',sans-serif;\
+         font-weight:{};font-size:{};color:transparent;text-align:{};opacity:{};white-space:nowrap;\
+         border:2px dashed #0a84ff;border-radius:4px;background:rgba(10,132,255,0.08);",
+        left, top, translate, t.font_family, t.font_weight, px, align, opacity
+    )
+}
+
 #[component]
 fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     let canvas_ref = create_node_ref::<html::Canvas>();
@@ -1135,7 +1179,8 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     view! {
                         <div class="canvas-wrap video-wrap">
                             <video src=m.object_url.clone() controls style=style></video>
-                            <VideoOverlays state=state item=m.clone()/>
+                            <VideoOverlays state=state/>
+                            <SelectedTextOverlay state=state tab=tab layer_drag=layer_drag/>
                             <p class="dim">"Preview is approximate — exact render happens at export."</p>
                         </div>
                     }.into_view()
@@ -1236,6 +1281,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                         <Show when=move || tab.get() == Tab::Crop fallback=|| ()>
                             <CropOverlay state=state working=working/>
                         </Show>
+                        <SelectedTextOverlay state=state tab=tab layer_drag=layer_drag/>
                     </div>
                 }.into_view(),
             }}
@@ -1244,39 +1290,58 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
 }
 
 #[component]
-fn VideoOverlays(state: AppState, item: MediaItem) -> impl IntoView {
-    let _ = state;
+fn VideoOverlays(state: AppState) -> impl IntoView {
     view! {
-        <div class="video-overlays" style="pointer-events:none">
-            {item.layers.iter().filter_map(|l| {
+        <div class="video-overlays">
+            {move || state.current_layers().into_iter().filter_map(|l| {
                 if !l.visible { return None; }
                 let LayerKind::Text(t) = &l.kind else { return None; };
-                let px = format!("{:.2}%", t.font_size * 100.0);
-                let left = format!("{:.2}%", t.x * 100.0);
-                let top = format!("{:.2}%", t.y * 100.0);
-                let align = t.alignment.canvas_value();
-                let translate = match t.alignment {
-                    TextAlign::Left => "translate(0,-50%)",
-                    TextAlign::Center => "translate(-50%,-50%)",
-                    TextAlign::Right => "translate(-100%,-50%)",
-                };
-                let shadow = format!(
-                    "{}px {}px {}px {}",
-                    t.shadow_offset_x, t.shadow_offset_y, t.shadow_blur, t.shadow_color
-                );
-                let stroke = if t.stroke_width > 0.0 {
-                    format!("-webkit-text-stroke: {}em {}", t.stroke_width, t.stroke_color)
-                } else {
-                    String::new()
-                };
-                let style = format!(
-                    "position:absolute;left:{};top:{};transform:{};font-family:'{}',sans-serif;\
-                     font-weight:{};font-size:{};color:{};text-align:{};text-shadow:{};opacity:{};white-space:nowrap;{}",
-                    left, top, translate, t.font_family, t.font_weight, px, t.color, align, shadow, l.opacity, stroke
-                );
-                Some(view! { <div style=style>{t.text.clone()}</div> })
+                let style = text_overlay_style(t, l.opacity);
+                Some(view! { <div class="video-text-overlay" style=style>{t.text.clone()}</div> })
             }).collect_view()}
         </div>
+    }
+}
+
+#[component]
+fn SelectedTextOverlay(
+    state: AppState,
+    tab: RwSignal<Tab>,
+    layer_drag: RwSignal<Option<(usize, f32, f32, f32, f32)>>,
+) -> impl IntoView {
+    let maybe_layer = move || {
+        if state.selected_tool.get() != Tool::Select || tab.get() != Tab::Layers {
+            return None;
+        }
+        let m = state.current()?;
+        let id = state.selected_layer.get()?;
+        let layer = m.layers.iter().find(|l| l.id == id)?;
+        if !layer.visible {
+            return None;
+        }
+        let LayerKind::Text(t) = &layer.kind else { return None; };
+        Some((layer.id, t.clone(), layer.opacity))
+    };
+
+    view! {
+        {move || {
+            let (id, t, opacity) = maybe_layer()?;
+            let style = selected_text_overlay_style(&t, opacity);
+            Some(view! {
+                <div
+                    class="text-overlay selected"
+                    style=style
+                    on:pointerdown=move |ev: web_sys::PointerEvent| {
+                        if tab.get() != Tab::Layers || state.selected_tool.get() != Tool::Select { return; }
+                        ev.stop_propagation();
+                        ev.prevent_default();
+                        let Some((nx, ny)) = layer_norm_pos(&ev) else { return; };
+                        state.selected_layer.set(Some(id));
+                        layer_drag.set(Some((id, nx, ny, t.x, t.y)));
+                    }
+                >{t.text.clone()}</div>
+            })
+        }}
     }
 }
 

@@ -139,6 +139,11 @@ pub async fn video_transcode(
 /// Trigger a browser download for a Blob.
 pub fn download_blob(blob: &Blob, filename: &str) {
     let url = Url::create_object_url_with_blob(blob).unwrap();
+    let _ = Reflect::set(
+        &window(),
+        &JsValue::from_str("__pesExportUrl"),
+        &JsValue::from_str(&url),
+    );
     let doc = document();
     let a: HtmlElement = doc
         .create_element("a")
@@ -160,7 +165,7 @@ pub fn download_blob(blob: &Blob, filename: &str) {
     window()
         .set_timeout_with_callback_and_timeout_and_arguments(
             cleanup.as_ref().unchecked_ref(),
-            5000,
+            60000,
             &js_sys::Array::new(),
         )
         .unwrap();
