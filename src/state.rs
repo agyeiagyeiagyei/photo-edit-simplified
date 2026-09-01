@@ -347,6 +347,8 @@ pub struct EditParams {
     pub selection: Option<Selection>,
     /// Video trim (start_s, end_s); None = untrimmed.
     pub trim: Option<(f32, f32)>,
+    /// Keep original audio track on export; if false, strip audio.
+    pub keep_audio: bool,
 }
 
 impl Default for EditParams {
@@ -362,6 +364,7 @@ impl Default for EditParams {
             warmth: 0.0,
             selection: None,
             trim: None,
+            keep_audio: true,
         }
     }
 }

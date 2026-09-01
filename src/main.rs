@@ -574,10 +574,15 @@ fn build_ffmpeg_args(item: &MediaItem, w: usize, h: usize, overlays: &[String]) 
         "-preset".into(), "veryfast".into(),
         "-crf".into(), "22".into(),
         "-pix_fmt".into(), "yuv420p".into(),
-        "-c:a".into(), "aac".into(),
         "-movflags".into(), "+faststart".into(),
-        "pes-out.mp4".into(),
     ]);
+    if item.edit.keep_audio {
+        args.push("-c:a".into());
+        args.push("aac".into());
+    } else {
+        args.push("-an".into());
+    }
+    args.push("pes-out.mp4".into());
     args
 }
 
@@ -1250,6 +1255,11 @@ fn VideoOverlays(state: AppState, item: MediaItem) -> impl IntoView {
                 let left = format!("{:.2}%", t.x * 100.0);
                 let top = format!("{:.2}%", t.y * 100.0);
                 let align = t.alignment.canvas_value();
+                let translate = match t.alignment {
+                    TextAlign::Left => "translate(0,-50%)",
+                    TextAlign::Center => "translate(-50%,-50%)",
+                    TextAlign::Right => "translate(-100%,-50%)",
+                };
                 let shadow = format!(
                     "{}px {}px {}px {}",
                     t.shadow_offset_x, t.shadow_offset_y, t.shadow_blur, t.shadow_color
@@ -1260,9 +1270,9 @@ fn VideoOverlays(state: AppState, item: MediaItem) -> impl IntoView {
                     String::new()
                 };
                 let style = format!(
-                    "position:absolute;left:{};top:{};font-family:'{}',sans-serif;font-weight:{};\
-                     font-size:{};color:{};text-align:{};text-shadow:{};opacity:{};{}",
-                    left, top, t.font_family, t.font_weight, px, t.color, align, shadow, l.opacity, stroke
+                    "position:absolute;left:{};top:{};transform:{};font-family:'{}',sans-serif;\
+                     font-weight:{};font-size:{};color:{};text-align:{};text-shadow:{};opacity:{};white-space:nowrap;{}",
+                    left, top, translate, t.font_family, t.font_weight, px, t.color, align, shadow, l.opacity, stroke
                 );
                 Some(view! { <div style=style>{t.text.clone()}</div> })
             }).collect_view()}
@@ -2282,6 +2292,8 @@ fn TrimTab(state: AppState) -> impl IntoView {
 #[component]
 fn ExportTab(state: AppState) -> impl IntoView {
     let multi = move || state.items.with(|v| v.len() > 1);
+    let is_video = move || state.current().map(|m| m.kind == MediaKind::Video).unwrap_or(false);
+    let keep_audio = move || state.current().map(|m| m.edit.keep_audio).unwrap_or(true);
     view! {
         <button class="btn primary" on:click=move |_| {
             if let Some(item) = state.current() {
@@ -2291,6 +2303,19 @@ fn ExportTab(state: AppState) -> impl IntoView {
                 }
             }
         }>"Download this"</button>
+        <Show when=is_video fallback=|| ()>
+            <label class="row" style="justify-content:flex-start;gap:0.5rem">
+                <input
+                    type="checkbox"
+                    prop:checked=move || keep_audio()
+                    on:change=move |ev| {
+                        let checked = event_target_checked(&ev);
+                        state.update_current_item(|m| m.edit.keep_audio = checked);
+                    }
+                />
+                "Keep original audio"
+            </label>
+        </Show>
         <Show when=multi fallback=|| ()>
             <button class="btn" on:click=move |_| {
                 let Some(cur) = state.current() else { return };

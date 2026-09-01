@@ -2,5 +2,3 @@ target/
 dist/
 node_modules/
 .DS_Store
-# Test video fixture; will be force-added when text-on-video milestone is reached.
-test-assets/IMG_4380.mov

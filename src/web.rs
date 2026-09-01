@@ -4,7 +4,7 @@ use js_sys::{Array, Function, Promise, Reflect, Uint8ClampedArray};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{Blob, CanvasRenderingContext2d, HtmlCanvasElement, HtmlImageElement, ImageData, Url};
+use web_sys::{Blob, CanvasRenderingContext2d, HtmlCanvasElement, HtmlElement, HtmlImageElement, ImageData, Url};
 
 pub fn window() -> web_sys::Window {
     web_sys::window().expect("no window")
@@ -139,14 +139,32 @@ pub async fn video_transcode(
 /// Trigger a browser download for a Blob.
 pub fn download_blob(blob: &Blob, filename: &str) {
     let url = Url::create_object_url_with_blob(blob).unwrap();
-    let a: web_sys::HtmlElement = document()
+    let doc = document();
+    let a: HtmlElement = doc
         .create_element("a")
         .unwrap()
         .unchecked_into();
     a.set_attribute("href", &url).unwrap();
     a.set_attribute("download", filename).unwrap();
+    a.set_attribute("style", "display:none").unwrap();
+    let _ = doc.body().unwrap().append_child(&a);
     a.click();
-    let _ = Url::revoke_object_url(&url);
+    let _ = a.remove();
+
+    // Keep the object URL alive long enough for the browser's download manager
+    // and any automation listener to observe the start of the download.
+    let cleanup_url = url.clone();
+    let cleanup = Closure::once(move || {
+        let _ = Url::revoke_object_url(&cleanup_url);
+    });
+    window()
+        .set_timeout_with_callback_and_timeout_and_arguments(
+            cleanup.as_ref().unchecked_ref(),
+            5000,
+            &js_sys::Array::new(),
+        )
+        .unwrap();
+    cleanup.forget();
 }
 
 pub async fn canvas_to_jpeg_blob(canvas: &HtmlCanvasElement, quality: f64) -> Result<Blob, JsValue> {
