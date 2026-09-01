@@ -66,7 +66,8 @@ ready-to-post sizes for social media.
 10. Batch export produces individual files (zip download if many).
 
 ## Explicit non-goals (v1)
-- No filters/presets library, no text/stickers, no collages.
+- No filters/presets library, no collages. (Text/drawing are v1
+  non-goals only — see v2 below.)
 - No accounts, no cloud save, no cross-session history.
 - No audio editing on video (keep/strip toggle only — default keep).
 
@@ -92,6 +93,35 @@ Implementation notes for the app: transformers.js + quantized CLIP
 (~100MB, Cache API after first load, same pattern as ffmpeg.wasm).
 Clusters render as stacks in the filmstrip with the keeper on top;
 tap to expand, swap keeper, or ungroup.
+
+### Creative editing suite (requested 2026-09-01)
+Four interdependent features. **Layers is the substrate — build it
+first**; drawing, text, and isolated subjects all live as layers.
+
+1. **Layers** — ordered stack above the base photo. Per layer: type
+   (raster/drawing/text), visibility toggle, opacity, reorder,
+   delete, drag-to-position. Composite via canvas at preview and
+   export; export flattens to JPEG. Photos only, not video.
+2. **Marquee selection + background isolation** — rect and free-form
+   (lasso) marquee for manual regions. Plus one-tap **subject
+   isolation**: client-side person/subject segmentation (MediaPipe
+   Selfie Segmentation or a quantized MODNet via ONNX Runtime Web —
+   both small enough for mobile) to lift the subject onto its own
+   layer. Once isolated: blur/darken/replace background, or move the
+   subject. Feathered edges by default; marquee ops (cut/copy to
+   layer, delete, adjust-within-selection) apply to both manual and
+   ML selections.
+3. **Pen tool + drawing** — freehand strokes on a drawing layer:
+   color picker, stroke width, opacity, edge smoothing. Touch- and
+   stylus-first. Undo = per-stroke, not global. Keep it a drawing
+   tool, not a paint suite — no brushes marketplace, no blend modes
+   in the first cut.
+4. **Font upload + text** — user uploads .ttf/.otf/.woff2, loaded
+   via the FontFace API (stays on-device). Text layers: drag
+   placement, size, color, weight where the font provides it,
+   stroke/outline + shadow for legibility over photos, alignment.
+   Ship a few bundled open-license defaults (e.g. Inter, Oswald) so
+   it works without an upload.
 
 ## UX sketch
 Grid of uploaded items → tap to edit one → bottom tool tabs
