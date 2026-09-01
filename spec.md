@@ -70,6 +70,29 @@ ready-to-post sizes for social media.
 - No accounts, no cloud save, no cross-session history.
 - No audio editing on video (keep/strip toggle only — default keep).
 
+## v2 candidates
+
+### Duplicate / near-duplicate culling (validated 2026-09-01)
+Client-side ML to cluster redundant shots after multi-select upload and
+suggest a keeper per cluster. Validated offline on a real 14-photo burst
+(one scene, varying poses) using CLIP `ViT-B-32` (laion2b_s34b_b79k)
+embeddings + cosine similarity + union-find clustering, keeper picked by
+Laplacian-variance sharpness:
+
+- Threshold is scene-dependent and must be user-facing: 0.94 merged the
+  whole burst into one cluster (everything is "same scene"); 0.97 culled
+  only true dupes (14 → 11); 0.96 over-merged distinct poses (14 → 3).
+  Ship a "strict ↔ aggressive" slider, default ~0.97.
+- Sharpness-only keeper selection picks the technically sharpest frame,
+  not necessarily the best composition — keeper must be manually
+  swappable in the UI. Pose/face-aware scoring is a later refinement.
+- Never auto-delete: clusters are suggestions; user confirms culls.
+
+Implementation notes for the app: transformers.js + quantized CLIP
+(~100MB, Cache API after first load, same pattern as ffmpeg.wasm).
+Clusters render as stacks in the filmstrip with the keeper on top;
+tap to expand, swap keeper, or ungroup.
+
 ## UX sketch
 Grid of uploaded items → tap to edit one → bottom tool tabs
 (Crop | Rotate | Color | Trim [video] | Export) → "Apply to all" bar when
