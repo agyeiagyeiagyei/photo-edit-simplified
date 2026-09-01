@@ -94,9 +94,14 @@ Implementation notes for the app: transformers.js + quantized CLIP
 Clusters render as stacks in the filmstrip with the keeper on top;
 tap to expand, swap keeper, or ungroup.
 
-### Creative editing suite (requested 2026-09-01)
+### Creative editing suite (requested 2026-09-01, BUILT 2026-09-01)
 Four interdependent features. **Layers is the substrate — build it
 first**; drawing, text, and isolated subjects all live as layers.
+
+Status: all four shipped — layers+text (f65492c), vector pen+brush
+(52bc7d7), marquee+subject isolation with MediaPipe vendored for
+offline (c8a26bb), text-on-video via PNG-overlay burn-in (2867cef,
+verified end-to-end on a 27.6s clip with keep/strip audio).
 
 1. **Layers** — ordered stack above the base photo. Per layer: type
    (raster/drawing/text), visibility toggle, opacity, reorder,
