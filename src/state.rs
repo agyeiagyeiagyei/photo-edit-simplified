@@ -343,6 +343,10 @@ pub struct EditParams {
     pub contrast: f32,
     pub saturation: f32,
     pub warmth: f32,
+    /// Levels (black/gamma/white per channel + composite). Identity = off.
+    pub levels: crate::levels::LevelsSettings,
+    /// Tone curves per channel + composite. Identity = off.
+    pub curves: crate::curves::CurvesSettings,
     /// Active selection mask (rect, lasso, or derived from ML segmentation).
     pub selection: Option<Selection>,
     /// Video trim (start_s, end_s); None = untrimmed.
@@ -362,6 +366,8 @@ impl Default for EditParams {
             contrast: 0.0,
             saturation: 0.0,
             warmth: 0.0,
+            levels: crate::levels::LevelsSettings::default(),
+            curves: crate::curves::CurvesSettings::default(),
             selection: None,
             trim: None,
             keep_audio: true,
@@ -375,6 +381,8 @@ impl EditParams {
             || self.contrast != 0.0
             || self.saturation != 0.0
             || self.warmth != 0.0
+            || !self.levels.is_identity()
+            || !self.curves.is_identity()
     }
 }
 

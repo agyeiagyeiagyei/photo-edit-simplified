@@ -1,3 +1,5 @@
+mod curves;
+mod levels;
 mod ops;
 mod state;
 mod web;
@@ -405,6 +407,10 @@ fn export_photo(state: AppState, item: MediaItem) {
         if item.edit.is_color_touched() {
             if let Some(sel) = &item.edit.selection {
                 let mask = ops::selection_mask(sel, w, h);
+                if !item.edit.levels.is_identity() {
+                    levels::levels_apply_masked(&mut p, &mask, &item.edit.levels.build_tables());
+                }
+                item.edit.curves.apply_masked(&mut p, &mask);
                 ops::adjust_masked(
                     &mut p,
                     &mask,
@@ -414,6 +420,10 @@ fn export_photo(state: AppState, item: MediaItem) {
                     item.edit.warmth,
                 );
             } else {
+                if !item.edit.levels.is_identity() {
+                    levels::levels_apply(&mut p, &item.edit.levels.build_tables());
+                }
+                item.edit.curves.apply(&mut p);
                 ops::adjust(
                     &mut p,
                     item.edit.brightness,
@@ -1122,6 +1132,10 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         if item.edit.is_color_touched() {
             if let Some(sel) = &item.edit.selection {
                 let mask = ops::selection_mask(sel, w, h);
+                if !item.edit.levels.is_identity() {
+                    levels::levels_apply_masked(&mut p, &mask, &item.edit.levels.build_tables());
+                }
+                item.edit.curves.apply_masked(&mut p, &mask);
                 ops::adjust_masked(
                     &mut p,
                     &mask,
@@ -1131,6 +1145,10 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     item.edit.warmth,
                 );
             } else {
+                if !item.edit.levels.is_identity() {
+                    levels::levels_apply(&mut p, &item.edit.levels.build_tables());
+                }
+                item.edit.curves.apply(&mut p);
                 ops::adjust(
                     &mut p,
                     item.edit.brightness,
@@ -1759,9 +1777,301 @@ fn ColorTab(state: AppState) -> impl IntoView {
         {slider("Contrast", |e| e.contrast, |e, v| e.contrast = v)}
         {slider("Saturation", |e| e.saturation, |e, v| e.saturation = v)}
         {slider("Warmth", |e| e.warmth, |e, v| e.warmth = v)}
+        <LevelsPanel state=state />
+        <CurvesPanel state=state />
         <button class="btn dim-btn" on:click=move |_| state.update_current(|e| {
             e.brightness = 0.0; e.contrast = 0.0; e.saturation = 0.0; e.warmth = 0.0;
         })>"Reset color"</button>
+    }
+}
+
+#[component]
+fn LevelsPanel(state: AppState) -> impl IntoView {
+    let channel = create_rw_signal(0usize); // 0=RGB, 1=R, 2=G, 3=B
+    let hist_ref = create_node_ref::<html::Canvas>();
+
+    // Redraw the histogram whenever the photo or its edits change.
+    create_effect(move |_| {
+        state.items.track();
+        state.selected.track();
+        let Some(canvas) = hist_ref.get() else { return };
+        let Some(item) = state.current() else { return };
+        if item.kind != MediaKind::Photo {
+            return;
+        }
+        let Some(photo) = get_photo(item.id) else { return };
+        let bins = levels::histogram(&photo.preview.0);
+        let scale = levels::histogram_display_scale(&bins[0]);
+        let ctx = web::ctx2d(&canvas);
+        ctx.clear_rect(0.0, 0.0, 256.0, 64.0);
+        if scale <= 0.0 {
+            return;
+        }
+        ctx.set_fill_style_str("rgba(255,255,255,0.75)");
+        for (i, &b) in bins[0].iter().enumerate() {
+            let h = (b / scale * 64.0).min(64.0);
+            if h >= 0.5 {
+                ctx.fill_rect(i as f64, 64.0 - h, 1.0, h);
+            }
+        }
+    });
+
+    let channel_btn = move |idx: usize, label: &'static str| {
+        view! {
+            <button
+                class=move || if channel.get() == idx { "btn small active" } else { "btn small" }
+                on:click=move |_| channel.set(idx)
+            >{label}</button>
+        }
+    };
+
+    let lslider = move |label: &'static str,
+                        min: f64,
+                        max: f64,
+                        step: f64,
+                        get: fn(&levels::LevelRange) -> f64,
+                        set: fn(&mut levels::LevelRange, f64),
+                        fmt: fn(f64) -> String| {
+        view! {
+            <label class="slider">
+                <span>{label} ": " {move || {
+                    state.current()
+                        .map(|m| fmt(get(&m.edit.levels.ranges[channel.get()])))
+                        .unwrap_or_else(|| "—".into())
+                }}</span>
+                <input
+                    type="range" min=min.to_string() max=max.to_string() step=step.to_string()
+                    prop:value=move || state.current()
+                        .map(|m| get(&m.edit.levels.ranges[channel.get()]).to_string())
+                        .unwrap_or_else(|| "0".into())
+                    on:input=move |ev| {
+                        let v: f64 = event_target_value(&ev).parse().unwrap_or(0.0);
+                        let ch = channel.get_untracked();
+                        state.update_current(|e| set(&mut e.levels.ranges[ch], v));
+                    }
+                />
+            </label>
+        }
+    };
+
+    let auto = move |mode: levels::AutoMode| {
+        let Some(item) = state.current() else { return };
+        let Some(photo) = get_photo(item.id) else { return };
+        let hist = levels::histogram(&photo.preview.0);
+        let s = levels::auto_settings(&hist, mode);
+        state.update_current(|e| e.levels = s);
+    };
+
+    view! {
+        <div class="levels-panel">
+            <canvas node_ref=hist_ref width="256" height="64" class="levels-hist"></canvas>
+            <div class="levels-channels">
+                {channel_btn(0, "RGB")}{channel_btn(1, "R")}{channel_btn(2, "G")}{channel_btn(3, "B")}
+            </div>
+            {lslider("Black point", 0.0, 254.0, 1.0, |r| r.black, |r, v| r.black = v, |v| format!("{v:.0}"))}
+            {lslider("Gamma", 0.1, 9.99, 0.01, |r| r.gamma, |r, v| r.gamma = v, |v| format!("{v:.2}"))}
+            {lslider("White point", 1.0, 255.0, 1.0, |r| r.white, |r, v| r.white = v, |v| format!("{v:.0}"))}
+            {lslider("Output black", 0.0, 255.0, 1.0, |r| r.output_black, |r, v| r.output_black = v, |v| format!("{v:.0}"))}
+            {lslider("Output white", 0.0, 255.0, 1.0, |r| r.output_white, |r, v| r.output_white = v, |v| format!("{v:.0}"))}
+            <div class="levels-auto">
+                <button class="btn small" on:click=move |_| auto(levels::AutoMode::Contrast)>"Auto contrast"</button>
+                <button class="btn small" on:click=move |_| auto(levels::AutoMode::Color)>"Auto color"</button>
+                <button class="btn small" on:click=move |_| auto(levels::AutoMode::ColorNeutral)>"Auto neutral"</button>
+                <button class="btn small dim-btn" on:click=move |_| {
+                    state.update_current(|e| e.levels = levels::LevelsSettings::default());
+                }>"Reset levels"</button>
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn CurvesPanel(state: AppState) -> impl IntoView {
+    let channel = create_rw_signal(0usize); // 0=RGB, 1=R, 2=G, 3=B
+    let selected = create_rw_signal(None::<usize>);
+    let dragging = store_value(None::<usize>);
+    let canvas_ref = create_node_ref::<html::Canvas>();
+
+    // Redraw the curve whenever the photo's edits, channel, or selection change.
+    create_effect(move |_| {
+        state.items.track();
+        channel.track();
+        selected.track();
+        let Some(canvas) = canvas_ref.get() else { return };
+        let Some(item) = state.current() else { return };
+        let ch = channel.get_untracked();
+        let sel = selected.get_untracked();
+        let pts = &item.edit.curves.channels[ch];
+        let ctx = web::ctx2d(&canvas);
+        ctx.clear_rect(0.0, 0.0, 256.0, 256.0);
+        ctx.set_stroke_style_str("rgba(255,255,255,0.12)");
+        ctx.set_line_width(1.0);
+        ctx.begin_path();
+        for i in 0..=4 {
+            let f = i as f64 / 4.0 * 256.0;
+            ctx.move_to(f, 0.0);
+            ctx.line_to(f, 256.0);
+            ctx.move_to(0.0, f);
+            ctx.line_to(256.0, f);
+        }
+        ctx.stroke();
+        ctx.set_stroke_style_str("#ffffff");
+        ctx.set_line_width(2.0);
+        ctx.begin_path();
+        for x in 0..=255 {
+            let y = item.edit.curves.value(x as f64, ch);
+            let px = x as f64 / 255.0 * 256.0;
+            let py = (1.0 - y / 255.0) * 256.0;
+            if x == 0 {
+                ctx.move_to(px, py);
+            } else {
+                ctx.line_to(px, py);
+            }
+        }
+        ctx.stroke();
+        for (i, pt) in pts.iter().enumerate() {
+            let px = pt.x / 255.0 * 256.0;
+            let py = (1.0 - pt.y / 255.0) * 256.0;
+            ctx.begin_path();
+            let _ = ctx.arc(px, py, 4.0, 0.0, std::f64::consts::TAU);
+            ctx.set_fill_style_str(if sel == Some(i) { "#0a84ff" } else { "#ffffff" });
+            ctx.fill();
+        }
+    });
+
+    let to_curve = move |ev: &web_sys::PointerEvent| -> Option<(f64, f64)> {
+        let canvas = canvas_ref.get()?;
+        let rect = canvas.get_bounding_client_rect();
+        if rect.width() <= 0.0 || rect.height() <= 0.0 {
+            return None;
+        }
+        let x = ((ev.client_x() as f64 - rect.left()) / rect.width() * 255.0).clamp(0.0, 255.0);
+        let y = (255.0 - (ev.client_y() as f64 - rect.top()) / rect.height() * 255.0).clamp(0.0, 255.0);
+        Some((x, y))
+    };
+
+    let on_down = move |ev: web_sys::PointerEvent| {
+        ev.prevent_default();
+        let Some((x, y)) = to_curve(&ev) else { return };
+        if let Some(canvas) = canvas_ref.get() {
+            let _ = canvas.set_pointer_capture(ev.pointer_id());
+        }
+        let ch = channel.get_untracked();
+        let Some(item) = state.current() else { return };
+        let pts = item.edit.curves.channels[ch].clone();
+        let nearest = pts
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                (a.x - x).hypot(a.y - y).partial_cmp(&(b.x - x).hypot(b.y - y)).unwrap()
+            })
+            .filter(|(_, p)| (p.x - x).hypot(p.y - y) < 14.0)
+            .map(|(i, _)| i);
+        if let Some(i) = nearest {
+            dragging.set_value(Some(i));
+            selected.set(Some(i));
+        } else if pts.len() < 32 && x > 1.0 && x < 254.0 && pts.iter().all(|p| (p.x - x).abs() > 1.0) {
+            let mut new_pts = pts.clone();
+            new_pts.push(curves::CurvePoint { x, y });
+            new_pts.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap());
+            let idx = new_pts.iter().position(|p| p.x == x).unwrap();
+            state.update_current(|e| e.curves.channels[ch] = new_pts);
+            dragging.set_value(Some(idx));
+            selected.set(Some(idx));
+        }
+    };
+
+    let on_move = move |ev: web_sys::PointerEvent| {
+        let Some(i) = dragging.get_value() else { return };
+        let Some((x, y)) = to_curve(&ev) else { return };
+        let ch = channel.get_untracked();
+        state.update_current(|e| {
+            let pts = &mut e.curves.channels[ch];
+            if i >= pts.len() {
+                return;
+            }
+            pts[i].y = y;
+            if i > 0 && i < pts.len() - 1 {
+                pts[i].x = x.min(pts[i + 1].x - 1.0).max(pts[i - 1].x + 1.0);
+            }
+        });
+    };
+
+    let on_up = move |_: web_sys::PointerEvent| dragging.set_value(None);
+
+    let channel_btn = move |idx: usize, label: &'static str| {
+        view! {
+            <button
+                class=move || if channel.get() == idx { "btn small active" } else { "btn small" }
+                on:click=move |_| {
+                    channel.set(idx);
+                    selected.set(None);
+                    dragging.set_value(None);
+                }
+            >{label}</button>
+        }
+    };
+
+    let removable = move || {
+        let Some(i) = selected.get() else { return false };
+        state
+            .current()
+            .map(|m| {
+                let n = m.edit.curves.channels[channel.get()].len();
+                i > 0 && i < n - 1
+            })
+            .unwrap_or(false)
+    };
+
+    view! {
+        <div class="curves-panel">
+            <div class="levels-channels">
+                {channel_btn(0, "RGB")}{channel_btn(1, "R")}{channel_btn(2, "G")}{channel_btn(3, "B")}
+            </div>
+            <canvas
+                node_ref=canvas_ref width="256" height="256" class="curves-canvas"
+                on:pointerdown=on_down
+                on:pointermove=on_move
+                on:pointerup=on_up
+            ></canvas>
+            <div class="curves-info">
+                <span>{move || {
+                    let i = selected.get();
+                    i.and_then(|i| {
+                        state.current().and_then(|m| {
+                            m.edit.curves.channels[channel.get()]
+                                .get(i)
+                                .map(|p| format!("Input {} · Output {}", p.x as i32, p.y as i32))
+                        })
+                    })
+                    .unwrap_or_else(|| "Click to add a point. Drag to adjust.".into())
+                }}</span>
+            </div>
+            <div class="levels-auto">
+                <button class="btn small" disabled=move || !removable() on:click=move |_| {
+                    if let Some(i) = selected.get_untracked() {
+                        let ch = channel.get_untracked();
+                        state.update_current(|e| {
+                            let pts = &mut e.curves.channels[ch];
+                            if i > 0 && i < pts.len() - 1 {
+                                pts.remove(i);
+                            }
+                        });
+                        selected.set(None);
+                    }
+                }>"Remove point"</button>
+                <button class="btn small dim-btn" on:click=move |_| {
+                    let ch = channel.get_untracked();
+                    state.update_current(|e| {
+                        e.curves.channels[ch] = vec![
+                            curves::CurvePoint { x: 0.0, y: 0.0 },
+                            curves::CurvePoint { x: 255.0, y: 255.0 },
+                        ];
+                    });
+                    selected.set(None);
+                }>"Reset curve"</button>
+            </div>
+        </div>
     }
 }
 
