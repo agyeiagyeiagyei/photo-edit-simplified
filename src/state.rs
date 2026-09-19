@@ -53,15 +53,17 @@ impl Tool {
 pub enum SelectTool {
     Rect,
     Lasso,
+    Wand,
 }
 
 impl SelectTool {
-    pub const ALL: [SelectTool; 2] = [SelectTool::Rect, SelectTool::Lasso];
+    pub const ALL: [SelectTool; 3] = [SelectTool::Rect, SelectTool::Lasso, SelectTool::Wand];
 
     pub fn label(self) -> &'static str {
         match self {
             SelectTool::Rect => "Rect",
             SelectTool::Lasso => "Lasso",
+            SelectTool::Wand => "Wand",
         }
     }
 }
@@ -198,6 +200,9 @@ pub struct RasterLayer {
 pub enum SelectionKind {
     Rect { x: f32, y: f32, w: f32, h: f32 },
     Lasso(Vec<(f32, f32)>),
+    /// Per-pixel mask (e.g. magic wand, ML segmentation) captured in the
+    /// geometry-corrected pixel space it was created at; scaled on use.
+    Mask { data: Vec<u8>, width: usize, height: usize },
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -420,6 +425,9 @@ pub struct AppState {
     pub next_id: RwSignal<usize>,
     /// Available font family names (bundled + user-uploaded).
     pub fonts: RwSignal<Vec<String>>,
+    /// Magic wand options-bar settings.
+    pub wand_tolerance: RwSignal<i32>,
+    pub wand_contiguous: RwSignal<bool>,
 }
 
 impl AppState {
@@ -434,6 +442,8 @@ impl AppState {
             progress: create_rw_signal(0.0),
             next_id: create_rw_signal(0),
             fonts: create_rw_signal(vec!["Inter".into(), "Oswald".into()]),
+            wand_tolerance: create_rw_signal(32),
+            wand_contiguous: create_rw_signal(true),
         }
     }
 

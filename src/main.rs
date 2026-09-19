@@ -2,6 +2,7 @@ mod curves;
 mod levels;
 mod ops;
 mod state;
+mod wand;
 mod web;
 
 use std::cell::RefCell;
@@ -888,6 +889,23 @@ fn draw_selection_overlay(ctx: &web_sys::CanvasRenderingContext2d, sel: &Selecti
             ctx.close_path();
             ctx.stroke();
         }
+        SelectionKind::Mask { .. } => {
+            let (wi, hi) = (w as usize, h as usize);
+            let mask = ops::selection_mask(sel, wi, hi);
+            let mut tint = vec![0u8; wi * hi * 4];
+            for (i, &m) in mask.iter().enumerate() {
+                if m == 0 {
+                    continue;
+                }
+                tint[i * 4] = 10;
+                tint[i * 4 + 1] = 132;
+                tint[i * 4 + 2] = 255;
+                tint[i * 4 + 3] = m / 3;
+            }
+            let tmp = web::create_canvas(wi as u32, hi as u32);
+            web::put_pixels(&tmp, &tint, wi as u32, hi as u32);
+            let _ = ctx.draw_image_with_html_canvas_element(&tmp, 0.0, 0.0);
+        }
     }
     ctx.restore();
 }
@@ -1215,6 +1233,9 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                     }
                                     SelectTool::Lasso => {
                                         select_drag.set(Some(SelectDrag::Lasso(vec![(nx, ny)])));
+                                    }
+                                    SelectTool::Wand => {
+                                        wand_select(state, nx, ny);
                                     }
                                 }
                                 return;
@@ -1581,6 +1602,46 @@ fn delete_selection(state: AppState) {
     });
 }
 
+/// Magic wand: flood-select pixels similar to the clicked one, sampled from
+/// the color-adjusted preview (what the user sees, minus selection masking).
+fn wand_select(state: AppState, nx: f32, ny: f32) {
+    let Some(item) = state.current() else { return };
+    if item.kind != MediaKind::Photo {
+        return;
+    }
+    let Some(photo) = get_photo(item.id) else { return };
+    let (pix, pw, ph) = &photo.preview;
+    let (mut p, w, h) = geometry(pix, *pw, *ph, &item.edit);
+    if item.edit.is_color_touched() {
+        if !item.edit.levels.is_identity() {
+            levels::levels_apply(&mut p, &item.edit.levels.build_tables());
+        }
+        item.edit.curves.apply(&mut p);
+        ops::adjust(
+            &mut p,
+            item.edit.brightness,
+            item.edit.contrast,
+            item.edit.saturation,
+            item.edit.warmth,
+        );
+    }
+    let sx = ((nx * w as f32) as usize).min(w - 1);
+    let sy = ((ny * h as f32) as usize).min(h - 1);
+    let tol = state.wand_tolerance.get_untracked();
+    let contig = state.wand_contiguous.get_untracked();
+    let (mask, count) = wand::wand_mask(&p, w, h, sx, sy, 0, tol, contig);
+    state.update_current(|e| {
+        e.selection = if count > 0 {
+            Some(state::Selection {
+                kind: state::SelectionKind::Mask { data: mask, width: w, height: h },
+                feather: 0.0,
+            })
+        } else {
+            None
+        };
+    });
+}
+
 fn isolate_subject(state: AppState) {
     let Some(item) = state.current() else { return; };
     if item.kind != MediaKind::Photo {
@@ -1663,6 +1724,32 @@ fn SelectTab(state: AppState) -> impl IntoView {
                     }
                 })}
             </div>
+            <Show
+                when=move || state.selected_select_tool.get() == SelectTool::Wand
+                fallback=|| ()
+            >
+                <label class="slider">
+                    <span>"Tolerance: " {move || state.wand_tolerance.get().to_string()}</span>
+                    <input
+                        type="range" min="0" max="100" step="1"
+                        prop:value=move || state.wand_tolerance.get().to_string()
+                        on:input=move |ev| {
+                            let v: i32 = event_target_value(&ev).parse().unwrap_or(32);
+                            state.wand_tolerance.set(v.clamp(0, 255));
+                        }
+                    />
+                </label>
+                <label class="row" style="justify-content:flex-start;gap:0.5rem">
+                    <input
+                        type="checkbox"
+                        prop:checked=move || state.wand_contiguous.get()
+                        on:change=move |ev| {
+                            state.wand_contiguous.set(event_target_checked(&ev));
+                        }
+                    />
+                    "Contiguous"
+                </label>
+            </Show>
             <div class="row select-row">
                 <button
                     class="btn"
@@ -1711,7 +1798,8 @@ fn SelectTab(state: AppState) -> impl IntoView {
                 "Isolate subject"
             </button>
             <p class="dim">
-                "Rect/Lasso selects a region. Cut/Copy lift it to a raster layer. \
+                "Rect/Lasso select a region; Wand selects pixels similar to the one you click. \
+                 Cut/Copy lift it to a raster layer. \
                  Isolate subject runs MediaPipe Selfie Segmentation (photo-only)."
             </p>
         </div>

@@ -169,6 +169,19 @@ pub fn selection_mask(sel: &Selection, w: usize, h: usize) -> Vec<u8> {
                 }
             }
         }
+        SelectionKind::Mask { data, width: mw, height: mh } => {
+            if *mw == w && *mh == h && data.len() == w * h {
+                mask.copy_from_slice(data);
+            } else if *mw > 0 && *mh > 0 && data.len() == mw * mh {
+                for y in 0..h {
+                    let sy = (y * *mh / h).min(mh - 1);
+                    for x in 0..w {
+                        let sx = (x * *mw / w).min(mw - 1);
+                        mask[y * w + x] = data[sy * mw + sx];
+                    }
+                }
+            }
+        }
     }
     if sel.feather > 0.001 {
         feather_mask(&mut mask, w, h, sel.feather);
