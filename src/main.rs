@@ -1,4 +1,5 @@
 mod curves;
+mod fill;
 mod heal;
 mod levels;
 mod noise;
@@ -1670,6 +1671,37 @@ fn delete_selection(state: AppState) {
     });
 }
 
+/// Content-aware fill: synthesize the selection from surrounding texture
+/// (PatchMatch-style), destructive on the base pixels like delete_selection.
+fn content_fill_selection(state: AppState) {
+    let Some(item) = state.current() else { return; };
+    if item.kind != MediaKind::Photo {
+        return;
+    }
+    let Some(sel) = item.edit.selection.clone() else { return; };
+    let Some(photo) = get_photo(item.id) else { return; };
+    let (full, fw, fh) = photo.full.clone();
+    let (mut base, w, h) = geometry(&full, fw, fh, &item.edit);
+    let mask = ops::selection_mask(&sel, w, h);
+    if !fill::content_fill(&mut base, &mask, w, h) {
+        return;
+    }
+    let preview = downscale_pixels(&base, w, h, 1024);
+    CACHE.with(|c| {
+        if let Some(pd) = c.borrow_mut().photos.get_mut(&item.id) {
+            let pd = Rc::make_mut(pd);
+            pd.full = (base, w, h);
+            pd.preview = preview;
+        }
+    });
+    state.update_current(|e| {
+        e.rot90 = 0;
+        e.fine_angle = 0.0;
+        e.crop = state::CropRect::default();
+        e.selection = None;
+    });
+}
+
 /// Spot heal: stamp soft discs along the stroke (normalized coords) into a
 /// coverage mask at full-res, run the patch-synthesis solver, and swap the
 /// cached pixels — destructive, mirroring delete_selection.
@@ -1917,6 +1949,13 @@ fn SelectTab(state: AppState) -> impl IntoView {
                 </button>
                 <button
                     class="btn"
+                    disabled=move || !has_selection()
+                    on:click=move |_| content_fill_selection(state)
+                >
+                    "Content fill"
+                </button>
+                <button
+                    class="btn"
                     on:click=move |_| state.update_current(|e| e.selection = None)
                 >
                     "Clear"
@@ -1942,7 +1981,8 @@ fn SelectTab(state: AppState) -> impl IntoView {
             </button>
             <p class="dim">
                 "Rect/Lasso select a region; Wand selects pixels similar to the one you click. \
-                 Cut/Copy lift it to a raster layer. \
+                 Cut/Copy lift it to a raster layer; Content fill synthesizes it from the \
+                 surroundings. \
                  Isolate subject runs MediaPipe Selfie Segmentation (photo-only)."
             </p>
         </div>
