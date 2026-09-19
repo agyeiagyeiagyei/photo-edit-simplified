@@ -1,5 +1,6 @@
 mod curves;
 mod levels;
+mod noise;
 mod ops;
 mod state;
 mod wand;
@@ -420,6 +421,7 @@ fn export_photo(state: AppState, item: MediaItem) {
                     item.edit.saturation,
                     item.edit.warmth,
                 );
+                noise::noise_add_masked(&mut p, &mask, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
             } else {
                 if !item.edit.levels.is_identity() {
                     levels::levels_apply(&mut p, &item.edit.levels.build_tables());
@@ -432,6 +434,7 @@ fn export_photo(state: AppState, item: MediaItem) {
                     item.edit.saturation,
                     item.edit.warmth,
                 );
+                noise::noise_add(&mut p, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
             }
         }
 
@@ -1162,6 +1165,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     item.edit.saturation,
                     item.edit.warmth,
                 );
+                noise::noise_add_masked(&mut p, &mask, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
             } else {
                 if !item.edit.levels.is_identity() {
                     levels::levels_apply(&mut p, &item.edit.levels.build_tables());
@@ -1174,6 +1178,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     item.edit.saturation,
                     item.edit.warmth,
                 );
+                noise::noise_add(&mut p, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
             }
         }
         web::put_pixels(&canvas, &p, w as u32, h as u32);
@@ -1867,6 +1872,7 @@ fn ColorTab(state: AppState) -> impl IntoView {
         {slider("Warmth", |e| e.warmth, |e, v| e.warmth = v)}
         <LevelsPanel state=state />
         <CurvesPanel state=state />
+        <GrainPanel state=state />
         <button class="btn dim-btn" on:click=move |_| state.update_current(|e| {
             e.brightness = 0.0; e.contrast = 0.0; e.saturation = 0.0; e.warmth = 0.0;
         })>"Reset color"</button>
@@ -2159,6 +2165,44 @@ fn CurvesPanel(state: AppState) -> impl IntoView {
                     selected.set(None);
                 }>"Reset curve"</button>
             </div>
+        </div>
+    }
+}
+
+#[component]
+fn GrainPanel(state: AppState) -> impl IntoView {
+    let grain = move || state.current().map(|m| m.edit.grain).unwrap_or(0.0);
+    let gaussian = move || state.current().map(|m| m.edit.grain_gaussian).unwrap_or(true);
+    let mono = move || state.current().map(|m| m.edit.grain_mono).unwrap_or(true);
+    view! {
+        <div class="grain-panel">
+            <label class="slider">
+                <span>"Grain: " {move || format!("{:.0}", grain())}</span>
+                <input
+                    type="range" min="0" max="100" step="1"
+                    prop:value=move || grain().to_string()
+                    on:input=move |ev| {
+                        let v: f32 = event_target_value(&ev).parse().unwrap_or(0.0);
+                        state.update_current(|e| e.grain = v.clamp(0.0, 100.0));
+                    }
+                />
+            </label>
+            <label class="row" style="justify-content:flex-start;gap:0.5rem">
+                <input
+                    type="checkbox"
+                    prop:checked=gaussian
+                    on:change=move |ev| state.update_current(|e| e.grain_gaussian = event_target_checked(&ev))
+                />
+                "Gaussian"
+            </label>
+            <label class="row" style="justify-content:flex-start;gap:0.5rem">
+                <input
+                    type="checkbox"
+                    prop:checked=mono
+                    on:change=move |ev| state.update_current(|e| e.grain_mono = event_target_checked(&ev))
+                />
+                "Monochromatic"
+            </label>
         </div>
     }
 }

@@ -402,3 +402,10 @@ button:disabled {
   gap: 8px;
   margin-top: 4px;
 }
+
+.grain-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+}

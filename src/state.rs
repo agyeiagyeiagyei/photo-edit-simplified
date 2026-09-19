@@ -348,6 +348,12 @@ pub struct EditParams {
     pub contrast: f32,
     pub saturation: f32,
     pub warmth: f32,
+    /// Film grain amount 0..=100 (0 = off).
+    pub grain: f32,
+    /// Gaussian (true) vs uniform (false) grain distribution.
+    pub grain_gaussian: bool,
+    /// Same noise on all channels (luma grain) vs per-channel color noise.
+    pub grain_mono: bool,
     /// Levels (black/gamma/white per channel + composite). Identity = off.
     pub levels: crate::levels::LevelsSettings,
     /// Tone curves per channel + composite. Identity = off.
@@ -371,6 +377,9 @@ impl Default for EditParams {
             contrast: 0.0,
             saturation: 0.0,
             warmth: 0.0,
+            grain: 0.0,
+            grain_gaussian: true,
+            grain_mono: true,
             levels: crate::levels::LevelsSettings::default(),
             curves: crate::curves::CurvesSettings::default(),
             selection: None,
@@ -386,6 +395,7 @@ impl EditParams {
             || self.contrast != 0.0
             || self.saturation != 0.0
             || self.warmth != 0.0
+            || self.grain > 0.0
             || !self.levels.is_identity()
             || !self.curves.is_identity()
     }
