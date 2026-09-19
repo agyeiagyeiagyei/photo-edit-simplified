@@ -438,6 +438,9 @@ pub struct AppState {
     /// Magic wand options-bar settings.
     pub wand_tolerance: RwSignal<i32>,
     pub wand_contiguous: RwSignal<bool>,
+    /// Spot-heal brush: radius as a fraction of the image diagonal.
+    pub heal_radius: RwSignal<f32>,
+    pub heal_mode: RwSignal<crate::heal::HealMode>,
 }
 
 impl AppState {
@@ -454,6 +457,8 @@ impl AppState {
             fonts: create_rw_signal(vec!["Inter".into(), "Oswald".into()]),
             wand_tolerance: create_rw_signal(32),
             wand_contiguous: create_rw_signal(true),
+            heal_radius: create_rw_signal(0.02),
+            heal_mode: create_rw_signal(crate::heal::HealMode::ContentAware),
         }
     }
 

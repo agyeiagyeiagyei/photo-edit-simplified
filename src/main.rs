@@ -1,4 +1,5 @@
 mod curves;
+mod heal;
 mod levels;
 mod noise;
 mod ops;
@@ -713,6 +714,7 @@ enum Tab {
     Rotate,
     Color,
     Select,
+    Heal,
     Layers,
     Trim,
     Export,
@@ -739,6 +741,7 @@ fn Editor(state: AppState) -> impl IntoView {
                     <TabBtn tab=tab t=Tab::Rotate label="Rotate"/>
                     <TabBtn tab=tab t=Tab::Color label="Color"/>
                     <TabBtn tab=tab t=Tab::Select label="Select"/>
+                    <TabBtn tab=tab t=Tab::Heal label="Heal"/>
                     <TabBtn tab=tab t=Tab::Layers label="Layers"/>
                     <Show
                         when=move || state.current().map(|m| m.kind == MediaKind::Video).unwrap_or(false)
@@ -754,6 +757,7 @@ fn Editor(state: AppState) -> impl IntoView {
                         Tab::Rotate => view! { <RotateTab state=state/> }.into_view(),
                         Tab::Color => view! { <ColorTab state=state/> }.into_view(),
                         Tab::Select => view! { <SelectTab state=state/> }.into_view(),
+                        Tab::Heal => view! { <HealTab state=state/> }.into_view(),
                         Tab::Layers => view! { <LayersTab state=state/> }.into_view(),
                         Tab::Trim => view! { <TrimTab state=state/> }.into_view(),
                         Tab::Export => view! { <ExportTab state=state/> }.into_view(),
@@ -947,6 +951,32 @@ fn draw_select_drag(ctx: &web_sys::CanvasRenderingContext2d, drag: &SelectDrag, 
     ctx.restore();
 }
 
+/// Heal-brush preview: soft translucent discs along the in-progress stroke.
+fn draw_heal_overlay(
+    ctx: &web_sys::CanvasRenderingContext2d,
+    pts: Option<&[(f32, f32)]>,
+    radius_frac: f32,
+    w: f64,
+    h: f64,
+) {
+    let Some(pts) = pts else { return };
+    if pts.is_empty() {
+        return;
+    }
+    let r = radius_frac as f64 * (w * w + h * h).sqrt();
+    ctx.save();
+    ctx.set_fill_style_str("rgba(255,255,255,0.35)");
+    ctx.set_stroke_style_str("rgba(255,255,255,0.9)");
+    ctx.set_line_width(1.5);
+    for &(nx, ny) in pts {
+        ctx.begin_path();
+        let _ = ctx.arc(nx as f64 * w, ny as f64 * h, r, 0.0, std::f64::consts::TAU);
+        ctx.fill();
+        ctx.stroke();
+    }
+    ctx.restore();
+}
+
 fn text_overlay_style(t: &state::TextLayer, opacity: f32) -> String {
     let px = format!("{:.2}%", t.font_size * 100.0);
     let left = format!("{:.2}%", t.x * 100.0);
@@ -999,6 +1029,23 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     let pen_drag = create_rw_signal(None::<(usize, PenDrag, f32, f32)>);
     let brush_draw = create_rw_signal(None::<usize>);
     let select_drag = create_rw_signal(None::<SelectDrag>);
+    let heal_drag = create_rw_signal(None::<Vec<(f32, f32)>>);
+
+    // --- heal brush stroke -----------------------------------------------------
+    window_event_listener(leptos::ev::pointermove, move |ev| {
+        let Some((nx, ny)) = layer_norm_pos(&ev) else { return };
+        let Some(Some(mut pts)) = heal_drag.try_get() else { return };
+        if pts.last().map(|last| dist2(*last, (nx, ny)) > 0.00005).unwrap_or(true) {
+            pts.push((nx, ny));
+            heal_drag.set(Some(pts));
+        }
+    });
+
+    window_event_listener(leptos::ev::pointerup, move |_| {
+        let Some(pts) = heal_drag.try_get().flatten() else { return };
+        let _ = heal_drag.try_set(None);
+        apply_heal(state, &pts);
+    });
 
     // --- text layer drag -------------------------------------------------------
     window_event_listener(leptos::ev::pointermove, move |ev| {
@@ -1140,6 +1187,8 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         state.selected_layer.track();
         state.selected_tool.track();
         state.selected_select_tool.track();
+        heal_drag.track();
+        state.heal_radius.track();
         let Some(item) = state.current() else { return };
         if item.kind != MediaKind::Photo {
             return;
@@ -1203,6 +1252,12 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 draw_select_drag(&ctx, &drag, w as f64, h as f64);
             }
         }
+
+        // Draw the heal stroke overlay on the Heal tab.
+        if tab.get() == Tab::Heal {
+            let ctx = web::ctx2d(&canvas);
+            draw_heal_overlay(&ctx, heal_drag.get().as_deref(), state.heal_radius.get(), w as f64, h as f64);
+        }
     });
 
     view! {
@@ -1230,6 +1285,14 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     <div
                         class="canvas-wrap"
                         on:pointerdown=move |ev: web_sys::PointerEvent| {
+                            if tab.get() == Tab::Heal {
+                                if state.current().map(|m| m.kind == MediaKind::Photo).unwrap_or(false) {
+                                    if let Some((nx, ny)) = layer_norm_pos(&ev) {
+                                        heal_drag.set(Some(vec![(nx, ny)]));
+                                    }
+                                }
+                                return;
+                            }
                             if tab.get() == Tab::Select {
                                 let Some((nx, ny)) = layer_norm_pos(&ev) else { return; };
                                 match state.selected_select_tool.get() {
@@ -1605,6 +1668,81 @@ fn delete_selection(state: AppState) {
         e.crop = state::CropRect::default();
         e.selection = None;
     });
+}
+
+/// Spot heal: stamp soft discs along the stroke (normalized coords) into a
+/// coverage mask at full-res, run the patch-synthesis solver, and swap the
+/// cached pixels — destructive, mirroring delete_selection.
+fn apply_heal(state: AppState, pts: &[(f32, f32)]) {
+    if pts.is_empty() {
+        return;
+    }
+    let Some(item) = state.current() else { return };
+    if item.kind != MediaKind::Photo {
+        return;
+    }
+    let Some(photo) = get_photo(item.id) else { return };
+    let (full, fw, fh) = photo.full.clone();
+    let (mut base, w, h) = geometry(&full, fw, fh, &item.edit);
+    let diag = ((w * w + h * h) as f32).sqrt();
+    let r = (state.heal_radius.get_untracked() * diag).max(1.0);
+    let mut coverage = vec![0u8; w * h];
+    stamp_stroke(&mut coverage, w, h, pts, r);
+    let mode = state.heal_mode.get_untracked();
+    if !heal::spot_heal(&mut base, &coverage, w, h, 1.0, mode, item.id as u32) {
+        return;
+    }
+    let preview = downscale_pixels(&base, w, h, 1024);
+    CACHE.with(|c| {
+        if let Some(pd) = c.borrow_mut().photos.get_mut(&item.id) {
+            let pd = Rc::make_mut(pd);
+            pd.full = (base, w, h);
+            pd.preview = preview;
+        }
+    });
+    state.update_current(|e| {
+        e.rot90 = 0;
+        e.fine_angle = 0.0;
+        e.crop = state::CropRect::default();
+        e.selection = None;
+    });
+}
+
+/// Rasterize a polyline stroke into a coverage mask as soft discs of radius r
+/// (255 at the center, feathering to 0 at the edge), taking the max on overlap.
+fn stamp_stroke(coverage: &mut [u8], w: usize, h: usize, pts: &[(f32, f32)], r: f32) {
+    let mut stamp = |cx: f32, cy: f32| {
+        let x0 = (cx - r).floor().max(0.0) as usize;
+        let y0 = (cy - r).floor().max(0.0) as usize;
+        let x1 = ((cx + r).ceil() as usize).min(w - 1);
+        let y1 = ((cy + r).ceil() as usize).min(h - 1);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let dx = x as f32 - cx;
+                let dy = y as f32 - cy;
+                let d = (dx * dx + dy * dy).sqrt();
+                if d < r {
+                    let v = (255.0 * (1.0 - d / r)) as u8;
+                    let i = y * w + x;
+                    coverage[i] = coverage[i].max(v);
+                }
+            }
+        }
+    };
+    let step = (r / 3.0).max(1.0);
+    for pair in pts.windows(2) {
+        let (ax, ay) = (pair[0].0 * w as f32, pair[0].1 * h as f32);
+        let (bx, by) = (pair[1].0 * w as f32, pair[1].1 * h as f32);
+        let len = ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt();
+        let n = (len / step).ceil().max(1.0) as usize;
+        for i in 0..=n {
+            let t = i as f32 / n as f32;
+            stamp(ax + (bx - ax) * t, ay + (by - ay) * t);
+        }
+    }
+    if pts.len() == 1 {
+        stamp(pts[0].0 * w as f32, pts[0].1 * h as f32);
+    }
 }
 
 /// Magic wand: flood-select pixels similar to the clicked one, sampled from
@@ -2203,6 +2341,50 @@ fn GrainPanel(state: AppState) -> impl IntoView {
                 />
                 "Monochromatic"
             </label>
+        </div>
+    }
+}
+
+#[component]
+fn HealTab(state: AppState) -> impl IntoView {
+    let modes = [
+        (heal::HealMode::ContentAware, "Content-aware"),
+        (heal::HealMode::SmoothFill, "Smooth fill"),
+        (heal::HealMode::ProximityMatch, "Proximity match"),
+    ];
+    let radius = move || state.heal_radius.get();
+    view! {
+        <div class="heal-panel">
+            <div class="chips">
+                {modes.map(|(m, label)| {
+                    let active = move || state.heal_mode.get() == m;
+                    view! {
+                        <button
+                            class="chip"
+                            class:active=active
+                            on:click=move |_| state.heal_mode.set(m)
+                        >
+                            {label}
+                        </button>
+                    }
+                })}
+            </div>
+            <label class="slider">
+                <span>"Brush size: " {move || format!("{:.0}%", radius() * 100.0)}</span>
+                <input
+                    type="range" min="0.005" max="0.1" step="0.005"
+                    prop:value=move || radius().to_string()
+                    on:input=move |ev| {
+                        let v: f32 = event_target_value(&ev).parse().unwrap_or(0.02);
+                        state.heal_radius.set(v.clamp(0.005, 0.1));
+                    }
+                />
+            </label>
+            <p class="dim">
+                "Paint over a blemish to remove it. Content-aware clones a matching patch, \
+                 smooth fill blends the surroundings, proximity match prefers nearby texture. \
+                 Applies when you release."
+            </p>
         </div>
     }
 }

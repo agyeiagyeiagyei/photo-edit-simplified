@@ -409,3 +409,9 @@ button:disabled {
   gap: 8px;
   margin-top: 4px;
 }
+
+.heal-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
