@@ -441,6 +441,17 @@ pub struct AppState {
     /// Spot-heal brush: radius as a fraction of the image diagonal.
     pub heal_radius: RwSignal<f32>,
     pub heal_mode: RwSignal<crate::heal::HealMode>,
+    /// Clone stamp source point, normalized geometry coords.
+    pub clone_source: RwSignal<Option<(f32, f32)>>,
+    /// Fixed stroke offset once an aligned stroke has started.
+    pub clone_offset: RwSignal<Option<(f32, f32)>>,
+    /// Aligned: source follows the brush across strokes; off: every stroke
+    /// restarts from the source point.
+    pub clone_aligned: RwSignal<bool>,
+    /// Set-source pick mode for the next canvas click.
+    pub clone_pick: RwSignal<bool>,
+    /// Clone brush radius as a fraction of the image diagonal.
+    pub clone_radius: RwSignal<f32>,
 }
 
 impl AppState {
@@ -459,6 +470,11 @@ impl AppState {
             wand_contiguous: create_rw_signal(true),
             heal_radius: create_rw_signal(0.02),
             heal_mode: create_rw_signal(crate::heal::HealMode::ContentAware),
+            clone_source: create_rw_signal(None),
+            clone_offset: create_rw_signal(None),
+            clone_aligned: create_rw_signal(true),
+            clone_pick: create_rw_signal(false),
+            clone_radius: create_rw_signal(0.03),
         }
     }
 

@@ -1,3 +1,4 @@
+mod clone;
 mod curves;
 mod fill;
 mod heal;
@@ -716,6 +717,7 @@ enum Tab {
     Color,
     Select,
     Heal,
+    Clone,
     Layers,
     Trim,
     Export,
@@ -743,6 +745,7 @@ fn Editor(state: AppState) -> impl IntoView {
                     <TabBtn tab=tab t=Tab::Color label="Color"/>
                     <TabBtn tab=tab t=Tab::Select label="Select"/>
                     <TabBtn tab=tab t=Tab::Heal label="Heal"/>
+                    <TabBtn tab=tab t=Tab::Clone label="Clone"/>
                     <TabBtn tab=tab t=Tab::Layers label="Layers"/>
                     <Show
                         when=move || state.current().map(|m| m.kind == MediaKind::Video).unwrap_or(false)
@@ -759,6 +762,7 @@ fn Editor(state: AppState) -> impl IntoView {
                         Tab::Color => view! { <ColorTab state=state/> }.into_view(),
                         Tab::Select => view! { <SelectTab state=state/> }.into_view(),
                         Tab::Heal => view! { <HealTab state=state/> }.into_view(),
+                        Tab::Clone => view! { <CloneTab state=state/> }.into_view(),
                         Tab::Layers => view! { <LayersTab state=state/> }.into_view(),
                         Tab::Trim => view! { <TrimTab state=state/> }.into_view(),
                         Tab::Export => view! { <ExportTab state=state/> }.into_view(),
@@ -978,6 +982,22 @@ fn draw_heal_overlay(
     ctx.restore();
 }
 
+fn draw_crosshair(ctx: &web_sys::CanvasRenderingContext2d, x: f32, y: f32) {
+    ctx.save();
+    ctx.set_stroke_style_str("rgba(10,132,255,0.9)");
+    ctx.set_line_width(1.5);
+    ctx.begin_path();
+    ctx.move_to(x as f64 - 9.0, y as f64);
+    ctx.line_to(x as f64 + 9.0, y as f64);
+    ctx.move_to(x as f64, y as f64 - 9.0);
+    ctx.line_to(x as f64, y as f64 + 9.0);
+    ctx.stroke();
+    ctx.begin_path();
+    let _ = ctx.arc(x as f64, y as f64, 4.0, 0.0, std::f64::consts::TAU);
+    ctx.stroke();
+    ctx.restore();
+}
+
 fn text_overlay_style(t: &state::TextLayer, opacity: f32) -> String {
     let px = format!("{:.2}%", t.font_size * 100.0);
     let left = format!("{:.2}%", t.x * 100.0);
@@ -1031,6 +1051,23 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     let brush_draw = create_rw_signal(None::<usize>);
     let select_drag = create_rw_signal(None::<SelectDrag>);
     let heal_drag = create_rw_signal(None::<Vec<(f32, f32)>>);
+    let clone_drag = create_rw_signal(None::<Vec<(f32, f32)>>);
+
+    // --- clone stamp stroke ----------------------------------------------------
+    window_event_listener(leptos::ev::pointermove, move |ev| {
+        let Some((nx, ny)) = layer_norm_pos(&ev) else { return };
+        let Some(Some(mut pts)) = clone_drag.try_get() else { return };
+        if pts.last().map(|last| dist2(*last, (nx, ny)) > 0.00005).unwrap_or(true) {
+            pts.push((nx, ny));
+            clone_drag.set(Some(pts));
+        }
+    });
+
+    window_event_listener(leptos::ev::pointerup, move |_| {
+        let Some(pts) = clone_drag.try_get().flatten() else { return };
+        let _ = clone_drag.try_set(None);
+        apply_clone(state, &pts);
+    });
 
     // --- heal brush stroke -----------------------------------------------------
     window_event_listener(leptos::ev::pointermove, move |ev| {
@@ -1190,6 +1227,10 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         state.selected_select_tool.track();
         heal_drag.track();
         state.heal_radius.track();
+        clone_drag.track();
+        state.clone_source.track();
+        state.clone_offset.track();
+        state.clone_radius.track();
         let Some(item) = state.current() else { return };
         if item.kind != MediaKind::Photo {
             return;
@@ -1259,6 +1300,27 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             let ctx = web::ctx2d(&canvas);
             draw_heal_overlay(&ctx, heal_drag.get().as_deref(), state.heal_radius.get(), w as f64, h as f64);
         }
+
+        // Clone tab: stroke discs plus a crosshair at the active sample point.
+        if tab.get() == Tab::Clone {
+            let ctx = web::ctx2d(&canvas);
+            let r = state.clone_radius.get();
+            draw_heal_overlay(&ctx, clone_drag.get().as_deref(), r, w as f64, h as f64);
+            // Where the brush is currently sampling from: the source until an
+            // aligned stroke fixes the offset, then source-follows-brush.
+            let sample = match (clone_drag.get(), state.clone_source.get()) {
+                (Some(pts), Some(src)) => {
+                    let start = pts[0];
+                    let off = state.clone_offset.get().unwrap_or((src.0 - start.0, src.1 - start.1));
+                    pts.last().map(|&p| (p.0 + off.0, p.1 + off.1))
+                }
+                (None, Some(src)) => Some(src),
+                _ => None,
+            };
+            if let Some((sx, sy)) = sample {
+                draw_crosshair(&ctx, sx * w as f32, sy * h as f32);
+            }
+        }
     });
 
     view! {
@@ -1286,6 +1348,20 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     <div
                         class="canvas-wrap"
                         on:pointerdown=move |ev: web_sys::PointerEvent| {
+                            if tab.get() == Tab::Clone {
+                                if state.current().map(|m| m.kind == MediaKind::Photo).unwrap_or(false) {
+                                    if let Some((nx, ny)) = layer_norm_pos(&ev) {
+                                        if state.clone_pick.get() || ev.alt_key() {
+                                            state.clone_source.set(Some((nx, ny)));
+                                            state.clone_offset.set(None);
+                                            state.clone_pick.set(false);
+                                        } else if state.clone_source.get().is_some() {
+                                            clone_drag.set(Some(vec![(nx, ny)]));
+                                        }
+                                    }
+                                }
+                                return;
+                            }
                             if tab.get() == Tab::Heal {
                                 if state.current().map(|m| m.kind == MediaKind::Photo).unwrap_or(false) {
                                     if let Some((nx, ny)) = layer_norm_pos(&ev) {
@@ -1754,7 +1830,13 @@ fn stamp_stroke(coverage: &mut [u8], w: usize, h: usize, pts: &[(f32, f32)], r: 
                 let dy = y as f32 - cy;
                 let d = (dx * dx + dy * dy).sqrt();
                 if d < r {
-                    let v = (255.0 * (1.0 - d / r)) as u8;
+                    // Plateau to 60% of the radius, linear feather beyond —
+                    // overlapping stamps keep full strength between centers.
+                    let v = if d <= r * 0.6 {
+                        255
+                    } else {
+                        (255.0 * (r - d) / (r * 0.4)) as u8
+                    };
                     let i = y * w + x;
                     coverage[i] = coverage[i].max(v);
                 }
@@ -1775,6 +1857,57 @@ fn stamp_stroke(coverage: &mut [u8], w: usize, h: usize, pts: &[(f32, f32)], r: 
     if pts.len() == 1 {
         stamp(pts[0].0 * w as f32, pts[0].1 * h as f32);
     }
+}
+
+/// Clone stamp: copy from the source point through the stroke's coverage mask
+/// at full-res. Aligned strokes keep the first stroke's offset; unaligned
+/// strokes re-derive it from the source each time. Destructive like apply_heal.
+fn apply_clone(state: AppState, pts: &[(f32, f32)]) {
+    if pts.is_empty() {
+        return;
+    }
+    let Some(item) = state.current() else { return };
+    if item.kind != MediaKind::Photo {
+        return;
+    }
+    let Some(src) = state.clone_source.get_untracked() else { return };
+    let Some(photo) = get_photo(item.id) else { return };
+    let (full, fw, fh) = photo.full.clone();
+    let (mut base, w, h) = geometry(&full, fw, fh, &item.edit);
+    let aligned = state.clone_aligned.get_untracked();
+    let offset = if aligned {
+        match state.clone_offset.get_untracked() {
+            Some(off) => off,
+            None => {
+                let off = (src.0 - pts[0].0, src.1 - pts[0].1);
+                state.clone_offset.set(Some(off));
+                off
+            }
+        }
+    } else {
+        (src.0 - pts[0].0, src.1 - pts[0].1)
+    };
+    let dx = (offset.0 * w as f32).round() as i32;
+    let dy = (offset.1 * h as f32).round() as i32;
+    let diag = ((w * w + h * h) as f32).sqrt();
+    let r = (state.clone_radius.get_untracked() * diag).max(1.0);
+    let mut coverage = vec![0u8; w * h];
+    stamp_stroke(&mut coverage, w, h, pts, r);
+    clone::clone_stamp(&mut base, w, h, &coverage, dx, dy);
+    let preview = downscale_pixels(&base, w, h, 1024);
+    CACHE.with(|c| {
+        if let Some(pd) = c.borrow_mut().photos.get_mut(&item.id) {
+            let pd = Rc::make_mut(pd);
+            pd.full = (base, w, h);
+            pd.preview = preview;
+        }
+    });
+    state.update_current(|e| {
+        e.rot90 = 0;
+        e.fine_angle = 0.0;
+        e.crop = state::CropRect::default();
+        e.selection = None;
+    });
 }
 
 /// Magic wand: flood-select pixels similar to the clicked one, sampled from
@@ -2424,6 +2557,68 @@ fn HealTab(state: AppState) -> impl IntoView {
                 "Paint over a blemish to remove it. Content-aware clones a matching patch, \
                  smooth fill blends the surroundings, proximity match prefers nearby texture. \
                  Applies when you release."
+            </p>
+        </div>
+    }
+}
+
+#[component]
+fn CloneTab(state: AppState) -> impl IntoView {
+    let has_source = move || state.clone_source.get().is_some();
+    let picking = move || state.clone_pick.get();
+    let radius = move || state.clone_radius.get();
+    view! {
+        <div class="clone-panel">
+            <div class="row select-row">
+                <button
+                    class="chip"
+                    class:active=picking
+                    on:click=move |_| state.clone_pick.set(!state.clone_pick.get_untracked())
+                >
+                    "Set source"
+                </button>
+                <button
+                    class="btn"
+                    disabled=move || !has_source()
+                    on:click=move |_| {
+                        state.clone_source.set(None);
+                        state.clone_offset.set(None);
+                    }
+                >
+                    "Clear source"
+                </button>
+            </div>
+            <label class="row" style="justify-content:flex-start;gap:0.5rem">
+                <input
+                    type="checkbox"
+                    prop:checked=move || state.clone_aligned.get()
+                    on:change=move |ev| {
+                        state.clone_aligned.set(event_target_checked(&ev));
+                        state.clone_offset.set(None);
+                    }
+                />
+                "Aligned"
+            </label>
+            <label class="slider">
+                <span>"Brush size: " {move || format!("{:.0}%", radius() * 100.0)}</span>
+                <input
+                    type="range" min="0.005" max="0.15" step="0.005"
+                    prop:value=move || radius().to_string()
+                    on:input=move |ev| {
+                        let v: f32 = event_target_value(&ev).parse().unwrap_or(0.03);
+                        state.clone_radius.set(v.clamp(0.005, 0.15));
+                    }
+                />
+            </label>
+            <p class="dim">
+                {move || if picking() {
+                    "Click the canvas to set the clone source."
+                } else if has_source() {
+                    "Drag to paint from the source. Alt-click sets a new source. \
+                     Aligned keeps the offset between strokes."
+                } else {
+                    "Set a source first: Alt-click the canvas, or tap Set source then click."
+                }}
             </p>
         </div>
     }

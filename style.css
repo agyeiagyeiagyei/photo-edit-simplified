@@ -415,3 +415,9 @@ button:disabled {
   flex-direction: column;
   gap: 8px;
 }
+
+.clone-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
