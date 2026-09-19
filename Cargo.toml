@@ -24,6 +24,14 @@ web-sys = { version = "0.3", features = [
 
 console_error_panic_hook = "0.1"
 
+# RAW import (rawler is the pure-Rust decoder from the dnglab project).
+# Vendored: upstream calls std::time::Instant::now() in demosaic timing logs,
+# which panics on wasm32-unknown-unknown; the vendored copy strips those calls.
+rawler = { path = "vendor/rawler" }
+# rawler's transitive deps need wasm-aware randomness sources.
+uuid = { version = "1", features = ["js"] }
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
 [profile.release]
 opt-level = 2
 lto = true

@@ -6,6 +6,7 @@ mod heal;
 mod levels;
 mod noise;
 mod ops;
+mod raw;
 mod state;
 mod wand;
 mod web;
@@ -103,6 +104,39 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                 } else {
                     web::log("video probe failed");
                 }
+            } else if raw::is_raw_name(&name) {
+                state.busy.set(Some(format!("Converting RAW {name}…")));
+                let Ok(buf) = web::read_file_array_buffer(&file).await else {
+                    state.busy.set(None);
+                    continue;
+                };
+                let bytes = js_sys::Uint8Array::new(&buf).to_vec();
+                let Ok((full_rgba, fw, fh)) = raw::decode_raw(&bytes) else {
+                    web::log(&format!("RAW decode failed for {name}"));
+                    state.busy.set(None);
+                    continue;
+                };
+                let (pp, pw, ph) = downscale_pixels(&full_rgba, fw, fh, 1024);
+                let canvas = web::create_canvas(pw as u32, ph as u32);
+                web::put_pixels(&canvas, &pp, pw as u32, ph as u32);
+                let url = canvas.to_data_url().unwrap_or_default();
+                CACHE.with(|c| {
+                    c.borrow_mut().photos.insert(
+                        id,
+                        Rc::new(PhotoData { full: (full_rgba, fw, fh), preview: (pp, pw, ph) }),
+                    )
+                });
+                push_item(state, MediaItem {
+                    id,
+                    kind: MediaKind::Photo,
+                    name,
+                    object_url: url,
+                    width: fw,
+                    height: fh,
+                    edit: EditParams::default(),
+                    layers: Vec::new(),
+                    next_layer_id: 0,
+                });
             } else {
                 state.busy.set(Some(format!("Loading {name}…")));
                 let mut blob: Blob = file.clone().into();
@@ -651,7 +685,7 @@ fn AddButton(state: AppState) -> impl IntoView {
             <input
                 node_ref=input_ref
                 type="file"
-                accept="image/*,.heic,.heif,video/*"
+                accept="image/*,.heic,.heif,.dng,.cr2,.cr3,.nef,.nrw,.arw,.orf,.rw2,.raf,.pef,.srw,video/*"
                 multiple
                 style="display:none"
                 on:change=move |_| {
