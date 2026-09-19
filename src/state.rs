@@ -348,6 +348,8 @@ pub struct EditParams {
     pub contrast: f32,
     pub saturation: f32,
     pub warmth: f32,
+    /// Gaussian blur amount 0..=100 (0 = off), maps to sigma 0..8 px.
+    pub blur: f32,
     /// Film grain amount 0..=100 (0 = off).
     pub grain: f32,
     /// Gaussian (true) vs uniform (false) grain distribution.
@@ -377,6 +379,7 @@ impl Default for EditParams {
             contrast: 0.0,
             saturation: 0.0,
             warmth: 0.0,
+            blur: 0.0,
             grain: 0.0,
             grain_gaussian: true,
             grain_mono: true,
@@ -395,6 +398,7 @@ impl EditParams {
             || self.contrast != 0.0
             || self.saturation != 0.0
             || self.warmth != 0.0
+            || self.blur > 0.0
             || self.grain > 0.0
             || !self.levels.is_identity()
             || !self.curves.is_identity()

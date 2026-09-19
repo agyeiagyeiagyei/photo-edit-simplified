@@ -421,3 +421,7 @@ button:disabled {
   flex-direction: column;
   gap: 8px;
 }
+
+.blur-panel {
+  margin-top: 4px;
+}

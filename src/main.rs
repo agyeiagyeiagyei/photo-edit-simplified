@@ -1,3 +1,4 @@
+mod blur;
 mod clone;
 mod curves;
 mod fill;
@@ -412,6 +413,7 @@ fn export_photo(state: AppState, item: MediaItem) {
         if item.edit.is_color_touched() {
             if let Some(sel) = &item.edit.selection {
                 let mask = ops::selection_mask(sel, w, h);
+                blur::blur_apply_masked(&mut p, &mask, w, h, item.edit.blur);
                 if !item.edit.levels.is_identity() {
                     levels::levels_apply_masked(&mut p, &mask, &item.edit.levels.build_tables());
                 }
@@ -426,6 +428,7 @@ fn export_photo(state: AppState, item: MediaItem) {
                 );
                 noise::noise_add_masked(&mut p, &mask, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
             } else {
+                blur::blur_apply(&mut p, w, h, item.edit.blur);
                 if !item.edit.levels.is_identity() {
                     levels::levels_apply(&mut p, &item.edit.levels.build_tables());
                 }
@@ -1244,6 +1247,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         if item.edit.is_color_touched() {
             if let Some(sel) = &item.edit.selection {
                 let mask = ops::selection_mask(sel, w, h);
+                blur::blur_apply_masked(&mut p, &mask, w, h, item.edit.blur);
                 if !item.edit.levels.is_identity() {
                     levels::levels_apply_masked(&mut p, &mask, &item.edit.levels.build_tables());
                 }
@@ -1258,6 +1262,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 );
                 noise::noise_add_masked(&mut p, &mask, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
             } else {
+                blur::blur_apply(&mut p, w, h, item.edit.blur);
                 if !item.edit.levels.is_identity() {
                     levels::levels_apply(&mut p, &item.edit.levels.build_tables());
                 }
@@ -1921,6 +1926,7 @@ fn wand_select(state: AppState, nx: f32, ny: f32) {
     let (pix, pw, ph) = &photo.preview;
     let (mut p, w, h) = geometry(pix, *pw, *ph, &item.edit);
     if item.edit.is_color_touched() {
+        blur::blur_apply(&mut p, w, h, item.edit.blur);
         if !item.edit.levels.is_identity() {
             levels::levels_apply(&mut p, &item.edit.levels.build_tables());
         }
@@ -2181,12 +2187,33 @@ fn ColorTab(state: AppState) -> impl IntoView {
         {slider("Contrast", |e| e.contrast, |e, v| e.contrast = v)}
         {slider("Saturation", |e| e.saturation, |e, v| e.saturation = v)}
         {slider("Warmth", |e| e.warmth, |e, v| e.warmth = v)}
+        <BlurPanel state=state />
         <LevelsPanel state=state />
         <CurvesPanel state=state />
         <GrainPanel state=state />
         <button class="btn dim-btn" on:click=move |_| state.update_current(|e| {
             e.brightness = 0.0; e.contrast = 0.0; e.saturation = 0.0; e.warmth = 0.0;
         })>"Reset color"</button>
+    }
+}
+
+#[component]
+fn BlurPanel(state: AppState) -> impl IntoView {
+    let blur = move || state.current().map(|m| m.edit.blur).unwrap_or(0.0);
+    view! {
+        <div class="blur-panel">
+            <label class="slider">
+                <span>"Blur: " {move || format!("{:.0}", blur())}</span>
+                <input
+                    type="range" min="0" max="100" step="1"
+                    prop:value=move || blur().to_string()
+                    on:input=move |ev| {
+                        let v: f32 = event_target_value(&ev).parse().unwrap_or(0.0);
+                        state.update_current(|e| e.blur = v.clamp(0.0, 100.0));
+                    }
+                />
+            </label>
+        </div>
     }
 }
 
