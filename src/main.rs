@@ -284,6 +284,13 @@ fn draw_text_layer(ctx: &web_sys::CanvasRenderingContext2d, layer: &state::Layer
     let x = (t.x * w as f32) as f64;
     let y = (t.y * h as f32) as f64;
 
+    ctx.save();
+    if t.angle != 0.0 {
+        let _ = ctx.translate(x, y);
+        let _ = ctx.rotate((t.angle as f64).to_radians());
+        let _ = ctx.translate(-x, -y);
+    }
+
     ctx.set_shadow_color(&t.shadow_color);
     ctx.set_shadow_blur(t.shadow_blur as f64);
     ctx.set_shadow_offset_x(t.shadow_offset_x as f64);
@@ -298,6 +305,7 @@ fn draw_text_layer(ctx: &web_sys::CanvasRenderingContext2d, layer: &state::Layer
     ctx.set_fill_style_str(&t.color);
     let _ = ctx.fill_text(&t.text, x, y);
 
+    ctx.restore();
     ctx.set_shadow_color("transparent");
     ctx.set_shadow_blur(0.0);
     ctx.set_shadow_offset_x(0.0);
@@ -1045,6 +1053,7 @@ fn text_overlay_style(t: &state::TextLayer, opacity: f32) -> String {
         TextAlign::Center => "translate(-50%,-50%)",
         TextAlign::Right => "translate(-100%,-50%)",
     };
+    let transform = format!("{} rotate({}deg)", translate, t.angle);
     let shadow = format!(
         "{}px {}px {}px {}",
         t.shadow_offset_x, t.shadow_offset_y, t.shadow_blur, t.shadow_color
@@ -1057,7 +1066,7 @@ fn text_overlay_style(t: &state::TextLayer, opacity: f32) -> String {
     format!(
         "position:absolute;left:{};top:{};transform:{};font-family:'{}',sans-serif;\
          font-weight:{};font-size:{};color:{};text-align:{};text-shadow:{};opacity:{};white-space:nowrap;{}",
-        left, top, translate, t.font_family, t.font_weight, px, t.color, align, shadow, opacity, stroke
+        left, top, transform, t.font_family, t.font_weight, px, t.color, align, shadow, opacity, stroke
     )
 }
 
@@ -1071,11 +1080,12 @@ fn selected_text_overlay_style(t: &state::TextLayer, opacity: f32) -> String {
         TextAlign::Center => "translate(-50%,-50%)",
         TextAlign::Right => "translate(-100%,-50%)",
     };
+    let transform = format!("{} rotate({}deg)", translate, t.angle);
     format!(
         "position:absolute;left:{};top:{};transform:{};font-family:'{}',sans-serif;\
          font-weight:{};font-size:{};color:transparent;text-align:{};opacity:{};white-space:nowrap;\
          border:2px dashed #0a84ff;border-radius:4px;background:rgba(10,132,255,0.08);",
-        left, top, translate, t.font_family, t.font_weight, px, align, opacity
+        left, top, transform, t.font_family, t.font_weight, px, align, opacity
     )
 }
 
@@ -3003,6 +3013,20 @@ fn TextLayerEditor(state: AppState) -> impl IntoView {
                             on:input=move |ev| {
                                 let v: f32 = event_target_value(&ev).parse().unwrap_or(0.08);
                                 with_text_layer(state, |t| t.font_size = v);
+                            }
+                        />
+                    </label>
+                    <label class="slider compact">
+                        "Angle"
+                        <input
+                            type="range"
+                            min="-180"
+                            max="180"
+                            step="1"
+                            prop:value=move || text_layer().map(|t| t.angle).unwrap_or_default().to_string()
+                            on:input=move |ev| {
+                                let v: f32 = event_target_value(&ev).parse().unwrap_or(0.0);
+                                with_text_layer(state, |t| t.angle = v);
                             }
                         />
                     </label>

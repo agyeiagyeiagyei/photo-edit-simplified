@@ -75,6 +75,8 @@ pub struct TextLayer {
     pub y: f32,
     /// Font size as a fraction of the image height.
     pub font_size: f32,
+    /// Clockwise rotation in degrees about the (x, y) anchor.
+    pub angle: f32,
     pub font_family: String,
     pub font_weight: u16,
     pub color: String,
@@ -94,6 +96,7 @@ impl Default for TextLayer {
             x: 0.5,
             y: 0.5,
             font_size: 0.08,
+            angle: 0.0,
             font_family: "Inter".into(),
             font_weight: 700,
             color: "#ffffff".into(),
