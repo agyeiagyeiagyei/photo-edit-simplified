@@ -91,6 +91,8 @@ h1 { font-size: 17px; font-weight: 600; }
 
 .editor { display: flex; flex-direction: column; gap: 10px; }
 
+.controls { display: flex; flex-direction: column; gap: 10px; }
+
 .preview { display: flex; justify-content: center; }
 
 .canvas-wrap {
@@ -426,4 +428,18 @@ button:disabled {
 
 .blur-panel {
   margin-top: 4px;
+}
+
+@media (min-width: 900px) {
+  .app { max-width: 1100px; }
+  .editor { flex-direction: row; align-items: flex-start; }
+  .preview { flex: 1; min-width: 0; }
+  .controls {
+    flex: 0 0 300px;
+    position: sticky;
+    top: 12px;
+    max-height: calc(100vh - 24px);
+    overflow-y: auto;
+  }
+  .tabs { display: grid; grid-template-columns: 1fr 1fr; }
 }

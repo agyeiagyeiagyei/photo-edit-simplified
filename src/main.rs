@@ -784,7 +784,8 @@ fn Editor(state: AppState) -> impl IntoView {
         <Show when=move || state.current().is_some() fallback=|| ()>
             <div class="editor">
                 <Preview state=state tab=tab/>
-                <div class="tabs">
+                <div class="controls">
+                    <div class="tabs">
                     <TabBtn tab=tab t=Tab::Crop label="Crop"/>
                     <TabBtn tab=tab t=Tab::Rotate label="Rotate"/>
                     <TabBtn tab=tab t=Tab::Color label="Color"/>
@@ -798,9 +799,9 @@ fn Editor(state: AppState) -> impl IntoView {
                     >
                         <TabBtn tab=tab t=Tab::Trim label="Trim"/>
                     </Show>
-                    <TabBtn tab=tab t=Tab::Export label="Export"/>
-                </div>
-                <div class="panel">
+                        <TabBtn tab=tab t=Tab::Export label="Export"/>
+                    </div>
+                    <div class="panel">
                     {move || match tab.get() {
                         Tab::Crop => view! { <CropTab state=state tab=tab/> }.into_view(),
                         Tab::Rotate => view! { <RotateTab state=state/> }.into_view(),
@@ -812,6 +813,7 @@ fn Editor(state: AppState) -> impl IntoView {
                         Tab::Trim => view! { <TrimTab state=state/> }.into_view(),
                         Tab::Export => view! { <ExportTab state=state/> }.into_view(),
                     }}
+                    </div>
                 </div>
             </div>
         </Show>
