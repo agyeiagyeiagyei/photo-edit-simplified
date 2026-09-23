@@ -1099,6 +1099,10 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     let select_drag = create_rw_signal(None::<SelectDrag>);
     let heal_drag = create_rw_signal(None::<Vec<(f32, f32)>>);
     let clone_drag = create_rw_signal(None::<Vec<(f32, f32)>>);
+    // Hoisted out of CropOverlay: crop edits re-render the preview, which
+    // remounts the overlay — a drag signal created inside it would be
+    // disposed mid-gesture, killing the drag after one pointermove.
+    let crop_drag = create_rw_signal(None::<(u8, f32, f32, state::CropRect)>);
 
     // --- clone stamp stroke ----------------------------------------------------
     window_event_listener(leptos::ev::pointermove, move |ev| {
@@ -1512,7 +1516,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     >
                         <canvas node_ref=canvas_ref></canvas>
                         <Show when=move || tab.get() == Tab::Crop fallback=|| ()>
-                            <CropOverlay state=state working=working/>
+                            <CropOverlay state=state working=working drag=crop_drag/>
                         </Show>
                         <SelectedTextOverlay state=state tab=tab layer_drag=layer_drag/>
                     </div>
@@ -1579,8 +1583,11 @@ fn SelectedTextOverlay(
 }
 
 #[component]
-fn CropOverlay(state: AppState, working: RwSignal<(usize, usize)>) -> impl IntoView {
-    let drag = create_rw_signal(None::<(u8, f32, f32, state::CropRect)>);
+fn CropOverlay(
+    state: AppState,
+    working: RwSignal<(usize, usize)>,
+    drag: RwSignal<Option<(u8, f32, f32, state::CropRect)>>,
+) -> impl IntoView {
 
     let norm_pos = |ev: &web_sys::PointerEvent| -> Option<(f32, f32)> {
         let el = web::document().query_selector(".canvas-wrap").ok().flatten()?;
@@ -1592,12 +1599,15 @@ fn CropOverlay(state: AppState, working: RwSignal<(usize, usize)>) -> impl IntoV
 
     let start = move |ev: web_sys::PointerEvent, handle: u8| {
         ev.prevent_default();
+        // Corner handles sit inside .crop-rect, which has its own pointerdown
+        // (move). Without this the press bubbles up and overwrites the drag.
+        ev.stop_propagation();
         let Some(item) = state.current() else { return };
         let Some((nx, ny)) = norm_pos(&ev) else { return };
         drag.set(Some((handle, nx, ny, item.edit.crop)));
     };
 
-    window_event_listener(leptos::ev::pointermove, move |ev| {
+    let pm = window_event_listener(leptos::ev::pointermove, move |ev| {
         // Signals are disposed when the Crop tab unmounts, but this window
         // listener outlives them — bail out instead of touching dead signals.
         let Some(Some((handle, sx, sy, orig))) = drag.try_get() else { return };
@@ -1617,44 +1627,48 @@ fn CropOverlay(state: AppState, working: RwSignal<(usize, usize)>) -> impl IntoV
                 c.y = (orig.y + dy).clamp(0.0, 1.0 - orig.h);
             }
             hdl => {
-                let (fx, fy) = match hdl {
-                    1 => (orig.x, orig.y),
-                    2 => (orig.x + orig.w, orig.y),
-                    3 => (orig.x, orig.y + orig.h),
-                    _ => (orig.x + orig.w, orig.y + orig.h),
-                };
+                // West handles anchor the right edge, east the left; north
+                // anchor the bottom, south the top.
+                let west = matches!(hdl, 1 | 3);
+                let north = matches!(hdl, 1 | 2);
+                let right = orig.x + orig.w;
+                let bottom = orig.y + orig.h;
+                let max_w = if west { right } else { 1.0 - orig.x };
+                let max_h = if north { bottom } else { 1.0 - orig.y };
                 let mut nw = match hdl {
-                    1 | 3 => (orig.w - dx).max(0.02),
-                    _ => (orig.w + dx).max(0.02),
+                    1 | 3 => orig.w - dx,
+                    _ => orig.w + dx,
                 };
                 let mut nh = match hdl {
-                    1 | 2 => (orig.h - dy).max(0.02),
-                    _ => (orig.h + dy).max(0.02),
+                    1 | 2 => orig.h - dy,
+                    _ => orig.h + dy,
                 };
                 if let Some(r) = ratio {
+                    nw = nw.clamp(0.02, max_w).min(max_h * r / img_aspect);
                     nh = nw * img_aspect / r;
-                    if fx + nw > 1.0 || fy + nh > 1.0 {
-                        nw = (1.0 - fx).min((1.0 - fy) * r / img_aspect);
-                        nh = nw * img_aspect / r;
-                    }
+                } else {
+                    nw = nw.clamp(0.02, max_w);
+                    nh = nh.clamp(0.02, max_h);
                 }
-                c.w = nw.clamp(0.02, 1.0);
-                c.h = nh.clamp(0.02, 1.0);
-                c.x = match hdl {
-                    1 | 3 => (fx + orig.w - c.w).clamp(0.0, 1.0 - c.w),
-                    _ => fx.clamp(0.0, 1.0 - c.w),
-                };
-                c.y = match hdl {
-                    1 | 2 => (fy + orig.h - c.h).clamp(0.0, 1.0 - c.h),
-                    _ => fy.clamp(0.0, 1.0 - c.h),
-                };
+                c.w = nw;
+                c.h = nh;
+                c.x = if west { right - nw } else { orig.x };
+                c.y = if north { bottom - nh } else { orig.y };
             }
         }
         state.update_current(|e| e.crop = c);
     });
 
-    window_event_listener(leptos::ev::pointerup, move |_| {
+    let pu = window_event_listener(leptos::ev::pointerup, move |_| {
         let _ = drag.try_set(None);
+    });
+
+    // window_event_listener has no Drop — without this, every CropOverlay
+    // remount (any crop edit re-renders the preview) adds another listener
+    // pair, and each one applies the drag again: an update storm.
+    on_cleanup(move || {
+        pm.remove();
+        pu.remove();
     });
 
     view! {
