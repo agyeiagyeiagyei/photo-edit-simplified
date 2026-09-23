@@ -27,6 +27,14 @@
   <script>
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('sw.js').catch(() => {});
+      // A newly activated service worker tells us to reload once, so clients
+      // pinned to stale cached HTML pick up the current build.
+      navigator.serviceWorker.addEventListener('message', (e) => {
+        if (e.data === 'pes-reload' && !sessionStorage.getItem('pes-reloaded')) {
+          sessionStorage.setItem('pes-reloaded', '1');
+          location.reload();
+        }
+      });
     }
 
     // HEIC -> JPEG blob. Called from Rust.
