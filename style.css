@@ -105,6 +105,8 @@ h1 { font-size: 17px; font-weight: 600; }
   border-radius: 10px;
   background: #000;
 }
+/* Cropped view: clip layer overlays that fall outside the crop region. */
+.canvas-wrap.cropped { overflow: hidden; border-radius: 10px; }
 
 .crop-overlay { position: absolute; inset: 0; }
 

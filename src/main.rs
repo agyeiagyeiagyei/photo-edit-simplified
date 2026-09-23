@@ -802,7 +802,7 @@ fn Editor(state: AppState) -> impl IntoView {
                 </div>
                 <div class="panel">
                     {move || match tab.get() {
-                        Tab::Crop => view! { <CropTab state=state/> }.into_view(),
+                        Tab::Crop => view! { <CropTab state=state tab=tab/> }.into_view(),
                         Tab::Rotate => view! { <RotateTab state=state/> }.into_view(),
                         Tab::Color => view! { <ColorTab state=state/> }.into_view(),
                         Tab::Select => view! { <SelectTab state=state/> }.into_view(),
@@ -838,12 +838,19 @@ enum SelectDrag {
     Lasso(Vec<(f32, f32)>),
 }
 
-fn layer_norm_pos(ev: &web_sys::MouseEvent) -> Option<(f32, f32)> {
+fn crop_is_full(c: &state::CropRect) -> bool {
+    c.x <= 0.0005 && c.y <= 0.0005 && c.w >= 0.999 && c.h >= 0.999
+}
+
+// Pointer position in full-image normalized coords. The preview canvas shows
+// only the crop region outside the Crop tab, so canvas-local coords map
+// through the crop rect (identity when uncropped).
+fn layer_norm_pos(ev: &web_sys::MouseEvent, crop: state::CropRect) -> Option<(f32, f32)> {
     let el = web::document().query_selector(".canvas-wrap").ok().flatten()?;
     let rect = el.get_bounding_client_rect();
     let nx = ((ev.client_x() as f32 - rect.left() as f32) / rect.width() as f32).clamp(0.0, 1.0);
     let ny = ((ev.client_y() as f32 - rect.top() as f32) / rect.height() as f32).clamp(0.0, 1.0);
-    Some((nx, ny))
+    Some((crop.x + nx * crop.w, crop.y + ny * crop.h))
 }
 
 fn dist2(a: (f32, f32), b: (f32, f32)) -> f32 {
@@ -1043,10 +1050,12 @@ fn draw_crosshair(ctx: &web_sys::CanvasRenderingContext2d, x: f32, y: f32) {
     ctx.restore();
 }
 
-fn text_overlay_style(t: &state::TextLayer, opacity: f32) -> String {
+fn text_overlay_style(t: &state::TextLayer, opacity: f32, crop: &state::CropRect) -> String {
     let px = format!("{:.2}%", t.font_size * 100.0);
-    let left = format!("{:.2}%", t.x * 100.0);
-    let top = format!("{:.2}%", t.y * 100.0);
+    // Overlay coords are % of the (possibly cropped) preview; layer coords are
+    // full-image normalized, so map through the crop rect.
+    let left = format!("{:.2}%", (t.x - crop.x) / crop.w * 100.0);
+    let top = format!("{:.2}%", (t.y - crop.y) / crop.h * 100.0);
     let align = t.alignment.canvas_value();
     let translate = match t.alignment {
         TextAlign::Left => "translate(0,-50%)",
@@ -1070,10 +1079,10 @@ fn text_overlay_style(t: &state::TextLayer, opacity: f32) -> String {
     )
 }
 
-fn selected_text_overlay_style(t: &state::TextLayer, opacity: f32) -> String {
+fn selected_text_overlay_style(t: &state::TextLayer, opacity: f32, crop: &state::CropRect) -> String {
     let px = format!("{:.2}%", t.font_size * 100.0);
-    let left = format!("{:.2}%", t.x * 100.0);
-    let top = format!("{:.2}%", t.y * 100.0);
+    let left = format!("{:.2}%", (t.x - crop.x) / crop.w * 100.0);
+    let top = format!("{:.2}%", (t.y - crop.y) / crop.h * 100.0);
     let align = t.alignment.canvas_value();
     let translate = match t.alignment {
         TextAlign::Left => "translate(0,-50%)",
@@ -1106,8 +1115,9 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
 
     // --- clone stamp stroke ----------------------------------------------------
     window_event_listener(leptos::ev::pointermove, move |ev| {
-        let Some((nx, ny)) = layer_norm_pos(&ev) else { return };
         let Some(Some(mut pts)) = clone_drag.try_get() else { return };
+        let Some(item) = state.current() else { return };
+        let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) else { return };
         if pts.last().map(|last| dist2(*last, (nx, ny)) > 0.00005).unwrap_or(true) {
             pts.push((nx, ny));
             clone_drag.set(Some(pts));
@@ -1122,8 +1132,9 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
 
     // --- heal brush stroke -----------------------------------------------------
     window_event_listener(leptos::ev::pointermove, move |ev| {
-        let Some((nx, ny)) = layer_norm_pos(&ev) else { return };
         let Some(Some(mut pts)) = heal_drag.try_get() else { return };
+        let Some(item) = state.current() else { return };
+        let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) else { return };
         if pts.last().map(|last| dist2(*last, (nx, ny)) > 0.00005).unwrap_or(true) {
             pts.push((nx, ny));
             heal_drag.set(Some(pts));
@@ -1139,7 +1150,8 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     // --- text layer drag -------------------------------------------------------
     window_event_listener(leptos::ev::pointermove, move |ev| {
         let Some(Some((id, nx0, ny0, x0, y0))) = layer_drag.try_get() else { return };
-        let Some((nx, ny)) = layer_norm_pos(&ev) else { return };
+        let Some(item) = state.current() else { return };
+        let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) else { return };
         let dx = nx - nx0;
         let dy = ny - ny0;
         state.update_current_item(|m| {
@@ -1158,7 +1170,8 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     // --- pen tool drag ---------------------------------------------------------
     window_event_listener(leptos::ev::pointermove, move |ev| {
         let Some(Some((id, drag, nx0, ny0))) = pen_drag.try_get() else { return };
-        let Some((nx, ny)) = layer_norm_pos(&ev) else { return };
+        let Some(item) = state.current() else { return };
+        let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) else { return };
         let dx = nx - nx0;
         let dy = ny - ny0;
         state.update_current_item(|m| {
@@ -1205,7 +1218,8 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     // --- brush tool drawing ----------------------------------------------------
     window_event_listener(leptos::ev::pointermove, move |ev| {
         let Some(id) = brush_draw.try_get().flatten() else { return };
-        let Some((nx, ny)) = layer_norm_pos(&ev) else { return };
+        let Some(item) = state.current() else { return };
+        let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) else { return };
         state.update_current_item(|m| {
             let Some(l) = m.layers.iter_mut().find(|l| l.id == id) else { return };
             let LayerKind::Brush(b) = &mut l.kind else { return };
@@ -1221,8 +1235,9 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
 
     // --- select tool drag --------------------------------------------------------
     window_event_listener(leptos::ev::pointermove, move |ev| {
-        let Some((nx, ny)) = layer_norm_pos(&ev) else { return };
         let Some(Some(drag)) = select_drag.try_get() else { return };
+        let Some(item) = state.current() else { return };
+        let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) else { return };
         match drag {
             SelectDrag::Rect(start, _) => {
                 select_drag.set(Some(SelectDrag::Rect(start, (nx, ny))));
@@ -1325,8 +1340,32 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 noise::noise_add(&mut p, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
             }
         }
-        web::put_pixels(&canvas, &p, w as u32, h as u32);
-        composite_layers(&canvas, &item.layers, w, h);
+        let crop = item.edit.crop;
+        let cropped_view = tab.get() != Tab::Crop && !crop_is_full(&crop);
+        if cropped_view {
+            // Composite at full size offscreen, then blit the crop region —
+            // the same pipeline as export, so the preview matches the output.
+            // Crop stays a stored rect; the original is never touched.
+            let (cx, cy, cw, ch) = crop_px(&item.edit, w, h);
+            let off = web::create_canvas(w as u32, h as u32);
+            web::put_pixels(&off, &p, w as u32, h as u32);
+            composite_layers(&off, &item.layers, w, h);
+            canvas.set_width(cw as u32);
+            canvas.set_height(ch as u32);
+            let ctx = web::ctx2d(&canvas);
+            ctx.draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+                &off, cx as f64, cy as f64, cw as f64, ch as f64,
+                0.0, 0.0, cw as f64, ch as f64,
+            )
+            .unwrap();
+            // The overlay drawing below uses full-image pixel coords; shift
+            // the origin so it lands on the cropped canvas.
+            ctx.save();
+            let _ = ctx.translate(-(cx as f64), -(cy as f64));
+        } else {
+            web::put_pixels(&canvas, &p, w as u32, h as u32);
+            composite_layers(&canvas, &item.layers, w, h);
+        }
 
         // Draw editing handles on top for the selected path layer.
         if tab.get() == Tab::Layers && state.selected_tool.get() == Tool::Pen {
@@ -1374,6 +1413,10 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 draw_crosshair(&ctx, sx * w as f32, sy * h as f32);
             }
         }
+
+        if cropped_view {
+            web::ctx2d(&canvas).restore();
+        }
     });
 
     view! {
@@ -1400,10 +1443,14 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 _ => view! {
                     <div
                         class="canvas-wrap"
+                        class:cropped=move || {
+                            tab.get() != Tab::Crop
+                                && state.current().map(|m| m.kind == MediaKind::Photo && !crop_is_full(&m.edit.crop)).unwrap_or(false)
+                        }
                         on:pointerdown=move |ev: web_sys::PointerEvent| {
                             if tab.get() == Tab::Clone {
-                                if state.current().map(|m| m.kind == MediaKind::Photo).unwrap_or(false) {
-                                    if let Some((nx, ny)) = layer_norm_pos(&ev) {
+                                if let Some(item) = state.current().filter(|m| m.kind == MediaKind::Photo) {
+                                    if let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) {
                                         if state.clone_pick.get() || ev.alt_key() {
                                             state.clone_source.set(Some((nx, ny)));
                                             state.clone_offset.set(None);
@@ -1416,15 +1463,16 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                 return;
                             }
                             if tab.get() == Tab::Heal {
-                                if state.current().map(|m| m.kind == MediaKind::Photo).unwrap_or(false) {
-                                    if let Some((nx, ny)) = layer_norm_pos(&ev) {
+                                if let Some(item) = state.current().filter(|m| m.kind == MediaKind::Photo) {
+                                    if let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) {
                                         heal_drag.set(Some(vec![(nx, ny)]));
                                     }
                                 }
                                 return;
                             }
                             if tab.get() == Tab::Select {
-                                let Some((nx, ny)) = layer_norm_pos(&ev) else { return; };
+                                let Some(item) = state.current() else { return };
+                                let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) else { return; };
                                 match state.selected_select_tool.get() {
                                     SelectTool::Rect => {
                                         select_drag.set(Some(SelectDrag::Rect((nx, ny), (nx, ny))));
@@ -1442,7 +1490,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                             let Some(id) = state.selected_layer.get() else { return; };
                             let Some(item) = state.current() else { return; };
                             let Some(layer) = item.layers.iter().find(|l| l.id == id) else { return };
-                            let Some((nx, ny)) = layer_norm_pos(&ev) else { return };
+                            let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) else { return };
 
                             match state.selected_tool.get() {
                                 Tool::Select => {
@@ -1497,7 +1545,8 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                         on:dblclick=move |ev: web_sys::MouseEvent| {
                             if tab.get() != Tab::Layers || state.selected_tool.get() != Tool::Pen { return; }
                             let Some(id) = state.selected_layer.get() else { return; };
-                            let Some((nx, ny)) = layer_norm_pos(&ev) else { return; };
+                            let Some(item) = state.current() else { return; };
+                            let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) else { return; };
                             state.update_current_item(|m| {
                                 if let Some(l) = m.layers.iter_mut().find(|l| l.id == id) {
                                     if let LayerKind::Path(p) = &mut l.kind {
@@ -1533,7 +1582,8 @@ fn VideoOverlays(state: AppState) -> impl IntoView {
             {move || state.current_layers().into_iter().filter_map(|l| {
                 if !l.visible { return None; }
                 let LayerKind::Text(t) = &l.kind else { return None; };
-                let style = text_overlay_style(t, l.opacity);
+                // Video preview is not cropped; identity mapping.
+                let style = text_overlay_style(t, l.opacity, &state::CropRect::default());
                 Some(view! { <div class="video-text-overlay" style=style>{t.text.clone()}</div> })
             }).collect_view()}
         </div>
@@ -1557,13 +1607,13 @@ fn SelectedTextOverlay(
             return None;
         }
         let LayerKind::Text(t) = &layer.kind else { return None; };
-        Some((layer.id, t.clone(), layer.opacity))
+        Some((layer.id, t.clone(), layer.opacity, m.edit.crop))
     };
 
     view! {
         {move || {
-            let (id, t, opacity) = maybe_layer()?;
-            let style = selected_text_overlay_style(&t, opacity);
+            let (id, t, opacity, crop) = maybe_layer()?;
+            let style = selected_text_overlay_style(&t, opacity, &crop);
             Some(view! {
                 <div
                     class="text-overlay selected"
@@ -1572,7 +1622,8 @@ fn SelectedTextOverlay(
                         if tab.get() != Tab::Layers || state.selected_tool.get() != Tool::Select { return; }
                         ev.stop_propagation();
                         ev.prevent_default();
-                        let Some((nx, ny)) = layer_norm_pos(&ev) else { return; };
+                        let Some(item) = state.current() else { return };
+                        let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) else { return };
                         state.selected_layer.set(Some(id));
                         layer_drag.set(Some((id, nx, ny, t.x, t.y)));
                     }
@@ -1700,7 +1751,7 @@ fn CropOverlay(
 }
 
 #[component]
-fn CropTab(state: AppState) -> impl IntoView {
+fn CropTab(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     let set_aspect = move |a: Aspect| {
         let Some(item) = state.current() else { return };
         let (w, h) = working_dims(item.width, item.height, &item.edit);
@@ -1724,7 +1775,22 @@ fn CropTab(state: AppState) -> impl IntoView {
                 }
             })}
         </div>
-        <p class="dim">"Drag the crop box on the image. Corners resize."</p>
+        <div class="row">
+            <button
+                class="btn"
+                disabled=move || state.current().map(|m| crop_is_full(&m.edit.crop)).unwrap_or(true)
+                on:click=move |_| state.update_current(|e| {
+                    e.crop = state::CropRect::default();
+                    e.aspect = Aspect::Original;
+                })
+            >
+                "Reset"
+            </button>
+            <button class="btn primary" on:click=move |_| tab.set(Tab::Color)>
+                "Done"
+            </button>
+        </div>
+        <p class="dim">"Drag the crop box on the image. Corners resize. Crop is non-destructive: Done shows the result, and you can come back here anytime to re-adjust."</p>
     }
 }
 
@@ -2717,7 +2783,17 @@ fn LayersTab(state: AppState) -> impl IntoView {
             let id = m.next_layer_id;
             m.next_layer_id += 1;
             let layer = match kind {
-                "text" => Layer::new_text(id),
+                "text" => {
+                    let mut l = Layer::new_text(id);
+                    // Place new text at the center of the current crop, not
+                    // the full image, so it's visible in the cropped preview.
+                    if let LayerKind::Text(t) = &mut l.kind {
+                        let c = m.edit.crop;
+                        t.x = c.x + c.w / 2.0;
+                        t.y = c.y + c.h / 2.0;
+                    }
+                    l
+                }
                 "path" => Layer::new_path(id),
                 "brush" => Layer::new_brush(id),
                 _ => Layer::new_text(id),
