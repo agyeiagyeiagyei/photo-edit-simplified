@@ -437,8 +437,11 @@ fn draw_raster_layer(ctx: &web_sys::CanvasRenderingContext2d, layer: &state::Lay
     }
     let canvas = web::create_canvas(r.width as u32, r.height as u32);
     web::put_pixels(&canvas, &r.pixels, r.width as u32, r.height as u32);
-    let _ = ctx.draw_image_with_html_canvas_element_and_dw_and_dh(&canvas, 0.0, 0.0, w, h,
-    );
+    let dw = (r.scale * w as f32) as f64;
+    let dh = dw * r.height as f64 / r.width as f64;
+    let dx = (r.x as f64 * w) - dw / 2.0;
+    let dy = (r.y as f64 * h) - dh / 2.0;
+    let _ = ctx.draw_image_with_html_canvas_element_and_dw_and_dh(&canvas, dx, dy, dw, dh);
 }
 
 fn composite_layers(canvas: &web_sys::HtmlCanvasElement, layers: &[state::Layer], w: usize, h: usize) {
@@ -1202,7 +1205,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         apply_heal(state, &pts);
     });
 
-    // --- text layer drag -------------------------------------------------------
+    // --- text/image layer drag ---------------------------------------------------
     window_event_listener(leptos::ev::pointermove, move |ev| {
         let Some(Some((id, nx0, ny0, x0, y0))) = layer_drag.try_get() else { return };
         let Some(item) = state.current() else { return };
@@ -1211,9 +1214,17 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         let dy = ny - ny0;
         state.update_current_item(|m| {
             if let Some(l) = m.layers.iter_mut().find(|l| l.id == id) {
-                let LayerKind::Text(t) = &mut l.kind else { return };
-                t.x = (x0 + dx).clamp(0.0, 1.0);
-                t.y = (y0 + dy).clamp(0.0, 1.0);
+                match &mut l.kind {
+                    LayerKind::Text(t) => {
+                        t.x = (x0 + dx).clamp(0.0, 1.0);
+                        t.y = (y0 + dy).clamp(0.0, 1.0);
+                    }
+                    LayerKind::Raster(r) => {
+                        r.x = (x0 + dx).clamp(0.0, 1.0);
+                        r.y = (y0 + dy).clamp(0.0, 1.0);
+                    }
+                    _ => {}
+                }
             }
         });
     });
@@ -1549,8 +1560,15 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
 
                             match state.selected_tool.get() {
                                 Tool::Select => {
-                                    let LayerKind::Text(t) = &layer.kind else { return };
-                                    layer_drag.set(Some((id, nx, ny, t.x, t.y)));
+                                    match &layer.kind {
+                                        LayerKind::Text(t) => {
+                                            layer_drag.set(Some((id, nx, ny, t.x, t.y)));
+                                        }
+                                        LayerKind::Raster(r) => {
+                                            layer_drag.set(Some((id, nx, ny, r.x, r.y)));
+                                        }
+                                        _ => {}
+                                    }
                                 }
                                 Tool::Pen => {
                                     let LayerKind::Path(ref p) = layer.kind else { return };
@@ -2910,12 +2928,56 @@ fn LayersTab(state: AppState) -> impl IntoView {
 
     let layers = create_memo(move |_| state.current_layers());
 
+    let image_input_ref = create_node_ref::<html::Input>();
+    let import_image = move |file: File| {
+        spawn_local(async move {
+            let blob: &Blob = file.as_ref();
+            let Ok((img, url)) = web::load_image(blob).await else { return };
+            let (pixels, w, h) = downscale(&img, 2048);
+            let _ = Url::revoke_object_url(&url);
+            let mut new_id = None;
+            state.update_current_item(|m| {
+                let id = m.next_layer_id;
+                m.next_layer_id += 1;
+                let mut layer = Layer::new_raster(id, pixels, w, h);
+                if let LayerKind::Raster(r) = &mut layer.kind {
+                    r.scale = 0.5;
+                }
+                m.layers.push(layer);
+                new_id = Some(id);
+            });
+            if let Some(id) = new_id {
+                state.selected_layer.set(Some(id));
+                state.selected_tool.set(Tool::Select);
+            }
+        });
+    };
+
     view! {
         <div class="layers-tab">
             <div class="row layer-add-row">
                 <button class="btn" on:click=move |_| add_layer("text")>"＋ Text"</button>
                 <button class="btn" on:click=move |_| add_layer("path")>"＋ Path"</button>
                 <button class="btn" on:click=move |_| add_layer("brush")>"＋ Brush"</button>
+                <label class="btn">
+                    "＋ Image"
+                    <input
+                        node_ref=image_input_ref
+                        type="file"
+                        accept="image/*"
+                        style="display:none"
+                        on:change=move |_| {
+                            if let Some(input) = image_input_ref.get() {
+                                if let Some(files) = input.files() {
+                                    if let Some(file) = files.item(0) {
+                                        import_image(file);
+                                    }
+                                }
+                                input.set_value("");
+                            }
+                        }
+                    />
+                </label>
             </div>
             <div class="layer-list">
                 <For
@@ -3001,6 +3063,7 @@ fn LayersTab(state: AppState) -> impl IntoView {
             <TextLayerEditor state=state/>
             <PathLayerEditor state=state/>
             <BrushLayerEditor state=state/>
+            <RasterLayerEditor state=state/>
         </div>
     }
 }
@@ -3439,6 +3502,51 @@ fn BrushLayerEditor(state: AppState) -> impl IntoView {
                     </button>
                 </div>
                 <p class="dim">"Brush: drag on the photo to draw freehand strokes."</p>
+            </div>
+        </Show>
+    }
+}
+
+#[component]
+fn RasterLayerEditor(state: AppState) -> impl IntoView {
+    let raster_layer = move || {
+        let sel = state.selected_layer.get()?;
+        state
+            .current_layers()
+            .into_iter()
+            .find(|l| l.id == sel)
+            .and_then(|l| match l.kind {
+                LayerKind::Raster(r) => Some(r),
+                _ => None,
+            })
+    };
+
+    view! {
+        <Show when=move || raster_layer().is_some() fallback=|| ()>
+            <div class="raster-editor">
+                <label class="slider compact">
+                    "Size"
+                    <input
+                        type="range"
+                        min="0.05"
+                        max="2.0"
+                        step="0.01"
+                        prop:value=move || raster_layer().map(|r| r.scale.to_string()).unwrap_or_default()
+                        on:input=move |ev| {
+                            let v: f32 = event_target_value(&ev).parse().unwrap_or(1.0);
+                            let sel = state.selected_layer.get_untracked();
+                            state.update_current_item(|m| {
+                                if let Some(l) = m.layers.iter_mut().find(|l| Some(l.id) == sel) {
+                                    if let LayerKind::Raster(r) = &mut l.kind {
+                                        r.scale = v.clamp(0.05, 2.0);
+                                    }
+                                }
+                            });
+                        }
+                    />
+                    {move || raster_layer().map(|r| format!(" {:.0}%", r.scale * 100.0)).unwrap_or_default()}
+                </label>
+                <p class="dim">"Image layer: drag on the photo to move it, use the slider to resize."</p>
             </div>
         </Show>
     }

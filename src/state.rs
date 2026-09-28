@@ -240,6 +240,12 @@ pub struct RasterLayer {
     pub pixels: Vec<u8>,
     pub width: usize,
     pub height: usize,
+    /// Center anchor in normalized canvas coords.
+    pub x: f32,
+    pub y: f32,
+    /// Drawn width as a fraction of canvas width; height follows the
+    /// buffer's aspect ratio. 1.0 = full-bleed.
+    pub scale: f32,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -299,7 +305,7 @@ impl Layer {
             id,
             visible: true,
             opacity: 1.0,
-            kind: LayerKind::Raster(RasterLayer { pixels, width, height }),
+            kind: LayerKind::Raster(RasterLayer { pixels, width, height, x: 0.5, y: 0.5, scale: 1.0 }),
         }
     }
 
@@ -308,7 +314,7 @@ impl Layer {
             LayerKind::Text(t) => format!("T: {}", t.text),
             LayerKind::Path(_) => "Path".into(),
             LayerKind::Brush(_) => "Brush".into(),
-            LayerKind::Raster(_) => "Raster".into(),
+            LayerKind::Raster(_) => "Image".into(),
         }
     }
 }
