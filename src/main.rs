@@ -8,6 +8,7 @@ mod noise;
 mod ops;
 mod raw;
 mod state;
+mod stroke;
 mod wand;
 mod web;
 
@@ -359,21 +360,73 @@ fn draw_path_layer(ctx: &web_sys::CanvasRenderingContext2d, layer: &state::Layer
 
 fn draw_brush_layer(ctx: &web_sys::CanvasRenderingContext2d, layer: &state::Layer, w: f64, h: f64) {
     let LayerKind::Brush(b) = &layer.kind else { return; };
-    ctx.set_stroke_style_str(&b.color);
-    ctx.set_line_width((b.width * h as f32) as f64);
-    ctx.set_line_cap("round");
-    ctx.set_line_join("round");
+    let size_px = (b.width * h as f32) as f64;
+    if b.shape == state::BrushShape::Smooth {
+        ctx.set_stroke_style_str(&b.color);
+        ctx.set_line_width(size_px);
+        ctx.set_line_cap("round");
+        ctx.set_line_join("round");
+        for stroke in &b.strokes {
+            if stroke.points.len() < 2 {
+                continue;
+            }
+            ctx.begin_path();
+            let (x0, y0) = stroke.points[0];
+            ctx.move_to((x0 * w as f32) as f64, (y0 * h as f32) as f64);
+            for &(x, y) in &stroke.points[1..] {
+                ctx.line_to((x * w as f32) as f64, (y * h as f32) as f64);
+            }
+            let _ = ctx.stroke();
+        }
+        return;
+    }
+
+    ctx.set_fill_style_str(&b.color);
+    let spacing_px = (b.spacing.clamp(0.1, 4.0) * b.width * h as f32).max(0.5);
+    let custom = if b.shape == state::BrushShape::Custom {
+        web_sys::Path2d::new_with_path_string(&b.custom_path).ok()
+    } else {
+        None
+    };
+    let half = size_px / 2.0;
     for stroke in &b.strokes {
-        if stroke.points.len() < 2 {
-            continue;
+        let pts: Vec<(f32, f32)> = stroke
+            .points
+            .iter()
+            .map(|&(x, y)| (x * w as f32, y * h as f32))
+            .collect();
+        for dab in stroke::dab_positions(&pts, spacing_px) {
+            ctx.save();
+            ctx.translate(dab.x as f64, dab.y as f64).ok();
+            ctx.rotate(dab.angle as f64).ok();
+            match b.shape {
+                state::BrushShape::Square => {
+                    ctx.fill_rect(-half, -half, size_px, size_px);
+                }
+                state::BrushShape::Dot => {
+                    ctx.begin_path();
+                    ctx.arc(0.0, 0.0, half, 0.0, std::f64::consts::TAU).ok();
+                    ctx.fill();
+                }
+                state::BrushShape::Triangle => {
+                    ctx.begin_path();
+                    ctx.move_to(half, 0.0);
+                    ctx.line_to(half * -0.5, half * 0.866);
+                    ctx.line_to(half * -0.5, half * -0.866);
+                    ctx.close_path();
+                    ctx.fill();
+                }
+                state::BrushShape::Custom => {
+                    if let Some(path) = &custom {
+                        ctx.scale(size_px / 100.0, size_px / 100.0).ok();
+                        ctx.translate(-50.0, -50.0).ok();
+                        ctx.fill_with_path_2d(path);
+                    }
+                }
+                state::BrushShape::Smooth => unreachable!(),
+            }
+            ctx.restore();
         }
-        ctx.begin_path();
-        let (x0, y0) = stroke.points[0];
-        ctx.move_to((x0 * w as f32) as f64, (y0 * h as f32) as f64);
-        for &(x, y) in &stroke.points[1..] {
-            ctx.line_to((x * w as f32) as f64, (y * h as f32) as f64);
-        }
-        let _ = ctx.stroke();
     }
 }
 
@@ -3333,6 +3386,50 @@ fn BrushLayerEditor(state: AppState) -> impl IntoView {
                         />
                     </label>
                 </div>
+                <div class="chips">
+                    {state::BrushShape::ALL.map(|shape| {
+                        let active = move || brush_layer().map(|b| b.shape) == Some(shape);
+                        view! {
+                            <button
+                                class="chip"
+                                class:active=active
+                                on:click=move |_| with_brush_layer(state, |b| b.shape = shape)
+                            >
+                                {shape.label()}
+                            </button>
+                        }
+                    })}
+                </div>
+                <Show when=move || brush_layer().map(|b| b.shape != state::BrushShape::Smooth).unwrap_or(false)>
+                    <label class="slider compact">
+                        "Spacing"
+                        <input
+                            type="range"
+                            min="0.1"
+                            max="4.0"
+                            step="0.05"
+                            prop:value=move || brush_layer().map(|b| b.spacing.to_string()).unwrap_or_default()
+                            on:input=move |ev| {
+                                let v: f32 = event_target_value(&ev).parse().unwrap_or(1.0);
+                                with_brush_layer(state, |b| b.spacing = v.clamp(0.1, 4.0));
+                            }
+                        />
+                        {move || brush_layer().map(|b| format!(" {:.2}×", b.spacing)).unwrap_or_default()}
+                    </label>
+                </Show>
+                <Show when=move || brush_layer().map(|b| b.shape == state::BrushShape::Custom).unwrap_or(false)>
+                    <label class="custom-path">
+                        "SVG path (100×100 box, centered on 50,50, pointing right)"
+                        <textarea
+                            rows="3"
+                            prop:value=move || brush_layer().map(|b| b.custom_path).unwrap_or_default()
+                            on:input=move |ev| {
+                                let v = event_target_value(&ev);
+                                with_brush_layer(state, |b| b.custom_path = v);
+                            }
+                        />
+                    </label>
+                </Show>
                 <div class="row">
                     <button class="btn" on:click=undo>"Undo"
                         {move || brush_layer().map(|b| format!(" ({})", b.history.len())).unwrap_or_default()}

@@ -164,11 +164,50 @@ pub struct BrushStroke {
     pub points: Vec<(f32, f32)>,
 }
 
+/// Stamp shape for a brush layer. Smooth is the classic continuous stroke;
+/// the rest stamp a dab every `spacing * width` along the stroke.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum BrushShape {
+    Smooth,
+    Square,
+    Dot,
+    Triangle,
+    /// User-supplied SVG path drawn in a 100x100 box, centered on (50, 50),
+    /// pointing +x (rotated to the stroke direction).
+    Custom,
+}
+
+impl BrushShape {
+    pub const ALL: [BrushShape; 5] = [
+        BrushShape::Smooth,
+        BrushShape::Square,
+        BrushShape::Dot,
+        BrushShape::Triangle,
+        BrushShape::Custom,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BrushShape::Smooth => "Smooth",
+            BrushShape::Square => "Square",
+            BrushShape::Dot => "Dot",
+            BrushShape::Triangle => "Triangle",
+            BrushShape::Custom => "Custom",
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct BrushLayer {
     pub strokes: Vec<BrushStroke>,
     pub color: String,
     pub width: f32,
+    pub shape: BrushShape,
+    /// Distance between dabs as a multiple of brush width (0.1..4).
+    /// Ignored for Smooth.
+    pub spacing: f32,
+    /// SVG path data for BrushShape::Custom (100x100 box).
+    pub custom_path: String,
     /// Per-layer undo stack of stroke states.
     pub history: Vec<Vec<BrushStroke>>,
 }
@@ -179,6 +218,10 @@ impl Default for BrushLayer {
             strokes: Vec::new(),
             color: "#0a84ff".into(),
             width: 0.015,
+            shape: BrushShape::Smooth,
+            spacing: 1.0,
+            custom_path: "M50 5 L61 39 L98 39 L68 60 L79 95 L50 73 L21 95 L32 60 L2 39 L39 39 Z"
+                .into(),
             history: Vec::new(),
         }
     }
