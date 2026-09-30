@@ -232,6 +232,20 @@ pub async fn read_file_array_buffer(file: &web_sys::File) -> Result<js_sys::Arra
     Ok(result.unchecked_into())
 }
 
+pub async fn blob_to_bytes(blob: &Blob) -> Result<Vec<u8>, JsValue> {
+    let buf = JsFuture::from(blob.array_buffer()).await?;
+    Ok(js_sys::Uint8Array::new(&buf).to_vec())
+}
+
+pub fn bytes_to_blob(bytes: &[u8], mime: &str) -> Result<Blob, JsValue> {
+    let arr = js_sys::Uint8Array::from(bytes);
+    let parts = js_sys::Array::new();
+    parts.push(&arr);
+    let bag = web_sys::BlobPropertyBag::new();
+    bag.set_type(mime);
+    Blob::new_with_u8_array_sequence_and_options(&parts, &bag)
+}
+
 pub async fn load_font(family: &str, url: &str, weight: &str) -> Result<(), JsValue> {
     let window = window();
     let desc = web_sys::FontFaceDescriptors::new();

@@ -15,6 +15,17 @@ pub fn is_raw_name(name: &str) -> bool {
     RAW_EXTENSIONS.iter().any(|ext| n.ends_with(&format!(".{ext}")))
 }
 
+/// Read camera metadata (make, model, exposure, GPS…) into an EXIF TIFF
+/// payload carried through to export.
+pub fn extract_exif_tiff(bytes: &[u8]) -> Option<Vec<u8>> {
+    let rawfile = RawSource::new_from_slice(bytes);
+    let decoder = rawler::get_decoder(&rawfile).ok()?;
+    let meta = decoder
+        .raw_metadata(&rawfile, &RawDecodeParams { image_index: 0 })
+        .ok()?;
+    Some(crate::exif::tiff_from_raw_metadata(&meta))
+}
+
 /// Decode + develop a RAW file into orientation-corrected RGBA pixels.
 pub fn decode_raw(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
     let rawfile = RawSource::new_from_slice(bytes);

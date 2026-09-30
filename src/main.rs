@@ -1,6 +1,7 @@
 mod blur;
 mod clone;
 mod curves;
+mod exif;
 mod fill;
 mod heal;
 mod levels;
@@ -23,7 +24,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{Blob, File, Url};
 
-use state::{AppState, Aspect, BrushStroke, EditParams, Layer, LayerKind, MediaItem, MediaKind, PathPoint, SelectTool, Selection, SelectionKind, TextAlign, Tool};
+use state::{AppState, Aspect, BrushStroke, EditParams, Layer, LayerKind, MediaItem, MediaKind, PathPoint, PhotoFormat, SelectTool, Selection, SelectionKind, TextAlign, Tool};
 
 // --- media cache (non-reactive) ---------------------------------------------
 
@@ -101,6 +102,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                         edit: EditParams::default(),
                         layers: Vec::new(),
                         next_layer_id: 0,
+                        exif: None,
                     });
                 } else {
                     web::log("video probe failed");
@@ -117,6 +119,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                     state.busy.set(None);
                     continue;
                 };
+                let exif = raw::extract_exif_tiff(&bytes).map(Rc::new);
                 let (pp, pw, ph) = downscale_pixels(&full_rgba, fw, fh, 1024);
                 let canvas = web::create_canvas(pw as u32, ph as u32);
                 web::put_pixels(&canvas, &pp, pw as u32, ph as u32);
@@ -137,10 +140,31 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                     edit: EditParams::default(),
                     layers: Vec::new(),
                     next_layer_id: 0,
+                    exif,
                 });
             } else {
                 state.busy.set(Some(format!("Loading {name}…")));
                 let mut blob: Blob = file.clone().into();
+                let lname = name.to_lowercase();
+                let is_jpeg = !is_heic(&file)
+                    && (lname.ends_with(".jpg") || lname.ends_with(".jpeg"));
+                let is_png = lname.ends_with(".png");
+                let exif = if is_jpeg || is_png {
+                    web::read_file_array_buffer(&file)
+                        .await
+                        .ok()
+                        .map(|b| js_sys::Uint8Array::new(&b).to_vec())
+                        .and_then(|b| {
+                            if is_png {
+                                exif::tiff_from_png(&b)
+                            } else {
+                                exif::tiff_from_jpeg(&b)
+                            }
+                        })
+                        .map(Rc::new)
+                } else {
+                    None
+                };
                 if is_heic(&file) {
                     state.busy.set(Some(format!("Converting HEIC {name}…")));
                     match web::heic_to_jpeg(blob).await {
@@ -171,6 +195,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                     edit: EditParams::default(),
                     layers: Vec::new(),
                     next_layer_id: 0,
+                    exif,
                 });
             }
             state.busy.set(None);
@@ -561,9 +586,33 @@ fn export_photo(state: AppState, item: MediaItem) {
         web::ctx2d(&out)
             .draw_image_with_html_canvas_element_and_dw_and_dh(&work, 0.0, 0.0, ew as f64, eh as f64)
             .unwrap();
-        if let Ok(blob) = web::canvas_to_jpeg_blob(&out, 0.92).await {
+        let format = state.photo_format.get_untracked();
+        let encoded = match format {
+            PhotoFormat::Jpeg => web::canvas_to_jpeg_blob(&out, 0.92).await,
+            PhotoFormat::JpegMax => web::canvas_to_jpeg_blob(&out, 1.0).await,
+            PhotoFormat::Png => web::canvas_to_blob(&out, "image/png").await,
+        };
+        if let Ok(blob) = encoded {
+            let (mime, ext) = match format {
+                PhotoFormat::Png => ("image/png", "png"),
+                _ => ("image/jpeg", "jpg"),
+            };
+            // Carry source EXIF into the export when we have it.
+            let blob = match &item.exif {
+                Some(tiff) => match web::blob_to_bytes(&blob).await {
+                    Ok(bytes) => {
+                        let bytes = match format {
+                            PhotoFormat::Png => exif::inject_png(&bytes, tiff),
+                            _ => exif::inject_jpeg(&bytes, tiff),
+                        };
+                        web::bytes_to_blob(&bytes, mime).unwrap_or(blob)
+                    }
+                    Err(_) => blob,
+                },
+                None => blob,
+            };
             let base = item.name.rsplitn(2, '.').last().unwrap_or("photo");
-            web::download_blob(&blob, &format!("edited-{}-{}.jpg", item.edit.aspect.label(), base));
+            web::download_blob(&blob, &format!("edited-{}-{}.{}", item.edit.aspect.label(), base, ext));
         }
         state.busy.set(None);
     });
@@ -3599,7 +3648,9 @@ fn TrimTab(state: AppState) -> impl IntoView {
 fn ExportTab(state: AppState) -> impl IntoView {
     let multi = move || state.items.with(|v| v.len() > 1);
     let is_video = move || state.current().map(|m| m.kind == MediaKind::Video).unwrap_or(false);
+    let is_photo = move || state.current().map(|m| m.kind == MediaKind::Photo).unwrap_or(false);
     let keep_audio = move || state.current().map(|m| m.edit.keep_audio).unwrap_or(true);
+    let format = move || state.photo_format.get();
     view! {
         <button class="btn primary" on:click=move |_| {
             if let Some(item) = state.current() {
@@ -3609,6 +3660,25 @@ fn ExportTab(state: AppState) -> impl IntoView {
                 }
             }
         }>"Download this"</button>
+        <Show when=is_photo fallback=|| ()>
+            <label class="row" style="justify-content:flex-start;gap:0.5rem">
+                "Format"
+                <select
+                    on:change=move |ev| {
+                        let f = match event_target_value(&ev).as_str() {
+                            "png" => PhotoFormat::Png,
+                            "jpeg100" => PhotoFormat::JpegMax,
+                            _ => PhotoFormat::Jpeg,
+                        };
+                        state.photo_format.set(f);
+                    }
+                >
+                    <option value="jpeg" selected=move || format() == PhotoFormat::Jpeg>"JPEG"</option>
+                    <option value="jpeg100" selected=move || format() == PhotoFormat::JpegMax>"JPEG (max quality)"</option>
+                    <option value="png" selected=move || format() == PhotoFormat::Png>"PNG (lossless)"</option>
+                </select>
+            </label>
+        </Show>
         <Show when=is_video fallback=|| ()>
             <label class="row" style="justify-content:flex-start;gap:0.5rem">
                 <input

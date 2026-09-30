@@ -463,6 +463,13 @@ pub enum MediaKind {
     Video,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum PhotoFormat {
+    Jpeg,
+    JpegMax,
+    Png,
+}
+
 #[derive(Clone)]
 pub struct MediaItem {
     pub id: usize,
@@ -476,6 +483,8 @@ pub struct MediaItem {
     pub edit: EditParams,
     pub layers: Vec<Layer>,
     pub next_layer_id: usize,
+    /// EXIF TIFF payload carried from the source file into exports.
+    pub exif: Option<std::rc::Rc<Vec<u8>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -508,6 +517,8 @@ pub struct AppState {
     pub clone_pick: RwSignal<bool>,
     /// Clone brush radius as a fraction of the image diagonal.
     pub clone_radius: RwSignal<f32>,
+    /// Photo export format.
+    pub photo_format: RwSignal<PhotoFormat>,
 }
 
 impl AppState {
@@ -531,6 +542,7 @@ impl AppState {
             clone_aligned: create_rw_signal(true),
             clone_pick: create_rw_signal(false),
             clone_radius: create_rw_signal(0.03),
+            photo_format: create_rw_signal(PhotoFormat::Jpeg),
         }
     }
 
