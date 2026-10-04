@@ -106,6 +106,60 @@
         throw e;
       }
     };
+
+    // Google Drive: Identity Services sign-in + folder Picker. Called from Rust.
+    let _gsiP = null, _gapiP = null;
+    function _pesLoadScript(src) {
+      return new Promise((res, rej) => {
+        const s = document.createElement('script');
+        s.src = src;
+        s.onload = res;
+        s.onerror = () => rej(new Error('script load failed: ' + src));
+        document.head.appendChild(s);
+      });
+    }
+    window.pesDriveSignIn = async function (clientId, scope) {
+      if (!_gsiP) _gsiP = _pesLoadScript('https://accounts.google.com/gsi/client');
+      await _gsiP;
+      return await new Promise((resolve, reject) => {
+        try {
+          const tc = google.accounts.oauth2.initTokenClient({
+            client_id: clientId,
+            scope,
+            callback: (resp) => {
+              if (resp && resp.access_token) resolve(resp.access_token);
+              else reject(new Error('sign-in failed: ' + (resp && resp.error || 'no token')));
+            },
+            error_callback: (e) => reject(new Error('sign-in failed: ' + (e && e.type || 'popup closed'))),
+          });
+          tc.requestAccessToken({ prompt: '' });
+        } catch (e) { reject(e); }
+      });
+    };
+    window.pesDrivePickFolder = async function (apiKey, appId, token) {
+      if (!_gapiP) _gapiP = _pesLoadScript('https://apis.google.com/js/api.js');
+      await _gapiP;
+      await new Promise((res) => gapi.load('picker', res));
+      return await new Promise((resolve) => {
+        const view = new google.picker.DocsView(google.picker.ViewId.FOLDERS)
+          .setSelectFolderEnabled(true);
+        const picker = new google.picker.PickerBuilder()
+          .setAppId(appId)
+          .setOAuthToken(token)
+          .setDeveloperKey(apiKey)
+          .addView(view)
+          .setCallback((data) => {
+            if (data.action === google.picker.Action.PICKED) {
+              const doc = data.docs[0];
+              resolve({ id: doc.id, name: doc.name });
+            } else if (data.action === google.picker.Action.CANCEL) {
+              resolve(null);
+            }
+          })
+          .build();
+        picker.setVisible(true);
+      });
+    };
   </script>
 </body>
 </html>

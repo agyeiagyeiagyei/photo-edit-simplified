@@ -443,3 +443,45 @@ button:disabled {
   }
   .tabs { display: grid; grid-template-columns: 1fr 1fr; }
 }
+
+.drive-panel { gap: 10px; }
+.drive-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0;
+}
+.drive-files {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(72px, 1fr));
+  gap: 8px;
+}
+.drive-file {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px;
+  overflow: hidden;
+}
+.drive-file.disabled { opacity: 0.4; cursor: default; }
+.drive-file img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 6px; }
+.drive-icon { font-size: 28px; line-height: 1.4; }
+.drive-name {
+  font-size: 11px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.drive-error { color: #e06c5c; }

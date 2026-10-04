@@ -485,6 +485,8 @@ pub struct MediaItem {
     pub next_layer_id: usize,
     /// EXIF TIFF payload carried from the source file into exports.
     pub exif: Option<std::rc::Rc<Vec<u8>>>,
+    /// Drive file id when the item was imported from (or saved to) Drive.
+    pub drive_file_id: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -519,6 +521,16 @@ pub struct AppState {
     pub clone_radius: RwSignal<f32>,
     /// Photo export format.
     pub photo_format: RwSignal<PhotoFormat>,
+    /// Google Drive access token (memory only — re-auth with one click).
+    pub drive_token: RwSignal<Option<std::rc::Rc<String>>>,
+    /// Granted Drive folder: (id, display name).
+    pub drive_folder: RwSignal<Option<(String, String)>>,
+    /// Files listed from the granted Drive folder.
+    pub drive_files: RwSignal<Vec<crate::drive::DriveFile>>,
+    /// Last Drive error to surface in the panel.
+    pub drive_error: RwSignal<Option<String>>,
+    /// Whether the Drive panel is expanded.
+    pub drive_open: RwSignal<bool>,
 }
 
 impl AppState {
@@ -543,6 +555,11 @@ impl AppState {
             clone_pick: create_rw_signal(false),
             clone_radius: create_rw_signal(0.03),
             photo_format: create_rw_signal(PhotoFormat::Jpeg),
+            drive_token: create_rw_signal(None),
+            drive_folder: create_rw_signal(crate::drive::saved_folder()),
+            drive_files: create_rw_signal(Vec::new()),
+            drive_error: create_rw_signal(None),
+            drive_open: create_rw_signal(false),
         }
     }
 

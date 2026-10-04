@@ -1,6 +1,7 @@
 mod blur;
 mod clone;
 mod curves;
+mod drive;
 mod exif;
 mod fill;
 mod heal;
@@ -103,6 +104,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                         layers: Vec::new(),
                         next_layer_id: 0,
                         exif: None,
+                        drive_file_id: None,
                     });
                 } else {
                     web::log("video probe failed");
@@ -141,6 +143,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                     layers: Vec::new(),
                     next_layer_id: 0,
                     exif,
+                    drive_file_id: None,
                 });
             } else {
                 state.busy.set(Some(format!("Loading {name}…")));
@@ -196,6 +199,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                     layers: Vec::new(),
                     next_layer_id: 0,
                     exif,
+                    drive_file_id: None,
                 });
             }
             state.busy.set(None);
@@ -210,6 +214,86 @@ fn push_item(state: AppState, item: MediaItem) {
         if state.selected.get_untracked().is_none() {
             state.selected.set(Some(id));
         }
+    });
+}
+
+/// Import a photo/RAW already downloaded from Drive as raw bytes.
+fn ingest_drive_bytes(state: AppState, drive_file_id: String, name: String, bytes: Vec<u8>) {
+    spawn_local(async move {
+        let id = state.next_id.get_untracked();
+        state.next_id.set(id + 1);
+        state.busy.set(Some(format!("Importing {name}…")));
+
+        if raw::is_raw_name(&name) {
+            let Ok((full_rgba, fw, fh)) = raw::decode_raw(&bytes) else {
+                web::log(&format!("RAW decode failed for {name}"));
+                state.busy.set(None);
+                return;
+            };
+            let exif = raw::extract_exif_tiff(&bytes).map(Rc::new);
+            let (pp, pw, ph) = downscale_pixels(&full_rgba, fw, fh, 1024);
+            let canvas = web::create_canvas(pw as u32, ph as u32);
+            web::put_pixels(&canvas, &pp, pw as u32, ph as u32);
+            let url = canvas.to_data_url().unwrap_or_default();
+            CACHE.with(|c| {
+                c.borrow_mut().photos.insert(
+                    id,
+                    Rc::new(PhotoData { full: (full_rgba, fw, fh), preview: (pp, pw, ph) }),
+                )
+            });
+            push_item(state, MediaItem {
+                id,
+                kind: MediaKind::Photo,
+                name,
+                object_url: url,
+                width: fw,
+                height: fh,
+                edit: EditParams::default(),
+                layers: Vec::new(),
+                next_layer_id: 0,
+                exif,
+                drive_file_id: Some(drive_file_id),
+            });
+        } else {
+            let lname = name.to_lowercase();
+            let mime = if lname.ends_with(".png") { "image/png" } else { "image/jpeg" };
+            let exif = if lname.ends_with(".png") {
+                exif::tiff_from_png(&bytes)
+            } else if lname.ends_with(".jpg") || lname.ends_with(".jpeg") {
+                exif::tiff_from_jpeg(&bytes)
+            } else {
+                None
+            }
+            .map(Rc::new);
+            let Ok(blob) = web::bytes_to_blob(&bytes, mime) else {
+                state.busy.set(None);
+                return;
+            };
+            let Ok((img, url)) = web::load_image(&blob).await else {
+                state.busy.set(None);
+                return;
+            };
+            let full = web::rgba_from_image(&img);
+            let (fw, fh) = (full.1, full.2);
+            let preview = downscale(&img, 1024);
+            CACHE.with(|c| {
+                c.borrow_mut().photos.insert(id, Rc::new(PhotoData { full, preview }))
+            });
+            push_item(state, MediaItem {
+                id,
+                kind: MediaKind::Photo,
+                name,
+                object_url: url,
+                width: fw,
+                height: fh,
+                edit: EditParams::default(),
+                layers: Vec::new(),
+                next_layer_id: 0,
+                exif,
+                drive_file_id: Some(drive_file_id),
+            });
+        }
+        state.busy.set(None);
     });
 }
 
@@ -524,98 +608,157 @@ fn crop_px(edit: &EditParams, w: usize, h: usize) -> (usize, usize, usize, usize
     (x, y, cw, ch)
 }
 
+/// Render a photo through the full edit pipeline into an encoded blob.
+/// Returns (blob, mime, filename).
+async fn render_photo_export(
+    state: AppState,
+    item: &MediaItem,
+) -> Option<(Blob, &'static str, String)> {
+    let photo = get_photo(item.id)?;
+    let (pix, w, h) = &photo.full;
+    let (mut p, w, h) = geometry(pix, *w, *h, &item.edit);
+    if item.edit.is_color_touched() {
+        if let Some(sel) = &item.edit.selection {
+            let mask = ops::selection_mask(sel, w, h);
+            blur::blur_apply_masked(&mut p, &mask, w, h, item.edit.blur);
+            if !item.edit.levels.is_identity() {
+                levels::levels_apply_masked(&mut p, &mask, &item.edit.levels.build_tables());
+            }
+            item.edit.curves.apply_masked(&mut p, &mask);
+            ops::adjust_masked(
+                &mut p,
+                &mask,
+                item.edit.brightness,
+                item.edit.contrast,
+                item.edit.saturation,
+                item.edit.warmth,
+            );
+            noise::noise_add_masked(&mut p, &mask, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
+        } else {
+            blur::blur_apply(&mut p, w, h, item.edit.blur);
+            if !item.edit.levels.is_identity() {
+                levels::levels_apply(&mut p, &item.edit.levels.build_tables());
+            }
+            item.edit.curves.apply(&mut p);
+            ops::adjust(
+                &mut p,
+                item.edit.brightness,
+                item.edit.contrast,
+                item.edit.saturation,
+                item.edit.warmth,
+            );
+            noise::noise_add(&mut p, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
+        }
+    }
+
+    // Composite onto the full geometry-corrected canvas, then crop.
+    let base = web::create_canvas(w as u32, h as u32);
+    web::put_pixels(&base, &p, w as u32, h as u32);
+    composite_layers(&base, &item.layers, w, h);
+
+    let (cx, cy, cw, ch) = crop_px(&item.edit, w, h);
+    let work = web::create_canvas(cw as u32, ch as u32);
+    web::ctx2d(&work)
+        .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+            &base, cx as f64, cy as f64, cw as f64, ch as f64,
+            0.0, 0.0, cw as f64, ch as f64,
+        )
+        .unwrap();
+
+    let (ew, eh) = item.edit.aspect.export_dims(cw, ch);
+    let out = web::create_canvas(ew as u32, eh as u32);
+    web::ctx2d(&out)
+        .draw_image_with_html_canvas_element_and_dw_and_dh(&work, 0.0, 0.0, ew as f64, eh as f64)
+        .unwrap();
+    let format = state.photo_format.get_untracked();
+    let encoded = match format {
+        PhotoFormat::Jpeg => web::canvas_to_jpeg_blob(&out, 0.92).await,
+        PhotoFormat::JpegMax => web::canvas_to_jpeg_blob(&out, 1.0).await,
+        PhotoFormat::Png => web::canvas_to_blob(&out, "image/png").await,
+    };
+    let blob = encoded.ok()?;
+    let (mime, ext) = match format {
+        PhotoFormat::Png => ("image/png", "png"),
+        _ => ("image/jpeg", "jpg"),
+    };
+    // Carry source EXIF into the export when we have it.
+    let blob = match &item.exif {
+        Some(tiff) => match web::blob_to_bytes(&blob).await {
+            Ok(bytes) => {
+                let bytes = match format {
+                    PhotoFormat::Png => exif::inject_png(&bytes, tiff),
+                    _ => exif::inject_jpeg(&bytes, tiff),
+                };
+                web::bytes_to_blob(&bytes, mime).unwrap_or(blob)
+            }
+            Err(_) => blob,
+        },
+        None => blob,
+    };
+    let base = item.name.rsplitn(2, '.').last().unwrap_or("photo");
+    let filename = format!("edited-{}-{}.{}", item.edit.aspect.label(), base, ext);
+    Some((blob, mime, filename))
+}
+
 fn export_photo(state: AppState, item: MediaItem) {
     spawn_local(async move {
         state.busy.set(Some(format!("Exporting {}…", item.name)));
-        let Some(photo) = get_photo(item.id) else {
-            state.busy.set(None);
-            return;
-        };
-        let (pix, w, h) = &photo.full;
-        let (mut p, w, h) = geometry(pix, *w, *h, &item.edit);
-        if item.edit.is_color_touched() {
-            if let Some(sel) = &item.edit.selection {
-                let mask = ops::selection_mask(sel, w, h);
-                blur::blur_apply_masked(&mut p, &mask, w, h, item.edit.blur);
-                if !item.edit.levels.is_identity() {
-                    levels::levels_apply_masked(&mut p, &mask, &item.edit.levels.build_tables());
-                }
-                item.edit.curves.apply_masked(&mut p, &mask);
-                ops::adjust_masked(
-                    &mut p,
-                    &mask,
-                    item.edit.brightness,
-                    item.edit.contrast,
-                    item.edit.saturation,
-                    item.edit.warmth,
-                );
-                noise::noise_add_masked(&mut p, &mask, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
-            } else {
-                blur::blur_apply(&mut p, w, h, item.edit.blur);
-                if !item.edit.levels.is_identity() {
-                    levels::levels_apply(&mut p, &item.edit.levels.build_tables());
-                }
-                item.edit.curves.apply(&mut p);
-                ops::adjust(
-                    &mut p,
-                    item.edit.brightness,
-                    item.edit.contrast,
-                    item.edit.saturation,
-                    item.edit.warmth,
-                );
-                noise::noise_add(&mut p, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
-            }
-        }
-
-        // Composite onto the full geometry-corrected canvas, then crop.
-        let base = web::create_canvas(w as u32, h as u32);
-        web::put_pixels(&base, &p, w as u32, h as u32);
-        composite_layers(&base, &item.layers, w, h);
-
-        let (cx, cy, cw, ch) = crop_px(&item.edit, w, h);
-        let work = web::create_canvas(cw as u32, ch as u32);
-        web::ctx2d(&work)
-            .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
-                &base, cx as f64, cy as f64, cw as f64, ch as f64,
-                0.0, 0.0, cw as f64, ch as f64,
-            )
-            .unwrap();
-
-        let (ew, eh) = item.edit.aspect.export_dims(cw, ch);
-        let out = web::create_canvas(ew as u32, eh as u32);
-        web::ctx2d(&out)
-            .draw_image_with_html_canvas_element_and_dw_and_dh(&work, 0.0, 0.0, ew as f64, eh as f64)
-            .unwrap();
-        let format = state.photo_format.get_untracked();
-        let encoded = match format {
-            PhotoFormat::Jpeg => web::canvas_to_jpeg_blob(&out, 0.92).await,
-            PhotoFormat::JpegMax => web::canvas_to_jpeg_blob(&out, 1.0).await,
-            PhotoFormat::Png => web::canvas_to_blob(&out, "image/png").await,
-        };
-        if let Ok(blob) = encoded {
-            let (mime, ext) = match format {
-                PhotoFormat::Png => ("image/png", "png"),
-                _ => ("image/jpeg", "jpg"),
-            };
-            // Carry source EXIF into the export when we have it.
-            let blob = match &item.exif {
-                Some(tiff) => match web::blob_to_bytes(&blob).await {
-                    Ok(bytes) => {
-                        let bytes = match format {
-                            PhotoFormat::Png => exif::inject_png(&bytes, tiff),
-                            _ => exif::inject_jpeg(&bytes, tiff),
-                        };
-                        web::bytes_to_blob(&bytes, mime).unwrap_or(blob)
-                    }
-                    Err(_) => blob,
-                },
-                None => blob,
-            };
-            let base = item.name.rsplitn(2, '.').last().unwrap_or("photo");
-            web::download_blob(&blob, &format!("edited-{}-{}.{}", item.edit.aspect.label(), base, ext));
+        if let Some((blob, _mime, filename)) = render_photo_export(state, &item).await {
+            web::download_blob(&blob, &filename);
         }
         state.busy.set(None);
     });
+}
+
+/// Upload the rendered export into the granted Drive folder; overwrites in
+/// place when the item came from Drive or was already saved there.
+fn save_photo_to_drive(state: AppState, item: MediaItem) {
+    spawn_local(async move {
+        let Some(token) = state.drive_token.get_untracked() else {
+            return;
+        };
+        let Some((folder_id, _)) = state.drive_folder.get_untracked() else {
+            return;
+        };
+        state.busy.set(Some(format!("Saving {} to Drive…", item.name)));
+        state.drive_error.set(None);
+        let Some((blob, mime, filename)) = render_photo_export(state, &item).await else {
+            state.busy.set(None);
+            return;
+        };
+        let result = async {
+            let bytes = web::blob_to_bytes(&blob).await?;
+            drive::upload_file(
+                &token,
+                &folder_id,
+                item.drive_file_id.as_deref(),
+                &filename,
+                mime,
+                &bytes,
+            )
+            .await
+        }
+        .await;
+        match result {
+            Ok(fid) => {
+                state.update_current_item(|m| m.drive_file_id = Some(fid));
+                if let Ok(listing) = drive::list_files(&token, &folder_id).await {
+                    state.drive_files.set(listing.files);
+                }
+            }
+            Err(e) => {
+                state
+                    .drive_error
+                    .set(Some(format!("Drive save failed: {}", js_err(&e))));
+            }
+        }
+        state.busy.set(None);
+    });
+}
+
+fn js_err(e: &JsValue) -> String {
+    e.as_string()
+        .unwrap_or_else(|| format!("{e:?}").chars().take(200).collect())
 }
 
 fn export_video(state: AppState, item: MediaItem) {
@@ -773,6 +916,7 @@ fn App() -> impl IntoView {
                 <h1>"photo-edit-simplified"</h1>
                 <AddButton state=state/>
             </header>
+            <DrivePanel state=state/>
             <Show when=move || state.items.with(|v| v.is_empty()) fallback=|| ()>
                 <DropZone state=state/>
             </Show>
@@ -860,9 +1004,199 @@ fn FilmStrip(state: AppState) -> impl IntoView {
     }
 }
 
+fn drive_refresh(state: AppState) {
+    spawn_local(async move {
+        let Some(token) = state.drive_token.get_untracked() else {
+            return;
+        };
+        let Some((fid, _)) = state.drive_folder.get_untracked() else {
+            return;
+        };
+        state.drive_error.set(None);
+        match drive::list_files(&token, &fid).await {
+            Ok(listing) => {
+                if !listing.skipped.is_empty() {
+                    state.drive_error.set(Some(format!(
+                        "Couldn't open {} subfolder(s): {}",
+                        listing.skipped.len(),
+                        listing.skipped.join(", ")
+                    )));
+                }
+                state.drive_files.set(listing.files);
+            }
+            Err(e) => state
+                .drive_error
+                .set(Some(format!("Drive list failed: {}", js_err(&e)))),
+        }
+    });
+}
+
+#[component]
+fn DrivePanel(state: AppState) -> impl IntoView {
+    let do_sign_in = move |_| {
+        spawn_local(async move {
+            state.busy.set(Some("Signing in to Google…".into()));
+            state.drive_error.set(None);
+            match drive::sign_in().await {
+                Ok(token) => {
+                    state.drive_token.set(Some(Rc::new(token)));
+                    drive_refresh(state);
+                }
+                Err(e) => state.drive_error.set(Some(js_err(&e))),
+            }
+            state.busy.set(None);
+        });
+    };
+    let do_pick_folder = move |_| {
+        spawn_local(async move {
+            let Some(token) = state.drive_token.get_untracked() else {
+                return;
+            };
+            state.drive_error.set(None);
+            match drive::pick_folder(&token).await {
+                Ok(Some((id, name))) => {
+                    drive::save_folder(&id, &name);
+                    state.drive_folder.set(Some((id, name)));
+                    drive_refresh(state);
+                }
+                Ok(None) => {}
+                Err(e) => state
+                    .drive_error
+                    .set(Some(format!("Folder pick failed: {}", js_err(&e)))),
+            }
+        });
+    };
+    let do_sign_out = move |_| {
+        state.drive_token.set(None);
+        state.drive_files.set(Vec::new());
+        state.drive_error.set(None);
+    };
+    let import_file = move |f: drive::DriveFile| {
+        if !f.importable() {
+            return;
+        }
+        spawn_local(async move {
+            let Some(token) = state.drive_token.get_untracked() else {
+                return;
+            };
+            state.busy.set(Some(format!("Downloading {} from Drive…", f.name)));
+            state.drive_error.set(None);
+            match drive::download_file(&token, &f.id).await {
+                Ok(bytes) => {
+                    state.busy.set(None);
+                    ingest_drive_bytes(state, f.id, f.name, bytes);
+                }
+                Err(e) => {
+                    state.busy.set(None);
+                    state
+                        .drive_error
+                        .set(Some(format!("Drive download failed: {}", js_err(&e))));
+                }
+            }
+        });
+    };
+
+    view! {
+        <div class="panel drive-panel">
+            <button
+                class="drive-head"
+                on:click=move |_| state.drive_open.update(|o| *o = !*o)
+            >
+                <span>{move || if state.drive_open.get() { "▾" } else { "▸" }} " Google Drive"</span>
+                <span class="dim">{move || {
+                    state.drive_folder.with(|f| {
+                        f.as_ref().map(|(_, n)| n.clone()).unwrap_or_default()
+                    })
+                }}</span>
+            </button>
+            <Show when=move || state.drive_open.get() fallback=|| ()>
+                {move || {
+                    if !drive::configured() {
+                        view! {
+                            <p class="dim">"Drive isn’t configured in this build yet."</p>
+                        }
+                        .into_view()
+                    } else if state.drive_token.with(|t| t.is_none()) {
+                        view! {
+                            <button class="btn primary" on:click=do_sign_in>
+                                "Sign in with Google"
+                            </button>
+                        }
+                        .into_view()
+                    } else {
+                        view! {
+                            <div class="chips">
+                                <button class="chip" on:click=do_pick_folder>
+                                    {move || {
+                                        if state.drive_folder.with(|f| f.is_some()) {
+                                            "Change folder"
+                                        } else {
+                                            "Choose folder"
+                                        }
+                                    }}
+                                </button>
+                                <Show
+                                    when=move || state.drive_folder.with(|f| f.is_some())
+                                    fallback=|| ()
+                                >
+                                    <button class="chip" on:click=move |_| drive_refresh(state)>
+                                        "↻ Refresh"
+                                    </button>
+                                </Show>
+                                <button class="chip" on:click=do_sign_out>"Sign out"</button>
+                            </div>
+                            <div class="drive-files">
+                                <For
+                                    each=move || state.drive_files.get()
+                                    key=|f: &drive::DriveFile| f.id.clone()
+                                    children=move |f: drive::DriveFile| {
+                                        let importable = f.importable();
+                                        let f2 = f.clone();
+                                        view! {
+                                            <div
+                                                class="drive-file"
+                                                class:disabled=!importable
+                                                title=format!("{}{}", f.path, f.name)
+                                                on:click=move |_| import_file(f2.clone())
+                                            >
+                                                {match &f.thumb {
+                                                    Some(t) => view! {
+                                                        <img src=t.clone()/>
+                                                    }
+                                                    .into_view(),
+                                                    None => view! { <span class="drive-icon">"🖼"</span> }
+                                                        .into_view(),
+                                                }}
+                                                <span class="drive-name">
+                                                    {if f.path.is_empty() {
+                                                        f.name.clone()
+                                                    } else {
+                                                        format!("{}{}", f.path, f.name)
+                                                    }}
+                                                </span>
+                                            </div>
+                                        }
+                                    }
+                                />
+                            </div>
+                        }
+                        .into_view()
+                    }
+                }}
+                {move || {
+                    state.drive_error.with(|e| {
+                        e.clone().map(|msg| {
+                            view! { <p class="dim drive-error">{msg}</p> }
+                        })
+                    })
+                }}
+            </Show>
+        </div>
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
-enum Tab {
-    Crop,
+enum Tab {    Crop,
     Rotate,
     Color,
     Select,
@@ -3661,6 +3995,21 @@ fn ExportTab(state: AppState) -> impl IntoView {
             }
         }>"Download this"</button>
         <Show when=is_photo fallback=|| ()>
+            <Show
+                when=move || {
+                    state.drive_token.with(|t| t.is_some())
+                        && state.drive_folder.with(|f| f.is_some())
+                }
+                fallback=|| ()
+            >
+                <button class="btn" on:click=move |_| {
+                    if let Some(item) = state.current() {
+                        if item.kind == MediaKind::Photo {
+                            save_photo_to_drive(state, item);
+                        }
+                    }
+                }>"Save to Drive"</button>
+            </Show>
             <label class="row" style="justify-content:flex-start;gap:0.5rem">
                 "Format"
                 <select
