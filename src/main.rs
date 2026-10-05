@@ -619,6 +619,34 @@ fn crop_px(edit: &EditParams, w: usize, h: usize) -> (usize, usize, usize, usize
     (x, y, cw, ch)
 }
 
+/// iPhone-style crop zoom: scale the crop rect about a fixed screen point
+/// (pinch centroid / cursor), then translate by the centroid's movement.
+/// Zooming in shrinks the crop rect — the photo appears to enlarge inside
+/// the frame. `ratio` locks the rect's on-image aspect when set.
+fn zoom_crop(
+    orig: state::CropRect,
+    zoom_from: (f32, f32),
+    pan: (f32, f32),
+    scale: f32,
+    ratio: Option<f32>,
+    img_aspect: f32,
+) -> state::CropRect {
+    let scale = scale.clamp(0.1, 16.0);
+    let (w, h) = match ratio {
+        Some(r) => {
+            let w = (orig.w / scale).clamp(0.02, 1.0f32.min(r / img_aspect));
+            (w, w * img_aspect / r)
+        }
+        None => (
+            (orig.w / scale).clamp(0.02, 1.0),
+            (orig.h / scale).clamp(0.02, 1.0),
+        ),
+    };
+    let x = (zoom_from.0 - (zoom_from.0 - orig.x) * (w / orig.w) + pan.0).clamp(0.0, 1.0 - w);
+    let y = (zoom_from.1 - (zoom_from.1 - orig.y) * (h / orig.h) + pan.1).clamp(0.0, 1.0 - h);
+    state::CropRect { x, y, w, h }
+}
+
 /// Render a photo through the full edit pipeline into an encoded blob.
 /// Returns (blob, mime, filename).
 async fn render_photo_export(
@@ -1178,6 +1206,8 @@ fn DrivePanel(state: AppState) -> impl IntoView {
                                     children=move |f: drive::DriveFile| {
                                         let importable = f.importable();
                                         let f2 = f.clone();
+                                        let thumb_broken = create_rw_signal(false);
+                                        let thumb_src = drive::thumb_url(&f.id);
                                         view! {
                                             <div
                                                 class="drive-file"
@@ -1185,14 +1215,24 @@ fn DrivePanel(state: AppState) -> impl IntoView {
                                                 title=format!("{}{}", f.path, f.name)
                                                 on:click=move |_| import_file(f2.clone())
                                             >
-                                                {match &f.thumb {
-                                                    Some(t) => view! {
-                                                        <img src=t.clone()/>
+                                                {move || {
+                                                    if thumb_broken.get() {
+                                                        view! { <span class="drive-icon">"🖼"</span> }
+                                                            .into_view()
+                                                    } else {
+                                                        view! {
+                                                            <img
+                                                                src=thumb_src.clone()
+                                                                loading="lazy"
+                                                                on:error=move |_| thumb_broken.set(true)
+                                                            />
+                                                        }
+                                                        .into_view()
                                                     }
-                                                    .into_view(),
-                                                    None => view! { <span class="drive-icon">"🖼"</span> }
-                                                        .into_view(),
                                                 }}
+                                                {f.edited.then(|| {
+                                                    view! { <span class="drive-badge">"Edited"</span> }
+                                                })}
                                                 <span class="drive-name">
                                                     {if f.path.is_empty() {
                                                         f.name.clone()
@@ -1579,6 +1619,14 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     // remounts the overlay — a drag signal created inside it would be
     // disposed mid-gesture, killing the drag after one pointermove.
     let crop_drag = create_rw_signal(None::<(u8, f32, f32, state::CropRect)>);
+    // Pinch-zoom state for the crop tab: live pointer positions plus the
+    // crop rect / centroid / spread captured when the second finger lands.
+    let crop_pinch = create_rw_signal(
+        None::<(
+            Vec<(i32, f32, f32)>,
+            Option<(state::CropRect, (f32, f32), f32)>,
+        )>,
+    );
 
     // --- clone stamp stroke ----------------------------------------------------
     window_event_listener(leptos::ev::pointermove, move |ev| {
@@ -2047,7 +2095,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     >
                         <canvas node_ref=canvas_ref></canvas>
                         <Show when=move || tab.get() == Tab::Crop fallback=|| ()>
-                            <CropOverlay state=state working=working drag=crop_drag/>
+                            <CropOverlay state=state working=working drag=crop_drag pinch=crop_pinch/>
                         </Show>
                         <SelectedTextOverlay state=state tab=tab layer_drag=layer_drag/>
                     </div>
@@ -2120,6 +2168,12 @@ fn CropOverlay(
     state: AppState,
     working: RwSignal<(usize, usize)>,
     drag: RwSignal<Option<(u8, f32, f32, state::CropRect)>>,
+    pinch: RwSignal<
+        Option<(
+            Vec<(i32, f32, f32)>,
+            Option<(state::CropRect, (f32, f32), f32)>,
+        )>,
+    >,
 ) -> impl IntoView {
 
     let norm_pos = |ev: &web_sys::PointerEvent| -> Option<(f32, f32)> {
@@ -2130,17 +2184,81 @@ fn CropOverlay(
         Some((nx, ny))
     };
 
+    // Register every finger that lands anywhere on the overlay; when the
+    // second one lands, snapshot the crop and switch from drag to pinch.
+    let register = move |ev: &web_sys::PointerEvent| {
+        let Some((nx, ny)) = norm_pos(ev) else { return };
+        pinch.update(|p| {
+            let (pts, snap) = p.get_or_insert_with(|| (Vec::new(), None));
+            let id = ev.pointer_id();
+            if !pts.iter().any(|(pid, _, _)| *pid == id) {
+                pts.push((id, nx, ny));
+            }
+            if pts.len() == 2 {
+                if let Some(item) = state.current() {
+                    let (a, b) = (pts[0], pts[1]);
+                    let mid = ((a.1 + b.1) / 2.0, (a.2 + b.2) / 2.0);
+                    let spread = ((a.1 - b.1).powi(2) + (a.2 - b.2).powi(2)).sqrt();
+                    *snap = Some((item.edit.crop, mid, spread));
+                    drag.set(None);
+                }
+            }
+        });
+    };
+
     let start = move |ev: web_sys::PointerEvent, handle: u8| {
         ev.prevent_default();
         // Corner handles sit inside .crop-rect, which has its own pointerdown
         // (move). Without this the press bubbles up and overwrites the drag.
         ev.stop_propagation();
+        register(&ev);
         let Some(item) = state.current() else { return };
         let Some((nx, ny)) = norm_pos(&ev) else { return };
         drag.set(Some((handle, nx, ny, item.edit.crop)));
     };
 
     let pm = window_event_listener(leptos::ev::pointermove, move |ev| {
+        // Pinch takes priority over the single-finger drag handlers.
+        let pinch_active = pinch
+            .try_get()
+            .flatten()
+            .map(|(_, s)| s.is_some())
+            .unwrap_or(false);
+        if pinch_active {
+            pinch.update(|p| {
+                let Some((pts, snap)) = p else { return };
+                for pt in pts.iter_mut() {
+                    if pt.0 == ev.pointer_id() {
+                        if let Some((nx, ny)) = norm_pos(&ev) {
+                            pt.1 = nx;
+                            pt.2 = ny;
+                        }
+                    }
+                }
+                let Some(((orig, mid0, d0), (a, b))) =
+                    snap.clone().zip(pts.first().copied().zip(pts.get(1).copied()))
+                else {
+                    return;
+                };
+                let mid = ((a.1 + b.1) / 2.0, (a.2 + b.2) / 2.0);
+                let spread = ((a.1 - b.1).powi(2) + (a.2 - b.2).powi(2)).sqrt();
+                if d0 <= f32::EPSILON {
+                    return;
+                }
+                let Some(item) = state.current() else { return };
+                let Some((ww, wh)) = working.try_get() else { return };
+                let c = zoom_crop(
+                    orig,
+                    mid0,
+                    (mid.0 - mid0.0, mid.1 - mid0.1),
+                    spread / d0,
+                    item.edit.aspect.ratio().map(|(rw, rh)| rw / rh),
+                    ww as f32 / wh as f32,
+                );
+                state.update_current(|e| e.crop = c);
+            });
+            return;
+        }
         // Signals are disposed when the Crop tab unmounts, but this window
         // listener outlives them — bail out instead of touching dead signals.
         let Some(Some((handle, sx, sy, orig))) = drag.try_get() else { return };
@@ -2192,8 +2310,34 @@ fn CropOverlay(
         state.update_current(|e| e.crop = c);
     });
 
-    let pu = window_event_listener(leptos::ev::pointerup, move |_| {
+    let pu = window_event_listener(leptos::ev::pointerup, move |ev| {
         let _ = drag.try_set(None);
+        pinch.update(|p| {
+            if let Some((pts, snap)) = p {
+                pts.retain(|(pid, _, _)| *pid != ev.pointer_id());
+                if pts.len() < 2 {
+                    *snap = None;
+                }
+                if pts.is_empty() {
+                    *p = None;
+                }
+            }
+        });
+    });
+
+    let pc = window_event_listener(leptos::ev::pointercancel, move |ev| {
+        let _ = drag.try_set(None);
+        pinch.update(|p| {
+            if let Some((pts, snap)) = p {
+                pts.retain(|(pid, _, _)| *pid != ev.pointer_id());
+                if pts.len() < 2 {
+                    *snap = None;
+                }
+                if pts.is_empty() {
+                    *p = None;
+                }
+            }
+        });
     });
 
     // window_event_listener has no Drop — without this, every CropOverlay
@@ -2202,6 +2346,54 @@ fn CropOverlay(
     on_cleanup(move || {
         pm.remove();
         pu.remove();
+        pc.remove();
+    });
+
+    // Leptos' delegated on:wheel is registered passive, so prevent_default
+    // (to keep the page from scrolling while zooming the crop) is rejected.
+    // Attach a native non-passive listener instead; filter to events whose
+    // target is inside the crop overlay.
+    let wheel_zoom = Closure::wrap(Box::new(move |ev: web_sys::WheelEvent| {
+        let inside = ev
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+            .and_then(|el| el.closest(".crop-overlay").ok().flatten())
+            .is_some();
+        if !inside {
+            return;
+        }
+        ev.prevent_default();
+        let Some(item) = state.current() else { return };
+        let Some((ww, wh)) = working.try_get() else { return };
+        let el = web::document().query_selector(".canvas-wrap").ok().flatten();
+        let Some(el) = el else { return };
+        let rect = el.get_bounding_client_rect();
+        let nx = ((ev.client_x() as f32 - rect.left() as f32) / rect.width() as f32).clamp(0.0, 1.0);
+        let ny = ((ev.client_y() as f32 - rect.top() as f32) / rect.height() as f32).clamp(0.0, 1.0);
+        let scale = if ev.delta_y() < 0.0 { 1.12 } else { 1.0 / 1.12 };
+        let c = zoom_crop(
+            item.edit.crop,
+            (nx, ny),
+            (0.0, 0.0),
+            scale,
+            item.edit.aspect.ratio().map(|(rw, rh)| rw / rh),
+            ww as f32 / wh as f32,
+        );
+        state.update_current(|e| e.crop = c);
+    }) as Box<dyn FnMut(_)>);
+    let wheel_opts = web_sys::AddEventListenerOptions::new();
+    wheel_opts.set_passive(false);
+    web::window()
+        .add_event_listener_with_callback_and_add_event_listener_options(
+            "wheel",
+            wheel_zoom.as_ref().unchecked_ref(),
+            &wheel_opts,
+        )
+        .ok();
+    on_cleanup(move || {
+        web::window()
+            .remove_event_listener_with_callback("wheel", wheel_zoom.as_ref().unchecked_ref())
+            .ok();
     });
 
     view! {
@@ -2212,7 +2404,13 @@ fn CropOverlay(
             let c = item.edit.crop;
             let pct = |v: f32| format!("{}%", v * 100.0);
             view! {
-                <div class="crop-overlay">
+                <div
+                    class="crop-overlay"
+                    on:pointerdown=move |ev| {
+                        ev.prevent_default();
+                        register(&ev);
+                    }
+                >
                     <div
                         class="crop-rect"
                         style:left=pct(c.x)

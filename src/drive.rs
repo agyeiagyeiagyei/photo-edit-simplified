@@ -37,8 +37,16 @@ pub struct DriveFile {
     pub path: String,
     /// Id of the containing folder — used to place save-as-copy fallbacks.
     pub parent: String,
-    /// Object URL for the Drive thumbnail (fetched with the access token).
-    pub thumb: Option<String>,
+    /// True when the file was written by this app (appProperties marker set
+    /// on upload) — shown as an "Edited" badge in the folder view.
+    pub edited: bool,
+}
+
+/// Thumbnail URL usable directly in an <img> tag. Drive's thumbnailLink is
+/// CORS-blocked for browser apps; this endpoint renders via the user's
+/// Google session instead.
+pub fn thumb_url(file_id: &str) -> String {
+    format!("https://drive.google.com/thumbnail?id={file_id}&sz=w400")
 }
 
 /// Result of a recursive folder listing.
@@ -186,7 +194,7 @@ fn walk_folder<'a>(
         loop {
             let mut url = format!(
                 "https://www.googleapis.com/drive/v3/files?q={}\
-                 &fields=nextPageToken,files(id,name,mimeType,size,thumbnailLink)\
+                 &fields=nextPageToken,files(id,name,mimeType,size,appProperties)\
                  &orderBy=modifiedTime%20desc&pageSize=200\
                  &supportsAllDrives=true&includeItemsFromAllDrives=true",
                 js_sys::encode_uri_component(&q)
@@ -214,29 +222,19 @@ fn walk_folder<'a>(
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(0)
                     / 1024;
-                let file = DriveFile {
+                let edited = Reflect::get(&f, &JsValue::from_str("appProperties"))
+                    .ok()
+                    .and_then(|p| js_str(&p, "pes_edited"))
+                    .as_deref()
+                    == Some("1");
+                out.files.push(DriveFile {
                     id,
                     name,
                     mime,
                     size_kb,
                     path: path.clone(),
                     parent: folder_id.to_string(),
-                    thumb: None,
-                };
-                // Thumbnails need the auth header, so fetch them into object
-                // URLs — but only for files the user can actually import, to
-                // bound the request fan-out on large trees.
-                let thumb = if file.importable() {
-                    match js_str(&f, "thumbnailLink") {
-                        Some(t) => fetch_thumb(token, &t).await,
-                        None => None,
-                    }
-                } else {
-                    None
-                };
-                out.files.push(DriveFile {
-                    thumb,
-                    ..file
+                    edited,
                 });
             }
             page_token = js_str(&json, "nextPageToken");
@@ -260,13 +258,6 @@ fn walk_folder<'a>(
         }
         Ok(())
     })
-}
-
-/// Fetch a Drive thumbnail (auth header required) into an object URL.
-async fn fetch_thumb(token: &str, url: &str) -> Option<String> {
-    let resp = drive_fetch(url, token, "GET", None, None).await.ok()?;
-    let b = JsFuture::from(resp.blob().ok()?).await.ok()?;
-    web_sys::Url::create_object_url_with_blob(&b.unchecked_into::<web_sys::Blob>()).ok()
 }
 
 /// Download a file's bytes.
@@ -296,9 +287,12 @@ pub async fn upload_file(
 ) -> Result<String, JsValue> {
     let boundary = "pes_drive_boundary";
     let meta = match existing_id {
-        Some(_) => format!("{{\"name\":\"{}\"}}", json_escape(name)),
+        Some(_) => format!(
+            "{{\"name\":\"{}\",\"appProperties\":{{\"pes_edited\":\"1\"}}}}",
+            json_escape(name)
+        ),
         None => format!(
-            "{{\"name\":\"{}\",\"parents\":[\"{}\"]}}",
+            "{{\"name\":\"{}\",\"parents\":[\"{}\"],\"appProperties\":{{\"pes_edited\":\"1\"}}}}",
             json_escape(name),
             json_escape(folder_id)
         ),

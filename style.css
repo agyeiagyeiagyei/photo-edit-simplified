@@ -110,7 +110,7 @@ h1 { font-size: 17px; font-weight: 600; }
 /* Cropped view: clip layer overlays that fall outside the crop region. */
 .canvas-wrap.cropped { overflow: hidden; border-radius: 10px; }
 
-.crop-overlay { position: absolute; inset: 0; }
+.crop-overlay { position: absolute; inset: 0; touch-action: none; }
 
 .crop-rect {
   position: absolute;
@@ -473,9 +473,22 @@ button:disabled {
   border-radius: 8px;
   padding: 6px;
   overflow: hidden;
+  position: relative;
 }
 .drive-file.disabled { opacity: 0.4; cursor: default; }
 .drive-file img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 6px; }
+.drive-badge {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 4px;
+  pointer-events: none;
+}
 .drive-icon { font-size: 28px; line-height: 1.4; }
 .drive-name {
   font-size: 11px;
