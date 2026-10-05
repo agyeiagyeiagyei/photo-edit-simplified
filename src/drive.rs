@@ -15,7 +15,8 @@ pub const CLIENT_ID: &str =
 pub const API_KEY: &str = "AIzaSyBK8OUW6AML5pcSQ6UQSRqj0UM0-IgjQL8";
 /// Google Cloud project number (Picker setAppId).
 pub const APP_ID: &str = "520957027706";
-pub const SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
+pub const SCOPE: &str = "https://www.googleapis.com/auth/drive.readonly \
+                         https://www.googleapis.com/auth/drive.file";
 
 pub fn configured() -> bool {
     !CLIENT_ID.starts_with("REPLACE_ME")
@@ -34,6 +35,8 @@ pub struct DriveFile {
     /// Subfolder path relative to the granted folder, e.g. "trip/iceland/"
     /// ("" for files at the root of the granted folder).
     pub path: String,
+    /// Id of the containing folder — used to place save-as-copy fallbacks.
+    pub parent: String,
     /// Object URL for the Drive thumbnail (fetched with the access token).
     pub thumb: Option<String>,
 }
@@ -217,6 +220,7 @@ fn walk_folder<'a>(
                     mime,
                     size_kb,
                     path: path.clone(),
+                    parent: folder_id.to_string(),
                     thumb: None,
                 };
                 // Thumbnails need the auth header, so fetch them into object

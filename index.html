@@ -141,13 +141,27 @@
       await _gapiP;
       await new Promise((res) => gapi.load('picker', res));
       return await new Promise((resolve) => {
-        const view = new google.picker.DocsView(google.picker.ViewId.FOLDERS)
-          .setSelectFolderEnabled(true);
+        const mine = new google.picker.DocsView(google.picker.ViewId.FOLDERS)
+          .setSelectFolderEnabled(true)
+          .setIncludeFolders(true);
+        const sharedDrives = new google.picker.DocsView(google.picker.ViewId.FOLDERS)
+          .setSelectFolderEnabled(true)
+          .setIncludeFolders(true)
+          .setEnableDrives(true)
+          .setLabel('Shared drives');
+        const sharedWithMe = new google.picker.DocsView(google.picker.ViewId.DOCS)
+          .setOwnedByMe(false)
+          .setSelectFolderEnabled(true)
+          .setIncludeFolders(true)
+          .setLabel('Shared with me');
         const picker = new google.picker.PickerBuilder()
           .setAppId(appId)
           .setOAuthToken(token)
           .setDeveloperKey(apiKey)
-          .addView(view)
+          .addView(mine)
+          .addView(sharedDrives)
+          .addView(sharedWithMe)
+          .enableFeature(google.picker.Feature.SUPPORT_DRIVES)
           .setCallback((data) => {
             if (data.action === google.picker.Action.PICKED) {
               const doc = data.docs[0];

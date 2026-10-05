@@ -105,6 +105,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                         next_layer_id: 0,
                         exif: None,
                         drive_file_id: None,
+                        drive_parent_id: None,
                     });
                 } else {
                     web::log("video probe failed");
@@ -144,6 +145,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                     next_layer_id: 0,
                     exif,
                     drive_file_id: None,
+                    drive_parent_id: None,
                 });
             } else {
                 state.busy.set(Some(format!("Loading {name}…")));
@@ -200,6 +202,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                     next_layer_id: 0,
                     exif,
                     drive_file_id: None,
+                    drive_parent_id: None,
                 });
             }
             state.busy.set(None);
@@ -218,7 +221,13 @@ fn push_item(state: AppState, item: MediaItem) {
 }
 
 /// Import a photo/RAW already downloaded from Drive as raw bytes.
-fn ingest_drive_bytes(state: AppState, drive_file_id: String, name: String, bytes: Vec<u8>) {
+fn ingest_drive_bytes(
+    state: AppState,
+    drive_file_id: String,
+    drive_parent_id: String,
+    name: String,
+    bytes: Vec<u8>,
+) {
     spawn_local(async move {
         let id = state.next_id.get_untracked();
         state.next_id.set(id + 1);
@@ -253,6 +262,7 @@ fn ingest_drive_bytes(state: AppState, drive_file_id: String, name: String, byte
                 next_layer_id: 0,
                 exif,
                 drive_file_id: Some(drive_file_id),
+                drive_parent_id: Some(drive_parent_id),
             });
         } else {
             let lname = name.to_lowercase();
@@ -291,6 +301,7 @@ fn ingest_drive_bytes(state: AppState, drive_file_id: String, name: String, byte
                 next_layer_id: 0,
                 exif,
                 drive_file_id: Some(drive_file_id),
+                drive_parent_id: Some(drive_parent_id),
             });
         }
         state.busy.set(None);
@@ -728,7 +739,7 @@ fn save_photo_to_drive(state: AppState, item: MediaItem) {
         };
         let result = async {
             let bytes = web::blob_to_bytes(&blob).await?;
-            drive::upload_file(
+            let first = drive::upload_file(
                 &token,
                 &folder_id,
                 item.drive_file_id.as_deref(),
@@ -736,12 +747,27 @@ fn save_photo_to_drive(state: AppState, item: MediaItem) {
                 mime,
                 &bytes,
             )
-            .await
+            .await;
+            match first {
+                Ok(fid) => Ok(fid),
+                // Overwrite-in-place needs write access; drive.file grants that
+                // only for app-created/picked files, so a readonly-imported
+                // original rejects PATCH. Fall back to a new copy beside it.
+                Err(e) => match item.drive_parent_id.as_deref() {
+                    Some(parent) => {
+                        drive::upload_file(&token, parent, None, &filename, mime, &bytes).await
+                    }
+                    None => Err(e),
+                },
+            }
         }
         .await;
         match result {
             Ok(fid) => {
-                state.update_current_item(|m| m.drive_file_id = Some(fid));
+                state.update_current_item(|m| {
+                    m.drive_file_id = Some(fid);
+                    m.drive_parent_id = None;
+                });
                 if let Ok(listing) = drive::list_files(&token, &folder_id).await {
                     state.drive_files.set(listing.files);
                 }
@@ -1084,7 +1110,7 @@ fn DrivePanel(state: AppState) -> impl IntoView {
             match drive::download_file(&token, &f.id).await {
                 Ok(bytes) => {
                     state.busy.set(None);
-                    ingest_drive_bytes(state, f.id, f.name, bytes);
+                    ingest_drive_bytes(state, f.id, f.parent, f.name, bytes);
                 }
                 Err(e) => {
                     state.busy.set(None);

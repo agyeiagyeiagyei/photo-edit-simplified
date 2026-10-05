@@ -487,6 +487,8 @@ pub struct MediaItem {
     pub exif: Option<std::rc::Rc<Vec<u8>>>,
     /// Drive file id when the item was imported from (or saved to) Drive.
     pub drive_file_id: Option<String>,
+    /// Id of the Drive folder containing the file, when imported from Drive.
+    pub drive_parent_id: Option<String>,
 }
 
 #[derive(Clone, Copy)]
