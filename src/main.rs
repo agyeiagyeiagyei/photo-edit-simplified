@@ -3349,6 +3349,13 @@ fn CropOverlay(
         if !inside {
             return;
         }
+        // Plain wheel is a scroll gesture — with the canvas filling the
+        // viewport it landed on the overlay constantly and hijacked the crop
+        // rect. Trackpad/touchscreen pinch arrives as ctrl+wheel; only zoom on
+        // that, and let plain wheel scroll the page.
+        if !ev.ctrl_key() {
+            return;
+        }
         ev.prevent_default();
         let Some(item) = state.current() else { return };
         let Some((ww, wh)) = working.try_get() else { return };
