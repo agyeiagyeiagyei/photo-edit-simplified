@@ -289,6 +289,38 @@ pub async fn download_file(token: &str, file_id: &str) -> Result<Vec<u8>, JsValu
     Ok(js_sys::Uint8Array::new(&buf).to_vec())
 }
 
+/// Fetch one file's metadata by id — resolves starred files that live outside
+/// the folder currently being browsed.
+pub async fn get_file(token: &str, file_id: &str) -> Result<DriveFile, JsValue> {
+    let url = format!(
+        "https://www.googleapis.com/drive/v3/files/{}\
+         ?fields=id,name,mimeType,size,modifiedTime,appProperties,parents\
+         &supportsAllDrives=true",
+        js_sys::encode_uri_component(file_id)
+    );
+    let resp = drive_fetch(&url, token, "GET", None, None).await?;
+    let json = JsFuture::from(resp.json()?).await?;
+    let id = js_str(&json, "id").ok_or_else(|| JsValue::from_str("bad file metadata"))?;
+    let name = js_str(&json, "name").unwrap_or_default();
+    let mime = js_str(&json, "mimeType").unwrap_or_default();
+    let size_kb = js_str(&json, "size")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
+        / 1024;
+    let modified = js_str(&json, "modifiedTime").unwrap_or_default();
+    let parent = Reflect::get(&json, &JsValue::from_str("parents"))
+        .ok()
+        .map(|p| Array::from(&p))
+        .and_then(|a| a.get(0).as_string())
+        .unwrap_or_default();
+    let edited = Reflect::get(&json, &JsValue::from_str("appProperties"))
+        .ok()
+        .and_then(|p| js_str(&p, "pes_edited"))
+        .as_deref()
+        == Some("1");
+    Ok(DriveFile { id, name, mime, size_kb, modified, parent, edited })
+}
+
 fn json_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }

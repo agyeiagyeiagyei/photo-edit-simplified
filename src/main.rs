@@ -1487,9 +1487,50 @@ fn DrivePanel(state: AppState) -> impl IntoView {
             .filter(|f| ids.contains(&f.id) && f.importable())
             .collect();
         state.drive_selected.set(Default::default());
+        state.drive_open.set(false);
         for f in files {
             download_import(state, f);
         }
+    };
+    // Import every starred file, including ones outside the current folder
+    // (resolved by id) and ones already in the filmstrip (imported again as
+    // duplicates, so an in-progress edit is never clobbered or skipped).
+    let import_starred = move |_| {
+        let ids = state.drive_shortlist.get_untracked();
+        if ids.is_empty() {
+            return;
+        }
+        state.drive_open.set(false);
+        let known = state.drive_files.get_untracked();
+        let mut missing: Vec<String> = Vec::new();
+        for f in known.iter().filter(|f| ids.contains(&f.id)) {
+            if f.importable() {
+                download_import(state, f.clone());
+            }
+        }
+        for id in ids.iter().filter(|id| !known.iter().any(|f| &f.id == *id)) {
+            missing.push(id.clone());
+        }
+        if missing.is_empty() {
+            return;
+        }
+        spawn_local(async move {
+            let Some(token) = state.drive_token.get_untracked() else {
+                return;
+            };
+            for id in missing {
+                match drive::get_file(&token, &id).await {
+                    Ok(f) => {
+                        if f.importable() {
+                            download_import(state, f);
+                        }
+                    }
+                    Err(e) => state
+                        .drive_error
+                        .set(Some(format!("Starred file lookup failed: {}", js_err(&e)))),
+                }
+            }
+        });
     };
 
     view! {
@@ -1625,6 +1666,16 @@ fn DrivePanel(state: AppState) -> impl IntoView {
                                         view! {
                                             <button class="btn primary" on:click=import_selected>
                                                 {format!("Import {n} selected")}
+                                            </button>
+                                        }
+                                    })
+                                }}
+                                {move || {
+                                    let n = state.drive_shortlist.with(|s| s.len());
+                                    (n > 0).then(|| {
+                                        view! {
+                                            <button class="btn" on:click=import_starred>
+                                                {format!("Import {n} starred")}
                                             </button>
                                         }
                                     })
@@ -1773,14 +1824,14 @@ fn DrivePanel(state: AppState) -> impl IntoView {
                         .into_view()
                     }
                 }}
-                {move || {
-                    state.drive_error.with(|e| {
-                        e.clone().map(|msg| {
-                            view! { <p class="dim drive-error">{msg}</p> }
-                        })
-                    })
-                }}
             </Show>
+            {move || {
+                state.drive_error.with(|e| {
+                    e.clone().map(|msg| {
+                        view! { <p class="dim drive-error">{msg}</p> }
+                    })
+                })
+            }}
         </div>
     }
 }
