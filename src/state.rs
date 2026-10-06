@@ -2,6 +2,7 @@
 
 use leptos::*;
 use leptos::batch;
+use std::rc::Rc;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum TextAlign {
@@ -237,7 +238,9 @@ pub enum LayerKind {
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct RasterLayer {
-    pub pixels: Vec<u8>,
+    /// Rc so cloning a MediaItem (every AppState::current read) is cheap;
+    /// pixels are immutable after layer creation.
+    pub pixels: Rc<Vec<u8>>,
     pub width: usize,
     pub height: usize,
     /// Center anchor in normalized canvas coords.
@@ -254,7 +257,8 @@ pub enum SelectionKind {
     Lasso(Vec<(f32, f32)>),
     /// Per-pixel mask (e.g. magic wand, ML segmentation) captured in the
     /// geometry-corrected pixel space it was created at; scaled on use.
-    Mask { data: Vec<u8>, width: usize, height: usize },
+    /// Rc for the same clone-cost reason as RasterLayer.pixels.
+    Mask { data: Rc<Vec<u8>>, width: usize, height: usize },
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -305,7 +309,7 @@ impl Layer {
             id,
             visible: true,
             opacity: 1.0,
-            kind: LayerKind::Raster(RasterLayer { pixels, width, height, x: 0.5, y: 0.5, scale: 1.0 }),
+            kind: LayerKind::Raster(RasterLayer { pixels: Rc::new(pixels), width, height, x: 0.5, y: 0.5, scale: 1.0 }),
         }
     }
 
@@ -477,6 +481,9 @@ pub struct MediaItem {
     pub name: String,
     /// Object URL for the source blob (photo preview / video element).
     pub object_url: String,
+    /// Small (<=256px) thumbnail blob URL for the filmstrip, so tiles don't
+    /// decode the full-resolution source.
+    pub thumb_url: String,
     /// Full-res RGBA for photos (loaded lazily).
     pub width: usize,
     pub height: usize,

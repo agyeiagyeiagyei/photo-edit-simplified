@@ -56,17 +56,19 @@ fn get_photo(id: usize) -> Option<Rc<PhotoData>> {
     CACHE.with(|c| c.borrow().photos.get(&id).cloned())
 }
 
-/// Drop an item from the filmstrip: revoke its object URL and free its
+/// Drop an item from the filmstrip: revoke its object URLs and free its
 /// cached pixels/video blob.
 fn remove_item(state: AppState, item_id: usize) {
-    let mut removed_url = None;
+    let mut removed = None;
     state.items.update(|v| {
         if let Some(pos) = v.iter().position(|m| m.id == item_id) {
-            removed_url = Some(v.remove(pos).object_url);
+            let m = v.remove(pos);
+            removed = Some((m.object_url, m.thumb_url));
         }
     });
-    if let Some(url) = removed_url {
+    if let Some((url, thumb)) = removed {
         let _ = Url::revoke_object_url(&url);
+        let _ = Url::revoke_object_url(&thumb);
     }
     CACHE.with(|c| {
         let mut c = c.borrow_mut();
@@ -124,7 +126,8 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                         id,
                         kind: MediaKind::Video,
                         name,
-                        object_url: url,
+                        object_url: url.clone(),
+                        thumb_url: url,
                         width: w as usize,
                         height: h as usize,
                         edit: EditParams::default(),
@@ -153,7 +156,13 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                 let (pp, pw, ph) = downscale_pixels(&full_rgba, fw, fh, 1024);
                 let canvas = web::create_canvas(pw as u32, ph as u32);
                 web::put_pixels(&canvas, &pp, pw as u32, ph as u32);
-                let url = canvas.to_data_url().unwrap_or_default();
+                // Blob URL, not a data URL: a 1024px base64 PNG is multi-MB and
+                // was deep-cloned on every state read.
+                let url = match web::canvas_to_blob(&canvas, "image/png").await {
+                    Ok(b) => Url::create_object_url_with_blob(&b).unwrap_or_default(),
+                    Err(_) => String::new(),
+                };
+                let thumb_url = thumb_object_url(&pp, pw, ph).await;
                 CACHE.with(|c| {
                     c.borrow_mut().photos.insert(
                         id,
@@ -165,6 +174,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                     kind: MediaKind::Photo,
                     name,
                     object_url: url,
+                    thumb_url,
                     width: fw,
                     height: fh,
                     edit: EditParams::default(),
@@ -214,6 +224,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                 let full = web::rgba_from_image(&img);
                 let (fw, fh) = (full.1, full.2);
                 let preview = downscale(&img, 1024);
+                let thumb_url = thumb_object_url(&preview.0, preview.1, preview.2).await;
                 CACHE.with(|c| {
                     c.borrow_mut().photos.insert(id, Rc::new(PhotoData { full, preview, gen: 0 }))
                 });
@@ -222,6 +233,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                     kind: MediaKind::Photo,
                     name,
                     object_url: url,
+                    thumb_url,
                     width: fw,
                     height: fh,
                     edit: EditParams::default(),
@@ -270,7 +282,11 @@ fn ingest_drive_bytes(
             let (pp, pw, ph) = downscale_pixels(&full_rgba, fw, fh, 1024);
             let canvas = web::create_canvas(pw as u32, ph as u32);
             web::put_pixels(&canvas, &pp, pw as u32, ph as u32);
-            let url = canvas.to_data_url().unwrap_or_default();
+            let url = match web::canvas_to_blob(&canvas, "image/png").await {
+                Ok(b) => Url::create_object_url_with_blob(&b).unwrap_or_default(),
+                Err(_) => String::new(),
+            };
+            let thumb_url = thumb_object_url(&pp, pw, ph).await;
             CACHE.with(|c| {
                 c.borrow_mut().photos.insert(
                     id,
@@ -282,6 +298,7 @@ fn ingest_drive_bytes(
                 kind: MediaKind::Photo,
                 name,
                 object_url: url,
+                thumb_url,
                 width: fw,
                 height: fh,
                 edit: EditParams::default(),
@@ -313,6 +330,7 @@ fn ingest_drive_bytes(
             let full = web::rgba_from_image(&img);
             let (fw, fh) = (full.1, full.2);
             let preview = downscale(&img, 1024);
+            let thumb_url = thumb_object_url(&preview.0, preview.1, preview.2).await;
             CACHE.with(|c| {
                 c.borrow_mut().photos.insert(id, Rc::new(PhotoData { full, preview, gen: 0 }))
             });
@@ -321,6 +339,7 @@ fn ingest_drive_bytes(
                 kind: MediaKind::Photo,
                 name,
                 object_url: url,
+                thumb_url,
                 width: fw,
                 height: fh,
                 edit: EditParams::default(),
@@ -1364,7 +1383,7 @@ fn FilmStrip(state: AppState) -> impl IntoView {
                             class:selected=move || state.selected.get() == Some(m.id)
                             on:click=move |_| state.selected.set(Some(m.id))
                         >
-                            <img src=m.object_url.clone()/>
+                            <img src=m.thumb_url.clone()/>
                             <span class="badge">{badge}</span>
                         </div>
                     }
@@ -3476,6 +3495,17 @@ fn CropTab(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     }
 }
 
+/// 256px JPEG thumbnail blob URL from a pixel buffer, for filmstrip tiles.
+async fn thumb_object_url(pixels: &[u8], w: usize, h: usize) -> String {
+    let (tp, tw, th) = downscale_pixels(pixels, w, h, 256);
+    let canvas = web::create_canvas(tw as u32, th as u32);
+    web::put_pixels(&canvas, &tp, tw as u32, th as u32);
+    match web::canvas_to_jpeg_blob(&canvas, 0.85).await {
+        Ok(b) => Url::create_object_url_with_blob(&b).unwrap_or_default(),
+        Err(_) => String::new(),
+    }
+}
+
 fn downscale_pixels(pixels: &[u8], w: usize, h: usize, long_edge: u32) -> (Vec<u8>, usize, usize) {
     let scale = (long_edge as f32 / w.max(h) as f32).min(1.0);
     let pw = (w as f32 * scale).max(1.0) as u32;
@@ -3758,7 +3788,7 @@ fn wand_select(state: AppState, nx: f32, ny: f32) {
     state.update_current(|e| {
         e.selection = if count > 0 {
             Some(state::Selection {
-                kind: state::SelectionKind::Mask { data: mask, width: w, height: h },
+                kind: state::SelectionKind::Mask { data: Rc::new(mask), width: w, height: h },
                 feather: 0.0,
             })
         } else {
