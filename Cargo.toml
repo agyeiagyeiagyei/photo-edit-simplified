@@ -34,6 +34,7 @@ uuid = { version = "1", features = ["js"] }
 getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [profile.release]
-opt-level = 2
+opt-level = 3
 lto = true
 codegen-units = 1
+panic = "abort"

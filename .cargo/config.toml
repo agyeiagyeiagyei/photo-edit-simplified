@@ -1,0 +1,4 @@
+# wasm SIMD is supported in every desktop browser since 2021; the per-pixel
+# loops in adjust/levels/blur autovectorize onto it.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]
