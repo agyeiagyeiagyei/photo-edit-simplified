@@ -625,3 +625,4 @@ button:disabled {
   white-space: nowrap;
 }
 .loupe-star.on { color: #f5c542; border-color: #f5c542; }
+.loupe-preload { display: none; }

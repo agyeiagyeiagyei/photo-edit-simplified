@@ -1314,6 +1314,27 @@ fn drive_hover_style(x: f64, y: f64) -> String {
 #[component]
 fn DriveLoupe(state: AppState) -> impl IntoView {
     let close = move |_| state.drive_loupe.set(None);
+    // Remember viewed files so their large thumbnails stay warm, and keep
+    // hidden <img> elements mounted for them plus the current neighbors —
+    // the thumbnail endpoint is cross-origin, so this is the only caching
+    // available to us. Cap the pool so a long session doesn't hoard memory.
+    create_effect(move |_| {
+        if let Some(idx) = state.drive_loupe.get() {
+            let files = visible_drive_files(state);
+            if let Some(f) = files.get(idx.min(files.len().saturating_sub(1))) {
+                let id = f.id.clone();
+                state.drive_loupe_seen.update(|v| {
+                    if let Some(pos) = v.iter().position(|x| *x == id) {
+                        v.remove(pos);
+                    }
+                    v.push(id);
+                    while v.len() > 12 {
+                        v.remove(0);
+                    }
+                });
+            }
+        }
+    });
     let step = move |d: i64| {
         let n = visible_drive_files(state).len();
         if n == 0 {
@@ -1351,12 +1372,33 @@ fn DriveLoupe(state: AppState) -> impl IntoView {
                 let fid = f.id.clone();
                 let f_import = f.clone();
                 let date = f.modified.get(..10).unwrap_or("").to_string();
+                // Warm pool: seen ids + immediate neighbors, minus current.
+                let n = files.len();
+                let mut warm: Vec<String> = state.drive_loupe_seen.get_untracked();
+                for d in [-1i64, 1] {
+                    let nb = ((idx as i64 + d).rem_euclid(n as i64)) as usize;
+                    if let Some(g) = files.get(nb) {
+                        if !warm.contains(&g.id) {
+                            warm.push(g.id.clone());
+                        }
+                    }
+                }
+                warm.retain(|id| id != &f.id);
                 view! {
                     <div class="loupe" on:click=close>
                         <div class="loupe-body" on:click=move |ev| ev.stop_propagation()>
                             <img src=drive::thumb_url_sz(&f.id, 1600) class="loupe-img"/>
+                            <div class="loupe-preload" aria-hidden="true">
+                                {warm
+                                    .into_iter()
+                                    .map(|id| {
+                                        view! { <img src=drive::thumb_url_sz(&id, 1600) loading="eager"/> }
+                                    })
+                                    .collect_view()}
+                            </div>
                             <div class="loupe-bar">
                                 <button class="btn" on:click=move |_| step(-1)>"‹ Prev"</button>
+                                <button class="btn" on:click=move |_| step(1)>"Next ›"</button>
                                 <div class="loupe-info">
                                     <span>{f.name.clone()}</span>
                                     <span class="dim">

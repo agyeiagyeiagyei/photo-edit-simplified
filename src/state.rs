@@ -547,6 +547,9 @@ pub struct AppState {
     pub drive_thumb_px: RwSignal<u32>,
     /// Index into the visible (filtered+sorted) file list while in loupe view.
     pub drive_loupe: RwSignal<Option<usize>>,
+    /// Recently viewed loupe file ids (most-recent last, capped) — kept as
+    /// hidden <img> elements so their large thumbnails stay decoded in memory.
+    pub drive_loupe_seen: RwSignal<Vec<String>>,
     /// Hover-zoom preview: (file id, cursor x, cursor y) while hovering a tile.
     pub drive_hover: RwSignal<Option<(String, f64, f64)>>,
     /// Bumped on hover enter/leave; only the latest generation opens a preview.
@@ -614,6 +617,7 @@ impl AppState {
             drive_sort: create_rw_signal(DriveSort::DateDesc),
             drive_thumb_px: create_rw_signal(88),
             drive_loupe: create_rw_signal(None),
+            drive_loupe_seen: create_rw_signal(Vec::new()),
             drive_hover: create_rw_signal(None),
             drive_hover_gen: create_rw_signal(0),
             drive_error: create_rw_signal(None),
