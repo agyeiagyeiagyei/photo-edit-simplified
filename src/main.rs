@@ -33,6 +33,9 @@ use state::{AppState, Aspect, BrushStroke, DriveFilter, DriveSort, EditParams, L
 struct PhotoData {
     full: (Vec<u8>, usize, usize),
     preview: (Vec<u8>, usize, usize),
+    /// Bumped whenever full/preview are rebuilt in place (heal, cut, …) so the
+    /// hi-res render cache knows its source pixels changed.
+    gen: u64,
 }
 
 struct Cache {
@@ -154,7 +157,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                 CACHE.with(|c| {
                     c.borrow_mut().photos.insert(
                         id,
-                        Rc::new(PhotoData { full: (full_rgba, fw, fh), preview: (pp, pw, ph) }),
+                        Rc::new(PhotoData { full: (full_rgba, fw, fh), preview: (pp, pw, ph), gen: 0 }),
                     )
                 });
                 push_item(state, MediaItem {
@@ -212,7 +215,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                 let (fw, fh) = (full.1, full.2);
                 let preview = downscale(&img, 1024);
                 CACHE.with(|c| {
-                    c.borrow_mut().photos.insert(id, Rc::new(PhotoData { full, preview }))
+                    c.borrow_mut().photos.insert(id, Rc::new(PhotoData { full, preview, gen: 0 }))
                 });
                 push_item(state, MediaItem {
                     id,
@@ -271,7 +274,7 @@ fn ingest_drive_bytes(
             CACHE.with(|c| {
                 c.borrow_mut().photos.insert(
                     id,
-                    Rc::new(PhotoData { full: (full_rgba, fw, fh), preview: (pp, pw, ph) }),
+                    Rc::new(PhotoData { full: (full_rgba, fw, fh), preview: (pp, pw, ph), gen: 0 }),
                 )
             });
             push_item(state, MediaItem {
@@ -311,7 +314,7 @@ fn ingest_drive_bytes(
             let (fw, fh) = (full.1, full.2);
             let preview = downscale(&img, 1024);
             CACHE.with(|c| {
-                c.borrow_mut().photos.insert(id, Rc::new(PhotoData { full, preview }))
+                c.borrow_mut().photos.insert(id, Rc::new(PhotoData { full, preview, gen: 0 }))
             });
             push_item(state, MediaItem {
                 id,
@@ -615,6 +618,237 @@ async fn render_text_overlay(t: &state::TextLayer, w: usize, h: usize) -> Result
     };
     draw_text_layer(&web::ctx2d(&canvas), &layer, w as f64, h as f64);
     web::canvas_to_blob(&canvas, "image/png").await
+}
+
+// --- hi-res display render ----------------------------------------------------
+//
+// The editing preview is a 1024px downscale; once the on-screen canvas is
+// bigger than that (large windows, retina, tight crops) it visibly softens.
+// When the preview underserves the display we render the whole working image
+// from the full-res original at display resolution into this cache, and blit
+// from it. Rebuilds are debounced so slider drags stay on the cheap path.
+
+/// Ceiling for the hi-res long edge — past this, CPU edit ops cost more than
+/// the sharpness is worth.
+const HI_MAX_EDGE: usize = 3200;
+
+struct HiCache {
+    item_id: usize,
+    fingerprint: u64,
+    canvas: web_sys::HtmlCanvasElement,
+    w: usize,
+    h: usize,
+}
+
+thread_local! {
+    static HI_CACHE: RefCell<Option<HiCache>> = const { RefCell::new(None) };
+    /// Generation guard for the debounced hi rebuild; only the latest fires.
+    static HI_DEBOUNCE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Last nonzero canvas display need (CSS px × DPR). Reactive remounts
+    /// briefly hand us a not-yet-inserted canvas with zero client size.
+    static LAST_NEED: std::cell::Cell<(f64, f64)> = const { std::cell::Cell::new((0.0, 0.0)) };
+}
+
+/// Content identity for the hi cache: everything that changes the rendered
+/// pixels EXCEPT the crop rect (crop only reframes the blit).
+fn content_fingerprint(item: &MediaItem, photo_gen: u64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    h.write_u64(photo_gen);
+    let e = &item.edit;
+    h.write_u8(e.rot90);
+    for v in [e.fine_angle, e.brightness, e.contrast, e.saturation, e.warmth, e.blur, e.grain] {
+        h.write_u32(v.to_bits());
+    }
+    h.write_u8(e.grain_gaussian as u8);
+    h.write_u8(e.grain_mono as u8);
+    match e.aspect.ratio() {
+        Some((a, b)) => {
+            h.write_u32(a.to_bits());
+            h.write_u32(b.to_bits());
+        }
+        None => h.write_u8(0),
+    }
+    format!("{:?}", e.levels).hash(&mut h);
+    format!("{:?}", e.curves).hash(&mut h);
+    match &e.selection {
+        None => h.write_u8(0),
+        Some(sel) => {
+            h.write_u32(sel.feather.to_bits());
+            match &sel.kind {
+                SelectionKind::Rect { x, y, w, h: rh } => {
+                    h.write_u8(1);
+                    for v in [*x, *y, *w, *rh] {
+                        h.write_u32(v.to_bits());
+                    }
+                }
+                SelectionKind::Lasso(pts) => {
+                    h.write_u8(2);
+                    pts.len().hash(&mut h);
+                    for p in pts.first().into_iter().chain(pts.last()) {
+                        h.write_u32(p.0.to_bits());
+                        h.write_u32(p.1.to_bits());
+                    }
+                }
+                SelectionKind::Mask { data, width, height } => {
+                    h.write_u8(3);
+                    width.hash(&mut h);
+                    height.hash(&mut h);
+                    if !data.is_empty() {
+                        data.len().hash(&mut h);
+                        for i in 0..8 {
+                            h.write_u8(data[i * data.len() / 8]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    item.layers.len().hash(&mut h);
+    for l in &item.layers {
+        l.id.hash(&mut h);
+        l.visible.hash(&mut h);
+        h.write_u32(l.opacity.to_bits());
+        match &l.kind {
+            LayerKind::Text(t) => {
+                h.write_u8(1);
+                t.text.hash(&mut h);
+                t.font_family.hash(&mut h);
+                t.color.hash(&mut h);
+                t.stroke_color.hash(&mut h);
+                t.shadow_color.hash(&mut h);
+                t.font_weight.hash(&mut h);
+                std::mem::discriminant(&t.alignment).hash(&mut h);
+                for v in [t.x, t.y, t.font_size, t.angle, t.stroke_width, t.shadow_blur, t.shadow_offset_x, t.shadow_offset_y] {
+                    h.write_u32(v.to_bits());
+                }
+            }
+            LayerKind::Path(p) => {
+                h.write_u8(2);
+                p.points.len().hash(&mut h);
+                p.closed.hash(&mut h);
+                p.fill_color.hash(&mut h);
+                p.stroke_color.hash(&mut h);
+                h.write_u32(p.stroke_width.to_bits());
+                for pt in p.points.first().into_iter().chain(p.points.last()) {
+                    h.write_u32(pt.x.to_bits());
+                    h.write_u32(pt.y.to_bits());
+                }
+            }
+            LayerKind::Brush(b) => {
+                h.write_u8(3);
+                b.strokes.len().hash(&mut h);
+                b.color.hash(&mut h);
+                b.custom_path.hash(&mut h);
+                std::mem::discriminant(&b.shape).hash(&mut h);
+                h.write_u32(b.width.to_bits());
+                h.write_u32(b.spacing.to_bits());
+                if let Some(s) = b.strokes.last() {
+                    s.points.len().hash(&mut h);
+                    if let Some(p) = s.points.last() {
+                        h.write_u32(p.0.to_bits());
+                        h.write_u32(p.1.to_bits());
+                    }
+                }
+            }
+            LayerKind::Raster(r) => {
+                h.write_u8(4);
+                r.width.hash(&mut h);
+                r.height.hash(&mut h);
+                h.write_u32(r.x.to_bits());
+                h.write_u32(r.y.to_bits());
+                h.write_u32(r.scale.to_bits());
+                if !r.pixels.is_empty() {
+                    r.pixels.len().hash(&mut h);
+                    for i in 0..8 {
+                        h.write_u8(r.pixels[i * r.pixels.len() / 8]);
+                    }
+                }
+            }
+        }
+    }
+    h.finish()
+}
+
+/// Resize a pixel buffer to exact dims via a canvas round-trip.
+fn resample_pixels(pixels: &[u8], w: usize, h: usize, tw: usize, th: usize) -> Vec<u8> {
+    let src = web::create_canvas(w as u32, h as u32);
+    web::put_pixels(&src, pixels, w as u32, h as u32);
+    let dst = web::create_canvas(tw as u32, th as u32);
+    web::ctx2d(&dst)
+        .draw_image_with_html_canvas_element_and_dw_and_dh(&src, 0.0, 0.0, tw as f64, th as f64)
+        .unwrap();
+    web::image_data_from_ctx(&web::ctx2d(&dst), tw as u32, th as u32).0
+}
+
+/// Render the photo from its full-res original at (roughly) display
+/// resolution. Mirrors the preview pipeline and export.
+/// Render size for the hi cache: enough that the requested total-image
+/// region covers the display, with headroom — capped by HI_MAX_EDGE and by
+/// the full-resolution working dims (rendering past the source buys nothing).
+fn hi_target(req_w: f64, req_h: f64, full_w: usize, full_h: usize) -> (usize, usize) {
+    let edge = (req_w.max(req_h) * 1.25).round();
+    let cap = (HI_MAX_EDGE as f64).min(full_w.max(full_h) as f64);
+    let t = edge.min(cap).max(1.0);
+    let scale = t / full_w.max(full_h) as f64;
+    if scale < 0.999 {
+        (
+            (full_w as f64 * scale).round().max(1.0) as usize,
+            (full_h as f64 * scale).round().max(1.0) as usize,
+        )
+    } else {
+        (full_w, full_h)
+    }
+}
+
+fn render_hi(item: &MediaItem, req_w: f64, req_h: f64) -> Option<HiCache> {
+    let photo = get_photo(item.id)?;
+    let fingerprint = content_fingerprint(item, photo.gen);
+    let (fpix, fw, fh) = &photo.full;
+    let (p, ww, wh) = geometry(fpix, *fw, *fh, &item.edit);
+    let (tw, th) = hi_target(req_w, req_h, ww, wh);
+    let mut buf = if (tw, th) != (ww, wh) {
+        resample_pixels(&p, ww, wh, tw, th)
+    } else {
+        p
+    };
+    if item.edit.is_color_touched() {
+        if let Some(sel) = &item.edit.selection {
+            let mask = ops::selection_mask(sel, tw, th);
+            blur::blur_apply_masked(&mut buf, &mask, tw, th, item.edit.blur);
+            if !item.edit.levels.is_identity() {
+                levels::levels_apply_masked(&mut buf, &mask, &item.edit.levels.build_tables());
+            }
+            item.edit.curves.apply_masked(&mut buf, &mask);
+            ops::adjust_masked(
+                &mut buf,
+                &mask,
+                item.edit.brightness,
+                item.edit.contrast,
+                item.edit.saturation,
+                item.edit.warmth,
+            );
+            noise::noise_add_masked(&mut buf, &mask, tw, th, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
+        } else {
+            blur::blur_apply(&mut buf, tw, th, item.edit.blur);
+            if !item.edit.levels.is_identity() {
+                levels::levels_apply(&mut buf, &item.edit.levels.build_tables());
+            }
+            item.edit.curves.apply(&mut buf);
+            ops::adjust(
+                &mut buf,
+                item.edit.brightness,
+                item.edit.contrast,
+                item.edit.saturation,
+                item.edit.warmth,
+            );
+            noise::noise_add(&mut buf, tw, th, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
+        }
+    }
+    let canvas = web::create_canvas(tw as u32, th as u32);
+    web::put_pixels(&canvas, &buf, tw as u32, th as u32);
+    composite_layers(&canvas, &item.layers, tw, th);
+    Some(HiCache { item_id: item.id, fingerprint, canvas, w: tw, h: th })
 }
 
 fn video_export_dims(edit: &EditParams, w: usize, h: usize) -> (usize, usize, usize, usize, usize, usize) {
@@ -2243,6 +2477,13 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         )>,
     );
 
+    // Window resizes change the canvas display size; bump a signal so the
+    // render effect re-checks whether the hi-res backing is still sufficient.
+    let rsz = window_event_listener(leptos::ev::resize, move |_| {
+        state.viewport_gen.update(|g| *g += 1);
+    });
+    on_cleanup(move || rsz.remove());
+
     // --- clone stamp stroke ----------------------------------------------------
     window_event_listener(leptos::ev::pointermove, move |ev| {
         let Some(Some(mut pts)) = clone_drag.try_get() else { return };
@@ -2429,6 +2670,8 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         state.selected_layer.track();
         state.selected_tool.track();
         state.selected_select_tool.track();
+        state.hi_built.track();
+        state.viewport_gen.track();
         heal_drag.track();
         state.heal_radius.track();
         clone_drag.track();
@@ -2445,65 +2688,182 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         let (pix, w, h) = &photo.preview;
         let (mut p, w, h) = geometry(pix, *w, *h, &item.edit);
         working.set((w, h));
-        if item.edit.is_color_touched() {
-            if let Some(sel) = &item.edit.selection {
-                let mask = ops::selection_mask(sel, w, h);
-                blur::blur_apply_masked(&mut p, &mask, w, h, item.edit.blur);
-                if !item.edit.levels.is_identity() {
-                    levels::levels_apply_masked(&mut p, &mask, &item.edit.levels.build_tables());
-                }
-                item.edit.curves.apply_masked(&mut p, &mask);
-                ops::adjust_masked(
-                    &mut p,
-                    &mask,
-                    item.edit.brightness,
-                    item.edit.contrast,
-                    item.edit.saturation,
-                    item.edit.warmth,
-                );
-                noise::noise_add_masked(&mut p, &mask, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
-            } else {
-                blur::blur_apply(&mut p, w, h, item.edit.blur);
-                if !item.edit.levels.is_identity() {
-                    levels::levels_apply(&mut p, &item.edit.levels.build_tables());
-                }
-                item.edit.curves.apply(&mut p);
-                ops::adjust(
-                    &mut p,
-                    item.edit.brightness,
-                    item.edit.contrast,
-                    item.edit.saturation,
-                    item.edit.warmth,
-                );
-                noise::noise_add(&mut p, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
-            }
-        }
         let crop = item.edit.crop;
         let cropped_view = tab.get() != Tab::Crop && !crop_is_full(&crop);
-        if cropped_view {
-            // Composite at full size offscreen, then blit the crop region —
-            // the same pipeline as export, so the preview matches the output.
-            // Crop stays a stored rect; the original is never touched.
-            let (cx, cy, cw, ch) = crop_px(&item.edit, w, h);
-            let off = web::create_canvas(w as u32, h as u32);
-            web::put_pixels(&off, &p, w as u32, h as u32);
-            composite_layers(&off, &item.layers, w, h);
-            canvas.set_width(cw as u32);
-            canvas.set_height(ch as u32);
-            let ctx = web::ctx2d(&canvas);
-            ctx.draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
-                &off, cx as f64, cy as f64, cw as f64, ch as f64,
-                0.0, 0.0, cw as f64, ch as f64,
-            )
-            .unwrap();
-            // The overlay drawing below uses full-image pixel coords; shift
-            // the origin so it lands on the cropped canvas.
-            ctx.save();
-            let _ = ctx.translate(-(cx as f64), -(cy as f64));
+
+        // Is the 1024px preview finer than what the screen is asking for?
+        // During reactive remounts this effect fires while the fresh canvas
+        // is built but not yet inserted — client size is 0 then, so fall
+        // back to the last real measurement for the hi-res decision.
+        let dpr = web::window().device_pixel_ratio();
+        let need_w = canvas.client_width() as f64 * dpr;
+        let need_h = canvas.client_height() as f64 * dpr;
+        let (need_w, need_h) = if need_w < 1.0 || need_h < 1.0 {
+            LAST_NEED.with(|n| n.get())
         } else {
-            web::put_pixels(&canvas, &p, w as u32, h as u32);
-            composite_layers(&canvas, &item.layers, w, h);
+            LAST_NEED.with(|n| n.set((need_w, need_h)));
+            (need_w, need_h)
+        };
+        let want_hi = need_w > w as f64 * 1.05 || need_h > h as f64 * 1.05;
+
+        // Total-image render size needed for the cache: when the view is
+        // cropped, the crop region alone must cover the display, so the
+        // whole image must be proportionally larger.
+        let (req_w, req_h) = if cropped_view {
+            (
+                need_w / crop.w.max(0.01) as f64,
+                need_h / crop.h.max(0.01) as f64,
+            )
+        } else {
+            (need_w, need_h)
+        };
+        // Exact size render_hi would produce for this request — the cache is
+        // sufficient iff it matches, which keeps rebuilds from looping.
+        let (fw, fh) = working_dims(photo.full.1, photo.full.2, &item.edit);
+        let target = hi_target(req_w, req_h, fw, fh);
+
+        let mut hi_dims: Option<(usize, usize)> = None;
+        if want_hi {
+            let fp = content_fingerprint(&item, photo.gen);
+            hi_dims = HI_CACHE.with(|c| {
+                let b = c.borrow();
+                let hi = b.as_ref()?;
+                if hi.item_id != item.id || hi.fingerprint != fp {
+                    return None;
+                }
+                if hi.w < target.0 || hi.h < target.1 {
+                    return None;
+                }
+                if cropped_view {
+                    let (cx2, cy2, cw2, ch2) = crop_px(&item.edit, hi.w, hi.h);
+                    canvas.set_width(cw2 as u32);
+                    canvas.set_height(ch2 as u32);
+                    web::ctx2d(&canvas)
+                        .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+                            &hi.canvas, cx2 as f64, cy2 as f64, cw2 as f64, ch2 as f64,
+                            0.0, 0.0, cw2 as f64, ch2 as f64,
+                        )
+                        .unwrap();
+                } else {
+                    canvas.set_width(hi.w as u32);
+                    canvas.set_height(hi.h as u32);
+                    web::ctx2d(&canvas)
+                        .draw_image_with_html_canvas_element(&hi.canvas, 0.0, 0.0)
+                        .unwrap();
+                }
+                Some((hi.w, hi.h))
+            });
         }
+
+        if hi_dims.is_none() {
+            if item.edit.is_color_touched() {
+                if let Some(sel) = &item.edit.selection {
+                    let mask = ops::selection_mask(sel, w, h);
+                    blur::blur_apply_masked(&mut p, &mask, w, h, item.edit.blur);
+                    if !item.edit.levels.is_identity() {
+                        levels::levels_apply_masked(&mut p, &mask, &item.edit.levels.build_tables());
+                    }
+                    item.edit.curves.apply_masked(&mut p, &mask);
+                    ops::adjust_masked(
+                        &mut p,
+                        &mask,
+                        item.edit.brightness,
+                        item.edit.contrast,
+                        item.edit.saturation,
+                        item.edit.warmth,
+                    );
+                    noise::noise_add_masked(&mut p, &mask, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
+                } else {
+                    blur::blur_apply(&mut p, w, h, item.edit.blur);
+                    if !item.edit.levels.is_identity() {
+                        levels::levels_apply(&mut p, &item.edit.levels.build_tables());
+                    }
+                    item.edit.curves.apply(&mut p);
+                    ops::adjust(
+                        &mut p,
+                        item.edit.brightness,
+                        item.edit.contrast,
+                        item.edit.saturation,
+                        item.edit.warmth,
+                    );
+                    noise::noise_add(&mut p, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
+                }
+            }
+            if cropped_view {
+                // Composite at full size offscreen, then blit the crop region —
+                // the same pipeline as export, so the preview matches the output.
+                // Crop stays a stored rect; the original is never touched.
+                let (cx, cy, cw, ch) = crop_px(&item.edit, w, h);
+                let off = web::create_canvas(w as u32, h as u32);
+                web::put_pixels(&off, &p, w as u32, h as u32);
+                composite_layers(&off, &item.layers, w, h);
+                canvas.set_width(cw as u32);
+                canvas.set_height(ch as u32);
+                web::ctx2d(&canvas)
+                    .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+                        &off, cx as f64, cy as f64, cw as f64, ch as f64,
+                        0.0, 0.0, cw as f64, ch as f64,
+                    )
+                    .unwrap();
+            } else {
+                web::put_pixels(&canvas, &p, w as u32, h as u32);
+                composite_layers(&canvas, &item.layers, w, h);
+            }
+            if want_hi {
+                // Sharp frame lands 150ms after edits settle; until then the
+                // cheap preview render keeps drags responsive.
+                HI_DEBOUNCE.with(|d| d.set(d.get() + 1));
+                let gen = HI_DEBOUNCE.with(|d| d.get());
+                let cb = Closure::once(move || {
+                    if HI_DEBOUNCE.with(|d| d.get()) != gen {
+                        return;
+                    }
+                    let Some(item) = state.current() else { return };
+                    if item.kind != MediaKind::Photo {
+                        return;
+                    }
+                    if let Some(hi) = render_hi(&item, req_w, req_h) {
+                        HI_CACHE.with(|c| *c.borrow_mut() = Some(hi));
+                        state.hi_built.update(|g| *g += 1);
+                    }
+                });
+                let _ = web::window().set_timeout_with_callback_and_timeout_and_arguments_0(
+                    cb.as_ref().unchecked_ref(),
+                    150,
+                );
+                cb.forget();
+            }
+        }
+
+        // Overlay draws below use full-image preview pixel coords; map them
+        // onto the canvas backing (hi-res scale and/or the crop offset).
+        let (cx_p, cy_p) = if cropped_view {
+            let (cx, cy, _, _) = crop_px(&item.edit, w, h);
+            (cx as f64, cy as f64)
+        } else {
+            (0.0, 0.0)
+        };
+        let ctx = web::ctx2d(&canvas);
+        let overlay_open = match (hi_dims, cropped_view) {
+            (Some((hw, _)), true) => {
+                ctx.save();
+                let s = hw as f64 / w as f64;
+                let _ = ctx.scale(s, s);
+                let _ = ctx.translate(-cx_p, -cy_p);
+                true
+            }
+            (Some((hw, _)), false) => {
+                ctx.save();
+                let _ = ctx.scale(hw as f64 / w as f64, hw as f64 / w as f64);
+                true
+            }
+            (None, true) => {
+                ctx.save();
+                let _ = ctx.translate(-cx_p, -cy_p);
+                true
+            }
+            (None, false) => false,
+        };
 
         // Draw editing handles on top for the selected path layer.
         if tab.get() == Tab::Layers && state.selected_tool.get() == Tool::Pen {
@@ -2552,8 +2912,8 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             }
         }
 
-        if cropped_view {
-            web::ctx2d(&canvas).restore();
+        if overlay_open {
+            ctx.restore();
         }
     });
 
@@ -3150,6 +3510,7 @@ fn selection_to_layer(state: AppState, cut: bool) {
                 let pd = Rc::make_mut(pd);
                 pd.full = (cleared, w, h);
                 pd.preview = preview;
+                pd.gen += 1;
             }
         });
         state.update_current(|e| {
@@ -3181,6 +3542,7 @@ fn delete_selection(state: AppState) {
             let pd = Rc::make_mut(pd);
             pd.full = (base, w, h);
             pd.preview = preview;
+            pd.gen += 1;
         }
     });
     state.update_current(|e| {
@@ -3212,6 +3574,7 @@ fn content_fill_selection(state: AppState) {
             let pd = Rc::make_mut(pd);
             pd.full = (base, w, h);
             pd.preview = preview;
+            pd.gen += 1;
         }
     });
     state.update_current(|e| {
@@ -3250,6 +3613,7 @@ fn apply_heal(state: AppState, pts: &[(f32, f32)]) {
             let pd = Rc::make_mut(pd);
             pd.full = (base, w, h);
             pd.preview = preview;
+            pd.gen += 1;
         }
     });
     state.update_current(|e| {
@@ -3344,6 +3708,7 @@ fn apply_clone(state: AppState, pts: &[(f32, f32)]) {
             let pd = Rc::make_mut(pd);
             pd.full = (base, w, h);
             pd.preview = preview;
+            pd.gen += 1;
         }
     });
     state.update_current(|e| {

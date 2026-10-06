@@ -541,6 +541,11 @@ pub struct AppState {
     pub drive_manifest_id: RwSignal<Option<String>>,
     /// Bumped on every star toggle; the debounced saver only writes the latest.
     pub drive_save_gen: RwSignal<u32>,
+    /// Bumped when the hi-res preview cache finishes rebuilding; the canvas
+    /// render effect listens and swaps the sharp frame in.
+    pub hi_built: RwSignal<u32>,
+    /// Bumped on window resize so the canvas backing can track display size.
+    pub viewport_gen: RwSignal<u32>,
     pub drive_filter: RwSignal<DriveFilter>,
     pub drive_sort: RwSignal<DriveSort>,
     /// Grid tile size in px.
@@ -613,6 +618,8 @@ impl AppState {
             drive_shortlist: create_rw_signal(std::collections::HashSet::new()),
             drive_manifest_id: create_rw_signal(None),
             drive_save_gen: create_rw_signal(0),
+            hi_built: create_rw_signal(0),
+            viewport_gen: create_rw_signal(0),
             drive_filter: create_rw_signal(DriveFilter::All),
             drive_sort: create_rw_signal(DriveSort::DateDesc),
             drive_thumb_px: create_rw_signal(88),
