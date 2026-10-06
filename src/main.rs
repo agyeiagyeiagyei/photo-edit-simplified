@@ -14,7 +14,7 @@ mod stroke;
 mod wand;
 mod web;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -1287,17 +1287,28 @@ fn build_ffmpeg_args(item: &MediaItem, w: usize, h: usize, overlays: &[String]) 
 
 // --- UI ------------------------------------------------------------------------
 
-#[component]
-fn App() -> impl IntoView {
-    let state = AppState::new();
-    provide_context(state);
+thread_local! {
+    static FONTS_REQUESTED: Cell<bool> = const { Cell::new(false) };
+}
 
-    spawn_local(async move {
+// The bundled fonts only matter once a text layer exists, so don't fetch them
+// at startup.
+fn ensure_fonts() {
+    if FONTS_REQUESTED.with(|c| c.replace(true)) {
+        return;
+    }
+    spawn_local(async {
         let _ = web::load_font("Inter", "fonts/inter-400.woff2", "400").await;
         let _ = web::load_font("Inter", "fonts/inter-700.woff2", "700").await;
         let _ = web::load_font("Oswald", "fonts/oswald-400.woff2", "400").await;
         let _ = web::load_font("Oswald", "fonts/oswald-700.woff2", "700").await;
     });
+}
+
+#[component]
+fn App() -> impl IntoView {
+    let state = AppState::new();
+    provide_context(state);
 
     view! {
         <div class="app">
@@ -4495,6 +4506,9 @@ fn CloneTab(state: AppState) -> impl IntoView {
 #[component]
 fn LayersTab(state: AppState) -> impl IntoView {
     let add_layer = move |kind: &str| {
+        if kind == "text" {
+            ensure_fonts();
+        }
         let mut new_id = None;
         state.update_current_item(|m| {
             let id = m.next_layer_id;

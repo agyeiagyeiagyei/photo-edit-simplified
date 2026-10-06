@@ -16,11 +16,16 @@
   <link data-trunk rel="copy-dir" href="public/fonts"/>
   <link data-trunk rel="copy-dir" href="public/vendor"/>
   <link data-trunk rel="rust" data-wasm-opt="3"/>
-  <script src="https://unpkg.com/heic2any@0.0.4/dist/heic2any.min.js"></script>
-  <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
-  <script type="module">
-    import { FilesetResolver, ImageSegmenter } from "./vendor/mediapipe-tasks-vision/vision_bundle.mjs";
-    window.PES = { FilesetResolver, ImageSegmenter };
+  <script>
+    function _pesLoadScript(src) {
+      return new Promise((res, rej) => {
+        const s = document.createElement('script');
+        s.src = src;
+        s.onload = res;
+        s.onerror = () => rej(new Error('script load failed: ' + src));
+        document.head.appendChild(s);
+      });
+    }
   </script>
 </head>
 <body>
@@ -39,6 +44,9 @@
 
     // HEIC -> JPEG blob. Called from Rust.
     window.pesHeicToJpeg = async function (blob) {
+      if (!window.heic2any) {
+        await _pesLoadScript('https://unpkg.com/heic2any@0.0.4/dist/heic2any.min.js');
+      }
       const out = await window.heic2any({ blob, toType: 'image/jpeg', quality: 0.92 });
       return Array.isArray(out) ? out[0] : out;
     };
@@ -46,6 +54,9 @@
     // MediaPipe Selfie Segmentation via Tasks Vision ImageSegmenter. Called from Rust.
     let _imageSegmenter = null;
     window.pesSegmentSelfie = async function (image) {
+      if (!window.PES) {
+        window.PES = await import('./vendor/mediapipe-tasks-vision/vision_bundle.mjs');
+      }
       const { FilesetResolver, ImageSegmenter } = window.PES;
       if (!_imageSegmenter) {
         const vision = await FilesetResolver.forVisionTasks(
@@ -77,6 +88,9 @@
     let _ffmpeg = null;
     window.pesVideoTranscode = async function (name, blob, args, overlays, onProgress) {
       try {
+        if (!window.FFmpeg) {
+          await _pesLoadScript('https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js');
+        }
         const { createFFmpeg, fetchFile } = FFmpeg;
         if (!_ffmpeg) {
           // Single-threaded core: no SharedArrayBuffer, works on GitHub Pages
@@ -109,15 +123,6 @@
 
     // Google Drive: Identity Services sign-in + folder Picker. Called from Rust.
     let _gsiP = null, _gapiP = null;
-    function _pesLoadScript(src) {
-      return new Promise((res, rej) => {
-        const s = document.createElement('script');
-        s.src = src;
-        s.onload = res;
-        s.onerror = () => rej(new Error('script load failed: ' + src));
-        document.head.appendChild(s);
-      });
-    }
     window.pesDriveSignIn = async function (clientId, scope) {
       if (!_gsiP) _gsiP = _pesLoadScript('https://accounts.google.com/gsi/client');
       await _gsiP;
