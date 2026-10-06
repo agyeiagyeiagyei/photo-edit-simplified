@@ -97,13 +97,18 @@ h1 { font-size: 17px; font-weight: 600; }
 
 .canvas-wrap {
   position: relative;
-  width: 100%;
-  max-width: min(100%, 60vh);
+  width: fit-content;
+  max-width: 100%;
   margin: 0 auto;
 }
+/* Width is the largest value that fits both the viewport width and the
+   viewport height given the image aspect ratio (--ar, set from Rust). */
 .canvas-wrap canvas, .canvas-wrap video {
-  width: 100%;
   display: block;
+  width: min(calc(100vw - 40px), calc((100vh - 360px) * var(--ar, 1.5)));
+  height: auto;
+  max-width: calc(100vw - 40px);
+  max-height: calc(100vh - 360px);
   border-radius: 10px;
   background: #000;
 }
@@ -115,9 +120,16 @@ h1 { font-size: 17px; font-weight: 600; }
 .crop-rect {
   position: absolute;
   border: 2px solid #fff;
-  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.45);
   cursor: move;
   touch-action: none;
+}
+
+/* Dim outside the crop box with four plain rects — a giant box-shadow here
+   repaints a 9999px region on every window-resize frame and lags the page. */
+.crop-dim {
+  position: absolute;
+  background: rgba(0, 0, 0, 0.45);
+  pointer-events: none;
 }
 
 .handle {
@@ -433,6 +445,13 @@ button:disabled {
 @media (min-width: 900px) {
   .editor { flex-direction: row; align-items: flex-start; }
   .preview { flex: 1; min-width: 0; }
+  /* Fill the space left of the 320px controls column, up to the viewport
+     height minus header, filmstrip and panel overhead. */
+  .canvas-wrap canvas, .canvas-wrap video {
+    width: min(calc(100vw - 400px), calc((100vh - 230px) * var(--ar, 1.5)));
+    max-width: calc(100vw - 400px);
+    max-height: calc(100vh - 230px);
+  }
   .controls {
     flex: 0 0 320px;
     position: sticky;

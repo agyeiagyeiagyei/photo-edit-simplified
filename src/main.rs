@@ -53,6 +53,30 @@ fn get_photo(id: usize) -> Option<Rc<PhotoData>> {
     CACHE.with(|c| c.borrow().photos.get(&id).cloned())
 }
 
+/// Drop an item from the filmstrip: revoke its object URL and free its
+/// cached pixels/video blob.
+fn remove_item(state: AppState, item_id: usize) {
+    let mut removed_url = None;
+    state.items.update(|v| {
+        if let Some(pos) = v.iter().position(|m| m.id == item_id) {
+            removed_url = Some(v.remove(pos).object_url);
+        }
+    });
+    if let Some(url) = removed_url {
+        let _ = Url::revoke_object_url(&url);
+    }
+    CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        c.photos.remove(&item_id);
+        c.video_blobs.remove(&item_id);
+        c.video_meta.remove(&item_id);
+    });
+    if state.selected.get_untracked() == Some(item_id) {
+        let next = state.items.with(|v| v.first().map(|m| m.id));
+        state.selected.set(next);
+    }
+}
+
 fn get_video(id: usize) -> Option<(Blob, f64, u32, u32)> {
     CACHE.with(|c| {
         let c = c.borrow();
@@ -1182,11 +1206,27 @@ fn visible_drive_files(state: AppState) -> Vec<drive::DriveFile> {
 }
 
 fn toggle_star(state: AppState, id: String) {
+    let mut unstarred = false;
     state.drive_shortlist.update(|s| {
-        if !s.remove(&id) {
+        if s.remove(&id) {
+            unstarred = true;
+        } else {
             s.insert(id.clone());
         }
     });
+    if unstarred {
+        // Unstarring a file that's imported (including one under edit) drops
+        // it from the filmstrip and frees its pixels.
+        let doomed: Vec<usize> = state.items.with(|v| {
+            v.iter()
+                .filter(|m| m.drive_file_id.as_deref() == Some(id.as_str()))
+                .map(|m| m.id)
+                .collect()
+        });
+        for item_id in doomed {
+            remove_item(state, item_id);
+        }
+    }
     // Debounced manifest write: only the latest generation actually saves.
     state.drive_save_gen.update(|g| *g += 1);
     let gen = state.drive_save_gen.get_untracked();
@@ -2541,6 +2581,18 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 _ => view! {
                     <div
                         class="canvas-wrap"
+                        style=move || {
+                            state.current().map(|m| {
+                                let (w, h) = working_dims(m.width, m.height, &m.edit);
+                                let (dw, dh) = if tab.get() != Tab::Crop && !crop_is_full(&m.edit.crop) {
+                                    let (_, _, cw, ch) = crop_px(&m.edit, w, h);
+                                    (cw, ch)
+                                } else {
+                                    (w, h)
+                                };
+                                format!("--ar:{}", dw as f64 / dh.max(1) as f64)
+                            }).unwrap_or_default()
+                        }
                         class:cropped=move || {
                             tab.get() != Tab::Crop
                                 && state.current().map(|m| m.kind == MediaKind::Photo && !crop_is_full(&m.edit.crop)).unwrap_or(false)
@@ -2986,6 +3038,14 @@ fn CropOverlay(
                         register(&ev);
                     }
                 >
+                    <div class="crop-dim" style:left="0" style:top="0"
+                        style:width="100%" style:height=pct(c.y)></div>
+                    <div class="crop-dim" style:left="0" style:top=pct(c.y + c.h)
+                        style:width="100%" style:height=pct(1.0 - c.y - c.h)></div>
+                    <div class="crop-dim" style:left="0" style:top=pct(c.y)
+                        style:width=pct(c.x) style:height=pct(c.h)></div>
+                    <div class="crop-dim" style:left=pct(c.x + c.w) style:top=pct(c.y)
+                        style:width=pct(1.0 - c.x - c.w) style:height=pct(c.h)></div>
                     <div
                         class="crop-rect"
                         style:left=pct(c.x)
