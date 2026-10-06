@@ -17,9 +17,9 @@ html, body {
 }
 
 .app {
-  max-width: 720px;
-  margin: 0 auto;
-  padding: 0 12px calc(24px + env(safe-area-inset-bottom));
+  max-width: none;
+  margin: 0;
+  padding: 0 20px calc(24px + env(safe-area-inset-bottom));
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -431,11 +431,10 @@ button:disabled {
 }
 
 @media (min-width: 900px) {
-  .app { max-width: 1100px; }
   .editor { flex-direction: row; align-items: flex-start; }
   .preview { flex: 1; min-width: 0; }
   .controls {
-    flex: 0 0 300px;
+    flex: 0 0 320px;
     position: sticky;
     top: 12px;
     max-height: calc(100vh - 24px);
@@ -498,3 +497,131 @@ button:disabled {
   white-space: nowrap;
 }
 .drive-error { color: #e06c5c; }
+
+.drive-crumbs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+.drive-crumb {
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+.drive-crumb:hover { background: var(--border); }
+
+.drive-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.drive-sort {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+  padding: 3px 6px;
+}
+.drive-size { width: 90px; accent-color: var(--accent); }
+
+.drive-select,
+.drive-star {
+  position: absolute;
+  top: 4px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: rgba(20, 20, 24, 0.75);
+  color: #fff;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.drive-file:hover .drive-select,
+.drive-file:hover .drive-star,
+.drive-select.on,
+.drive-star.on { opacity: 1; }
+.drive-select { left: 4px; }
+.drive-select.on { background: var(--accent); border-color: var(--accent); }
+.drive-star { right: 4px; }
+.drive-star.on { color: #f5c542; border-color: #f5c542; opacity: 1; }
+
+.drive-hover {
+  position: fixed;
+  z-index: 70;
+  pointer-events: none;
+  background: #111;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px;
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.55);
+}
+.drive-hover img {
+  width: 400px;
+  max-height: 50vh;
+  object-fit: contain;
+  display: block;
+  border-radius: 5px;
+}
+
+.drive-folder { justify-content: center; }
+.drive-folder .drive-icon { font-size: 34px; }
+
+.loupe {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 60;
+  padding: 24px;
+}
+.loupe-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 100%;
+  max-height: 100%;
+}
+.loupe-img {
+  max-width: min(92vw, 1100px);
+  max-height: calc(100vh - 140px);
+  object-fit: contain;
+  border-radius: 8px;
+  background: #111;
+}
+.loupe-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+.loupe-info {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+.loupe-info span:first-child {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.loupe-star.on { color: #f5c542; border-color: #f5c542; }

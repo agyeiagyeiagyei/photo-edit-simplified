@@ -237,6 +237,14 @@ pub async fn blob_to_bytes(blob: &Blob) -> Result<Vec<u8>, JsValue> {
     Ok(js_sys::Uint8Array::new(&buf).to_vec())
 }
 
+/// Read back the bytes behind a blob: object URL (the untouched source file).
+pub async fn object_url_bytes(url: &str) -> Result<Vec<u8>, JsValue> {
+    let v = JsFuture::from(window().fetch_with_str(url)).await?;
+    let resp: web_sys::Response = v.unchecked_into();
+    let buf = JsFuture::from(resp.array_buffer()?).await?;
+    Ok(js_sys::Uint8Array::new(&buf).to_vec())
+}
+
 pub fn bytes_to_blob(bytes: &[u8], mime: &str) -> Result<Blob, JsValue> {
     let arr = js_sys::Uint8Array::from(bytes);
     let parts = js_sys::Array::new();

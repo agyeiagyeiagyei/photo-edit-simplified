@@ -25,7 +25,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{Blob, File, Url};
 
-use state::{AppState, Aspect, BrushStroke, EditParams, Layer, LayerKind, MediaItem, MediaKind, PathPoint, PhotoFormat, SelectTool, Selection, SelectionKind, TextAlign, Tool};
+use state::{AppState, Aspect, BrushStroke, DriveFilter, DriveSort, EditParams, Layer, LayerKind, MediaItem, MediaKind, PathPoint, PhotoFormat, SelectTool, Selection, SelectionKind, TextAlign, Tool};
 
 // --- media cache (non-reactive) ---------------------------------------------
 
@@ -761,6 +761,39 @@ fn save_photo_to_drive(state: AppState, item: MediaItem) {
         };
         state.busy.set(Some(format!("Saving {} to Drive…", item.name)));
         state.drive_error.set(None);
+
+        // Unedited JPEG/PNG: upload the source bytes untouched. If the item
+        // came from Drive it is already byte-identical there — nothing to do.
+        if photo_unedited(&item) {
+            if let Some(mime) = passthru_mime(&item.name) {
+                if item.drive_file_id.is_some() {
+                    state.busy.set(None);
+                    state
+                        .drive_error
+                        .set(Some(format!("{} is unchanged — already in Drive", item.name)));
+                    return;
+                }
+                match web::object_url_bytes(&item.object_url).await {
+                    Ok(bytes) => {
+                        let r = drive::upload_file(&token, &folder_id, None, &item.name, mime, &bytes).await;
+                        state.busy.set(None);
+                        match r {
+                            Ok(fid) => {
+                                state.update_current_item(|m| m.drive_file_id = Some(fid));
+                                drive_refresh(state);
+                            }
+                            Err(e) => state
+                                .drive_error
+                                .set(Some(format!("Drive save failed: {}", js_err(&e)))),
+                        }
+                        return;
+                    }
+                    // Couldn't read the source back — fall through to re-encode.
+                    Err(_) => {}
+                }
+            }
+        }
+
         let Some((blob, mime, filename)) = render_photo_export(state, &item).await else {
             state.busy.set(None);
             return;
@@ -796,9 +829,7 @@ fn save_photo_to_drive(state: AppState, item: MediaItem) {
                     m.drive_file_id = Some(fid);
                     m.drive_parent_id = None;
                 });
-                if let Ok(listing) = drive::list_files(&token, &folder_id).await {
-                    state.drive_files.set(listing.files);
-                }
+                drive_refresh(state);
             }
             Err(e) => {
                 state
@@ -813,6 +844,33 @@ fn save_photo_to_drive(state: AppState, item: MediaItem) {
 fn js_err(e: &JsValue) -> String {
     e.as_string()
         .unwrap_or_else(|| format!("{e:?}").chars().take(200).collect())
+}
+
+/// True when nothing about the photo differs from the source file — saving
+/// can pass the original bytes through instead of re-encoding (a JPEG would
+/// otherwise lose a generation on every save).
+fn photo_unedited(item: &MediaItem) -> bool {
+    let e = &item.edit;
+    e.aspect == Aspect::Original
+        && e.crop == state::CropRect::default()
+        && e.rot90 == 0
+        && e.fine_angle == 0.0
+        && !e.is_color_touched()
+        && e.selection.is_none()
+        && item.layers.iter().all(|l| !l.visible)
+}
+
+/// Mime for byte pass-through, or None when the object URL doesn't hold the
+/// original file bytes (RAW/HEIC are decoded to a working format on import).
+fn passthru_mime(name: &str) -> Option<&'static str> {
+    let n = name.to_lowercase();
+    if n.ends_with(".png") {
+        Some("image/png")
+    } else if n.ends_with(".jpg") || n.ends_with(".jpeg") {
+        Some("image/jpeg")
+    } else {
+        None
+    }
 }
 
 fn export_video(state: AppState, item: MediaItem) {
@@ -1058,31 +1116,279 @@ fn FilmStrip(state: AppState) -> impl IntoView {
     }
 }
 
+/// Folder currently being browsed: deepest breadcrumb, or the granted root.
+fn drive_current_folder(state: AppState) -> Option<(String, String)> {
+    if let Some(last) = state.drive_path.get_untracked().last() {
+        return Some(last.clone());
+    }
+    state.drive_folder.get_untracked()
+}
+
 fn drive_refresh(state: AppState) {
     spawn_local(async move {
         let Some(token) = state.drive_token.get_untracked() else {
             return;
         };
-        let Some((fid, _)) = state.drive_folder.get_untracked() else {
+        let Some((root_id, _)) = state.drive_folder.get_untracked() else {
+            return;
+        };
+        let Some((fid, _)) = drive_current_folder(state) else {
             return;
         };
         state.drive_error.set(None);
-        match drive::list_files(&token, &fid).await {
-            Ok(listing) => {
-                if !listing.skipped.is_empty() {
-                    state.drive_error.set(Some(format!(
-                        "Couldn't open {} subfolder(s): {}",
-                        listing.skipped.len(),
-                        listing.skipped.join(", ")
-                    )));
-                }
-                state.drive_files.set(listing.files);
+        let order = state.drive_sort.get_untracked().order_by();
+        match drive::list_folder(&token, &fid, order).await {
+            Ok((files, subs)) => {
+                state.drive_files.set(files);
+                state.drive_subfolders.set(subs);
             }
             Err(e) => state
                 .drive_error
                 .set(Some(format!("Drive list failed: {}", js_err(&e)))),
         }
+        // The shortlist manifest lives at the granted root regardless of
+        // which subfolder is being browsed.
+        match drive::find_manifest(&token, &root_id).await {
+            Ok(Some(mid)) => {
+                state.drive_manifest_id.set(Some(mid.clone()));
+                if let Ok(bytes) = drive::download_file(&token, &mid).await {
+                    state.drive_shortlist.set(drive::parse_shortlist(&bytes));
+                }
+            }
+            Ok(None) => {
+                state.drive_manifest_id.set(None);
+                state.drive_shortlist.set(Default::default());
+            }
+            Err(_) => {}
+        }
     });
+}
+
+/// Files as shown in the grid: current folder, star filter applied.
+/// Sorting happens server-side via orderBy on the listing.
+fn visible_drive_files(state: AppState) -> Vec<drive::DriveFile> {
+    let filter = state.drive_filter.get();
+    let shortlist = state.drive_shortlist.get();
+    state.drive_files.with(|v| {
+        v.iter()
+            .filter(|f| match filter {
+                DriveFilter::All => true,
+                DriveFilter::Starred => shortlist.contains(&f.id),
+                DriveFilter::Unstarred => !shortlist.contains(&f.id),
+            })
+            .cloned()
+            .collect()
+    })
+}
+
+fn toggle_star(state: AppState, id: String) {
+    state.drive_shortlist.update(|s| {
+        if !s.remove(&id) {
+            s.insert(id.clone());
+        }
+    });
+    // Debounced manifest write: only the latest generation actually saves.
+    state.drive_save_gen.update(|g| *g += 1);
+    let gen = state.drive_save_gen.get_untracked();
+    let cb = wasm_bindgen::closure::Closure::once(move || {
+        spawn_local(async move {
+            if state.drive_save_gen.get_untracked() != gen {
+                return;
+            }
+            let Some(token) = state.drive_token.get_untracked() else {
+                return;
+            };
+            let Some((root_id, _)) = state.drive_folder.get_untracked() else {
+                return;
+            };
+            let ids = state.drive_shortlist.get_untracked();
+            let body = drive::shortlist_json(&ids);
+            let existing = state.drive_manifest_id.get_untracked();
+            match drive::upload_file(
+                &token,
+                &root_id,
+                existing.as_deref(),
+                drive::MANIFEST_NAME,
+                "application/json",
+                &body,
+            )
+            .await
+            {
+                Ok(fid) => state.drive_manifest_id.set(Some(fid)),
+                Err(e) => state
+                    .drive_error
+                    .set(Some(format!("Couldn't save shortlist: {}", js_err(&e)))),
+            }
+        });
+    });
+    let _ = web::window().set_timeout_with_callback_and_timeout_and_arguments_0(
+        cb.as_ref().unchecked_ref(),
+        900,
+    );
+    cb.forget();
+}
+
+fn drive_navigate(state: AppState, depth: usize) {
+    // depth 0 = root; otherwise truncate breadcrumbs to that many levels.
+    state.drive_path.update(|p| p.truncate(depth));
+    state.drive_selected.set(Default::default());
+    state.drive_loupe.set(None);
+    drive_hover_clear(state);
+    drive_refresh(state);
+}
+
+fn drive_enter(state: AppState, folder: drive::SubFolder) {
+    state
+        .drive_path
+        .update(|p| p.push((folder.id, folder.name)));
+    state.drive_selected.set(Default::default());
+    state.drive_loupe.set(None);
+    drive_hover_clear(state);
+    drive_refresh(state);
+}
+
+fn download_import(state: AppState, f: drive::DriveFile) {
+    spawn_local(async move {
+        let Some(token) = state.drive_token.get_untracked() else {
+            return;
+        };
+        state.busy.set(Some(format!("Downloading {} from Drive…", f.name)));
+        state.drive_error.set(None);
+        match drive::download_file(&token, &f.id).await {
+            Ok(bytes) => {
+                state.busy.set(None);
+                ingest_drive_bytes(state, f.id, f.parent, f.name, bytes);
+            }
+            Err(e) => {
+                state.busy.set(None);
+                state
+                    .drive_error
+                    .set(Some(format!("Drive download failed: {}", js_err(&e))));
+            }
+        }
+    });
+}
+
+/// Hover-zoom: open the floating preview after a short rest on a tile, so
+/// sweeping the cursor across the grid doesn't strobe previews.
+fn drive_hover_soon(state: AppState, id: String, x: f64, y: f64) {
+    state.drive_hover_gen.update(|g| *g += 1);
+    let gen = state.drive_hover_gen.get_untracked();
+    let cb = wasm_bindgen::closure::Closure::once(move || {
+        if state.drive_hover_gen.get_untracked() == gen {
+            state.drive_hover.set(Some((id, x, y)));
+        }
+    });
+    let _ = web::window().set_timeout_with_callback_and_timeout_and_arguments_0(
+        cb.as_ref().unchecked_ref(),
+        280,
+    );
+    cb.forget();
+}
+
+fn drive_hover_move(state: AppState, id: &str, x: f64, y: f64) {
+    let showing = state.drive_hover.with(|h| {
+        h.as_ref().map(|(hid, _, _)| hid == id).unwrap_or(false)
+    });
+    if showing {
+        state.drive_hover.set(Some((id.to_string(), x, y)));
+    }
+}
+
+fn drive_hover_clear(state: AppState) {
+    state.drive_hover_gen.update(|g| *g += 1);
+    state.drive_hover.set(None);
+}
+
+/// Fixed-position style for the hover preview, kept inside the viewport.
+fn drive_hover_style(x: f64, y: f64) -> String {
+    let w = 400.0_f64;
+    let h = 340.0_f64;
+    let vw = web::window().inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(1280.0);
+    let vh = web::window().inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(800.0);
+    let left = if x + 24.0 + w > vw { (x - w - 14.0).max(8.0) } else { x + 24.0 };
+    let top = (y - h / 2.0).max(8.0).min((vh - h - 8.0).max(8.0));
+    format!("left:{left:.0}px;top:{top:.0}px")
+}
+
+#[component]
+fn DriveLoupe(state: AppState) -> impl IntoView {
+    let close = move |_| state.drive_loupe.set(None);
+    let step = move |d: i64| {
+        let n = visible_drive_files(state).len();
+        if n == 0 {
+            return;
+        }
+        let cur = state.drive_loupe.get_untracked().unwrap_or(0) as i64;
+        state
+            .drive_loupe
+            .set(Some(((cur + d).rem_euclid(n as i64)) as usize));
+    };
+    let kd = window_event_listener(leptos::ev::keydown, move |ev| {
+        if state.drive_loupe.get_untracked().is_none() {
+            return;
+        }
+        match ev.key().as_str() {
+            "ArrowLeft" => step(-1),
+            "ArrowRight" => step(1),
+            "Escape" => state.drive_loupe.set(None),
+            _ => {}
+        }
+    });
+    on_cleanup(move || kd.remove());
+
+    view! {
+        <Show when=move || state.drive_loupe.get().is_some() fallback=|| ()>
+            {move || {
+                let files = visible_drive_files(state);
+                let Some(idx) = state.drive_loupe.get() else {
+                    return view! { <div></div> }.into_view();
+                };
+                let Some(f) = files.get(idx.min(files.len().saturating_sub(1))).cloned() else {
+                    return view! { <div></div> }.into_view();
+                };
+                let starred = state.drive_shortlist.with(|s| s.contains(&f.id));
+                let fid = f.id.clone();
+                let f_import = f.clone();
+                let date = f.modified.get(..10).unwrap_or("").to_string();
+                view! {
+                    <div class="loupe" on:click=close>
+                        <div class="loupe-body" on:click=move |ev| ev.stop_propagation()>
+                            <img src=drive::thumb_url_sz(&f.id, 1600) class="loupe-img"/>
+                            <div class="loupe-bar">
+                                <button class="btn" on:click=move |_| step(-1)>"‹ Prev"</button>
+                                <div class="loupe-info">
+                                    <span>{f.name.clone()}</span>
+                                    <span class="dim">
+                                        {format!("{} · {} KB · {}/{}", date, f.size_kb, idx + 1, files.len())}
+                                    </span>
+                                </div>
+                                <button
+                                    class="btn loupe-star"
+                                    class:on=starred
+                                    on:click=move |_| toggle_star(state, fid.clone())
+                                >
+                                    {if starred { "★ Starred" } else { "☆ Star" }}
+                                </button>
+                                <button
+                                    class="btn primary"
+                                    disabled=!f_import.importable()
+                                    on:click=move |_| {
+                                        download_import(state, f_import.clone());
+                                        state.drive_loupe.set(None);
+                                    }
+                                >
+                                    "Import"
+                                </button>
+                                <button class="btn" on:click=close>"✕"</button>
+                            </div>
+                        </div>
+                    </div>
+                }
+                .into_view()
+            }}
+        </Show>
+    }
 }
 
 #[component]
@@ -1111,6 +1417,7 @@ fn DrivePanel(state: AppState) -> impl IntoView {
                 Ok(Some((id, name))) => {
                     drive::save_folder(&id, &name);
                     state.drive_folder.set(Some((id, name)));
+                    state.drive_path.set(Vec::new());
                     drive_refresh(state);
                 }
                 Ok(None) => {}
@@ -1123,31 +1430,24 @@ fn DrivePanel(state: AppState) -> impl IntoView {
     let do_sign_out = move |_| {
         state.drive_token.set(None);
         state.drive_files.set(Vec::new());
+        state.drive_subfolders.set(Vec::new());
+        state.drive_path.set(Vec::new());
+        state.drive_selected.set(Default::default());
+        state.drive_loupe.set(None);
         state.drive_error.set(None);
     };
-    let import_file = move |f: drive::DriveFile| {
-        if !f.importable() {
-            return;
+    let import_selected = move |_| {
+        let ids = state.drive_selected.get_untracked();
+        let files: Vec<drive::DriveFile> = state
+            .drive_files
+            .get_untracked()
+            .into_iter()
+            .filter(|f| ids.contains(&f.id) && f.importable())
+            .collect();
+        state.drive_selected.set(Default::default());
+        for f in files {
+            download_import(state, f);
         }
-        spawn_local(async move {
-            let Some(token) = state.drive_token.get_untracked() else {
-                return;
-            };
-            state.busy.set(Some(format!("Downloading {} from Drive…", f.name)));
-            state.drive_error.set(None);
-            match drive::download_file(&token, &f.id).await {
-                Ok(bytes) => {
-                    state.busy.set(None);
-                    ingest_drive_bytes(state, f.id, f.parent, f.name, bytes);
-                }
-                Err(e) => {
-                    state.busy.set(None);
-                    state
-                        .drive_error
-                        .set(Some(format!("Drive download failed: {}", js_err(&e))));
-                }
-            }
-        });
     };
 
     view! {
@@ -1199,21 +1499,169 @@ fn DrivePanel(state: AppState) -> impl IntoView {
                                 </Show>
                                 <button class="chip" on:click=do_sign_out>"Sign out"</button>
                             </div>
-                            <div class="drive-files">
+                            // Breadcrumbs: granted root + descended subfolders.
+                            <div class="drive-crumbs">
+                                <button class="drive-crumb" on:click=move |_| drive_navigate(state, 0)>
+                                    {move || {
+                                        state.drive_folder.with(|f| {
+                                            f.as_ref().map(|(_, n)| n.clone()).unwrap_or_default()
+                                        })
+                                    }}
+                                </button>
+                                {move || {
+                                    state
+                                        .drive_path
+                                        .get()
+                                        .into_iter()
+                                        .enumerate()
+                                        .map(|(i, (_, name))| {
+                                            view! {
+                                                <span class="dim">"›"</span>
+                                                <button
+                                                    class="drive-crumb"
+                                                    on:click=move |_| drive_navigate(state, i + 1)
+                                                >
+                                                    {name}
+                                                </button>
+                                            }
+                                        })
+                                        .collect_view()
+                                }}
+                            </div>
+                            // Toolbar: star filter, sort, tile size, batch import.
+                            <div class="drive-toolbar">
+                                <div class="chips">
+                                    {[
+                                        (DriveFilter::All, "All"),
+                                        (DriveFilter::Starred, "★ Starred"),
+                                        (DriveFilter::Unstarred, "☆ Unstarred"),
+                                    ]
+                                    .map(|(f, label)| {
+                                        view! {
+                                            <button
+                                                class="chip"
+                                                class:active=move || state.drive_filter.get() == f
+                                                on:click=move |_| state.drive_filter.set(f)
+                                            >
+                                                {label}
+                                            </button>
+                                        }
+                                    })}
+                                </div>
+                                <select
+                                    class="drive-sort"
+                                    on:change=move |ev| {
+                                        let v = event_target_value(&ev);
+                                        state.drive_sort.set(if v == "name" {
+                                            DriveSort::NameAsc
+                                        } else {
+                                            DriveSort::DateDesc
+                                        });
+                                        drive_refresh(state);
+                                    }
+                                >
+                                    <option value="date" selected=move || state.drive_sort.get() == DriveSort::DateDesc>"Newest"</option>
+                                    <option value="name" selected=move || state.drive_sort.get() == DriveSort::NameAsc>"Name"</option>
+                                </select>
+                                <input
+                                    type="range"
+                                    min="56"
+                                    max="160"
+                                    step="8"
+                                    prop:value=move || state.drive_thumb_px.get()
+                                    on:input=move |ev| {
+                                        if let Ok(v) = event_target_value(&ev).parse::<u32>() {
+                                            state.drive_thumb_px.set(v);
+                                        }
+                                    }
+                                    class="drive-size"
+                                    title="Thumbnail size"
+                                />
+                                {move || {
+                                    let n = state.drive_selected.with(|s| s.len());
+                                    (n > 0).then(|| {
+                                        view! {
+                                            <button class="btn primary" on:click=import_selected>
+                                                {format!("Import {n} selected")}
+                                            </button>
+                                        }
+                                    })
+                                }}
+                            </div>
+                            <div
+                                class="drive-files"
+                                style:grid-template-columns=move || {
+                                    format!(
+                                        "repeat(auto-fill, minmax({}px, 1fr))",
+                                        state.drive_thumb_px.get()
+                                    )
+                                }
+                            >
                                 <For
-                                    each=move || state.drive_files.get()
-                                    key=|f: &drive::DriveFile| f.id.clone()
-                                    children=move |f: drive::DriveFile| {
+                                    each=move || state.drive_subfolders.get()
+                                    key=|s: &drive::SubFolder| s.id.clone()
+                                    children=move |s: drive::SubFolder| {
+                                        let sname = s.name.clone();
+                                        view! {
+                                            <div
+                                                class="drive-file drive-folder"
+                                                on:click=move |_| drive_enter(state, s.clone())
+                                            >
+                                                <span class="drive-icon">"📁"</span>
+                                                <span class="drive-name">{sname}</span>
+                                            </div>
+                                        }
+                                    }
+                                />
+                                <For
+                                    each=move || {
+                                        visible_drive_files(state)
+                                            .into_iter()
+                                            .enumerate()
+                                            .collect::<Vec<_>>()
+                                    }
+                                    key=|(_, f): &(usize, drive::DriveFile)| f.id.clone()
+                                    children=move |(idx, f): (usize, drive::DriveFile)| {
                                         let importable = f.importable();
-                                        let f2 = f.clone();
                                         let thumb_broken = create_rw_signal(false);
                                         let thumb_src = drive::thumb_url(&f.id);
+                                        let fid = f.id.clone();
+                                        let fid_class = f.id.clone();
+                                        let fid2 = f.id.clone();
+                                        let fid2_class = f.id.clone();
+                                        let fid2_text = f.id.clone();
+                                        let fid3 = f.id.clone();
+                                        let fid3_move = f.id.clone();
                                         view! {
                                             <div
                                                 class="drive-file"
                                                 class:disabled=!importable
-                                                title=format!("{}{}", f.path, f.name)
-                                                on:click=move |_| import_file(f2.clone())
+                                                title=f.name.clone()
+                                                on:click=move |_| {
+                                                    drive_hover_clear(state);
+                                                    if importable {
+                                                        state.drive_loupe.set(Some(idx));
+                                                    }
+                                                }
+                                                on:mouseenter=move |ev| {
+                                                    if importable {
+                                                        drive_hover_soon(
+                                                            state,
+                                                            fid3.clone(),
+                                                            ev.client_x() as f64,
+                                                            ev.client_y() as f64,
+                                                        );
+                                                    }
+                                                }
+                                                on:mousemove=move |ev| {
+                                                    drive_hover_move(
+                                                        state,
+                                                        &fid3_move,
+                                                        ev.client_x() as f64,
+                                                        ev.client_y() as f64,
+                                                    );
+                                                }
+                                                on:mouseleave=move |_| drive_hover_clear(state)
                                             >
                                                 {move || {
                                                     if thumb_broken.get() {
@@ -1230,21 +1678,55 @@ fn DrivePanel(state: AppState) -> impl IntoView {
                                                         .into_view()
                                                     }
                                                 }}
+                                                <button
+                                                    class="drive-select"
+                                                    class:on=move || state.drive_selected.with(|s| s.contains(&fid_class))
+                                                    on:click=move |ev| {
+                                                        ev.stop_propagation();
+                                                        state.drive_selected.update(|s| {
+                                                            if !s.remove(&fid) {
+                                                                s.insert(fid.clone());
+                                                            }
+                                                        });
+                                                    }
+                                                >
+                                                    "✓"
+                                                </button>
+                                                <button
+                                                    class="drive-star"
+                                                    class:on=move || state.drive_shortlist.with(|s| s.contains(&fid2_class))
+                                                    on:click=move |ev| {
+                                                        ev.stop_propagation();
+                                                        toggle_star(state, fid2.clone());
+                                                    }
+                                                >
+                                                    {move || {
+                                                        if state.drive_shortlist.with(|s| s.contains(&fid2_text)) {
+                                                            "★"
+                                                        } else {
+                                                            "☆"
+                                                        }
+                                                    }}
+                                                </button>
                                                 {f.edited.then(|| {
                                                     view! { <span class="drive-badge">"Edited"</span> }
                                                 })}
-                                                <span class="drive-name">
-                                                    {if f.path.is_empty() {
-                                                        f.name.clone()
-                                                    } else {
-                                                        format!("{}{}", f.path, f.name)
-                                                    }}
-                                                </span>
+                                                <span class="drive-name">{f.name.clone()}</span>
                                             </div>
                                         }
                                     }
                                 />
                             </div>
+                            <DriveLoupe state=state/>
+                            {move || {
+                                state.drive_hover.get().map(|(id, x, y)| {
+                                    view! {
+                                        <div class="drive-hover" style=drive_hover_style(x, y)>
+                                            <img src=drive::thumb_url_sz(&id, 800)/>
+                                        </div>
+                                    }
+                                })
+                            }}
                         }
                         .into_view()
                     }

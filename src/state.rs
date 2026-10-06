@@ -529,10 +529,54 @@ pub struct AppState {
     pub drive_folder: RwSignal<Option<(String, String)>>,
     /// Files listed from the granted Drive folder.
     pub drive_files: RwSignal<Vec<crate::drive::DriveFile>>,
+    /// Subfolders of the folder currently being browsed.
+    pub drive_subfolders: RwSignal<Vec<crate::drive::SubFolder>>,
+    /// Breadcrumb below the granted root: (id, name) per descended level.
+    pub drive_path: RwSignal<Vec<(String, String)>>,
+    /// Multi-select set for batch import (Drive file ids).
+    pub drive_selected: RwSignal<std::collections::HashSet<String>>,
+    /// Shortlisted (starred) Drive file ids, synced via the manifest file.
+    pub drive_shortlist: RwSignal<std::collections::HashSet<String>>,
+    /// Drive id of the shortlist manifest, when it exists.
+    pub drive_manifest_id: RwSignal<Option<String>>,
+    /// Bumped on every star toggle; the debounced saver only writes the latest.
+    pub drive_save_gen: RwSignal<u32>,
+    pub drive_filter: RwSignal<DriveFilter>,
+    pub drive_sort: RwSignal<DriveSort>,
+    /// Grid tile size in px.
+    pub drive_thumb_px: RwSignal<u32>,
+    /// Index into the visible (filtered+sorted) file list while in loupe view.
+    pub drive_loupe: RwSignal<Option<usize>>,
+    /// Hover-zoom preview: (file id, cursor x, cursor y) while hovering a tile.
+    pub drive_hover: RwSignal<Option<(String, f64, f64)>>,
+    /// Bumped on hover enter/leave; only the latest generation opens a preview.
+    pub drive_hover_gen: RwSignal<u32>,
     /// Last Drive error to surface in the panel.
     pub drive_error: RwSignal<Option<String>>,
     /// Whether the Drive panel is expanded.
     pub drive_open: RwSignal<bool>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum DriveFilter {
+    All,
+    Starred,
+    Unstarred,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum DriveSort {
+    DateDesc,
+    NameAsc,
+}
+
+impl DriveSort {
+    pub fn order_by(self) -> &'static str {
+        match self {
+            DriveSort::DateDesc => "modifiedTime desc",
+            DriveSort::NameAsc => "name",
+        }
+    }
 }
 
 impl AppState {
@@ -560,6 +604,18 @@ impl AppState {
             drive_token: create_rw_signal(None),
             drive_folder: create_rw_signal(crate::drive::saved_folder()),
             drive_files: create_rw_signal(Vec::new()),
+            drive_subfolders: create_rw_signal(Vec::new()),
+            drive_path: create_rw_signal(Vec::new()),
+            drive_selected: create_rw_signal(std::collections::HashSet::new()),
+            drive_shortlist: create_rw_signal(std::collections::HashSet::new()),
+            drive_manifest_id: create_rw_signal(None),
+            drive_save_gen: create_rw_signal(0),
+            drive_filter: create_rw_signal(DriveFilter::All),
+            drive_sort: create_rw_signal(DriveSort::DateDesc),
+            drive_thumb_px: create_rw_signal(88),
+            drive_loupe: create_rw_signal(None),
+            drive_hover: create_rw_signal(None),
+            drive_hover_gen: create_rw_signal(0),
             drive_error: create_rw_signal(None),
             drive_open: create_rw_signal(false),
         }

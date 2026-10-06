@@ -32,9 +32,8 @@ pub struct DriveFile {
     pub name: String,
     pub mime: String,
     pub size_kb: u64,
-    /// Subfolder path relative to the granted folder, e.g. "trip/iceland/"
-    /// ("" for files at the root of the granted folder).
-    pub path: String,
+    /// RFC3339 modified time — sorts lexicographically, shown as a date.
+    pub modified: String,
     /// Id of the containing folder — used to place save-as-copy fallbacks.
     pub parent: String,
     /// True when the file was written by this app (appProperties marker set
@@ -42,19 +41,21 @@ pub struct DriveFile {
     pub edited: bool,
 }
 
-/// Thumbnail URL usable directly in an <img> tag. Drive's thumbnailLink is
-/// CORS-blocked for browser apps; this endpoint renders via the user's
-/// Google session instead.
-pub fn thumb_url(file_id: &str) -> String {
-    format!("https://drive.google.com/thumbnail?id={file_id}&sz=w400")
+#[derive(Clone, PartialEq)]
+pub struct SubFolder {
+    pub id: String,
+    pub name: String,
 }
 
-/// Result of a recursive folder listing.
-pub struct Listing {
-    pub files: Vec<DriveFile>,
-    /// Subfolders that could not be opened (e.g. the Drive grant doesn't
-    /// cover them) — surfaced so the user knows the listing is partial.
-    pub skipped: Vec<String>,
+/// Thumbnail URL usable directly in an <img> tag at a given pixel width.
+/// Drive's thumbnailLink is CORS-blocked for browser apps; this endpoint
+/// renders via the user's Google session instead.
+pub fn thumb_url_sz(file_id: &str, width: u32) -> String {
+    format!("https://drive.google.com/thumbnail?id={file_id}&sz=w{width}")
+}
+
+pub fn thumb_url(file_id: &str) -> String {
+    thumb_url_sz(file_id, 400)
 }
 
 impl DriveFile {
@@ -161,103 +162,121 @@ fn js_str(v: &JsValue, key: &str) -> Option<String> {
 }
 
 const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
-/// Runaway guards for the recursive walk.
-const MAX_DEPTH: u32 = 10;
+/// Runaway guard for one folder's listing.
 const MAX_FILES: usize = 2000;
 
-/// List the granted folder recursively (subfolders included), depth-first.
-/// Files arrive grouped by folder, each level newest-first. Subfolders that
-/// fail to open are collected in `Listing::skipped` instead of aborting.
-pub async fn list_files(token: &str, folder_id: &str) -> Result<Listing, JsValue> {
-    let mut out = Listing {
-        files: Vec::new(),
-        skipped: Vec::new(),
-    };
-    walk_folder(token, folder_id, String::new(), 0, &mut out).await?;
-    Ok(out)
+/// Name of the app-owned shortlist manifest stored at the root of the
+/// granted folder. Filtered out of the browsing grid.
+pub const MANIFEST_NAME: &str = "photo-edit-shortlist.json";
+
+/// List a single folder (not recursive): importable files plus subfolders.
+/// `order` is a Drive orderBy clause, e.g. "modifiedTime desc" or "name".
+pub async fn list_folder(
+    token: &str,
+    folder_id: &str,
+    order: &str,
+) -> Result<(Vec<DriveFile>, Vec<SubFolder>), JsValue> {
+    let q = format!(
+        "'{}' in parents and trashed = false",
+        folder_id.replace('\'', "\\'")
+    );
+    let mut files = Vec::new();
+    let mut subfolders = Vec::new();
+    let mut page_token: Option<String> = None;
+    loop {
+        let mut url = format!(
+            "https://www.googleapis.com/drive/v3/files?q={}\
+             &fields=nextPageToken,files(id,name,mimeType,size,modifiedTime,appProperties)\
+             &orderBy={}&pageSize=200\
+             &supportsAllDrives=true&includeItemsFromAllDrives=true",
+            js_sys::encode_uri_component(&q),
+            js_sys::encode_uri_component(order),
+        );
+        if let Some(pt) = &page_token {
+            url.push_str("&pageToken=");
+            url.push_str(&String::from(js_sys::encode_uri_component(pt)));
+        }
+        let resp = drive_fetch(&url, token, "GET", None, None).await?;
+        let json = JsFuture::from(resp.json()?).await?;
+        let files_v = Reflect::get(&json, &JsValue::from_str("files"))?;
+        let arr: Array = files_v.unchecked_into();
+        for f in arr.iter() {
+            let Some(id) = js_str(&f, "id") else { continue };
+            let Some(name) = js_str(&f, "name") else { continue };
+            let mime = js_str(&f, "mimeType").unwrap_or_default();
+            if mime == FOLDER_MIME {
+                subfolders.push(SubFolder { id, name });
+                continue;
+            }
+            if name == MANIFEST_NAME || files.len() >= MAX_FILES {
+                continue;
+            }
+            let size_kb = js_str(&f, "size")
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0)
+                / 1024;
+            let modified = js_str(&f, "modifiedTime").unwrap_or_default();
+            let edited = Reflect::get(&f, &JsValue::from_str("appProperties"))
+                .ok()
+                .and_then(|p| js_str(&p, "pes_edited"))
+                .as_deref()
+                == Some("1");
+            files.push(DriveFile {
+                id,
+                name,
+                mime,
+                size_kb,
+                modified,
+                parent: folder_id.to_string(),
+                edited,
+            });
+        }
+        page_token = js_str(&json, "nextPageToken");
+        if page_token.is_none() {
+            break;
+        }
+    }
+    Ok((files, subfolders))
 }
 
-fn walk_folder<'a>(
-    token: &'a str,
-    folder_id: &'a str,
-    path: String,
-    depth: u32,
-    out: &'a mut Listing,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), JsValue>> + 'a>> {
-    Box::pin(async move {
-        let q = format!(
-            "'{}' in parents and trashed = false",
-            folder_id.replace('\'', "\\'")
-        );
-        let mut page_token: Option<String> = None;
-        let mut subfolders: Vec<(String, String)> = Vec::new();
-        loop {
-            let mut url = format!(
-                "https://www.googleapis.com/drive/v3/files?q={}\
-                 &fields=nextPageToken,files(id,name,mimeType,size,appProperties)\
-                 &orderBy=modifiedTime%20desc&pageSize=200\
-                 &supportsAllDrives=true&includeItemsFromAllDrives=true",
-                js_sys::encode_uri_component(&q)
-            );
-            if let Some(pt) = &page_token {
-                url.push_str("&pageToken=");
-                url.push_str(&String::from(js_sys::encode_uri_component(pt)));
-            }
-            let resp = drive_fetch(&url, token, "GET", None, None).await?;
-            let json = JsFuture::from(resp.json()?).await?;
-            let files_v = Reflect::get(&json, &JsValue::from_str("files"))?;
-            let arr: Array = files_v.unchecked_into();
-            for f in arr.iter() {
-                let Some(id) = js_str(&f, "id") else { continue };
-                let Some(name) = js_str(&f, "name") else { continue };
-                let mime = js_str(&f, "mimeType").unwrap_or_default();
-                if mime == FOLDER_MIME {
-                    subfolders.push((id, name));
-                    continue;
-                }
-                if out.files.len() >= MAX_FILES {
-                    continue;
-                }
-                let size_kb = js_str(&f, "size")
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0)
-                    / 1024;
-                let edited = Reflect::get(&f, &JsValue::from_str("appProperties"))
-                    .ok()
-                    .and_then(|p| js_str(&p, "pes_edited"))
-                    .as_deref()
-                    == Some("1");
-                out.files.push(DriveFile {
-                    id,
-                    name,
-                    mime,
-                    size_kb,
-                    path: path.clone(),
-                    parent: folder_id.to_string(),
-                    edited,
-                });
-            }
-            page_token = js_str(&json, "nextPageToken");
-            if page_token.is_none() {
-                break;
-            }
+/// Find the shortlist manifest at the root of the granted folder.
+pub async fn find_manifest(token: &str, folder_id: &str) -> Result<Option<String>, JsValue> {
+    let q = format!(
+        "name = '{}' and '{}' in parents and trashed = false",
+        MANIFEST_NAME,
+        folder_id.replace('\'', "\\'")
+    );
+    let url = format!(
+        "https://www.googleapis.com/drive/v3/files?q={}&fields=files(id)\
+         &supportsAllDrives=true&includeItemsFromAllDrives=true",
+        js_sys::encode_uri_component(&q)
+    );
+    let resp = drive_fetch(&url, token, "GET", None, None).await?;
+    let json = JsFuture::from(resp.json()?).await?;
+    let files_v = Reflect::get(&json, &JsValue::from_str("files"))?;
+    let arr: Array = files_v.unchecked_into();
+    Ok(arr.iter().next().and_then(|f| js_str(&f, "id")))
+}
+
+/// Read the starred file ids out of the manifest: {"version":1,"starred":[ids]}.
+pub fn parse_shortlist(bytes: &[u8]) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let Ok(text) = std::str::from_utf8(bytes) else { return out };
+    let Ok(v) = js_sys::JSON::parse(text) else { return out };
+    let Ok(arr_v) = Reflect::get(&v, &JsValue::from_str("starred")) else { return out };
+    let arr: Array = arr_v.unchecked_into();
+    for id in arr.iter() {
+        if let Some(s) = id.as_string() {
+            out.insert(s);
         }
-        if depth >= MAX_DEPTH {
-            out.skipped
-                .extend(subfolders.into_iter().map(|(_, n)| format!("{path}{n}/")));
-            return Ok(());
-        }
-        for (id, name) in subfolders {
-            let subpath = format!("{path}{name}/");
-            if walk_folder(token, &id, subpath.clone(), depth + 1, out)
-                .await
-                .is_err()
-            {
-                out.skipped.push(subpath);
-            }
-        }
-        Ok(())
-    })
+    }
+    out
+}
+
+pub fn shortlist_json(ids: &std::collections::HashSet<String>) -> Vec<u8> {
+    let mut items: Vec<String> = ids.iter().map(|i| format!("\"{}\"", json_escape(i))).collect();
+    items.sort();
+    format!("{{\"version\":1,\"starred\":[{}]}}", items.join(",")).into_bytes()
 }
 
 /// Download a file's bytes.
