@@ -45,7 +45,7 @@
     // HEIC -> JPEG blob. Called from Rust.
     window.pesHeicToJpeg = async function (blob) {
       if (!window.heic2any) {
-        await _pesLoadScript('https://unpkg.com/heic2any@0.0.4/dist/heic2any.min.js');
+        await _pesLoadScript('./vendor/heic2any/heic2any.min.js');
       }
       const out = await window.heic2any({ blob, toType: 'image/jpeg', quality: 0.92 });
       return Array.isArray(out) ? out[0] : out;
@@ -89,7 +89,7 @@
     window.pesVideoTranscode = async function (name, blob, args, overlays, onProgress) {
       try {
         if (!window.FFmpeg) {
-          await _pesLoadScript('https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js');
+          await _pesLoadScript('./vendor/ffmpeg/ffmpeg.min.js');
         }
         const { createFFmpeg, fetchFile } = FFmpeg;
         if (!_ffmpeg) {
@@ -97,7 +97,7 @@
           // (no COOP/COEP headers needed).
           _ffmpeg = createFFmpeg({
             log: false,
-            corePath: 'https://unpkg.com/@ffmpeg/core-st@0.11.1/dist/ffmpeg-core.js',
+            corePath: new URL('./vendor/ffmpeg-core/ffmpeg-core.js', window.location.href).href,
             mainName: 'main',
             progress: (p) => onProgress(p.ratio || 0),
           });
