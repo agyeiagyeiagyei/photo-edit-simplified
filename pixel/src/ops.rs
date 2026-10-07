@@ -1,6 +1,6 @@
 //! Pure-Rust pixel operations on RGBA buffers.
 
-use crate::state::{Selection, SelectionKind};
+use crate::types::{Selection, SelectionKind};
 
 /// Apply brightness / contrast / saturation / warmth in place.
 /// All parameters in [-1.0, 1.0].

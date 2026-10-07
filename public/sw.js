@@ -5,7 +5,7 @@
 // delay activation, and the old worker keeps serving stale pages until then).
 // MediaPipe vendor files are still cached lazily by the fetch handler on
 // first use.
-const CACHE = 'pes-v3';
+const CACHE = 'pes-v4';
 const SHELL = [
   './', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png',
 ];
@@ -66,6 +66,21 @@ self.addEventListener('fetch', (e) => {
         }
         return res;
       }).catch(() => caches.match(e.request).then((hit) => hit || caches.match('./index.html')))
+    );
+    return;
+  }
+
+  // Pixel-worker bundle: not fingerprinted, so network-first (cache fallback
+  // offline) — cache-first would pin a stale worker against a fresh app wasm.
+  if (new URL(e.request.url).pathname.includes('/pixel-worker/')) {
+    e.respondWith(
+      fetch(e.request).then((res) => {
+        if (res.ok) {
+          const copy = res.clone();
+          e.waitUntil(caches.open(CACHE).then((c) => c.put(e.request, copy)));
+        }
+        return res;
+      }).catch(() => caches.match(e.request))
     );
     return;
   }

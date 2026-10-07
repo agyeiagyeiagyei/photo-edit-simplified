@@ -1,19 +1,13 @@
-mod blur;
-mod clone;
-mod curves;
 mod drive;
 mod exif;
-mod fill;
-mod heal;
-mod levels;
-mod noise;
-mod ops;
+mod pworker;
 mod raw;
 mod session;
 mod state;
-mod stroke;
-mod wand;
 mod web;
+
+use pes_pixel::{blur, clone, curves, fill, heal, levels, noise, ops, stroke, wand};
+use pes_pixel::geo::{crop_px, geometry, hi_target, stamp_stroke, working_dims};
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -82,6 +76,7 @@ fn remove_item(state: AppState, item_id: usize) {
         c.raw_bytes.remove(&item_id);
         c.video_meta.remove(&item_id);
     });
+    pworker::unload(item_id);
     if state.selected.get_untracked() == Some(item_id) {
         let next = state.items.with(|v| v.first().map(|m| m.id));
         state.selected.set(next);
@@ -106,6 +101,7 @@ fn is_heic(file: &File) -> bool {
 
 fn main() {
     console_error_panic_hook::set_once();
+    pworker::init();
     mount_to_body(|| view! { <App/> });
 }
 
@@ -171,6 +167,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                     Err(_) => String::new(),
                 };
                 let thumb_url = thumb_object_url(&pp, pw, ph).await;
+                pworker::load(id, &full_rgba, fw, fh);
                 CACHE.with(|c| {
                     c.borrow_mut().photos.insert(
                         id,
@@ -234,6 +231,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                 let (fw, fh) = (full.1, full.2);
                 let preview = downscale(&img, 1024);
                 let thumb_url = thumb_object_url(&preview.0, preview.1, preview.2).await;
+                pworker::load(id, &full.0, full.1, full.2);
                 CACHE.with(|c| {
                     c.borrow_mut().photos.insert(id, Rc::new(PhotoData { full, preview, gen: 0 }))
                 });
@@ -318,6 +316,7 @@ fn ingest_drive_bytes(
                 Err(_) => String::new(),
             };
             let thumb_url = thumb_object_url(&pp, pw, ph).await;
+            pworker::load(id, &full_rgba, fw, fh);
             CACHE.with(|c| {
                 c.borrow_mut().photos.insert(
                     id,
@@ -363,6 +362,7 @@ fn ingest_drive_bytes(
             let (fw, fh) = (full.1, full.2);
             let preview = downscale(&img, 1024);
             let thumb_url = thumb_object_url(&preview.0, preview.1, preview.2).await;
+            pworker::load(id, &full.0, full.1, full.2);
             CACHE.with(|c| {
                 c.borrow_mut().photos.insert(id, Rc::new(PhotoData { full, preview, gen: 0 }))
             });
@@ -419,38 +419,6 @@ fn downscale(img: &web_sys::HtmlImageElement, long_edge: u32) -> (Vec<u8>, usize
 }
 
 // --- processing pipeline ------------------------------------------------------
-
-fn geometry(pixels: &[u8], w: usize, h: usize, edit: &EditParams) -> (Vec<u8>, usize, usize) {
-    let (p, w, h) = if edit.rot90 % 4 != 0 {
-        ops::rotate_90(pixels, w, h, edit.rot90)
-    } else {
-        (pixels.to_vec(), w, h)
-    };
-    if edit.fine_angle.abs() > 0.01 {
-        ops::rotate_auto_crop(&p, w, h, edit.fine_angle)
-    } else {
-        (p, w, h)
-    }
-}
-
-fn working_dims(w: usize, h: usize, edit: &EditParams) -> (usize, usize) {
-    let (w, h) = if edit.rot90 % 2 == 1 { (h, w) } else { (w, h) };
-    if edit.fine_angle.abs() > 0.01 {
-        let a = edit.fine_angle.to_radians().abs();
-        let (sin, cos) = (a.sin(), a.cos());
-        let bw = w as f32 * cos + h as f32 * sin;
-        let bh = w as f32 * sin + h as f32 * cos;
-        let x1 = (w * w) as f32 / (2.0 * bw);
-        let x2 = (w * h) as f32 / (2.0 * bh);
-        let half = x1.min(x2);
-        (
-            (half * 2.0).floor().max(1.0) as usize,
-            (half * 2.0 * h as f32 / w as f32).floor().max(1.0) as usize,
-        )
-    } else {
-        (w, h)
-    }
-}
 
 fn default_crop(w: usize, h: usize, aspect: Aspect) -> state::CropRect {
     match aspect.ratio() {
@@ -696,6 +664,9 @@ thread_local! {
     static HI_CACHE: RefCell<Option<HiCache>> = const { RefCell::new(None) };
     /// Generation guard for the debounced hi rebuild; only the latest fires.
     static HI_DEBOUNCE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Generation guard for an in-flight worker render; only the latest may
+    /// land in HI_CACHE.
+    static HI_REQ_GEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// Last nonzero canvas display need (CSS px × DPR). Reactive remounts
     /// briefly hand us a not-yet-inserted canvas with zero client size.
     static LAST_NEED: std::cell::Cell<(f64, f64)> = const { std::cell::Cell::new((0.0, 0.0)) };
@@ -835,30 +806,12 @@ fn resample_pixels(pixels: &[u8], w: usize, h: usize, tw: usize, th: usize) -> V
 
 /// Render the photo from its full-res original at (roughly) display
 /// resolution. Mirrors the preview pipeline and export.
-/// Render size for the hi cache: enough that the requested total-image
-/// region covers the display, with headroom — capped by HI_MAX_EDGE and by
-/// the full-resolution working dims (rendering past the source buys nothing).
-fn hi_target(req_w: f64, req_h: f64, full_w: usize, full_h: usize) -> (usize, usize) {
-    let edge = (req_w.max(req_h) * 1.25).round();
-    let cap = (HI_MAX_EDGE as f64).min(full_w.max(full_h) as f64);
-    let t = edge.min(cap).max(1.0);
-    let scale = t / full_w.max(full_h) as f64;
-    if scale < 0.999 {
-        (
-            (full_w as f64 * scale).round().max(1.0) as usize,
-            (full_h as f64 * scale).round().max(1.0) as usize,
-        )
-    } else {
-        (full_w, full_h)
-    }
-}
-
 fn render_hi(item: &MediaItem, req_w: f64, req_h: f64) -> Option<HiCache> {
     let photo = get_photo(item.id)?;
     let fingerprint = content_fingerprint(item, photo.gen);
     let (fpix, fw, fh) = &photo.full;
     let (p, ww, wh) = geometry(fpix, *fw, *fh, &item.edit);
-    let (tw, th) = hi_target(req_w, req_h, ww, wh);
+    let (tw, th) = hi_target(req_w, req_h, ww, wh, HI_MAX_EDGE as u32);
     let mut buf = if (tw, th) != (ww, wh) {
         resample_pixels(&p, ww, wh, tw, th)
     } else {
@@ -919,15 +872,6 @@ fn video_export_dims(edit: &EditParams, w: usize, h: usize) -> (usize, usize, us
 }
 
 // --- export --------------------------------------------------------------------
-
-fn crop_px(edit: &EditParams, w: usize, h: usize) -> (usize, usize, usize, usize) {
-    let c = edit.crop;
-    let x = (c.x * w as f32).round() as usize;
-    let y = (c.y * h as f32).round() as usize;
-    let cw = ((c.w * w as f32).round() as usize).max(1).min(w - x);
-    let ch = ((c.h * h as f32).round() as usize).max(1).min(h - y);
-    (x, y, cw, ch)
-}
 
 /// iPhone-style crop zoom: scale the crop rect about a fixed screen point
 /// (pinch centroid / cursor), then translate by the centroid's movement.
@@ -1983,6 +1927,7 @@ fn restore_session(state: AppState) {
                     Err(_) => String::new(),
                 };
                 let thumb_url = thumb_object_url(&pp, pw, ph).await;
+                pworker::load(id, &full_rgba, fw, fh);
                 CACHE.with(|c| {
                     c.borrow_mut().photos.insert(
                         id,
@@ -2011,6 +1956,7 @@ fn restore_session(state: AppState) {
                 let (fw, fh) = (full.1, full.2);
                 let preview = downscale(&img, 1024);
                 let thumb_url = thumb_object_url(&preview.0, preview.1, preview.2).await;
+                pworker::load(id, &full.0, full.1, full.2);
                 CACHE.with(|c| {
                     c.borrow_mut().photos.insert(id, Rc::new(PhotoData { full, preview, gen: 0 }))
                 });
@@ -3346,7 +3292,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         // Exact size render_hi would produce for this request — the cache is
         // sufficient iff it matches, which keeps rebuilds from looping.
         let (fw, fh) = working_dims(photo.full.1, photo.full.2, &item.edit);
-        let target = hi_target(req_w, req_h, fw, fh);
+        let target = hi_target(req_w, req_h, fw, fh, HI_MAX_EDGE as u32);
 
         let mut hi_dims: Option<(usize, usize)> = None;
         if want_hi {
@@ -3448,9 +3394,59 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     if item.kind != MediaKind::Photo {
                         return;
                     }
-                    if let Some(hi) = render_hi(&item, req_w, req_h) {
-                        HI_CACHE.with(|c| *c.borrow_mut() = Some(hi));
-                        state.hi_built.update(|g| *g += 1);
+                    HI_REQ_GEN.with(|d| d.set(d.get() + 1));
+                    let rgen = HI_REQ_GEN.with(|d| d.get());
+                    let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
+                    let sel = item.edit.selection.clone();
+                    let fp = get_photo(item.id).map(|p| content_fingerprint(&item, p.gen));
+                    let item_id = item.id;
+                    let item_cb = item.clone();
+                    let accepted = pworker::render(
+                        item_id,
+                        &recipe,
+                        req_w,
+                        req_h,
+                        HI_MAX_EDGE as u32,
+                        sel.as_ref(),
+                        move |reply| {
+                            if HI_REQ_GEN.with(|d| d.get()) != rgen {
+                                return;
+                            }
+                            match (reply, fp) {
+                                (Ok(r), Some(fp)) => {
+                                    let canvas = web::create_canvas(r.w, r.h);
+                                    web::put_pixels_view(&canvas, &r.pixels, r.w, r.h);
+                                    composite_layers(
+                                        &canvas,
+                                        &item_cb.layers,
+                                        r.w as usize,
+                                        r.h as usize,
+                                    );
+                                    HI_CACHE.with(|c| {
+                                        *c.borrow_mut() = Some(HiCache {
+                                            item_id,
+                                            fingerprint: fp,
+                                            canvas,
+                                            w: r.w as usize,
+                                            h: r.h as usize,
+                                        })
+                                    });
+                                    state.hi_built.update(|g| *g += 1);
+                                }
+                                _ => {
+                                    if let Some(hi) = render_hi(&item_cb, req_w, req_h) {
+                                        HI_CACHE.with(|c| *c.borrow_mut() = Some(hi));
+                                        state.hi_built.update(|g| *g += 1);
+                                    }
+                                }
+                            }
+                        },
+                    );
+                    if !accepted {
+                        if let Some(hi) = render_hi(&item, req_w, req_h) {
+                            HI_CACHE.with(|c| *c.borrow_mut() = Some(hi));
+                            state.hi_built.update(|g| *g += 1);
+                        }
                     }
                 });
                 let _ = web::window().set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -4127,6 +4123,46 @@ fn downscale_pixels(pixels: &[u8], w: usize, h: usize, long_edge: u32) -> (Vec<u
 }
 
 fn selection_to_layer(state: AppState, cut: bool) {
+    let Some(item) = state.current() else { return };
+    if item.kind != MediaKind::Photo {
+        return;
+    }
+    if item.edit.selection.is_none() {
+        return;
+    }
+    if get_photo(item.id).is_none() {
+        return;
+    }
+    pworker::destructive(
+        move || {
+            let Some(item) = state.current() else { return false };
+            let Some(sel) = item.edit.selection.clone() else { return false };
+            let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
+            let item_id = item.id;
+            pworker::extract(item_id, &recipe, &sel, cut, move |res| {
+                match res {
+                    Ok(Some(r)) => {
+                        state.items.update(|v| {
+                            if let Some(m) = v.iter_mut().find(|m| m.id == item_id) {
+                                let nid = m.next_layer_id;
+                                m.next_layer_id += 1;
+                                m.layers.push(Layer::new_raster(nid, r.layer, r.lw, r.lh));
+                            }
+                        });
+                        if let Some(c) = r.cut {
+                            destructive_apply(state, item_id, c);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(()) => selection_to_layer_sync(state, cut),
+                }
+            })
+        },
+        move || selection_to_layer_sync(state, cut),
+    );
+}
+
+fn selection_to_layer_sync(state: AppState, cut: bool) {
     let Some(item) = state.current() else { return; };
     if item.kind != MediaKind::Photo {
         return;
@@ -4149,6 +4185,7 @@ fn selection_to_layer(state: AppState, cut: bool) {
             px[3] = (px[3] as f32 * (1.0 - a)).min(255.0) as u8;
         }
         let preview = downscale_pixels(&cleared, w, h, 1024);
+        pworker::load(item.id, &cleared, w, h);
         CACHE.with(|c| {
             if let Some(pd) = c.borrow_mut().photos.get_mut(&item.id) {
                 let pd = Rc::make_mut(pd);
@@ -4171,6 +4208,35 @@ fn delete_selection(state: AppState) {
     if item.kind != MediaKind::Photo {
         return;
     }
+    if item.edit.selection.is_none() {
+        return;
+    }
+    if get_photo(item.id).is_none() {
+        return;
+    }
+    pworker::destructive(
+        move || {
+            let Some(item) = state.current() else { return false };
+            let Some(sel) = item.edit.selection.clone() else { return false };
+            let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
+            let item_id = item.id;
+            pworker::cut(item_id, &recipe, &sel, move |res| {
+                match res {
+                    Ok(Some(r)) => destructive_apply(state, item_id, r),
+                    Ok(None) => {}
+                    Err(()) => delete_selection_sync(state),
+                }
+            })
+        },
+        move || delete_selection_sync(state),
+    );
+}
+
+fn delete_selection_sync(state: AppState) {
+    let Some(item) = state.current() else { return; };
+    if item.kind != MediaKind::Photo {
+        return;
+    }
     let Some(sel) = item.edit.selection.clone() else { return; };
     let Some(photo) = get_photo(item.id) else { return; };
     let (full, fw, fh) = photo.full.clone();
@@ -4181,6 +4247,7 @@ fn delete_selection(state: AppState) {
         px[3] = (px[3] as f32 * (1.0 - a)).min(255.0) as u8;
     }
     let preview = downscale_pixels(&base, w, h, 1024);
+    pworker::load(item.id, &base, w, h);
     CACHE.with(|c| {
         if let Some(pd) = c.borrow_mut().photos.get_mut(&item.id) {
             let pd = Rc::make_mut(pd);
@@ -4204,6 +4271,35 @@ fn content_fill_selection(state: AppState) {
     if item.kind != MediaKind::Photo {
         return;
     }
+    if item.edit.selection.is_none() {
+        return;
+    }
+    if get_photo(item.id).is_none() {
+        return;
+    }
+    pworker::destructive(
+        move || {
+            let Some(item) = state.current() else { return false };
+            let Some(sel) = item.edit.selection.clone() else { return false };
+            let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
+            let item_id = item.id;
+            pworker::fill(item_id, &recipe, &sel, move |res| {
+                match res {
+                    Ok(Some(r)) => destructive_apply(state, item_id, r),
+                    Ok(None) => {}
+                    Err(()) => content_fill_selection_sync(state),
+                }
+            })
+        },
+        move || content_fill_selection_sync(state),
+    );
+}
+
+fn content_fill_selection_sync(state: AppState) {
+    let Some(item) = state.current() else { return; };
+    if item.kind != MediaKind::Photo {
+        return;
+    }
     let Some(sel) = item.edit.selection.clone() else { return; };
     let Some(photo) = get_photo(item.id) else { return; };
     let (full, fw, fh) = photo.full.clone();
@@ -4213,6 +4309,7 @@ fn content_fill_selection(state: AppState) {
         return;
     }
     let preview = downscale_pixels(&base, w, h, 1024);
+    pworker::load(item.id, &base, w, h);
     CACHE.with(|c| {
         if let Some(pd) = c.borrow_mut().photos.get_mut(&item.id) {
             let pd = Rc::make_mut(pd);
@@ -4229,10 +4326,75 @@ fn content_fill_selection(state: AppState) {
     });
 }
 
+/// Swap an item's cached pixels after a destructive op (worker or sync) and
+/// reset the baked geometry/selection on its edit.
+fn destructive_apply(state: AppState, item_id: usize, r: pworker::DestructiveResult) {
+    CACHE.with(|c| {
+        if let Some(pd) = c.borrow_mut().photos.get_mut(&item_id) {
+            let pd = Rc::make_mut(pd);
+            pd.full = (r.pixels, r.w, r.h);
+            pd.preview = (r.preview, r.pw, r.ph);
+            pd.gen += 1;
+        }
+    });
+    state.items.update(|v| {
+        if let Some(m) = v.iter_mut().find(|m| m.id == item_id) {
+            m.edit.rot90 = 0;
+            m.edit.fine_angle = 0.0;
+            m.edit.crop = state::CropRect::default();
+            m.edit.selection = None;
+        }
+    });
+}
+
+fn heal_mode_u8(m: heal::HealMode) -> u8 {
+    match m {
+        heal::HealMode::ContentAware => 0,
+        heal::HealMode::SmoothFill => 1,
+        heal::HealMode::ProximityMatch => 2,
+    }
+}
+
 /// Spot heal: stamp soft discs along the stroke (normalized coords) into a
 /// coverage mask at full-res, run the patch-synthesis solver, and swap the
 /// cached pixels — destructive, mirroring delete_selection.
 fn apply_heal(state: AppState, pts: &[(f32, f32)]) {
+    if pts.is_empty() {
+        return;
+    }
+    let Some(item) = state.current() else { return };
+    if item.kind != MediaKind::Photo {
+        return;
+    }
+    if get_photo(item.id).is_none() {
+        return;
+    }
+    let pts = pts.to_vec();
+    let pts_sync = pts.clone();
+    pworker::destructive(
+        move || {
+            let Some(item) = state.current() else { return false };
+            if item.kind != MediaKind::Photo {
+                return false;
+            }
+            let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
+            let radius = state.heal_radius.get_untracked();
+            let mode = heal_mode_u8(state.heal_mode.get_untracked());
+            let item_id = item.id;
+            let pts_fb = pts.clone();
+            pworker::heal(item_id, &recipe, &pts, radius, mode, move |res| {
+                match res {
+                    Ok(Some(r)) => destructive_apply(state, item_id, r),
+                    Ok(None) => {}
+                    Err(()) => apply_heal_sync(state, &pts_fb),
+                }
+            })
+        },
+        move || apply_heal_sync(state, &pts_sync),
+    );
+}
+
+fn apply_heal_sync(state: AppState, pts: &[(f32, f32)]) {
     if pts.is_empty() {
         return;
     }
@@ -4252,6 +4414,7 @@ fn apply_heal(state: AppState, pts: &[(f32, f32)]) {
         return;
     }
     let preview = downscale_pixels(&base, w, h, 1024);
+    pworker::load(item.id, &base, w, h);
     CACHE.with(|c| {
         if let Some(pd) = c.borrow_mut().photos.get_mut(&item.id) {
             let pd = Rc::make_mut(pd);
@@ -4268,53 +4431,66 @@ fn apply_heal(state: AppState, pts: &[(f32, f32)]) {
     });
 }
 
-/// Rasterize a polyline stroke into a coverage mask as soft discs of radius r
-/// (255 at the center, feathering to 0 at the edge), taking the max on overlap.
-fn stamp_stroke(coverage: &mut [u8], w: usize, h: usize, pts: &[(f32, f32)], r: f32) {
-    let mut stamp = |cx: f32, cy: f32| {
-        let x0 = (cx - r).floor().max(0.0) as usize;
-        let y0 = (cy - r).floor().max(0.0) as usize;
-        let x1 = ((cx + r).ceil() as usize).min(w - 1);
-        let y1 = ((cy + r).ceil() as usize).min(h - 1);
-        for y in y0..=y1 {
-            for x in x0..=x1 {
-                let dx = x as f32 - cx;
-                let dy = y as f32 - cy;
-                let d = (dx * dx + dy * dy).sqrt();
-                if d < r {
-                    // Plateau to 60% of the radius, linear feather beyond —
-                    // overlapping stamps keep full strength between centers.
-                    let v = if d <= r * 0.6 {
-                        255
-                    } else {
-                        (255.0 * (r - d) / (r * 0.4)) as u8
-                    };
-                    let i = y * w + x;
-                    coverage[i] = coverage[i].max(v);
-                }
-            }
-        }
-    };
-    let step = (r / 3.0).max(1.0);
-    for pair in pts.windows(2) {
-        let (ax, ay) = (pair[0].0 * w as f32, pair[0].1 * h as f32);
-        let (bx, by) = (pair[1].0 * w as f32, pair[1].1 * h as f32);
-        let len = ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt();
-        let n = (len / step).ceil().max(1.0) as usize;
-        for i in 0..=n {
-            let t = i as f32 / n as f32;
-            stamp(ax + (bx - ax) * t, ay + (by - ay) * t);
-        }
-    }
-    if pts.len() == 1 {
-        stamp(pts[0].0 * w as f32, pts[0].1 * h as f32);
-    }
-}
-
 /// Clone stamp: copy from the source point through the stroke's coverage mask
 /// at full-res. Aligned strokes keep the first stroke's offset; unaligned
 /// strokes re-derive it from the source each time. Destructive like apply_heal.
 fn apply_clone(state: AppState, pts: &[(f32, f32)]) {
+    if pts.is_empty() {
+        return;
+    }
+    let Some(item) = state.current() else { return };
+    if item.kind != MediaKind::Photo {
+        return;
+    }
+    if state.clone_source.get_untracked().is_none() {
+        return;
+    }
+    if get_photo(item.id).is_none() {
+        return;
+    }
+    let pts = pts.to_vec();
+    let pts_sync = pts.clone();
+    pworker::destructive(
+        move || {
+            let Some(item) = state.current() else { return false };
+            if item.kind != MediaKind::Photo {
+                return false;
+            }
+            let Some(photo) = get_photo(item.id) else { return false };
+            let Some(src) = state.clone_source.get_untracked() else { return false };
+            let aligned = state.clone_aligned.get_untracked();
+            let offset = if aligned {
+                match state.clone_offset.get_untracked() {
+                    Some(off) => off,
+                    None => {
+                        let off = (src.0 - pts[0].0, src.1 - pts[0].1);
+                        state.clone_offset.set(Some(off));
+                        off
+                    }
+                }
+            } else {
+                (src.0 - pts[0].0, src.1 - pts[0].1)
+            };
+            let (ww, wh) = working_dims(photo.full.1, photo.full.2, &item.edit);
+            let dx = (offset.0 * ww as f32).round() as i32;
+            let dy = (offset.1 * wh as f32).round() as i32;
+            let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
+            let radius = state.clone_radius.get_untracked();
+            let item_id = item.id;
+            let pts_fb = pts.clone();
+            pworker::clone_stamp(item_id, &recipe, &pts, radius, dx, dy, move |res| {
+                match res {
+                    Ok(Some(r)) => destructive_apply(state, item_id, r),
+                    Ok(None) => {}
+                    Err(()) => apply_clone_sync(state, &pts_fb),
+                }
+            })
+        },
+        move || apply_clone_sync(state, &pts_sync),
+    );
+}
+
+fn apply_clone_sync(state: AppState, pts: &[(f32, f32)]) {
     if pts.is_empty() {
         return;
     }
@@ -4347,6 +4523,7 @@ fn apply_clone(state: AppState, pts: &[(f32, f32)]) {
     stamp_stroke(&mut coverage, w, h, pts, r);
     clone::clone_stamp(&mut base, w, h, &coverage, dx, dy);
     let preview = downscale_pixels(&base, w, h, 1024);
+    pworker::load(item.id, &base, w, h);
     CACHE.with(|c| {
         if let Some(pd) = c.borrow_mut().photos.get_mut(&item.id) {
             let pd = Rc::make_mut(pd);

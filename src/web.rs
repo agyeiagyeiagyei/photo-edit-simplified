@@ -1,6 +1,6 @@
 //! Browser interop: canvas pixel access, blob helpers, JS library bridges.
 
-use js_sys::{Array, Function, Promise, Reflect, Uint8ClampedArray};
+use js_sys::{Array, Function, Promise, Reflect, Uint8Array, Uint8ClampedArray};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
@@ -51,6 +51,19 @@ pub fn put_pixels(
     canvas.set_height(h);
     let arr = Uint8ClampedArray::from(pixels);
     let data = ImageData::new_with_js_u8_clamped_array_and_sh(&arr, w, h).unwrap();
+    ctx2d(canvas).put_image_data(&data, 0.0, 0.0).unwrap();
+}
+
+/// put_pixels from a JS-side buffer view (worker replies) without a Rust copy.
+pub fn put_pixels_view(canvas: &HtmlCanvasElement, pixels: &Uint8Array, w: u32, h: u32) {
+    canvas.set_width(w);
+    canvas.set_height(h);
+    let clamped = Uint8ClampedArray::new_with_byte_offset_and_length(
+        &pixels.buffer(),
+        pixels.byte_offset(),
+        pixels.byte_length(),
+    );
+    let data = ImageData::new_with_js_u8_clamped_array_and_sh(&clamped, w, h).unwrap();
     ctx2d(canvas).put_image_data(&data, 0.0, 0.0).unwrap();
 }
 

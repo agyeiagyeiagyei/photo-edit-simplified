@@ -1,0 +1,16 @@
+[package]
+name = "pixel-worker"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pes-pixel = { path = "../pixel" }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+  "OffscreenCanvas", "OffscreenCanvasRenderingContext2d", "ImageData",
+] }
