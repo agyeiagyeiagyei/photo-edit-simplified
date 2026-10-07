@@ -54,10 +54,6 @@ pub fn thumb_url_sz(file_id: &str, width: u32) -> String {
     format!("https://drive.google.com/thumbnail?id={file_id}&sz=w{width}")
 }
 
-pub fn thumb_url(file_id: &str) -> String {
-    thumb_url_sz(file_id, 400)
-}
-
 impl DriveFile {
     pub fn importable(&self) -> bool {
         self.mime.starts_with("image/") || crate::raw::is_raw_name(&self.name)

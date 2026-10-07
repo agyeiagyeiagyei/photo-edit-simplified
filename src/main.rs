@@ -1615,6 +1615,13 @@ fn drive_hover_style(x: f64, y: f64) -> String {
     format!("left:{left:.0}px;top:{top:.0}px")
 }
 
+/// Grid tile width to request from the Drive thumbnail endpoint: CSS tile
+/// size × dpr, bucketed to 100px so URL churn stays low when the slider moves.
+fn drive_grid_thumb_w(state: AppState) -> u32 {
+    let px = state.drive_thumb_px.get() as f64 * web::window().device_pixel_ratio();
+    ((px / 100.0).ceil() as u32 * 100).clamp(100, 400)
+}
+
 #[component]
 fn DriveLoupe(state: AppState) -> impl IntoView {
     let close = move |_| state.drive_loupe.set(None);
@@ -1638,6 +1645,13 @@ fn DriveLoupe(state: AppState) -> impl IntoView {
                 });
             }
         }
+    });
+    // Loupe paints the w800 thumb first (likely already fetched by hover) and
+    // swaps to w1600 once that finishes downloading in the background.
+    let hi_ready = create_rw_signal(false);
+    create_effect(move |_| {
+        let _ = state.drive_loupe.get();
+        hi_ready.set(false);
     });
     let step = move |d: i64| {
         let n = visible_drive_files(state).len();
@@ -1691,12 +1705,32 @@ fn DriveLoupe(state: AppState) -> impl IntoView {
                 view! {
                     <div class="loupe" on:click=close>
                         <div class="loupe-body" on:click=move |ev| ev.stop_propagation()>
-                            <img src=drive::thumb_url_sz(&f.id, 1600) class="loupe-img"/>
+                            <img
+                                src={
+                                    let id = f.id.clone();
+                                    move || {
+                                        if hi_ready.get() {
+                                            drive::thumb_url_sz(&id, 1600)
+                                        } else {
+                                            drive::thumb_url_sz(&id, 800)
+                                        }
+                                    }
+                                }
+                                class="loupe-img"
+                                decoding="async"
+                            />
+                            <img
+                                src=drive::thumb_url_sz(&f.id, 1600)
+                                style="display:none"
+                                aria-hidden="true"
+                                decoding="async"
+                                on:load=move |_| hi_ready.set(true)
+                            />
                             <div class="loupe-preload" aria-hidden="true">
                                 {warm
                                     .into_iter()
                                     .map(|id| {
-                                        view! { <img src=drive::thumb_url_sz(&id, 1600) loading="eager"/> }
+                                        view! { <img src=drive::thumb_url_sz(&id, 1600) loading="eager" decoding="async"/> }
                                     })
                                     .collect_view()}
                             </div>
@@ -2021,7 +2055,7 @@ fn DrivePanel(state: AppState) -> impl IntoView {
                                     children=move |(idx, f): (usize, drive::DriveFile)| {
                                         let importable = f.importable();
                                         let thumb_broken = create_rw_signal(false);
-                                        let thumb_src = drive::thumb_url(&f.id);
+                                        let fid_thumb = f.id.clone();
                                         let fid = f.id.clone();
                                         let fid_class = f.id.clone();
                                         let fid2 = f.id.clone();
@@ -2067,8 +2101,17 @@ fn DrivePanel(state: AppState) -> impl IntoView {
                                                     } else {
                                                         view! {
                                                             <img
-                                                                src=thumb_src.clone()
+                                                                src={
+                                                                    let id = fid_thumb.clone();
+                                                                    move || {
+                                                                        drive::thumb_url_sz(
+                                                                            &id,
+                                                                            drive_grid_thumb_w(state),
+                                                                        )
+                                                                    }
+                                                                }
                                                                 loading="lazy"
+                                                                decoding="async"
                                                                 on:error=move |_| thumb_broken.set(true)
                                                             />
                                                         }
@@ -2119,7 +2162,7 @@ fn DrivePanel(state: AppState) -> impl IntoView {
                                 state.drive_hover.get().map(|(id, x, y)| {
                                     view! {
                                         <div class="drive-hover" style=drive_hover_style(x, y)>
-                                            <img src=drive::thumb_url_sz(&id, 800)/>
+                                            <img src=drive::thumb_url_sz(&id, 800) decoding="async"/>
                                         </div>
                                     }
                                 })
