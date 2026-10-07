@@ -136,6 +136,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                         exif: None,
                         drive_file_id: None,
                         drive_parent_id: None,
+                        drive_baked: false,
                     });
                 } else {
                     web::log("video probe failed");
@@ -183,6 +184,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                     exif,
                     drive_file_id: None,
                     drive_parent_id: None,
+                    drive_baked: false,
                 });
             } else {
                 state.busy.set(Some(format!("Loading {name}…")));
@@ -242,6 +244,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                     exif,
                     drive_file_id: None,
                     drive_parent_id: None,
+                    drive_baked: false,
                 });
             }
             state.busy.set(None);
@@ -260,17 +263,37 @@ fn push_item(state: AppState, item: MediaItem) {
 }
 
 /// Import a photo/RAW already downloaded from Drive as raw bytes.
+/// `drive_edited` is the file's pes_edited appProperty: baked pixels, so any
+/// stored recipe for the id is ignored (it would double-apply).
 fn ingest_drive_bytes(
     state: AppState,
     drive_file_id: String,
     drive_parent_id: String,
     name: String,
+    drive_edited: bool,
     bytes: Vec<u8>,
 ) {
     spawn_local(async move {
         let id = state.next_id.get_untracked();
         state.next_id.set(id + 1);
         state.busy.set(Some(format!("Importing {name}…")));
+
+        // Params describe work-in-progress on the original pixels; a file the
+        // app already flattened starts from identity.
+        let (edit, drive_baked) = if drive_edited {
+            (EditParams::default(), true)
+        } else {
+            let recipe = state.drive_edits.with(|m| m.get(&drive_file_id).cloned());
+            match recipe.as_deref().and_then(state::edit_params_from_recipe) {
+                Some(e) => {
+                    if e != EditParams::default() {
+                        state.drive_error.set(Some(format!("Edits restored for {name}")));
+                    }
+                    (e, false)
+                }
+                None => (EditParams::default(), false),
+            }
+        };
 
         if raw::is_raw_name(&name) {
             let Ok((full_rgba, fw, fh)) = raw::decode_raw(&bytes) else {
@@ -301,12 +324,13 @@ fn ingest_drive_bytes(
                 thumb_url,
                 width: fw,
                 height: fh,
-                edit: EditParams::default(),
+                edit,
                 layers: Vec::new(),
                 next_layer_id: 0,
                 exif,
                 drive_file_id: Some(drive_file_id),
                 drive_parent_id: Some(drive_parent_id),
+                drive_baked,
             });
         } else {
             let lname = name.to_lowercase();
@@ -342,12 +366,13 @@ fn ingest_drive_bytes(
                 thumb_url,
                 width: fw,
                 height: fh,
-                edit: EditParams::default(),
+                edit,
                 layers: Vec::new(),
                 next_layer_id: 0,
                 exif,
                 drive_file_id: Some(drive_file_id),
                 drive_parent_id: Some(drive_parent_id),
+                drive_baked,
             });
         }
         state.busy.set(None);
@@ -1056,7 +1081,10 @@ fn save_photo_to_drive(state: AppState, item: MediaItem) {
                         state.busy.set(None);
                         match r {
                             Ok(fid) => {
-                                state.update_current_item(|m| m.drive_file_id = Some(fid));
+                                state.update_current_item(|m| {
+                                    m.drive_file_id = Some(fid);
+                                    m.drive_baked = true;
+                                });
                                 drive_refresh(state);
                             }
                             Err(e) => state
@@ -1102,10 +1130,25 @@ fn save_photo_to_drive(state: AppState, item: MediaItem) {
         .await;
         match result {
             Ok(fid) => {
+                // PATCH (same id) means the recipe's pixels are now canonical:
+                // drop the manifest entry so a reopen doesn't re-apply it.
+                // A copy (new id) leaves the original's recipe untouched.
+                let patched_in_place = item.drive_file_id.as_deref() == Some(fid.as_str());
                 state.update_current_item(|m| {
-                    m.drive_file_id = Some(fid);
+                    m.drive_file_id = Some(fid.clone());
                     m.drive_parent_id = None;
+                    m.drive_baked = true;
                 });
+                if patched_in_place {
+                    // Only rewrite the manifest when an entry was actually
+                    // dropped — a baked item never had one.
+                    if state.drive_edits.with(|m| m.contains_key(&fid)) {
+                        state.drive_edits.update(|m| {
+                            m.remove(&fid);
+                        });
+                        schedule_manifest_save(state);
+                    }
+                }
                 drive_refresh(state);
             }
             Err(e) => {
@@ -1310,6 +1353,31 @@ fn App() -> impl IntoView {
     let state = AppState::new();
     provide_context(state);
 
+    // Persist parametric edits of Drive-backed items into the manifest's
+    // edits map (debounced). Baked items carry no recipe — their Drive copy
+    // has the edits flattened into pixels. Reset to identity removes the
+    // entry via the same path.
+    create_effect(move |_| {
+        let Some(item) = state.current() else { return };
+        let Some(fid) = item.drive_file_id.clone() else { return };
+        if item.drive_baked {
+            return;
+        }
+        let recipe = state::edit_recipe_json(&item.edit);
+        let stored = state.drive_edits.with(|m| m.get(&fid).cloned());
+        if stored != recipe {
+            state.drive_edits.update(|m| match &recipe {
+                Some(r) => {
+                    m.insert(fid.clone(), r.clone());
+                }
+                None => {
+                    m.remove(&fid);
+                }
+            });
+            schedule_manifest_save(state);
+        }
+    });
+
     view! {
         <div class="app">
             <header>
@@ -1434,18 +1502,32 @@ fn drive_refresh(state: AppState) {
                 .drive_error
                 .set(Some(format!("Drive list failed: {}", js_err(&e)))),
         }
-        // The shortlist manifest lives at the granted root regardless of
-        // which subfolder is being browsed.
+        // The manifest lives at the granted root regardless of which
+        // subfolder is being browsed. While a debounced write is outstanding
+        // (or a change landed mid-fetch, moving save_gen) the remote copy is
+        // stale — local state wins and the pending writer overwrites remote.
+        let gen_at_read = state.drive_save_gen.get_untracked();
         match drive::find_manifest(&token, &root_id).await {
             Ok(Some(mid)) => {
                 state.drive_manifest_id.set(Some(mid.clone()));
                 if let Ok(bytes) = drive::download_file(&token, &mid).await {
-                    state.drive_shortlist.set(drive::parse_shortlist(&bytes));
+                    let fresh = !state.drive_save_pending.get_untracked()
+                        && state.drive_save_gen.get_untracked() == gen_at_read;
+                    if fresh {
+                        let (starred, edits) = drive::parse_manifest(&bytes);
+                        state.drive_shortlist.set(starred);
+                        state.drive_edits.set(edits);
+                    }
                 }
             }
             Ok(None) => {
                 state.drive_manifest_id.set(None);
-                state.drive_shortlist.set(Default::default());
+                let fresh = !state.drive_save_pending.get_untracked()
+                    && state.drive_save_gen.get_untracked() == gen_at_read;
+                if fresh {
+                    state.drive_shortlist.set(Default::default());
+                    state.drive_edits.set(Default::default());
+                }
             }
             Err(_) => {}
         }
@@ -1467,6 +1549,57 @@ fn visible_drive_files(state: AppState) -> Vec<drive::DriveFile> {
             .cloned()
             .collect()
     })
+}
+
+/// Debounced manifest write (starred ids + edit recipes): only the latest
+/// generation actually saves, so slider drags coalesce into one upload.
+/// Reads both maps at fire time.
+fn schedule_manifest_save(state: AppState) {
+    state.drive_save_gen.update(|g| *g += 1);
+    state.drive_save_pending.set(true);
+    let gen = state.drive_save_gen.get_untracked();
+    let cb = wasm_bindgen::closure::Closure::once(move || {
+        spawn_local(async move {
+            if state.drive_save_gen.get_untracked() != gen {
+                // Superseded by a newer change; that write owns the flag.
+                return;
+            }
+            let Some(token) = state.drive_token.get_untracked() else {
+                state.drive_save_pending.set(false);
+                return;
+            };
+            let Some((root_id, _)) = state.drive_folder.get_untracked() else {
+                state.drive_save_pending.set(false);
+                return;
+            };
+            let ids = state.drive_shortlist.get_untracked();
+            let edits = state.drive_edits.get_untracked();
+            let body = drive::manifest_json(&ids, &edits);
+            let existing = state.drive_manifest_id.get_untracked();
+            let result = drive::upload_file(
+                &token,
+                &root_id,
+                existing.as_deref(),
+                drive::MANIFEST_NAME,
+                "application/json",
+                &body,
+            )
+            .await;
+            // Remote now reflects local; refreshes may apply it again.
+            state.drive_save_pending.set(false);
+            match result {
+                Ok(fid) => state.drive_manifest_id.set(Some(fid)),
+                Err(e) => state
+                    .drive_error
+                    .set(Some(format!("Couldn't save shortlist: {}", js_err(&e)))),
+            }
+        });
+    });
+    let _ = web::window().set_timeout_with_callback_and_timeout_and_arguments_0(
+        cb.as_ref().unchecked_ref(),
+        900,
+    );
+    cb.forget();
 }
 
 fn toggle_star(state: AppState, id: String) {
@@ -1491,45 +1624,7 @@ fn toggle_star(state: AppState, id: String) {
             remove_item(state, item_id);
         }
     }
-    // Debounced manifest write: only the latest generation actually saves.
-    state.drive_save_gen.update(|g| *g += 1);
-    let gen = state.drive_save_gen.get_untracked();
-    let cb = wasm_bindgen::closure::Closure::once(move || {
-        spawn_local(async move {
-            if state.drive_save_gen.get_untracked() != gen {
-                return;
-            }
-            let Some(token) = state.drive_token.get_untracked() else {
-                return;
-            };
-            let Some((root_id, _)) = state.drive_folder.get_untracked() else {
-                return;
-            };
-            let ids = state.drive_shortlist.get_untracked();
-            let body = drive::shortlist_json(&ids);
-            let existing = state.drive_manifest_id.get_untracked();
-            match drive::upload_file(
-                &token,
-                &root_id,
-                existing.as_deref(),
-                drive::MANIFEST_NAME,
-                "application/json",
-                &body,
-            )
-            .await
-            {
-                Ok(fid) => state.drive_manifest_id.set(Some(fid)),
-                Err(e) => state
-                    .drive_error
-                    .set(Some(format!("Couldn't save shortlist: {}", js_err(&e)))),
-            }
-        });
-    });
-    let _ = web::window().set_timeout_with_callback_and_timeout_and_arguments_0(
-        cb.as_ref().unchecked_ref(),
-        900,
-    );
-    cb.forget();
+    schedule_manifest_save(state);
 }
 
 fn drive_navigate(state: AppState, depth: usize) {
@@ -1561,7 +1656,7 @@ fn download_import(state: AppState, f: drive::DriveFile) {
         match drive::download_file(&token, &f.id).await {
             Ok(bytes) => {
                 state.busy.set(None);
-                ingest_drive_bytes(state, f.id, f.parent, f.name, bytes);
+                ingest_drive_bytes(state, f.id, f.parent, f.name, f.edited, bytes);
             }
             Err(e) => {
                 state.busy.set(None);

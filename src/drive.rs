@@ -161,8 +161,9 @@ const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 /// Runaway guard for one folder's listing.
 const MAX_FILES: usize = 2000;
 
-/// Name of the app-owned shortlist manifest stored at the root of the
-/// granted folder. Filtered out of the browsing grid.
+/// Name of the app-owned manifest stored at the root of the granted folder:
+/// starred file ids plus parametric edit recipes. Filtered out of the
+/// browsing grid.
 pub const MANIFEST_NAME: &str = "photo-edit-shortlist.json";
 
 /// List a single folder (not recursive): importable files plus subfolders.
@@ -254,25 +255,65 @@ pub async fn find_manifest(token: &str, folder_id: &str) -> Result<Option<String
     Ok(arr.iter().next().and_then(|f| js_str(&f, "id")))
 }
 
-/// Read the starred file ids out of the manifest: {"version":1,"starred":[ids]}.
-pub fn parse_shortlist(bytes: &[u8]) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
-    let Ok(text) = std::str::from_utf8(bytes) else { return out };
-    let Ok(v) = js_sys::JSON::parse(text) else { return out };
-    let Ok(arr_v) = Reflect::get(&v, &JsValue::from_str("starred")) else { return out };
-    let arr: Array = arr_v.unchecked_into();
-    for id in arr.iter() {
-        if let Some(s) = id.as_string() {
-            out.insert(s);
+/// Parse the manifest into (starred ids, edits map of file id → raw recipe
+/// JSON string). Version 1 manifests (no edits key) parse as empty edits.
+pub fn parse_manifest(
+    bytes: &[u8],
+) -> (std::collections::HashSet<String>, std::collections::HashMap<String, String>) {
+    let mut starred = std::collections::HashSet::new();
+    let mut edits = std::collections::HashMap::new();
+    let Ok(text) = std::str::from_utf8(bytes) else { return (starred, edits) };
+    let Ok(v) = js_sys::JSON::parse(text) else { return (starred, edits) };
+    if let Ok(arr_v) = Reflect::get(&v, &JsValue::from_str("starred")) {
+        if Array::is_array(&arr_v) {
+            let arr: Array = arr_v.unchecked_into();
+            for id in arr.iter() {
+                if let Some(s) = id.as_string() {
+                    starred.insert(s);
+                }
+            }
         }
     }
-    out
+    if let Ok(edits_v) = Reflect::get(&v, &JsValue::from_str("edits")) {
+        if edits_v.is_object() {
+            let obj: js_sys::Object = edits_v.clone().unchecked_into();
+            let keys = js_sys::Object::keys(&obj);
+            for k in keys.iter() {
+                let Some(key) = k.as_string() else { continue };
+                let Ok(recipe) = Reflect::get(&edits_v, &k) else { continue };
+                // Round-trip through stringify to keep the recipe as a raw JSON
+                // string — the map stores recipes unparsed until applied.
+                if let Ok(s) = js_sys::JSON::stringify(&recipe) {
+                    if let Some(s) = s.as_string() {
+                        edits.insert(key, s);
+                    }
+                }
+            }
+        }
+    }
+    (starred, edits)
 }
 
-pub fn shortlist_json(ids: &std::collections::HashSet<String>) -> Vec<u8> {
-    let mut items: Vec<String> = ids.iter().map(|i| format!("\"{}\"", json_escape(i))).collect();
-    items.sort();
-    format!("{{\"version\":1,\"starred\":[{}]}}", items.join(",")).into_bytes()
+/// Serialize the manifest (version 2). Recipes are raw JSON strings produced
+/// by state::edit_recipe_json and spliced in verbatim; keys sorted for stable
+/// diffs in Drive's revision history.
+pub fn manifest_json(
+    starred: &std::collections::HashSet<String>,
+    edits: &std::collections::HashMap<String, String>,
+) -> Vec<u8> {
+    let mut ids: Vec<String> = starred.iter().map(|i| format!("\"{}\"", json_escape(i))).collect();
+    ids.sort();
+    let mut entries: Vec<String> = edits
+        .iter()
+        .map(|(k, r)| format!("\"{}\":{}", json_escape(k), r))
+        .collect();
+    entries.sort();
+    format!(
+        "{{\"version\":2,\"starred\":[{}],\"edits\":{{{}}}}}",
+        ids.join(","),
+        entries.join(",")
+    )
+    .into_bytes()
 }
 
 /// Download a file's bytes.
