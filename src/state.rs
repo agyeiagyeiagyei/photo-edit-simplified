@@ -562,7 +562,7 @@ pub fn edit_recipe_json(e: &EditParams) -> Option<String> {
     }
 }
 
-fn jget(v: &wasm_bindgen::JsValue, key: &str) -> Option<wasm_bindgen::JsValue> {
+pub(crate) fn jget(v: &wasm_bindgen::JsValue, key: &str) -> Option<wasm_bindgen::JsValue> {
     let r = js_sys::Reflect::get(v, &wasm_bindgen::JsValue::from_str(key)).ok()?;
     if r.is_undefined() || r.is_null() {
         None
@@ -571,11 +571,11 @@ fn jget(v: &wasm_bindgen::JsValue, key: &str) -> Option<wasm_bindgen::JsValue> {
     }
 }
 
-fn jnum(v: &wasm_bindgen::JsValue, key: &str) -> Option<f64> {
+pub(crate) fn jnum(v: &wasm_bindgen::JsValue, key: &str) -> Option<f64> {
     jget(v, key)?.as_f64()
 }
 
-fn jbool(v: &wasm_bindgen::JsValue, key: &str) -> Option<bool> {
+pub(crate) fn jbool(v: &wasm_bindgen::JsValue, key: &str) -> Option<bool> {
     jget(v, key)?.as_bool()
 }
 
