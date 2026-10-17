@@ -10,7 +10,7 @@ use pes_pixel::{blur, clone, curves, fill, heal, levels, noise, ops, stroke, wan
 use pes_pixel::geo::{crop_px, geometry, hi_target, stamp_stroke, working_dims};
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use leptos::leptos_dom::helpers::window_event_listener;
@@ -26,8 +26,16 @@ use state::{AppState, Aspect, BrushStroke, DriveFilter, DriveSort, EditParams, L
 
 #[derive(Clone)]
 struct PhotoData {
-    full: (Vec<u8>, usize, usize),
+    /// Full-res RGBA. None until materialized (imports decode preview-only);
+    /// may be evicted under memory pressure, but never while `dirty`.
+    full: Option<(Vec<u8>, usize, usize)>,
+    /// Source dimensions, known without holding the pixels.
+    full_dims: (usize, usize),
     preview: (Vec<u8>, usize, usize),
+    /// A destructive op landed since the last session save persisted the
+    /// raster — until then this cache copy is the only full-res source of
+    /// truth, so dirty items are exempt from eviction.
+    dirty: bool,
     /// Bumped whenever full/preview are rebuilt in place (heal, cut, …) so the
     /// hi-res render cache knows its source pixels changed.
     gen: u64,
@@ -35,6 +43,9 @@ struct PhotoData {
 
 struct Cache {
     photos: HashMap<usize, Rc<PhotoData>>,
+    /// Compressed source blobs (JPEG/PNG/HEIC-converted) for on-demand
+    /// full-res re-decode. File-backed for local imports, so cheap to hold.
+    photo_src: HashMap<usize, Blob>,
     video_blobs: HashMap<usize, Blob>,
     video_meta: HashMap<usize, (f64, u32, u32)>, // duration, w, h
     /// Original RAW file bytes, kept so session persistence can store the
@@ -45,6 +56,7 @@ struct Cache {
 thread_local! {
     static CACHE: RefCell<Cache> = RefCell::new(Cache {
         photos: HashMap::new(),
+        photo_src: HashMap::new(),
         video_blobs: HashMap::new(),
         video_meta: HashMap::new(),
         raw_bytes: HashMap::new(),
@@ -53,6 +65,176 @@ thread_local! {
 
 fn get_photo(id: usize) -> Option<Rc<PhotoData>> {
     CACHE.with(|c| c.borrow().photos.get(&id).cloned())
+}
+
+/// Decoded full-res budget across all items (~512 MB, e.g. ~5 25MP photos).
+/// The worker mirrors the same set, so the true footprint is ~2x this plus
+/// decode transients — keep it well under the renderer's memory cap.
+/// Dirty items (a destructive op landed since the last session save) are
+/// exempt — their cache copy is the only source of truth until persisted.
+const FULL_BUDGET: usize = 512 << 20;
+
+thread_local! {
+    static FULL_INFLIGHT: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+    static FULL_WAITERS: RefCell<HashMap<usize, Vec<Box<dyn FnOnce()>>>> =
+        RefCell::new(HashMap::new());
+    static LAST_USE: RefCell<HashMap<usize, u64>> = RefCell::new(HashMap::new());
+    static USE_TICK: Cell<u64> = const { Cell::new(0) };
+}
+
+fn full_present(id: usize) -> bool {
+    CACHE.with(|c| {
+        c.borrow()
+            .photos
+            .get(&id)
+            .map(|p| p.full.is_some())
+            .unwrap_or(false)
+    })
+}
+
+fn touch_full(id: usize) {
+    let t = USE_TICK.with(|t| {
+        t.set(t.get() + 1);
+        t.get()
+    });
+    LAST_USE.with(|l| l.borrow_mut().insert(id, t));
+}
+
+/// Drop least-recently-used clean full-res buffers until the decoded total
+/// fits the budget; the worker's copy goes with each eviction.
+fn evict_full_lru() {
+    let evicted: Vec<usize> = CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        let mut total: usize = c
+            .photos
+            .values()
+            .filter_map(|p| p.full.as_ref().map(|f| f.0.len()))
+            .sum();
+        if total <= FULL_BUDGET {
+            return Vec::new();
+        }
+        let mut candidates: Vec<(u64, usize, usize)> = c
+            .photos
+            .iter()
+            .filter(|(_, p)| !p.dirty && p.full.is_some())
+            .map(|(id, p)| {
+                (
+                    LAST_USE.with(|l| l.borrow().get(id).copied()).unwrap_or(0),
+                    *id,
+                    p.full.as_ref().map(|f| f.0.len()).unwrap_or(0),
+                )
+            })
+            .collect();
+        candidates.sort_by_key(|c| c.0);
+        let mut evicted = Vec::new();
+        for (_, id, len) in candidates {
+            if total <= FULL_BUDGET {
+                break;
+            }
+            if let Some(p) = c.photos.get_mut(&id) {
+                Rc::make_mut(p).full = None;
+                total -= len;
+                evicted.push(id);
+            }
+        }
+        evicted
+    });
+    for id in evicted {
+        pworker::unload(id);
+    }
+}
+
+/// Install a freshly decoded full-res buffer: cache + worker + LRU, then run
+/// waiters and nudge items so pending hi-res renders reschedule.
+fn materialize_full(state: AppState, id: usize, pixels: Vec<u8>, w: usize, h: usize) {
+    pworker::load(id, &pixels, w, h);
+    CACHE.with(|c| {
+        if let Some(p) = c.borrow_mut().photos.get_mut(&id) {
+            let p = Rc::make_mut(p);
+            p.full_dims = (w, h);
+            p.full = Some((pixels, w, h));
+        }
+    });
+    touch_full(id);
+    evict_full_lru();
+    let waiters = FULL_WAITERS.with(|w| w.borrow_mut().remove(&id)).unwrap_or_default();
+    for w in waiters {
+        w();
+    }
+    state.items.update(|_| {});
+}
+
+/// Decode an item's full-res pixels on demand from its source blob (healed
+/// PNG or imported JPEG/PNG) or RAW bytes. No-op when present or in flight;
+/// `waiter` runs once the buffer lands.
+fn ensure_full(state: AppState, id: usize, waiter: Option<Box<dyn FnOnce()>>) {
+    touch_full(id);
+    if full_present(id) {
+        if let Some(w) = waiter {
+            w();
+        }
+        return;
+    }
+    if let Some(w) = waiter {
+        FULL_WAITERS.with(|ws| ws.borrow_mut().entry(id).or_default().push(w));
+    }
+    if !FULL_INFLIGHT.with(|f| f.borrow_mut().insert(id)) {
+        return;
+    }
+    let src = CACHE.with(|c| c.borrow().photo_src.get(&id).cloned());
+    let raw = CACHE.with(|c| c.borrow().raw_bytes.get(&id).cloned());
+    spawn_local(async move {
+        let decoded = if let Some(blob) = src {
+            match web::load_image(&blob).await {
+                Ok((img, url)) => {
+                    let _ = Url::revoke_object_url(&url);
+                    Some(web::rgba_from_image(&img))
+                }
+                Err(_) => None,
+            }
+        } else if let Some(bytes) = raw {
+            raw::decode_raw(&bytes).ok()
+        } else {
+            None
+        };
+        FULL_INFLIGHT.with(|f| f.borrow_mut().remove(&id));
+        let still_tracked = CACHE.with(|c| c.borrow().photos.contains_key(&id));
+        match (decoded, still_tracked) {
+            (Some((px, w, h)), true) => materialize_full(state, id, px, w, h),
+            _ => {
+                // Gone or undecodable — drop waiters; their fns re-check and bail.
+                let waiters =
+                    FULL_WAITERS.with(|w| w.borrow_mut().remove(&id)).unwrap_or_default();
+                for w in waiters {
+                    w();
+                }
+            }
+        }
+    });
+}
+
+async fn sleep_ms(ms: i32) {
+    let p = js_sys::Promise::new(&mut |res, _| {
+        let _ = web::window().set_timeout_with_callback_and_timeout_and_arguments_0(&res, ms);
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(p).await;
+}
+
+/// Awaitable ensure_full for the export path. False when undecodable.
+async fn ensure_full_async(state: AppState, id: usize) -> bool {
+    if full_present(id) {
+        return true;
+    }
+    let done = Rc::new(Cell::new(false));
+    let done2 = done.clone();
+    ensure_full(state, id, Some(Box::new(move || done2.set(true))));
+    for _ in 0..600 {
+        if done.get() {
+            break;
+        }
+        sleep_ms(50).await;
+    }
+    full_present(id)
 }
 
 /// Drop an item from the filmstrip: revoke its object URLs and free its
@@ -72,10 +254,13 @@ fn remove_item(state: AppState, item_id: usize) {
     CACHE.with(|c| {
         let mut c = c.borrow_mut();
         c.photos.remove(&item_id);
+        c.photo_src.remove(&item_id);
         c.video_blobs.remove(&item_id);
         c.raw_bytes.remove(&item_id);
         c.video_meta.remove(&item_id);
     });
+    LAST_USE.with(|l| l.borrow_mut().remove(&item_id));
+    FULL_WAITERS.with(|w| w.borrow_mut().remove(&item_id));
     pworker::unload(item_id);
     if state.selected.get_untracked() == Some(item_id) {
         let next = state.items.with(|v| v.first().map(|m| m.id));
@@ -171,9 +356,17 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                 CACHE.with(|c| {
                     c.borrow_mut().photos.insert(
                         id,
-                        Rc::new(PhotoData { full: (full_rgba, fw, fh), preview: (pp, pw, ph), gen: 0 }),
+                        Rc::new(PhotoData {
+                            full: Some((full_rgba, fw, fh)),
+                            full_dims: (fw, fh),
+                            preview: (pp, pw, ph),
+                            dirty: false,
+                            gen: 0,
+                        }),
                     )
                 });
+                touch_full(id);
+                evict_full_lru();
                 push_item(state, MediaItem {
                     id,
                     kind: MediaKind::Photo,
@@ -227,13 +420,22 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                     state.busy.set(None);
                     continue;
                 };
-                let full = web::rgba_from_image(&img);
-                let (fw, fh) = (full.1, full.2);
+                let (fw, fh) = (img.natural_width() as usize, img.natural_height() as usize);
                 let preview = downscale(&img, 1024);
                 let thumb_url = thumb_object_url(&preview.0, preview.1, preview.2).await;
-                pworker::load(id, &full.0, full.1, full.2);
                 CACHE.with(|c| {
-                    c.borrow_mut().photos.insert(id, Rc::new(PhotoData { full, preview, gen: 0 }))
+                    let mut c = c.borrow_mut();
+                    c.photo_src.insert(id, blob);
+                    c.photos.insert(
+                        id,
+                        Rc::new(PhotoData {
+                            full: None,
+                            full_dims: (fw, fh),
+                            preview,
+                            dirty: false,
+                            gen: 0,
+                        }),
+                    );
                 });
                 push_item(state, MediaItem {
                     id,
@@ -320,9 +522,17 @@ fn ingest_drive_bytes(
             CACHE.with(|c| {
                 c.borrow_mut().photos.insert(
                     id,
-                    Rc::new(PhotoData { full: (full_rgba, fw, fh), preview: (pp, pw, ph), gen: 0 }),
+                    Rc::new(PhotoData {
+                        full: Some((full_rgba, fw, fh)),
+                        full_dims: (fw, fh),
+                        preview: (pp, pw, ph),
+                        dirty: false,
+                        gen: 0,
+                    }),
                 )
             });
+            touch_full(id);
+            evict_full_lru();
             push_item(state, MediaItem {
                 id,
                 kind: MediaKind::Photo,
@@ -358,13 +568,22 @@ fn ingest_drive_bytes(
                 state.busy.set(None);
                 return;
             };
-            let full = web::rgba_from_image(&img);
-            let (fw, fh) = (full.1, full.2);
+            let (fw, fh) = (img.natural_width() as usize, img.natural_height() as usize);
             let preview = downscale(&img, 1024);
             let thumb_url = thumb_object_url(&preview.0, preview.1, preview.2).await;
-            pworker::load(id, &full.0, full.1, full.2);
             CACHE.with(|c| {
-                c.borrow_mut().photos.insert(id, Rc::new(PhotoData { full, preview, gen: 0 }))
+                let mut c = c.borrow_mut();
+                c.photo_src.insert(id, blob);
+                c.photos.insert(
+                    id,
+                    Rc::new(PhotoData {
+                        full: None,
+                        full_dims: (fw, fh),
+                        preview,
+                        dirty: false,
+                        gen: 0,
+                    }),
+                );
             });
             push_item(state, MediaItem {
                 id,
@@ -809,7 +1028,7 @@ fn resample_pixels(pixels: &[u8], w: usize, h: usize, tw: usize, th: usize) -> V
 fn render_hi(item: &MediaItem, req_w: f64, req_h: f64) -> Option<HiCache> {
     let photo = get_photo(item.id)?;
     let fingerprint = content_fingerprint(item, photo.gen);
-    let (fpix, fw, fh) = &photo.full;
+    let (fpix, fw, fh) = photo.full.as_ref()?;
     let (p, ww, wh) = geometry(fpix, *fw, *fh, &item.edit);
     let (tw, th) = hi_target(req_w, req_h, ww, wh, HI_MAX_EDGE as u32);
     let mut buf = if (tw, th) != (ww, wh) {
@@ -907,8 +1126,11 @@ async fn render_photo_export(
     state: AppState,
     item: &MediaItem,
 ) -> Option<(Blob, &'static str, String)> {
+    if !ensure_full_async(state, item.id).await {
+        return None;
+    }
     let photo = get_photo(item.id)?;
-    let (pix, w, h) = &photo.full;
+    let (pix, w, h) = photo.full.as_ref()?;
     let (mut p, w, h) = geometry(pix, *w, *h, &item.edit);
     if item.edit.is_color_touched() {
         if let Some(sel) = &item.edit.selection {
@@ -1312,6 +1534,18 @@ fn App() -> impl IntoView {
         state.items.track();
         state.selected.track();
         schedule_session_save(state);
+    });
+
+    // Decode the selected photo's full-res pixels on demand; unselected
+    // photos stay preview-only and their decoded buffers are LRU-evicted.
+    create_effect(move |_| {
+        let Some(id) = state.selected.get() else { return };
+        let is_photo = state
+            .items
+            .with(|v| v.iter().any(|m| m.id == id && m.kind == MediaKind::Photo));
+        if is_photo {
+            ensure_full(state, id, None);
+        }
     });
 
     // Persist parametric edits of Drive-backed items into the manifest's
@@ -1755,6 +1989,7 @@ async fn persist_session(state: AppState) {
         let healed = item.kind == MediaKind::Photo && gen > 0;
         session::jset(rec_v, "raw", matches!(sig.bytes, BytesSig::Raw(_, _)) && !healed);
         session::jset(rec_v, "raster", healed);
+        let mut persisted_png: Option<Blob> = None;
         if bytes_moved {
             let blob: Option<Blob> = match &sig.bytes {
                 BytesSig::Video(_) => {
@@ -1771,15 +2006,20 @@ async fn persist_session(state: AppState) {
                     Err(_) => None,
                 },
                 // Healed: the cache's full-res raster is the source of truth.
+                // gen moved ⇒ the item is dirty ⇒ full is present (dirty
+                // items are eviction-exempt), so the None arm can't fire.
                 BytesSig::Photo(_, _) | BytesSig::Raw(_, _) => match get_photo(item.id) {
-                    Some(p) => {
-                        let (px, w, h) = &p.full;
-                        pixels_to_png_blob(px, *w, *h).await.ok()
-                    }
+                    Some(p) => match &p.full {
+                        Some((px, w, h)) => pixels_to_png_blob(px, *w, *h).await.ok(),
+                        None => None,
+                    },
                     None => None,
                 },
             };
             let Some(blob) = blob else { continue };
+            if healed {
+                persisted_png = Some(blob.clone());
+            }
             session::jset(rec_v, "bytes", blob);
         } else if let Ok(Some(old)) = session::get_item(&db, item.id).await {
             if let Some(b) = state::jget(&old, "bytes") {
@@ -1813,6 +2053,17 @@ async fn persist_session(state: AppState) {
         SESSION_SIGS.with(|s| {
             s.borrow_mut().insert(item.id, sig);
         });
+        // A healed raster just landed in IndexedDB — it becomes the re-decode
+        // source and the cache copy is clean (evictable) again.
+        if let Some(png) = persisted_png {
+            CACHE.with(|c| {
+                let mut c = c.borrow_mut();
+                c.photo_src.insert(item.id, png);
+                if let Some(p) = c.photos.get_mut(&item.id) {
+                    Rc::make_mut(p).dirty = false;
+                }
+            });
+        }
     }
 
     let meta = session::jobj();
@@ -1931,9 +2182,17 @@ fn restore_session(state: AppState) {
                 CACHE.with(|c| {
                     c.borrow_mut().photos.insert(
                         id,
-                        Rc::new(PhotoData { full: (full_rgba, fw, fh), preview: (pp, pw, ph), gen: 0 }),
+                        Rc::new(PhotoData {
+                            full: Some((full_rgba, fw, fh)),
+                            full_dims: (fw, fh),
+                            preview: (pp, pw, ph),
+                            dirty: false,
+                            gen: 0,
+                        }),
                     )
                 });
+                touch_full(id);
+                evict_full_lru();
                 push_item(state, MediaItem {
                     id,
                     kind: MediaKind::Photo,
@@ -1952,13 +2211,22 @@ fn restore_session(state: AppState) {
                 });
             } else {
                 let Ok((img, url)) = web::load_image(&blob).await else { continue };
-                let full = web::rgba_from_image(&img);
-                let (fw, fh) = (full.1, full.2);
+                let (fw, fh) = (img.natural_width() as usize, img.natural_height() as usize);
                 let preview = downscale(&img, 1024);
                 let thumb_url = thumb_object_url(&preview.0, preview.1, preview.2).await;
-                pworker::load(id, &full.0, full.1, full.2);
                 CACHE.with(|c| {
-                    c.borrow_mut().photos.insert(id, Rc::new(PhotoData { full, preview, gen: 0 }))
+                    let mut c = c.borrow_mut();
+                    c.photo_src.insert(id, blob);
+                    c.photos.insert(
+                        id,
+                        Rc::new(PhotoData {
+                            full: None,
+                            full_dims: (fw, fh),
+                            preview,
+                            dirty: false,
+                            gen: 0,
+                        }),
+                    );
                 });
                 push_item(state, MediaItem {
                     id,
@@ -3291,7 +3559,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         };
         // Exact size render_hi would produce for this request — the cache is
         // sufficient iff it matches, which keeps rebuilds from looping.
-        let (fw, fh) = working_dims(photo.full.1, photo.full.2, &item.edit);
+        let (fw, fh) = working_dims(photo.full_dims.0, photo.full_dims.1, &item.edit);
         let target = hi_target(req_w, req_h, fw, fh, HI_MAX_EDGE as u32);
 
         let mut hi_dims: Option<(usize, usize)> = None;
@@ -3392,6 +3660,13 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     }
                     let Some(item) = state.current() else { return };
                     if item.kind != MediaKind::Photo {
+                        return;
+                    }
+                    if !full_present(item.id) {
+                        // Pixels not decoded yet — kick the loader; its
+                        // completion nudge retriggers this effect and
+                        // reschedules the hi-res render.
+                        ensure_full(state, item.id, None);
                         return;
                     }
                     HI_REQ_GEN.with(|d| d.set(d.get() + 1));
@@ -4130,7 +4405,8 @@ fn selection_to_layer(state: AppState, cut: bool) {
     if item.edit.selection.is_none() {
         return;
     }
-    if get_photo(item.id).is_none() {
+    if !full_present(item.id) {
+        ensure_full(state, item.id, Some(Box::new(move || selection_to_layer(state, cut))));
         return;
     }
     pworker::destructive(
@@ -4169,7 +4445,7 @@ fn selection_to_layer_sync(state: AppState, cut: bool) {
     }
     let Some(sel) = item.edit.selection.clone() else { return; };
     let Some(photo) = get_photo(item.id) else { return; };
-    let (full, fw, fh) = photo.full.clone();
+    let Some((full, fw, fh)) = photo.full.clone() else { return };
     let (base, w, h) = geometry(&full, fw, fh, &item.edit);
     let mask = ops::selection_mask(&sel, w, h);
     let extracted = ops::extract_masked(&base, &mask);
@@ -4189,8 +4465,10 @@ fn selection_to_layer_sync(state: AppState, cut: bool) {
         CACHE.with(|c| {
             if let Some(pd) = c.borrow_mut().photos.get_mut(&item.id) {
                 let pd = Rc::make_mut(pd);
-                pd.full = (cleared, w, h);
+                pd.full = Some((cleared, w, h));
+                pd.full_dims = (w, h);
                 pd.preview = preview;
+                pd.dirty = true;
                 pd.gen += 1;
             }
         });
@@ -4211,7 +4489,8 @@ fn delete_selection(state: AppState) {
     if item.edit.selection.is_none() {
         return;
     }
-    if get_photo(item.id).is_none() {
+    if !full_present(item.id) {
+        ensure_full(state, item.id, Some(Box::new(move || delete_selection(state))));
         return;
     }
     pworker::destructive(
@@ -4239,7 +4518,7 @@ fn delete_selection_sync(state: AppState) {
     }
     let Some(sel) = item.edit.selection.clone() else { return; };
     let Some(photo) = get_photo(item.id) else { return; };
-    let (full, fw, fh) = photo.full.clone();
+    let Some((full, fw, fh)) = photo.full.clone() else { return };
     let (mut base, w, h) = geometry(&full, fw, fh, &item.edit);
     let mask = ops::selection_mask(&sel, w, h);
     for (px, m) in base.chunks_exact_mut(4).zip(mask.iter()) {
@@ -4251,8 +4530,10 @@ fn delete_selection_sync(state: AppState) {
     CACHE.with(|c| {
         if let Some(pd) = c.borrow_mut().photos.get_mut(&item.id) {
             let pd = Rc::make_mut(pd);
-            pd.full = (base, w, h);
+            pd.full = Some((base, w, h));
+            pd.full_dims = (w, h);
             pd.preview = preview;
+            pd.dirty = true;
             pd.gen += 1;
         }
     });
@@ -4274,7 +4555,8 @@ fn content_fill_selection(state: AppState) {
     if item.edit.selection.is_none() {
         return;
     }
-    if get_photo(item.id).is_none() {
+    if !full_present(item.id) {
+        ensure_full(state, item.id, Some(Box::new(move || content_fill_selection(state))));
         return;
     }
     pworker::destructive(
@@ -4302,7 +4584,7 @@ fn content_fill_selection_sync(state: AppState) {
     }
     let Some(sel) = item.edit.selection.clone() else { return; };
     let Some(photo) = get_photo(item.id) else { return; };
-    let (full, fw, fh) = photo.full.clone();
+    let Some((full, fw, fh)) = photo.full.clone() else { return };
     let (mut base, w, h) = geometry(&full, fw, fh, &item.edit);
     let mask = ops::selection_mask(&sel, w, h);
     if !fill::content_fill(&mut base, &mask, w, h) {
@@ -4313,8 +4595,10 @@ fn content_fill_selection_sync(state: AppState) {
     CACHE.with(|c| {
         if let Some(pd) = c.borrow_mut().photos.get_mut(&item.id) {
             let pd = Rc::make_mut(pd);
-            pd.full = (base, w, h);
+            pd.full = Some((base, w, h));
+            pd.full_dims = (w, h);
             pd.preview = preview;
+            pd.dirty = true;
             pd.gen += 1;
         }
     });
@@ -4332,8 +4616,10 @@ fn destructive_apply(state: AppState, item_id: usize, r: pworker::DestructiveRes
     CACHE.with(|c| {
         if let Some(pd) = c.borrow_mut().photos.get_mut(&item_id) {
             let pd = Rc::make_mut(pd);
-            pd.full = (r.pixels, r.w, r.h);
+            pd.full = Some((r.pixels, r.w, r.h));
+            pd.full_dims = (r.w, r.h);
             pd.preview = (r.preview, r.pw, r.ph);
+            pd.dirty = true;
             pd.gen += 1;
         }
     });
@@ -4366,7 +4652,9 @@ fn apply_heal(state: AppState, pts: &[(f32, f32)]) {
     if item.kind != MediaKind::Photo {
         return;
     }
-    if get_photo(item.id).is_none() {
+    if !full_present(item.id) {
+        let pts = pts.to_vec();
+        ensure_full(state, item.id, Some(Box::new(move || apply_heal(state, &pts))));
         return;
     }
     let pts = pts.to_vec();
@@ -4403,7 +4691,7 @@ fn apply_heal_sync(state: AppState, pts: &[(f32, f32)]) {
         return;
     }
     let Some(photo) = get_photo(item.id) else { return };
-    let (full, fw, fh) = photo.full.clone();
+    let Some((full, fw, fh)) = photo.full.clone() else { return };
     let (mut base, w, h) = geometry(&full, fw, fh, &item.edit);
     let diag = ((w * w + h * h) as f32).sqrt();
     let r = (state.heal_radius.get_untracked() * diag).max(1.0);
@@ -4418,8 +4706,10 @@ fn apply_heal_sync(state: AppState, pts: &[(f32, f32)]) {
     CACHE.with(|c| {
         if let Some(pd) = c.borrow_mut().photos.get_mut(&item.id) {
             let pd = Rc::make_mut(pd);
-            pd.full = (base, w, h);
+            pd.full = Some((base, w, h));
+            pd.full_dims = (w, h);
             pd.preview = preview;
+            pd.dirty = true;
             pd.gen += 1;
         }
     });
@@ -4445,7 +4735,9 @@ fn apply_clone(state: AppState, pts: &[(f32, f32)]) {
     if state.clone_source.get_untracked().is_none() {
         return;
     }
-    if get_photo(item.id).is_none() {
+    if !full_present(item.id) {
+        let pts = pts.to_vec();
+        ensure_full(state, item.id, Some(Box::new(move || apply_clone(state, &pts))));
         return;
     }
     let pts = pts.to_vec();
@@ -4471,7 +4763,7 @@ fn apply_clone(state: AppState, pts: &[(f32, f32)]) {
             } else {
                 (src.0 - pts[0].0, src.1 - pts[0].1)
             };
-            let (ww, wh) = working_dims(photo.full.1, photo.full.2, &item.edit);
+            let (ww, wh) = working_dims(photo.full_dims.0, photo.full_dims.1, &item.edit);
             let dx = (offset.0 * ww as f32).round() as i32;
             let dy = (offset.1 * wh as f32).round() as i32;
             let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
@@ -4500,7 +4792,7 @@ fn apply_clone_sync(state: AppState, pts: &[(f32, f32)]) {
     }
     let Some(src) = state.clone_source.get_untracked() else { return };
     let Some(photo) = get_photo(item.id) else { return };
-    let (full, fw, fh) = photo.full.clone();
+    let Some((full, fw, fh)) = photo.full.clone() else { return };
     let (mut base, w, h) = geometry(&full, fw, fh, &item.edit);
     let aligned = state.clone_aligned.get_untracked();
     let offset = if aligned {
@@ -4527,8 +4819,10 @@ fn apply_clone_sync(state: AppState, pts: &[(f32, f32)]) {
     CACHE.with(|c| {
         if let Some(pd) = c.borrow_mut().photos.get_mut(&item.id) {
             let pd = Rc::make_mut(pd);
-            pd.full = (base, w, h);
+            pd.full = Some((base, w, h));
+            pd.full_dims = (w, h);
             pd.preview = preview;
+            pd.dirty = true;
             pd.gen += 1;
         }
     });
