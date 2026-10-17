@@ -597,6 +597,34 @@ button:disabled {
   border-radius: 5px;
 }
 
+.loupe-hover {
+  position: fixed;
+  z-index: 70;
+  pointer-events: none;
+  background: #111;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px;
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.55);
+}
+.loupe-hover canvas {
+  width: 480px;
+  height: 360px;
+  display: block;
+  border-radius: 5px;
+  background: #000;
+}
+.loupe-tag {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  font-size: 11px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.55);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
 .drive-folder { justify-content: center; }
 .drive-folder .drive-icon { font-size: 34px; }
 

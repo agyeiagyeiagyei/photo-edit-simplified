@@ -427,6 +427,12 @@ pub struct AppState {
     pub drive_loupe_seen: RwSignal<Vec<String>>,
     /// Hover-zoom preview: (file id, cursor x, cursor y) while hovering a tile.
     pub drive_hover: RwSignal<Option<(String, f64, f64)>>,
+    /// Filmstrip focus loupe: (item id, normalized x, normalized y, client x,
+    /// client y) while the cursor rests on a thumb; the crop pans with the
+    /// cursor at 1:1 pixels.
+    pub loupe: RwSignal<Option<(usize, f64, f64, f64, f64)>>,
+    /// Bumped on hover enter/leave; only the latest generation opens the loupe.
+    pub loupe_gen: RwSignal<u32>,
     /// Bumped on hover enter/leave; only the latest generation opens a preview.
     pub drive_hover_gen: RwSignal<u32>,
     /// Last Drive error to surface in the panel.
@@ -499,6 +505,8 @@ impl AppState {
             drive_loupe_seen: create_rw_signal(Vec::new()),
             drive_hover: create_rw_signal(None),
             drive_hover_gen: create_rw_signal(0),
+            loupe: create_rw_signal(None),
+            loupe_gen: create_rw_signal(0),
             drive_error: create_rw_signal(None),
             drive_open: create_rw_signal(false),
         }

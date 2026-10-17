@@ -1642,6 +1642,164 @@ fn DropZone(state: AppState) -> impl IntoView {
     }
 }
 
+/// Normalized (0..1) cursor position within the thumb under the cursor.
+/// Bubbling events are delegated in Leptos, so current_target is not the
+/// thumb — resolve via target + closest instead.
+fn thumb_norm_pos(ev: &web_sys::MouseEvent) -> Option<(f64, f64)> {
+    let el: web_sys::Element = ev.target()?.dyn_into().ok()?;
+    let thumb = el.closest(".thumb").ok().flatten()?;
+    let r = thumb.get_bounding_client_rect();
+    Some((
+        ((ev.client_x() as f64 - r.left()) / r.width()).clamp(0.0, 1.0),
+        ((ev.client_y() as f64 - r.top()) / r.height()).clamp(0.0, 1.0),
+    ))
+}
+
+/// Resting the cursor on a thumb opens the focus loupe after a short dwell,
+/// so sweeping across the strip doesn't strobe full-res decodes.
+fn loupe_soon(state: AppState, id: usize, ev: &web_sys::MouseEvent) {
+    let Some((nx, ny)) = thumb_norm_pos(ev) else { return };
+    let (cx, cy) = (ev.client_x() as f64, ev.client_y() as f64);
+    state.loupe_gen.update(|g| *g += 1);
+    let gen = state.loupe_gen.get_untracked();
+    let cb = wasm_bindgen::closure::Closure::once(move || {
+        if state.loupe_gen.get_untracked() == gen {
+            ensure_full(state, id, None);
+            state.loupe.set(Some((id, nx, ny, cx, cy)));
+        }
+    });
+    let _ = web::window().set_timeout_with_callback_and_timeout_and_arguments_0(
+        cb.as_ref().unchecked_ref(),
+        250,
+    );
+    cb.forget();
+}
+
+fn loupe_move(state: AppState, id: usize, ev: &web_sys::MouseEvent) {
+    let showing = state.loupe.with(|l| matches!(l, Some((lid, ..)) if *lid == id));
+    if showing {
+        let Some((nx, ny)) = thumb_norm_pos(ev) else { return };
+        state
+            .loupe
+            .set(Some((id, nx, ny, ev.client_x() as f64, ev.client_y() as f64)));
+    }
+}
+
+fn loupe_clear(state: AppState) {
+    state.loupe_gen.update(|g| *g += 1);
+    state.loupe.set(None);
+}
+
+// Preview-res scratch canvas for the loupe's pre-decode placeholder (full-res
+// paints copy the 1:1 crop straight out of the cache instead, so hovering a
+// 25MP photo never materializes a third full-size buffer).
+thread_local! {
+    static LOUPE_SRC: RefCell<Option<(usize, web_sys::HtmlCanvasElement, u32, u32)>> =
+        RefCell::new(None);
+}
+
+/// Filmstrip focus loupe: a floating 1:1 pixel window into the hovered thumb,
+/// for judging focus/sharpness without selecting each item.
+#[component]
+fn FocusLoupe(state: AppState) -> impl IntoView {
+    let canvas_ref = create_node_ref::<html::Canvas>();
+    let tag = create_rw_signal("");
+
+    create_effect(move |_| {
+        state.items.track(); // repaint when a full-res buffer lands
+        let Some((id, nx, ny, _, _)) = state.loupe.get() else {
+            LOUPE_SRC.with(|s| *s.borrow_mut() = None);
+            return;
+        };
+        let Some(canvas) = canvas_ref.get() else { return };
+        let dpr = web::window().device_pixel_ratio().max(1.0);
+        let bw = (480.0 * dpr) as usize;
+        let bh = (360.0 * dpr) as usize;
+        if canvas.width() != bw as u32 || canvas.height() != bh as u32 {
+            canvas.set_width(bw as u32);
+            canvas.set_height(bh as u32);
+        }
+        let Some(photo) = get_photo(id) else { return };
+        let has_full = photo.full.is_some();
+        if has_full {
+            tag.set("1:1");
+            let (px, w, h) = photo.full.as_ref().unwrap();
+            let (w, h) = (*w, *h);
+            if w >= bw && h >= bh {
+                // 1:1 crop copied row-wise out of the cache buffer.
+                let sx = ((nx * w as f64 - bw as f64 / 2.0) as isize)
+                    .clamp(0, (w - bw) as isize) as usize;
+                let sy = ((ny * h as f64 - bh as f64 / 2.0) as isize)
+                    .clamp(0, (h - bh) as isize) as usize;
+                let mut crop = vec![0u8; bw * bh * 4];
+                for row in 0..bh {
+                    let src = ((sy + row) * w + sx) * 4;
+                    crop[row * bw * 4..(row + 1) * bw * 4]
+                        .copy_from_slice(&px[src..src + bw * 4]);
+                }
+                web::put_pixels(&canvas, &crop, bw as u32, bh as u32);
+                return;
+            }
+        } else {
+            tag.set("preview…");
+        }
+        // Placeholder path (preview-res, or image smaller than the loupe):
+        // paint from a small scratch canvas with scaling.
+        let rebuild = LOUPE_SRC.with(|s| !matches!(&*s.borrow(), Some((sid, ..)) if *sid == id));
+        if rebuild {
+            let (px, w, h) = match (&photo.full, has_full) {
+                (Some((px, w, h)), true) => (px.clone(), *w, *h),
+                _ => (photo.preview.0.clone(), photo.preview.1, photo.preview.2),
+            };
+            let scratch = web::create_canvas(w as u32, h as u32);
+            web::put_pixels(&scratch, &px, w as u32, h as u32);
+            LOUPE_SRC.with(|s| *s.borrow_mut() = Some((id, scratch, w as u32, h as u32)));
+        }
+        LOUPE_SRC.with(|s| {
+            let b = s.borrow();
+            let Some((_, scratch, w, h)) = &*b else { return };
+            let (w, h) = (*w as f64, *h as f64);
+            let sw = (bw as f64).min(w);
+            let sh = (bh as f64).min(h);
+            let sx = (nx * w - sw / 2.0).clamp(0.0, (w - sw).max(0.0));
+            let sy = (ny * h - sh / 2.0).clamp(0.0, (h - sh).max(0.0));
+            let _ = web::ctx2d(&canvas)
+                .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+                    scratch, sx, sy, sw, sh, 0.0, 0.0, bw as f64, bh as f64,
+                );
+        });
+    });
+
+    view! {
+        <Show when=move || state.loupe.with(|l| l.is_some()) fallback=|| ()>
+            <div
+                class="loupe-hover"
+                style=move || {
+                    state
+                        .loupe
+                        .get()
+                        .map(|(_, _, _, cx, cy)| loupe_style(cx, cy))
+                        .unwrap_or_default()
+                }
+            >
+                <canvas node_ref=canvas_ref width="480" height="360"></canvas>
+                <span class="loupe-tag">{move || tag.get()}</span>
+            </div>
+        </Show>
+    }
+}
+
+/// Fixed-position style for the loupe panel, kept inside the viewport.
+fn loupe_style(x: f64, y: f64) -> String {
+    let w = 496.0_f64;
+    let h = 398.0_f64;
+    let vw = web::window().inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(1280.0);
+    let vh = web::window().inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(800.0);
+    let left = if x + 24.0 + w > vw { (x - w - 14.0).max(8.0) } else { x + 24.0 };
+    let top = (y - h / 2.0).max(8.0).min((vh - h - 8.0).max(8.0));
+    format!("left:{left:.0}px;top:{top:.0}px")
+}
+
 #[component]
 fn FilmStrip(state: AppState) -> impl IntoView {
     view! {
@@ -1650,12 +1808,21 @@ fn FilmStrip(state: AppState) -> impl IntoView {
                 each=move || state.items.get()
                 key=|m| m.id
                 children=move |m: MediaItem| {
+                    let id = m.id;
+                    let is_photo = m.kind == MediaKind::Photo;
                     let badge = if m.kind == MediaKind::Video { "▶" } else { "" };
                     view! {
                         <div
                             class="thumb"
-                            class:selected=move || state.selected.get() == Some(m.id)
-                            on:click=move |_| state.selected.set(Some(m.id))
+                            class:selected=move || state.selected.get() == Some(id)
+                            on:click=move |_| state.selected.set(Some(id))
+                            on:mouseenter=move |ev| {
+                                if is_photo {
+                                    loupe_soon(state, id, &ev);
+                                }
+                            }
+                            on:mousemove=move |ev| loupe_move(state, id, &ev)
+                            on:mouseleave=move |_| loupe_clear(state)
                         >
                             <img src=m.thumb_url.clone()/>
                             <span class="badge">{badge}</span>
@@ -1664,6 +1831,7 @@ fn FilmStrip(state: AppState) -> impl IntoView {
                 }
             />
         </div>
+        <FocusLoupe state=state/>
     }
 }
 
