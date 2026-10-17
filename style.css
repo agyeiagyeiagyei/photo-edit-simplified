@@ -590,11 +590,22 @@ button:disabled {
   box-shadow: 0 10px 34px rgba(0, 0, 0, 0.55);
 }
 .drive-hover img {
-  width: 400px;
-  max-height: 50vh;
+  width: 480px;
+  height: 360px;
   object-fit: contain;
   display: block;
   border-radius: 5px;
+  background: #000;
+}
+.drive-hover canvas {
+  position: absolute;
+  left: 4px;
+  top: 4px;
+  width: 480px;
+  height: 360px;
+  display: none;
+  border-radius: 5px;
+  background: #000;
 }
 
 .loupe-hover {

@@ -1673,14 +1673,20 @@ fn DropZone(state: AppState) -> impl IntoView {
 /// Normalized (0..1) cursor position within the thumb under the cursor.
 /// Bubbling events are delegated in Leptos, so current_target is not the
 /// thumb — resolve via target + closest instead.
-fn thumb_norm_pos(ev: &web_sys::MouseEvent) -> Option<(f64, f64)> {
+/// Cursor position normalized inside the hovered ancestor matching `sel`.
+/// (Leptos delegates bubbling events, so current_target is unusable.)
+fn norm_pos_in(ev: &web_sys::MouseEvent, sel: &str) -> Option<(f64, f64)> {
     let el: web_sys::Element = ev.target()?.dyn_into().ok()?;
-    let thumb = el.closest(".thumb").ok().flatten()?;
-    let r = thumb.get_bounding_client_rect();
+    let tile = el.closest(sel).ok().flatten()?;
+    let r = tile.get_bounding_client_rect();
     Some((
         ((ev.client_x() as f64 - r.left()) / r.width()).clamp(0.0, 1.0),
         ((ev.client_y() as f64 - r.top()) / r.height()).clamp(0.0, 1.0),
     ))
+}
+
+fn thumb_norm_pos(ev: &web_sys::MouseEvent) -> Option<(f64, f64)> {
+    norm_pos_in(ev, ".thumb")
 }
 
 /// Resting the cursor on a thumb opens the focus loupe after a short dwell,
@@ -1811,6 +1817,114 @@ fn FocusLoupe(state: AppState) -> impl IntoView {
                 }
             >
                 <canvas node_ref=canvas_ref width="480" height="360"></canvas>
+                <span class="loupe-tag">{move || tag.get()}</span>
+            </div>
+        </Show>
+    }
+}
+
+/// Drive grid hover popup: w800 thumbnail on dwell, upgrading to a panning
+/// 1:1 full-res crop once the original has been downloaded and decoded.
+/// Mirrors FocusLoupe: <Show> keeps the canvas mounted, paints happen in the
+/// effect, and the 1:1 crop is row-copied out of the cache buffer.
+#[component]
+fn DriveHoverLoupe(state: AppState) -> impl IntoView {
+    let canvas_ref = create_node_ref::<html::Canvas>();
+    let tag = create_rw_signal("preview…");
+    let canvas_on = create_rw_signal(false);
+
+    create_effect(move |_| {
+        let hover = state.drive_hover.get();
+        let ready = state.drive_hover_ready.get();
+        let Some((id, nx, ny, _, _)) = hover else { return };
+        let Some(canvas) = canvas_ref.get() else { return };
+        let full = if ready.as_deref() == Some(id.as_str()) {
+            DRIVE_HOVER_CACHE.with(|c| c.borrow().1.get(&id).cloned())
+        } else {
+            None
+        };
+        let Some(full) = full else {
+            tag.set("preview…");
+            canvas_on.set(false);
+            return;
+        };
+        tag.set("1:1");
+        canvas_on.set(true);
+        let (px, w, h) = &*full;
+        let (w, h) = (*w, *h);
+        let dpr = web::window().device_pixel_ratio().max(1.0);
+        let bw = (480.0 * dpr) as usize;
+        let bh = (360.0 * dpr) as usize;
+        if canvas.width() != bw as u32 || canvas.height() != bh as u32 {
+            canvas.set_width(bw as u32);
+            canvas.set_height(bh as u32);
+        }
+        if w >= bw && h >= bh {
+            let sx = ((nx * w as f64 - bw as f64 / 2.0) as isize)
+                .clamp(0, (w - bw) as isize) as usize;
+            let sy = ((ny * h as f64 - bh as f64 / 2.0) as isize)
+                .clamp(0, (h - bh) as isize) as usize;
+            let mut crop = vec![0u8; bw * bh * 4];
+            for row in 0..bh {
+                let src = ((sy + row) * w + sx) * 4;
+                crop[row * bw * 4..(row + 1) * bw * 4]
+                    .copy_from_slice(&px[src..src + bw * 4]);
+            }
+            web::put_pixels(&canvas, &crop, bw as u32, bh as u32);
+        } else {
+            // Image smaller than the loupe: scale-to-fit via a scratch canvas.
+            let scratch = web::create_canvas(w as u32, h as u32);
+            web::put_pixels(&scratch, px, w as u32, h as u32);
+            let scale = (bw as f64 / w as f64).min(bh as f64 / h as f64);
+            let dw = w as f64 * scale;
+            let dh = h as f64 * scale;
+            let ctx = web::ctx2d(&canvas);
+            ctx.set_fill_style_str("#000");
+            ctx.fill_rect(0.0, 0.0, bw as f64, bh as f64);
+            let _ = ctx.draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+                &scratch,
+                0.0,
+                0.0,
+                w as f64,
+                h as f64,
+                (bw as f64 - dw) / 2.0,
+                (bh as f64 - dh) / 2.0,
+                dw,
+                dh,
+            );
+        }
+    });
+
+    view! {
+        <Show when=move || state.drive_hover.with(|h| h.is_some()) fallback=|| ()>
+            <div
+                class="drive-hover"
+                style=move || {
+                    state
+                        .drive_hover
+                        .get()
+                        .map(|(_, _, _, cx, cy)| drive_hover_style(cx, cy))
+                        .unwrap_or_default()
+                }
+            >
+                <img
+                    src=move || {
+                        state
+                            .drive_hover
+                            .with(|h| {
+                                h.as_ref()
+                                    .map(|(id, ..)| drive::thumb_url_sz(id, 800))
+                                    .unwrap_or_default()
+                            })
+                    }
+                    decoding="async"
+                />
+                <canvas
+                    node_ref=canvas_ref
+                    width="480"
+                    height="360"
+                    style:display=move || if canvas_on.get() { "block" } else { "none" }
+                ></canvas>
                 <span class="loupe-tag">{move || tag.get()}</span>
             </div>
         </Show>
@@ -2545,14 +2659,80 @@ fn download_import(state: AppState, f: drive::DriveFile) {
     });
 }
 
+/// Full-res RGBA decoded on Drive hover for the 1:1 loupe; FIFO-capped at 2
+/// files (~192MB for 24MP shots) so flip-flopping between two candidates
+/// stays instant without inviting the OOM the 512MB working set guards
+/// against. Crops are row-copied out of these buffers — never a third
+/// full-res canvas.
+thread_local! {
+    static DRIVE_HOVER_CACHE: RefCell<(Vec<String>, HashMap<String, Rc<(Vec<u8>, usize, usize)>>)> =
+        RefCell::new((Vec::new(), HashMap::new()));
+    static DRIVE_HOVER_INFLIGHT: RefCell<std::collections::HashSet<String>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+/// Download + decode a Drive photo's original for the hover loupe. Only
+/// browser-decodable stills (JPEG/PNG) — RAW and HEIC keep the w800 preview.
+fn drive_hover_prefetch(state: AppState, id: String, name: String) {
+    let lname = name.to_lowercase();
+    let mime = if lname.ends_with(".png") {
+        "image/png"
+    } else if lname.ends_with(".jpg") || lname.ends_with(".jpeg") {
+        "image/jpeg"
+    } else {
+        return;
+    };
+    if DRIVE_HOVER_CACHE.with(|c| c.borrow().1.contains_key(&id)) {
+        state.drive_hover_ready.set(Some(id));
+        return;
+    }
+    if !DRIVE_HOVER_INFLIGHT.with(|s| s.borrow_mut().insert(id.clone())) {
+        return;
+    }
+    let Some(token) = state.drive_token.get_untracked() else {
+        DRIVE_HOVER_INFLIGHT.with(|s| {
+            s.borrow_mut().remove(&id);
+        });
+        return;
+    };
+    spawn_local(async move {
+        let decoded = async {
+            let bytes = drive::download_file(token.as_str(), &id).await.ok()?;
+            let blob = web::bytes_to_blob(&bytes, mime).ok()?;
+            let (img, _) = web::load_image(&blob).await.ok()?;
+            Some(web::rgba_from_image(&img))
+        }
+        .await;
+        DRIVE_HOVER_INFLIGHT.with(|s| {
+            s.borrow_mut().remove(&id);
+        });
+        if let Some((px, w, h)) = decoded {
+            DRIVE_HOVER_CACHE.with(|c| {
+                let mut c = c.borrow_mut();
+                c.0.retain(|k| k != &id);
+                c.0.push(id.clone());
+                c.1.insert(id.clone(), Rc::new((px, w, h)));
+                while c.0.len() > 2 {
+                    let old = c.0.remove(0);
+                    c.1.remove(&old);
+                }
+            });
+            state.drive_hover_ready.set(Some(id));
+        }
+    });
+}
+
 /// Hover-zoom: open the floating preview after a short rest on a tile, so
 /// sweeping the cursor across the grid doesn't strobe previews.
-fn drive_hover_soon(state: AppState, id: String, x: f64, y: f64) {
+fn drive_hover_soon(state: AppState, id: String, name: String, ev: &web_sys::MouseEvent) {
+    let Some((nx, ny)) = norm_pos_in(ev, ".drive-file") else { return };
+    let (cx, cy) = (ev.client_x() as f64, ev.client_y() as f64);
     state.drive_hover_gen.update(|g| *g += 1);
     let gen = state.drive_hover_gen.get_untracked();
     let cb = wasm_bindgen::closure::Closure::once(move || {
         if state.drive_hover_gen.get_untracked() == gen {
-            state.drive_hover.set(Some((id, x, y)));
+            drive_hover_prefetch(state, id.clone(), name);
+            state.drive_hover.set(Some((id, nx, ny, cx, cy)));
         }
     });
     let _ = web::window().set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -2562,12 +2742,19 @@ fn drive_hover_soon(state: AppState, id: String, x: f64, y: f64) {
     cb.forget();
 }
 
-fn drive_hover_move(state: AppState, id: &str, x: f64, y: f64) {
+fn drive_hover_move(state: AppState, id: &str, ev: &web_sys::MouseEvent) {
     let showing = state.drive_hover.with(|h| {
-        h.as_ref().map(|(hid, _, _)| hid == id).unwrap_or(false)
+        h.as_ref().map(|(hid, ..)| hid == id).unwrap_or(false)
     });
     if showing {
-        state.drive_hover.set(Some((id.to_string(), x, y)));
+        let Some((nx, ny)) = norm_pos_in(ev, ".drive-file") else { return };
+        state.drive_hover.set(Some((
+            id.to_string(),
+            nx,
+            ny,
+            ev.client_x() as f64,
+            ev.client_y() as f64,
+        )));
     }
 }
 
@@ -2578,8 +2765,8 @@ fn drive_hover_clear(state: AppState) {
 
 /// Fixed-position style for the hover preview, kept inside the viewport.
 fn drive_hover_style(x: f64, y: f64) -> String {
-    let w = 400.0_f64;
-    let h = 340.0_f64;
+    let w = 496.0_f64;
+    let h = 398.0_f64;
     let vw = web::window().inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(1280.0);
     let vh = web::window().inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(800.0);
     let left = if x + 24.0 + w > vw { (x - w - 14.0).max(8.0) } else { x + 24.0 };
@@ -3035,6 +3222,7 @@ fn DrivePanel(state: AppState) -> impl IntoView {
                                         let fid2_text = f.id.clone();
                                         let fid3 = f.id.clone();
                                         let fid3_move = f.id.clone();
+                                        let fname = f.name.clone();
                                         view! {
                                             <div
                                                 class="drive-file"
@@ -3051,8 +3239,8 @@ fn DrivePanel(state: AppState) -> impl IntoView {
                                                         drive_hover_soon(
                                                             state,
                                                             fid3.clone(),
-                                                            ev.client_x() as f64,
-                                                            ev.client_y() as f64,
+                                                            fname.clone(),
+                                                            &ev,
                                                         );
                                                     }
                                                 }
@@ -3060,8 +3248,7 @@ fn DrivePanel(state: AppState) -> impl IntoView {
                                                     drive_hover_move(
                                                         state,
                                                         &fid3_move,
-                                                        ev.client_x() as f64,
-                                                        ev.client_y() as f64,
+                                                        &ev,
                                                     );
                                                 }
                                                 on:mouseleave=move |_| drive_hover_clear(state)
@@ -3130,15 +3317,7 @@ fn DrivePanel(state: AppState) -> impl IntoView {
                                 />
                             </div>
                             <DriveLoupe state=state/>
-                            {move || {
-                                state.drive_hover.get().map(|(id, x, y)| {
-                                    view! {
-                                        <div class="drive-hover" style=drive_hover_style(x, y)>
-                                            <img src=drive::thumb_url_sz(&id, 800) decoding="async"/>
-                                        </div>
-                                    }
-                                })
-                            }}
+                            <DriveHoverLoupe state=state/>
                         }
                         .into_view()
                     }

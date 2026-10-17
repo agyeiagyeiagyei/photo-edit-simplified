@@ -428,8 +428,12 @@ pub struct AppState {
     /// Recently viewed loupe file ids (most-recent last, capped) — kept as
     /// hidden <img> elements so their large thumbnails stay decoded in memory.
     pub drive_loupe_seen: RwSignal<Vec<String>>,
-    /// Hover-zoom preview: (file id, cursor x, cursor y) while hovering a tile.
-    pub drive_hover: RwSignal<Option<(String, f64, f64)>>,
+    /// Hover-zoom preview: (file id, normalized x, normalized y, client x,
+    /// client y) while hovering a tile; the crop pans with the cursor once
+    /// the original is decoded.
+    pub drive_hover: RwSignal<Option<(String, f64, f64, f64, f64)>>,
+    /// Drive file id whose full-res hover decode is in DRIVE_HOVER_CACHE.
+    pub drive_hover_ready: RwSignal<Option<String>>,
     /// Filmstrip focus loupe: (item id, normalized x, normalized y, client x,
     /// client y) while the cursor rests on a thumb; the crop pans with the
     /// cursor at 1:1 pixels.
@@ -507,6 +511,7 @@ impl AppState {
             drive_loupe: create_rw_signal(None),
             drive_loupe_seen: create_rw_signal(Vec::new()),
             drive_hover: create_rw_signal(None),
+            drive_hover_ready: create_rw_signal(None),
             drive_hover_gen: create_rw_signal(0),
             loupe: create_rw_signal(None),
             loupe_gen: create_rw_signal(0),
