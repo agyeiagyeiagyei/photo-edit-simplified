@@ -1253,113 +1253,155 @@ fn export_photo(state: AppState, item: MediaItem) {
     });
 }
 
+enum DriveSave {
+    Saved,
+    AlreadyThere,
+}
+
+/// Upload one photo into the granted Drive folder; overwrites in place when
+/// the item came from Drive or was already saved there. No busy indicator or
+/// panel refresh — callers own both (single save and the batch loop differ).
+async fn save_photo_to_drive_inner(state: AppState, item: MediaItem) -> Result<DriveSave, String> {
+    let Some(token) = state.drive_token.get_untracked() else {
+        return Err("not signed in to Drive".into());
+    };
+    let Some((folder_id, _)) = state.drive_folder.get_untracked() else {
+        return Err("no Drive folder granted".into());
+    };
+    let item_id = item.id;
+
+    // Unedited JPEG/PNG: upload the source bytes untouched. If the item
+    // came from Drive it is already byte-identical there — nothing to do.
+    if photo_unedited(&item) {
+        if let Some(mime) = passthru_mime(&item.name) {
+            if item.drive_file_id.is_some() {
+                return Ok(DriveSave::AlreadyThere);
+            }
+            if let Ok(bytes) = web::object_url_bytes(&item.object_url).await {
+                return match drive::upload_file(&token, &folder_id, None, &item.name, mime, &bytes).await {
+                    Ok(fid) => {
+                        state.update_item_by_id(item_id, |m| {
+                            m.drive_file_id = Some(fid);
+                            m.drive_baked = true;
+                        });
+                        Ok(DriveSave::Saved)
+                    }
+                    Err(e) => Err(js_err(&e)),
+                };
+            }
+            // Couldn't read the source back — fall through to re-encode.
+        }
+    }
+
+    let Some((blob, mime, filename)) = render_photo_export(state, &item).await else {
+        return Err("render failed".into());
+    };
+    let result = async {
+        let bytes = web::blob_to_bytes(&blob).await?;
+        let first = drive::upload_file(
+            &token,
+            &folder_id,
+            item.drive_file_id.as_deref(),
+            &filename,
+            mime,
+            &bytes,
+        )
+        .await;
+        match first {
+            Ok(fid) => Ok(fid),
+            // Overwrite-in-place needs write access; drive.file grants that
+            // only for app-created/picked files, so a readonly-imported
+            // original rejects PATCH. Fall back to a new copy beside it.
+            Err(e) => match item.drive_parent_id.as_deref() {
+                Some(parent) => {
+                    drive::upload_file(&token, parent, None, &filename, mime, &bytes).await
+                }
+                None => Err(e),
+            },
+        }
+    }
+    .await;
+    match result {
+        Ok(fid) => {
+            // PATCH (same id) means the recipe's pixels are now canonical:
+            // drop the manifest entry so a reopen doesn't re-apply it.
+            // A copy (new id) leaves the original's recipe untouched.
+            let patched_in_place = item.drive_file_id.as_deref() == Some(fid.as_str());
+            state.update_item_by_id(item_id, |m| {
+                m.drive_file_id = Some(fid.clone());
+                m.drive_parent_id = None;
+                m.drive_baked = true;
+            });
+            if patched_in_place && state.drive_edits.with(|m| m.contains_key(&fid)) {
+                state.drive_edits.update(|m| {
+                    m.remove(&fid);
+                });
+                schedule_manifest_save(state);
+            }
+            Ok(DriveSave::Saved)
+        }
+        Err(e) => Err(js_err(&e)),
+    }
+}
+
 /// Upload the rendered export into the granted Drive folder; overwrites in
 /// place when the item came from Drive or was already saved there.
 fn save_photo_to_drive(state: AppState, item: MediaItem) {
     spawn_local(async move {
-        let Some(token) = state.drive_token.get_untracked() else {
-            return;
-        };
-        let Some((folder_id, _)) = state.drive_folder.get_untracked() else {
-            return;
-        };
         state.busy.set(Some(format!("Saving {} to Drive…", item.name)));
         state.drive_error.set(None);
-
-        // Unedited JPEG/PNG: upload the source bytes untouched. If the item
-        // came from Drive it is already byte-identical there — nothing to do.
-        if photo_unedited(&item) {
-            if let Some(mime) = passthru_mime(&item.name) {
-                if item.drive_file_id.is_some() {
-                    state.busy.set(None);
-                    state
-                        .drive_error
-                        .set(Some(format!("{} is unchanged — already in Drive", item.name)));
-                    return;
-                }
-                match web::object_url_bytes(&item.object_url).await {
-                    Ok(bytes) => {
-                        let r = drive::upload_file(&token, &folder_id, None, &item.name, mime, &bytes).await;
-                        state.busy.set(None);
-                        match r {
-                            Ok(fid) => {
-                                state.update_current_item(|m| {
-                                    m.drive_file_id = Some(fid);
-                                    m.drive_baked = true;
-                                });
-                                drive_refresh(state);
-                            }
-                            Err(e) => state
-                                .drive_error
-                                .set(Some(format!("Drive save failed: {}", js_err(&e)))),
-                        }
-                        return;
-                    }
-                    // Couldn't read the source back — fall through to re-encode.
-                    Err(_) => {}
-                }
-            }
+        match save_photo_to_drive_inner(state, item.clone()).await {
+            Ok(DriveSave::AlreadyThere) => state
+                .drive_error
+                .set(Some(format!("{} is unchanged — already in Drive", item.name))),
+            Ok(DriveSave::Saved) => drive_refresh(state),
+            Err(e) => state
+                .drive_error
+                .set(Some(format!("Drive save failed: {}", e))),
         }
+        state.busy.set(None);
+    });
+}
 
-        let Some((blob, mime, filename)) = render_photo_export(state, &item).await else {
-            state.busy.set(None);
+/// True for photos that differ from what Drive holds: edited params, an
+/// unsaved destructive op, or a local file never uploaded. This is the
+/// "Save N edited to Drive" set.
+fn photo_needs_save(m: &MediaItem) -> bool {
+    m.kind == MediaKind::Photo
+        && (!photo_unedited(m) || get_photo(m.id).map(|p| p.dirty).unwrap_or(false))
+}
+
+/// Sequential batch save of every photo that needs it; one panel refresh at
+/// the end. Sequential because each upload re-encodes full-res pixels.
+fn save_edited_to_drive(state: AppState) {
+    spawn_local(async move {
+        if state.drive_token.get_untracked().is_none() || state.drive_folder.get_untracked().is_none() {
             return;
-        };
-        let result = async {
-            let bytes = web::blob_to_bytes(&blob).await?;
-            let first = drive::upload_file(
-                &token,
-                &folder_id,
-                item.drive_file_id.as_deref(),
-                &filename,
-                mime,
-                &bytes,
-            )
-            .await;
-            match first {
-                Ok(fid) => Ok(fid),
-                // Overwrite-in-place needs write access; drive.file grants that
-                // only for app-created/picked files, so a readonly-imported
-                // original rejects PATCH. Fall back to a new copy beside it.
-                Err(e) => match item.drive_parent_id.as_deref() {
-                    Some(parent) => {
-                        drive::upload_file(&token, parent, None, &filename, mime, &bytes).await
-                    }
-                    None => Err(e),
-                },
-            }
         }
-        .await;
-        match result {
-            Ok(fid) => {
-                // PATCH (same id) means the recipe's pixels are now canonical:
-                // drop the manifest entry so a reopen doesn't re-apply it.
-                // A copy (new id) leaves the original's recipe untouched.
-                let patched_in_place = item.drive_file_id.as_deref() == Some(fid.as_str());
-                state.update_current_item(|m| {
-                    m.drive_file_id = Some(fid.clone());
-                    m.drive_parent_id = None;
-                    m.drive_baked = true;
-                });
-                if patched_in_place {
-                    // Only rewrite the manifest when an entry was actually
-                    // dropped — a baked item never had one.
-                    if state.drive_edits.with(|m| m.contains_key(&fid)) {
-                        state.drive_edits.update(|m| {
-                            m.remove(&fid);
-                        });
-                        schedule_manifest_save(state);
-                    }
-                }
-                drive_refresh(state);
-            }
-            Err(e) => {
-                state
-                    .drive_error
-                    .set(Some(format!("Drive save failed: {}", js_err(&e))));
+        let targets: Vec<MediaItem> =
+            state.items.with(|v| v.iter().filter(|m| photo_needs_save(m)).cloned().collect());
+        if targets.is_empty() {
+            return;
+        }
+        state.drive_error.set(None);
+        let n = targets.len();
+        let mut failed: Vec<String> = Vec::new();
+        for (i, item) in targets.into_iter().enumerate() {
+            state.busy.set(Some(format!("Saving edited to Drive… ({}/{})", i + 1, n)));
+            if let Err(e) = save_photo_to_drive_inner(state, item.clone()).await {
+                failed.push(format!("{}: {}", item.name, e));
             }
         }
         state.busy.set(None);
+        if !failed.is_empty() {
+            state.drive_error.set(Some(format!(
+                "Saved {}/{} — failed: {}",
+                n - failed.len(),
+                n,
+                failed.join("; ")
+            )));
+        }
+        drive_refresh(state);
     });
 }
 
@@ -1942,6 +1984,27 @@ fn loupe_style(x: f64, y: f64) -> String {
     format!("left:{left:.0}px;top:{top:.0}px")
 }
 
+/// True when an item carries any visible edit: adjusted params, crop/rotate,
+/// trim, annotation layers, an unsaved destructive op, or a Drive copy that
+/// already has edits baked in.
+fn item_edited(m: &MediaItem) -> bool {
+    let dirty = get_photo(m.id).map(|p| p.dirty).unwrap_or(false);
+    m.drive_baked
+        || dirty
+        || match m.kind {
+            MediaKind::Photo => !photo_unedited(m),
+            MediaKind::Video => {
+                let e = &m.edit;
+                e.trim.is_some()
+                    || !e.keep_audio
+                    || e.crop != state::CropRect::default()
+                    || e.rot90 != 0
+                    || e.fine_angle != 0.0
+                    || e.aspect != Aspect::Original
+            }
+        }
+}
+
 #[component]
 fn FilmStrip(state: AppState) -> impl IntoView {
     view! {
@@ -1953,6 +2016,7 @@ fn FilmStrip(state: AppState) -> impl IntoView {
                     let id = m.id;
                     let is_photo = m.kind == MediaKind::Photo;
                     let badge = if m.kind == MediaKind::Video { "▶" } else { "" };
+                    let drive_id = m.drive_file_id.clone();
                     view! {
                         <div
                             class="thumb"
@@ -1969,6 +2033,34 @@ fn FilmStrip(state: AppState) -> impl IntoView {
                         >
                             <img src=m.thumb_url.clone()/>
                             <span class="badge">{badge}</span>
+                            {move || {
+                                let edited = state.items.with(|v| {
+                                    v.iter().find(|m| m.id == id).map(item_edited).unwrap_or(false)
+                                });
+                                edited.then(|| {
+                                    view! { <span class="badge thumb-edited" title="Has edits">"✎"</span> }
+                                })
+                            }}
+                            {move || {
+                                let Some(did) = drive_id.clone() else {
+                                    return None;
+                                };
+                                if !state.drive_shortlist.with(|s| s.contains(&did)) {
+                                    return None;
+                                }
+                                Some(view! {
+                                    <button
+                                        class="thumb-star"
+                                        title="Starred on Drive — click to unstar (removes it here)"
+                                        on:click=move |ev| {
+                                            ev.stop_propagation();
+                                            toggle_star(state, did.clone());
+                                        }
+                                    >
+                                        "★"
+                                    </button>
+                                })
+                            }}
                         </div>
                     }
                 }
@@ -2723,9 +2815,11 @@ fn drive_hover_prefetch(state: AppState, id: String, name: String) {
 }
 
 /// Hover-zoom: open the floating preview after a short rest on a tile, so
-/// sweeping the cursor across the grid doesn't strobe previews.
-fn drive_hover_soon(state: AppState, id: String, name: String, ev: &web_sys::MouseEvent) {
-    let Some((nx, ny)) = norm_pos_in(ev, ".drive-file") else { return };
+/// sweeping the cursor across the grid doesn't strobe previews. `sel` is the
+/// element the normalized position is measured against (grid tile or the
+/// popped-up loupe image).
+fn drive_hover_soon(state: AppState, id: String, name: String, ev: &web_sys::MouseEvent, sel: &str) {
+    let Some((nx, ny)) = norm_pos_in(ev, sel) else { return };
     let (cx, cy) = (ev.client_x() as f64, ev.client_y() as f64);
     state.drive_hover_gen.update(|g| *g += 1);
     let gen = state.drive_hover_gen.get_untracked();
@@ -2742,12 +2836,12 @@ fn drive_hover_soon(state: AppState, id: String, name: String, ev: &web_sys::Mou
     cb.forget();
 }
 
-fn drive_hover_move(state: AppState, id: &str, ev: &web_sys::MouseEvent) {
+fn drive_hover_move(state: AppState, id: &str, ev: &web_sys::MouseEvent, sel: &str) {
     let showing = state.drive_hover.with(|h| {
         h.as_ref().map(|(hid, ..)| hid == id).unwrap_or(false)
     });
     if showing {
-        let Some((nx, ny)) = norm_pos_in(ev, ".drive-file") else { return };
+        let Some((nx, ny)) = norm_pos_in(ev, sel) else { return };
         state.drive_hover.set(Some((
             id.to_string(),
             nx,
@@ -2783,7 +2877,10 @@ fn drive_grid_thumb_w(state: AppState) -> u32 {
 
 #[component]
 fn DriveLoupe(state: AppState) -> impl IntoView {
-    let close = move |_| state.drive_loupe.set(None);
+    let close = move |_| {
+        drive_hover_clear(state);
+        state.drive_loupe.set(None);
+    };
     // Remember viewed files so their large thumbnails stay warm, and keep
     // hidden <img> elements mounted for them plus the current neighbors —
     // the thumbnail endpoint is cross-origin, so this is the only caching
@@ -2817,6 +2914,7 @@ fn DriveLoupe(state: AppState) -> impl IntoView {
         if n == 0 {
             return;
         }
+        drive_hover_clear(state);
         let cur = state.drive_loupe.get_untracked().unwrap_or(0) as i64;
         state
             .drive_loupe
@@ -2829,7 +2927,10 @@ fn DriveLoupe(state: AppState) -> impl IntoView {
         match ev.key().as_str() {
             "ArrowLeft" => step(-1),
             "ArrowRight" => step(1),
-            "Escape" => state.drive_loupe.set(None),
+            "Escape" => {
+                drive_hover_clear(state);
+                state.drive_loupe.set(None);
+            }
             _ => {}
         }
     });
@@ -2848,6 +2949,9 @@ fn DriveLoupe(state: AppState) -> impl IntoView {
                 let starred = state.drive_shortlist.with(|s| s.contains(&f.id));
                 let fid = f.id.clone();
                 let f_import = f.clone();
+                let fid_h1 = f.id.clone();
+                let fid_h2 = f.id.clone();
+                let fname_h = f.name.clone();
                 let date = f.modified.get(..10).unwrap_or("").to_string();
                 // Warm pool: seen ids + immediate neighbors, minus current.
                 let n = files.len();
@@ -2877,6 +2981,19 @@ fn DriveLoupe(state: AppState) -> impl IntoView {
                                 }
                                 class="loupe-img"
                                 decoding="async"
+                                on:mouseenter=move |ev| {
+                                    drive_hover_soon(
+                                        state,
+                                        fid_h1.clone(),
+                                        fname_h.clone(),
+                                        &ev,
+                                        ".loupe-img",
+                                    );
+                                }
+                                on:mousemove=move |ev| {
+                                    drive_hover_move(state, &fid_h2, &ev, ".loupe-img")
+                                }
+                                on:mouseleave=move |_| drive_hover_clear(state)
                             />
                             <img
                                 src=drive::thumb_url_sz(&f.id, 1600)
@@ -3241,6 +3358,7 @@ fn DrivePanel(state: AppState) -> impl IntoView {
                                                             fid3.clone(),
                                                             fname.clone(),
                                                             &ev,
+                                                            ".drive-file",
                                                         );
                                                     }
                                                 }
@@ -3249,6 +3367,7 @@ fn DrivePanel(state: AppState) -> impl IntoView {
                                                         state,
                                                         &fid3_move,
                                                         &ev,
+                                                        ".drive-file",
                                                     );
                                                 }
                                                 on:mouseleave=move |_| drive_hover_clear(state)
@@ -6711,6 +6830,11 @@ fn ExportTab(state: AppState) -> impl IntoView {
     let is_photo = move || state.current().map(|m| m.kind == MediaKind::Photo).unwrap_or(false);
     let keep_audio = move || state.current().map(|m| m.edit.keep_audio).unwrap_or(true);
     let format = move || state.photo_format.get();
+    let edited_count = move || state.items.with(|v| v.iter().filter(|m| item_edited(m)).count());
+    let save_count = move || state.items.with(|v| v.iter().filter(|m| photo_needs_save(m)).count());
+    let drive_ready = move || {
+        state.drive_token.with(|t| t.is_some()) && state.drive_folder.with(|f| f.is_some())
+    };
     view! {
         <button class="btn primary" on:click=move |_| {
             if let Some(item) = state.current() {
@@ -6780,14 +6904,22 @@ fn ExportTab(state: AppState) -> impl IntoView {
                     });
                 });
             }>"Apply edits to all"</button>
-            <button class="btn" on:click=move |_| {
+            <button class="btn" disabled=move || edited_count() == 0 on:click=move |_| {
                 for item in state.items.get() {
+                    if !item_edited(&item) {
+                        continue;
+                    }
                     match item.kind {
                         MediaKind::Photo => export_photo(state, item),
                         MediaKind::Video => export_video(state, item),
                     }
                 }
-            }>"Download all"</button>
+            }>{move || format!("Download {} edited", edited_count())}</button>
+            <Show when=drive_ready fallback=|| ()>
+                <button class="btn" disabled=move || save_count() == 0 on:click=move |_| {
+                    save_edited_to_drive(state);
+                }>{move || format!("Save {} edited to Drive", save_count())}</button>
+            </Show>
         </Show>
         <p class="dim">"Exports match the selected aspect preset’s social-media dimensions."</p>
     }

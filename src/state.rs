@@ -544,9 +544,13 @@ impl AppState {
             Some(s) => s,
             None => return,
         };
+        self.update_item_by_id(sel, f);
+    }
+
+    pub fn update_item_by_id(self, id: usize, f: impl FnOnce(&mut MediaItem)) {
         batch(|| {
             self.items.update(|v| {
-                if let Some(m) = v.iter_mut().find(|m| m.id == sel) {
+                if let Some(m) = v.iter_mut().find(|m| m.id == id) {
                     f(m);
                 }
             });
