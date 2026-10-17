@@ -107,6 +107,98 @@ fn normalize_orientation(t: &mut Vec<u8>) {
     }
 }
 
+// ---------- capture-time reader ----------
+
+/// Capture time from a TIFF payload, as epoch seconds. EXIF datetimes carry
+/// no zone, so the string is read as-if-UTC — only relative ordering matters.
+/// ExifIFD DateTimeOriginal (0x9003) → CreateDate (0x9004) → IFD0 DateTime
+/// (0x0132).
+pub fn taken_from_tiff(t: &[u8]) -> Option<f64> {
+    if t.len() < 8 {
+        return None;
+    }
+    let le = match &t[0..2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return None,
+    };
+    let u16at = |o: usize| -> Option<u16> {
+        let s = t.get(o..o + 2)?;
+        Some(if le {
+            u16::from_le_bytes([s[0], s[1]])
+        } else {
+            u16::from_be_bytes([s[0], s[1]])
+        })
+    };
+    let u32at = |o: usize| -> Option<u32> {
+        let s = t.get(o..o + 4)?;
+        Some(if le {
+            u32::from_le_bytes([s[0], s[1], s[2], s[3]])
+        } else {
+            u32::from_be_bytes([s[0], s[1], s[2], s[3]])
+        })
+    };
+    // ASCII value of `tag` in the IFD at offset `ifd`.
+    let ascii_at = |ifd: usize, tag: u16| -> Option<String> {
+        let n = u16at(ifd)? as usize;
+        for k in 0..n {
+            let e = ifd + 2 + 12 * k;
+            if u16at(e)? != tag {
+                continue;
+            }
+            let count = u32at(e + 4)? as usize;
+            let data = if count <= 4 {
+                t.get(e + 8..e + 8 + count)?
+            } else {
+                let off = u32at(e + 8)? as usize;
+                t.get(off..off + count)?
+            };
+            let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+            return std::str::from_utf8(&data[..end]).ok().map(|s| s.trim().to_string());
+        }
+        None
+    };
+    let ifd0 = u32at(4)? as usize;
+    let mut exif_ifd = None;
+    if let Some(n) = u16at(ifd0) {
+        for k in 0..n as usize {
+            let e = ifd0 + 2 + 12 * k;
+            if u16at(e) == Some(0x8769) {
+                exif_ifd = u32at(e + 8).map(|v| v as usize);
+            }
+        }
+    }
+    if let Some(x) = exif_ifd {
+        for tag in [0x9003u16, 0x9004] {
+            if let Some(v) = ascii_at(x, tag).and_then(|s| parse_exif_datetime(&s)) {
+                return Some(v);
+            }
+        }
+    }
+    ascii_at(ifd0, 0x0132).and_then(|s| parse_exif_datetime(&s))
+}
+
+/// "YYYY:MM:DD HH:MM:SS" → epoch seconds (as-if-UTC), via days-from-civil.
+fn parse_exif_datetime(s: &str) -> Option<f64> {
+    if s.len() < 19 {
+        return None;
+    }
+    let num = |i: usize, n: usize| s.get(i..i + n)?.parse::<i64>().ok();
+    let (y, mo, d) = (num(0, 4)?, num(5, 2)?, num(8, 2)?);
+    let (h, mi, se) = (num(11, 2)?, num(14, 2)?, num(17, 2)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 60 {
+        return None;
+    }
+    let y2 = if mo <= 2 { y - 1 } else { y };
+    let era = if y2 >= 0 { y2 } else { y2 - 399 } / 400;
+    let yoe = y2 - era * 400;
+    let mp = (mo + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some((days * 86400 + h * 3600 + mi * 60 + se) as f64)
+}
+
 // ---------- TIFF writer ----------
 
 const ASCII: u16 = 2;
@@ -499,6 +591,49 @@ mod tests {
         let got = tiff_from_jpeg(&jpeg).unwrap();
         // orientation value (entry value field at 8+2+8) is now 1
         assert_eq!(got[18], 1);
+    }
+
+    #[test]
+    fn taken_reads_datetime_original() {
+        let tiff = build_tiff(
+            vec![e_ascii(0x010F, "Canon")],
+            vec![e_ascii(0x9003, "2020:03:15 10:30:00")],
+            vec![],
+        );
+        assert_eq!(taken_from_tiff(&tiff), Some(1584268200.0));
+    }
+
+    #[test]
+    fn taken_prefers_original_over_create_and_ifd0() {
+        let tiff = build_tiff(
+            vec![e_ascii(0x0132, "1999:12:31 23:59:59")],
+            vec![
+                e_ascii(0x9003, "2020:03:15 10:30:00"),
+                e_ascii(0x9004, "2021:01:01 00:00:00"),
+            ],
+            vec![],
+        );
+        assert_eq!(taken_from_tiff(&tiff), Some(1584268200.0));
+    }
+
+    #[test]
+    fn taken_falls_back_to_ifd0_datetime() {
+        let tiff = build_tiff(vec![e_ascii(0x0132, "1999:12:31 23:59:59")], vec![], vec![]);
+        assert_eq!(taken_from_tiff(&tiff), Some(946684799.0));
+    }
+
+    #[test]
+    fn taken_handles_big_endian() {
+        // minimal MM TIFF, IFD0 with DateTime "2023:06:01 12:00:00" (20 bytes)
+        let mut t = vec![b'M', b'M', 0, 42, 0, 0, 0, 8];
+        t.extend_from_slice(&1u16.to_be_bytes());
+        t.extend_from_slice(&0x0132u16.to_be_bytes());
+        t.extend_from_slice(&2u16.to_be_bytes());
+        t.extend_from_slice(&20u32.to_be_bytes());
+        t.extend_from_slice(&26u32.to_be_bytes());
+        t.extend_from_slice(&0u32.to_be_bytes());
+        t.extend_from_slice(b"2023:06:01 12:00:00\0");
+        assert_eq!(taken_from_tiff(&t), Some(1685620800.0));
     }
 
     #[test]

@@ -296,6 +296,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
     spawn_local(async move {
         for file in files {
             let name = file.name();
+            let mtime = Some(file.last_modified() / 1000.0);
             let id = state.next_id.get_untracked();
             state.next_id.set(id + 1);
 
@@ -321,6 +322,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                         layers: Vec::new(),
                         next_layer_id: 0,
                         exif: None,
+                        taken: mtime,
                         drive_file_id: None,
                         drive_parent_id: None,
                         drive_baked: false,
@@ -341,7 +343,9 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                     continue;
                 };
                 CACHE.with(|c| c.borrow_mut().raw_bytes.insert(id, Rc::new(bytes.clone())));
-                let exif = raw::extract_exif_tiff(&bytes).map(Rc::new);
+                let exif_tiff = raw::extract_exif_tiff(&bytes);
+                let taken = exif_tiff.as_deref().and_then(exif::taken_from_tiff).or(mtime);
+                let exif = exif_tiff.map(Rc::new);
                 let (pp, pw, ph) = downscale_pixels(&full_rgba, fw, fh, 1024);
                 let canvas = web::create_canvas(pw as u32, ph as u32);
                 web::put_pixels(&canvas, &pp, pw as u32, ph as u32);
@@ -379,6 +383,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                     layers: Vec::new(),
                     next_layer_id: 0,
                     exif,
+                    taken,
                     drive_file_id: None,
                     drive_parent_id: None,
                     drive_baked: false,
@@ -390,7 +395,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                 let is_jpeg = !is_heic(&file)
                     && (lname.ends_with(".jpg") || lname.ends_with(".jpeg"));
                 let is_png = lname.ends_with(".png");
-                let exif = if is_jpeg || is_png {
+                let exif_tiff = if is_jpeg || is_png {
                     web::read_file_array_buffer(&file)
                         .await
                         .ok()
@@ -402,10 +407,11 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                                 exif::tiff_from_jpeg(&b)
                             }
                         })
-                        .map(Rc::new)
                 } else {
                     None
                 };
+                let taken = exif_tiff.as_deref().and_then(exif::taken_from_tiff).or(mtime);
+                let exif = exif_tiff.map(Rc::new);
                 if is_heic(&file) {
                     state.busy.set(Some(format!("Converting HEIC {name}…")));
                     match web::heic_to_jpeg(blob).await {
@@ -449,6 +455,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                     layers: Vec::new(),
                     next_layer_id: 0,
                     exif,
+                    taken,
                     drive_file_id: None,
                     drive_parent_id: None,
                     drive_baked: false,
@@ -459,10 +466,26 @@ fn ingest_files(state: AppState, files: Vec<File>) {
     });
 }
 
+/// Insert in capture-time order (taken, then name, then id) so the filmstrip
+/// reads chronologically no matter which order async imports complete in.
 fn push_item(state: AppState, item: MediaItem) {
     let id = item.id;
+    let k = (item.taken.unwrap_or(f64::INFINITY), item.name.clone(), item.id);
     batch(|| {
-        state.items.update(|v| v.push(item));
+        state.items.update(|v| {
+            let pos = v
+                .iter()
+                .position(|m| {
+                    m.taken
+                        .unwrap_or(f64::INFINITY)
+                        .total_cmp(&k.0)
+                        .then_with(|| m.name.cmp(&k.1))
+                        .then_with(|| m.id.cmp(&k.2))
+                        == std::cmp::Ordering::Greater
+                })
+                .unwrap_or(v.len());
+            v.insert(pos, item);
+        });
         if state.selected.get_untracked().is_none() {
             state.selected.set(Some(id));
         }
@@ -509,7 +532,9 @@ fn ingest_drive_bytes(
                 return;
             };
             CACHE.with(|c| c.borrow_mut().raw_bytes.insert(id, Rc::new(bytes.clone())));
-            let exif = raw::extract_exif_tiff(&bytes).map(Rc::new);
+            let exif_tiff = raw::extract_exif_tiff(&bytes);
+            let taken = exif_tiff.as_deref().and_then(exif::taken_from_tiff);
+            let exif = exif_tiff.map(Rc::new);
             let (pp, pw, ph) = downscale_pixels(&full_rgba, fw, fh, 1024);
             let canvas = web::create_canvas(pw as u32, ph as u32);
             web::put_pixels(&canvas, &pp, pw as u32, ph as u32);
@@ -545,6 +570,7 @@ fn ingest_drive_bytes(
                 layers: Vec::new(),
                 next_layer_id: 0,
                 exif,
+                taken,
                 drive_file_id: Some(drive_file_id),
                 drive_parent_id: Some(drive_parent_id),
                 drive_baked,
@@ -552,14 +578,15 @@ fn ingest_drive_bytes(
         } else {
             let lname = name.to_lowercase();
             let mime = if lname.ends_with(".png") { "image/png" } else { "image/jpeg" };
-            let exif = if lname.ends_with(".png") {
+            let exif_tiff = if lname.ends_with(".png") {
                 exif::tiff_from_png(&bytes)
             } else if lname.ends_with(".jpg") || lname.ends_with(".jpeg") {
                 exif::tiff_from_jpeg(&bytes)
             } else {
                 None
-            }
-            .map(Rc::new);
+            };
+            let taken = exif_tiff.as_deref().and_then(exif::taken_from_tiff);
+            let exif = exif_tiff.map(Rc::new);
             let Ok(blob) = web::bytes_to_blob(&bytes, mime) else {
                 state.busy.set(None);
                 return;
@@ -597,6 +624,7 @@ fn ingest_drive_bytes(
                 layers: Vec::new(),
                 next_layer_id: 0,
                 exif,
+                taken,
                 drive_file_id: Some(drive_file_id),
                 drive_parent_id: Some(drive_parent_id),
                 drive_baked,
@@ -1814,6 +1842,7 @@ fn FilmStrip(state: AppState) -> impl IntoView {
                     view! {
                         <div
                             class="thumb"
+                            title=m.name.clone()
                             class:selected=move || state.selected.get() == Some(id)
                             on:click=move |_| state.selected.set(Some(id))
                             on:mouseenter=move |ev| {
@@ -2146,6 +2175,10 @@ async fn persist_session(state: AppState) {
         } else {
             session::jset(rec_v, "exif", JsValue::NULL);
         }
+        match item.taken {
+            Some(t) => session::jset(rec_v, "taken", t),
+            None => session::jset(rec_v, "taken", JsValue::NULL),
+        }
 
         // Bytes: rewrite only when the bytes signature moved; otherwise carry
         // the stored blob over (put() replaces the whole record).
@@ -2305,6 +2338,7 @@ fn restore_session(state: AppState) {
             let drive_parent_id = state::jget(&v, "dpid").and_then(|s| s.as_string());
             let drive_baked = state::jbool(&v, "dbaked").unwrap_or(false);
             let next_layer_id = state::jnum(&v, "nlid").unwrap_or(0.0) as usize;
+            let taken = state::jnum(&v, "taken");
 
             if is_video {
                 let url = Url::create_object_url_with_blob(&blob).unwrap_or_default();
@@ -2326,6 +2360,7 @@ fn restore_session(state: AppState) {
                     layers,
                     next_layer_id,
                     exif,
+                    taken,
                     drive_file_id,
                     drive_parent_id,
                     drive_baked,
@@ -2373,6 +2408,7 @@ fn restore_session(state: AppState) {
                     layers,
                     next_layer_id,
                     exif,
+                    taken,
                     drive_file_id,
                     drive_parent_id,
                     drive_baked,
@@ -2408,6 +2444,7 @@ fn restore_session(state: AppState) {
                     layers,
                     next_layer_id,
                     exif,
+                    taken,
                     drive_file_id,
                     drive_parent_id,
                     drive_baked,
@@ -2415,7 +2452,7 @@ fn restore_session(state: AppState) {
             }
             // Seed the signature so the next persist pass doesn't rewrite
             // bytes that are already stored.
-            let ord = state.items.with(|v| v.len().saturating_sub(1));
+            let ord = state.items.with(|v| v.iter().position(|m| m.id == id).unwrap_or(0));
             if let Some(item) = state.items.with(|v| v.iter().find(|m| m.id == id).cloned()) {
                 let sig = item_sig(&item, ord);
                 SESSION_SIGS.with(|s| {

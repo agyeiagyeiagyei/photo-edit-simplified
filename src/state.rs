@@ -343,6 +343,9 @@ pub struct MediaItem {
     pub next_layer_id: usize,
     /// EXIF TIFF payload carried from the source file into exports.
     pub exif: Option<std::rc::Rc<Vec<u8>>>,
+    /// Capture time (epoch seconds, EXIF read as-if-UTC) for filmstrip
+    /// ordering; falls back to file mtime, None when neither exists.
+    pub taken: Option<f64>,
     /// Drive file id when the item was imported from (or saved to) Drive.
     pub drive_file_id: Option<String>,
     /// Id of the Drive folder containing the file, when imported from Drive.
