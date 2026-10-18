@@ -1,5 +1,6 @@
 mod drive;
 mod exif;
+mod zip;
 mod pworker;
 mod raw;
 mod session;
@@ -244,12 +245,12 @@ fn remove_item(state: AppState, item_id: usize) {
     state.items.update(|v| {
         if let Some(pos) = v.iter().position(|m| m.id == item_id) {
             let m = v.remove(pos);
-            removed = Some((m.object_url, m.thumb_url));
+            removed = Some((m.object_url, m.thumb_url, pos));
         }
     });
-    if let Some((url, thumb)) = removed {
-        let _ = Url::revoke_object_url(&url);
-        let _ = Url::revoke_object_url(&thumb);
+    if let Some((url, thumb, _)) = &removed {
+        let _ = Url::revoke_object_url(url);
+        let _ = Url::revoke_object_url(thumb);
     }
     CACHE.with(|c| {
         let mut c = c.borrow_mut();
@@ -262,8 +263,17 @@ fn remove_item(state: AppState, item_id: usize) {
     LAST_USE.with(|l| l.borrow_mut().remove(&item_id));
     FULL_WAITERS.with(|w| w.borrow_mut().remove(&item_id));
     pworker::unload(item_id);
+    // Hover loupes clear on mouseleave, which never fires when the hovered
+    // thumb has just left the DOM — drop any loupe showing the removed item.
+    if state.loupe.get_untracked().map(|(id, ..)| id) == Some(item_id) {
+        loupe_clear(state);
+    }
+    if state.canvas_loupe.get_untracked().map(|(id, ..)| id) == Some(item_id) {
+        canvas_loupe_clear(state);
+    }
     if state.selected.get_untracked() == Some(item_id) {
-        let next = state.items.with(|v| v.first().map(|m| m.id));
+        let pos = removed.map(|(_, _, p)| p).unwrap_or(0);
+        let next = state.items.with(|v| v.get(pos).or_else(|| v.last()).map(|m| m.id));
         state.selected.set(next);
     }
 }
@@ -1258,9 +1268,23 @@ enum DriveSave {
     AlreadyThere,
 }
 
-/// Upload one photo into the granted Drive folder; overwrites in place when
-/// the item came from Drive or was already saved there. No busy indicator or
-/// panel refresh — callers own both (single save and the batch loop differ).
+/// Resolve (find-or-create) the "edits" subfolder under the granted root —
+/// every new file the app writes to Drive lands there. Cached in state.
+async fn edits_folder_id(state: AppState, token: &str, root_id: &str) -> Result<String, String> {
+    if let Some(id) = state.drive_edits_folder.get_untracked() {
+        return Ok(id);
+    }
+    let id = drive::ensure_child_folder(token, root_id, drive::EDITS_FOLDER_NAME)
+        .await
+        .map_err(|e| js_err(&e))?;
+    state.drive_edits_folder.set(Some(id.clone()));
+    Ok(id)
+}
+
+/// Upload one photo into the granted Drive folder's "edits" subfolder;
+/// overwrites in place when the item came from Drive or was already saved
+/// there. No busy indicator or panel refresh — callers own both (single save
+/// and the batch loop differ).
 async fn save_photo_to_drive_inner(state: AppState, item: MediaItem) -> Result<DriveSave, String> {
     let Some(token) = state.drive_token.get_untracked() else {
         return Err("not signed in to Drive".into());
@@ -1278,7 +1302,8 @@ async fn save_photo_to_drive_inner(state: AppState, item: MediaItem) -> Result<D
                 return Ok(DriveSave::AlreadyThere);
             }
             if let Ok(bytes) = web::object_url_bytes(&item.object_url).await {
-                return match drive::upload_file(&token, &folder_id, None, &item.name, mime, &bytes).await {
+                let dest = edits_folder_id(state, &token, &folder_id).await?;
+                return match drive::upload_file(&token, &dest, None, &item.name, mime, &bytes).await {
                     Ok(fid) => {
                         state.update_item_by_id(item_id, |m| {
                             m.drive_file_id = Some(fid);
@@ -1293,14 +1318,21 @@ async fn save_photo_to_drive_inner(state: AppState, item: MediaItem) -> Result<D
         }
     }
 
+    // New uploads land in the "edits" folder; PATCH-in-place (item already
+    // in Drive) keeps the file where it is.
+    let dest = match item.drive_file_id {
+        Some(_) => None,
+        None => Some(edits_folder_id(state, &token, &folder_id).await?),
+    };
     let Some((blob, mime, filename)) = render_photo_export(state, &item).await else {
         return Err("render failed".into());
     };
     let result = async {
         let bytes = web::blob_to_bytes(&blob).await?;
+        let parent = dest.as_deref().unwrap_or(&folder_id);
         let first = drive::upload_file(
             &token,
-            &folder_id,
+            parent,
             item.drive_file_id.as_deref(),
             &filename,
             mime,
@@ -1311,10 +1343,16 @@ async fn save_photo_to_drive_inner(state: AppState, item: MediaItem) -> Result<D
             Ok(fid) => Ok(fid),
             // Overwrite-in-place needs write access; drive.file grants that
             // only for app-created/picked files, so a readonly-imported
-            // original rejects PATCH. Fall back to a new copy beside it.
+            // original rejects PATCH. Fall back to a new copy in edits/.
             Err(e) => match item.drive_parent_id.as_deref() {
-                Some(parent) => {
-                    drive::upload_file(&token, parent, None, &filename, mime, &bytes).await
+                Some(_) => {
+                    let dest = match &dest {
+                        Some(d) => d.clone(),
+                        None => edits_folder_id(state, &token, &folder_id)
+                            .await
+                            .map_err(|e| JsValue::from_str(&e))?,
+                    };
+                    drive::upload_file(&token, &dest, None, &filename, mime, &bytes).await
                 }
                 None => Err(e),
             },
@@ -1441,37 +1479,81 @@ fn export_video(state: AppState, item: MediaItem) {
     spawn_local(async move {
         state.busy.set(Some(format!("Exporting {}…", item.name)));
         state.progress.set(0.0);
-        let Some((blob, _dur, w, h)) = get_video(item.id) else {
-            state.busy.set(None);
-            return;
-        };
-        let (_, _, _, _, ew, eh) = video_export_dims(&item.edit, w as usize, h as usize);
+        if let Some((out, filename)) = render_video_export(state, &item).await {
+            web::download_blob(&out, &filename);
+        }
+        state.busy.set(None);
+        state.progress.set(0.0);
+    });
+}
 
-        let mut overlays: Vec<(String, Blob)> = Vec::new();
-        for (i, layer) in item.layers.iter().enumerate() {
-            if !layer.visible || layer.opacity <= 0.01 {
-                continue;
-            }
-            let state::LayerKind::Text(t) = &layer.kind else {
-                // Path/brush layers are photo-only for now.
-                continue;
+/// Transcode a video through the edit pipeline; returns (blob, filename).
+async fn render_video_export(state: AppState, item: &MediaItem) -> Option<(Blob, String)> {
+    let (blob, _dur, w, h) = get_video(item.id)?;
+    let (_, _, _, _, ew, eh) = video_export_dims(&item.edit, w as usize, h as usize);
+
+    let mut overlays: Vec<(String, Blob)> = Vec::new();
+    for (i, layer) in item.layers.iter().enumerate() {
+        if !layer.visible || layer.opacity <= 0.01 {
+            continue;
+        }
+        let state::LayerKind::Text(t) = &layer.kind else {
+            // Path/brush layers are photo-only for now.
+            continue;
+        };
+        match render_text_overlay(t, ew, eh).await {
+            Ok(blob) => overlays.push((format!("overlay-{i}.png"), blob)),
+            Err(_) => web::log("text overlay render failed"),
+        }
+    }
+
+    let overlay_names: Vec<String> = overlays.iter().map(|(n, _)| n.clone()).collect();
+    let args = build_ffmpeg_args(item, w as usize, h as usize, &overlay_names);
+    let on_progress = Closure::new(move |r: f64| state.progress.set(r as f32));
+    match web::video_transcode(&item.name, blob, args, overlays, on_progress).await {
+        Ok(out) => {
+            let base = item.name.rsplitn(2, '.').last().unwrap_or("video");
+            Some((out, format!("edited-{}.mp4", base)))
+        }
+        Err(e) => {
+            web::log_err(&format!("transcode failed: {e:?}"));
+            None
+        }
+    }
+}
+
+/// Batch-download every edited item packaged into a single zip. Entries are
+/// STOREd — JPEG/PNG/MP4 are already compressed, so DEFLATE would buy
+/// nothing.
+fn download_edited_zip(state: AppState) {
+    spawn_local(async move {
+        let targets: Vec<MediaItem> =
+            state.items.with(|v| v.iter().filter(|m| item_edited(m)).cloned().collect());
+        if targets.is_empty() {
+            return;
+        }
+        let n = targets.len();
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        for (i, item) in targets.into_iter().enumerate() {
+            state.busy.set(Some(format!("Packaging zip… ({}/{})", i + 1, n)));
+            let rendered = match item.kind {
+                MediaKind::Photo => render_photo_export(state, &item)
+                    .await
+                    .map(|(b, _, f)| (b, f)),
+                MediaKind::Video => render_video_export(state, &item).await,
             };
-            match render_text_overlay(t, ew, eh).await {
-                Ok(blob) => overlays.push((format!("overlay-{i}.png"), blob)),
-                Err(_) => web::log("text overlay render failed"),
+            if let Some((blob, filename)) = rendered {
+                if let Ok(bytes) = web::blob_to_bytes(&blob).await {
+                    entries.push((filename, bytes));
+                }
             }
         }
-
-        let overlay_names: Vec<String> = overlays.iter().map(|(n, _)| n.clone()).collect();
-        let args = build_ffmpeg_args(&item, w as usize, h as usize, &overlay_names);
-        let on_progress = Closure::new(move |r: f64| state.progress.set(r as f32));
-        let result = web::video_transcode(&item.name, blob, args, overlays, on_progress).await;
-        match result {
-            Ok(out) => {
-                let base = item.name.rsplitn(2, '.').last().unwrap_or("video");
-                web::download_blob(&out, &format!("edited-{}.mp4", base));
+        if !entries.is_empty() {
+            state.busy.set(Some("Building zip…".into()));
+            let bytes = zip::build_zip(&entries);
+            if let Ok(blob) = web::bytes_to_blob(&bytes, "application/zip") {
+                web::download_blob(&blob, "photo-edit-edited.zip");
             }
-            Err(e) => web::log_err(&format!("transcode failed: {e:?}")),
         }
         state.busy.set(None);
         state.progress.set(0.0);
@@ -1865,6 +1947,303 @@ fn FocusLoupe(state: AppState) -> impl IntoView {
     }
 }
 
+// --- editor-canvas hover loupe -------------------------------------------------
+
+/// Full-res *edited* render feeding the canvas loupe. Separate from HI_CACHE
+/// (display-sized) — the loupe wants native pixels, so its render targets the
+/// full working resolution (still HI_MAX_EDGE-capped) and runs in the worker.
+thread_local! {
+    static CANVAS_LOUPE_HI: RefCell<Option<HiCache>> = RefCell::new(None);
+    static CANVAS_LOUPE_REQ: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Normalized working-image coords of a pointer over the editor canvas. The
+/// wrap shows the crop region outside the Crop tab, so map through the crop.
+fn canvas_loupe_norm(state: AppState, tab: Tab, ev: &web_sys::PointerEvent) -> Option<(f64, f64)> {
+    let el: web_sys::Element = ev.target()?.dyn_into().ok()?;
+    let wrap = el.closest(".canvas-wrap").ok().flatten()?;
+    let r = wrap.get_bounding_client_rect();
+    if r.width() < 1.0 || r.height() < 1.0 {
+        return None;
+    }
+    let nx = ((ev.client_x() as f64 - r.left()) / r.width()).clamp(0.0, 1.0);
+    let ny = ((ev.client_y() as f64 - r.top()) / r.height()).clamp(0.0, 1.0);
+    let item = state.current()?;
+    let crop = item.edit.crop;
+    if tab != Tab::Crop && !crop_is_full(&crop) {
+        Some((
+            crop.x as f64 + nx * crop.w as f64,
+            crop.y as f64 + ny * crop.h as f64,
+        ))
+    } else {
+        Some((nx, ny))
+    }
+}
+
+/// Resting the mouse on the editor canvas opens the 1:1 loupe after a dwell.
+/// Re-armed on every move while hidden, so sweeps across the canvas never
+/// strobe full-res renders — the loupe only opens once the cursor stops.
+fn canvas_loupe_soon(state: AppState, tab: RwSignal<Tab>, ev: &web_sys::PointerEvent) {
+    if ev.pointer_type() != "mouse" {
+        return;
+    }
+    let Some(item) = state.current() else { return };
+    if item.kind != MediaKind::Photo {
+        return;
+    }
+    let Some((nx, ny)) = canvas_loupe_norm(state, tab.get_untracked(), ev) else { return };
+    let (cx, cy) = (ev.client_x() as f64, ev.client_y() as f64);
+    let id = item.id;
+    state.canvas_loupe_gen.update(|g| *g += 1);
+    let gen = state.canvas_loupe_gen.get_untracked();
+    let cb = Closure::once(move || {
+        if state.canvas_loupe_gen.get_untracked() == gen {
+            ensure_full(state, id, None);
+            state.canvas_loupe.set(Some((id, nx, ny, cx, cy)));
+        }
+    });
+    let _ = web::window().set_timeout_with_callback_and_timeout_and_arguments_0(
+        cb.as_ref().unchecked_ref(),
+        250,
+    );
+    cb.forget();
+}
+
+fn canvas_loupe_move(state: AppState, tab: RwSignal<Tab>, ev: &web_sys::PointerEvent) {
+    // Drags (heal/clone/crop/select/layers) never open the loupe.
+    if ev.buttons() != 0 {
+        canvas_loupe_clear(state);
+        return;
+    }
+    if state.canvas_loupe.with(|l| l.is_some()) {
+        let Some(item) = state.current() else { return };
+        if let Some((nx, ny)) = canvas_loupe_norm(state, tab.get_untracked(), ev) {
+            state.canvas_loupe.set(Some((
+                item.id,
+                nx,
+                ny,
+                ev.client_x() as f64,
+                ev.client_y() as f64,
+            )));
+        }
+    } else {
+        canvas_loupe_soon(state, tab, ev);
+    }
+}
+
+fn canvas_loupe_clear(state: AppState) {
+    state.canvas_loupe_gen.update(|g| *g += 1);
+    state.canvas_loupe.set(None);
+}
+
+/// Editor-canvas hover loupe: a floating 1:1 window into the *edited* image —
+/// a full-res render through the whole pipeline, so it shows what an export
+/// would. Untouched photos take the cheap source-pixel path instead.
+#[component]
+fn CanvasLoupe(
+    state: AppState,
+    tab: RwSignal<Tab>,
+    main_canvas: NodeRef<html::Canvas>,
+) -> impl IntoView {
+    let canvas_ref = create_node_ref::<html::Canvas>();
+    let tag = create_rw_signal("");
+
+    // Clear on any press inside the wrap. Capture phase: overlay children
+    // (crop rect, selected text) stop propagation, so the wrap's delegated
+    // on:pointerdown never sees those presses.
+    let pd = Closure::wrap(Box::new(move |ev: web_sys::PointerEvent| {
+        let hit = ev
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+            .and_then(|el| el.closest(".canvas-wrap").ok().flatten())
+            .is_some();
+        if hit {
+            canvas_loupe_clear(state);
+        }
+    }) as Box<dyn FnMut(_)>);
+    let pd_opts = web_sys::AddEventListenerOptions::new();
+    pd_opts.set_capture(true);
+    web::window()
+        .add_event_listener_with_callback_and_add_event_listener_options(
+            "pointerdown",
+            pd.as_ref().unchecked_ref(),
+            &pd_opts,
+        )
+        .ok();
+    on_cleanup(move || {
+        web::window()
+            .remove_event_listener_with_callback_and_bool(
+                "pointerdown",
+                pd.as_ref().unchecked_ref(),
+                true,
+            )
+            .ok();
+    });
+
+    create_effect(move |_| {
+        state.items.track(); // edits, full-res decodes, render landings
+        state.selected.track();
+        let Some((id, nx, ny, _, _)) = state.canvas_loupe.get() else { return };
+        let Some(item) = state.current() else {
+            canvas_loupe_clear(state);
+            return;
+        };
+        if item.id != id || item.kind != MediaKind::Photo {
+            canvas_loupe_clear(state);
+            return;
+        }
+        let Some(photo) = get_photo(id) else { return };
+        let Some(canvas) = canvas_ref.get() else { return };
+        let dpr = web::window().device_pixel_ratio().max(1.0);
+        let bw = (480.0 * dpr) as usize;
+        let bh = (360.0 * dpr) as usize;
+        if canvas.width() != bw as u32 || canvas.height() != bh as u32 {
+            canvas.set_width(bw as u32);
+            canvas.set_height(bh as u32);
+        }
+
+        // Fast path: nothing alters the pixels (no geometry, color, selection
+        // or visible layers) → 1:1 row-copy straight from the source.
+        if photo_unedited(&item) {
+            if let Some((px, w, h)) = photo.full.as_ref() {
+                let (w, h) = (*w, *h);
+                if w >= bw && h >= bh {
+                    tag.set("1:1");
+                    let sx = ((nx * w as f64 - bw as f64 / 2.0) as isize)
+                        .clamp(0, (w - bw) as isize) as usize;
+                    let sy = ((ny * h as f64 - bh as f64 / 2.0) as isize)
+                        .clamp(0, (h - bh) as isize) as usize;
+                    let mut crop = vec![0u8; bw * bh * 4];
+                    for row in 0..bh {
+                        let src = ((sy + row) * w + sx) * 4;
+                        crop[row * bw * 4..(row + 1) * bw * 4]
+                            .copy_from_slice(&px[src..src + bw * 4]);
+                    }
+                    web::put_pixels(&canvas, &crop, bw as u32, bh as u32);
+                    return;
+                }
+            }
+        }
+
+        let fp = content_fingerprint(&item, photo.gen);
+        let hit = CANVAS_LOUPE_HI.with(|c| {
+            let b = c.borrow();
+            let hi = b.as_ref()?;
+            (hi.item_id == id && hi.fingerprint == fp).then(|| (hi.canvas.clone(), hi.w, hi.h))
+        });
+        if let Some((hi_canvas, hw, hh)) = hit {
+            tag.set("1:1");
+            let ctx = web::ctx2d(&canvas);
+            let sw = (bw as f64).min(hw as f64);
+            let sh = (bh as f64).min(hh as f64);
+            let sx = (nx * hw as f64 - sw / 2.0).clamp(0.0, (hw as f64 - sw).max(0.0));
+            let sy = (ny * hh as f64 - sh / 2.0).clamp(0.0, (hh as f64 - sh).max(0.0));
+            let _ = ctx
+                .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+                    &hi_canvas, sx, sy, sw, sh, 0.0, 0.0, bw as f64, bh as f64,
+                );
+            return;
+        }
+
+        // Placeholder until the full-res render lands: magnify the on-screen
+        // canvas (~2x, display res). Its backing shows the crop region
+        // outside the Crop tab, so map working coords through the crop.
+        tag.set("rendering…");
+        if let Some(main) = main_canvas.get() {
+            let (mw, mh) = (main.width() as f64, main.height() as f64);
+            if mw > 1.0 && mh > 1.0 {
+                let crop = item.edit.crop;
+                let cropped_view = tab.get_untracked() != Tab::Crop && !crop_is_full(&crop);
+                let (dx, dy) = if cropped_view {
+                    (
+                        ((nx - crop.x as f64) / crop.w as f64).clamp(0.0, 1.0),
+                        ((ny - crop.y as f64) / crop.h as f64).clamp(0.0, 1.0),
+                    )
+                } else {
+                    (nx, ny)
+                };
+                let sw = bw as f64 / 2.0;
+                let sh = bh as f64 / 2.0;
+                let sx = (dx * mw - sw / 2.0).clamp(0.0, (mw - sw).max(0.0));
+                let sy = (dy * mh - sh / 2.0).clamp(0.0, (mh - sh).max(0.0));
+                let _ = web::ctx2d(&canvas)
+                    .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+                        &main, sx, sy, sw, sh, 0.0, 0.0, bw as f64, bh as f64,
+                    );
+            }
+        }
+
+        // Kick the full-res edited render. Every kick invalidates the one
+        // before it; the store nudges items, re-running this effect.
+        if !full_present(id) {
+            ensure_full(state, id, None);
+            return;
+        }
+        CANVAS_LOUPE_REQ.with(|c| c.set(c.get() + 1));
+        let rgen = CANVAS_LOUPE_REQ.with(|c| c.get());
+        let (fw, fh) = working_dims(photo.full_dims.0, photo.full_dims.1, &item.edit);
+        let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
+        let sel = item.edit.selection.clone();
+        let item_cb = item.clone();
+        let accepted = pworker::render(
+            id,
+            &recipe,
+            fw as f64,
+            fh as f64,
+            HI_MAX_EDGE as u32,
+            sel.as_ref(),
+            move |reply| {
+                if CANVAS_LOUPE_REQ.with(|c| c.get()) != rgen {
+                    return;
+                }
+                let hi = match reply {
+                    Ok(r) => {
+                        let c = web::create_canvas(r.w, r.h);
+                        web::put_pixels_view(&c, &r.pixels, r.w, r.h);
+                        composite_layers(&c, &item_cb.layers, r.w as usize, r.h as usize);
+                        Some(HiCache {
+                            item_id: id,
+                            fingerprint: fp,
+                            canvas: c,
+                            w: r.w as usize,
+                            h: r.h as usize,
+                        })
+                    }
+                    Err(_) => render_hi(&item_cb, fw as f64, fh as f64),
+                };
+                if let Some(hi) = hi {
+                    CANVAS_LOUPE_HI.with(|c| *c.borrow_mut() = Some(hi));
+                    state.items.update(|_| {});
+                }
+            },
+        );
+        if !accepted {
+            if let Some(hi) = render_hi(&item, fw as f64, fh as f64) {
+                CANVAS_LOUPE_HI.with(|c| *c.borrow_mut() = Some(hi));
+                state.items.update(|_| {});
+            }
+        }
+    });
+
+    view! {
+        <Show when=move || state.canvas_loupe.with(|l| l.is_some()) fallback=|| ()>
+            <div
+                class="loupe-hover"
+                style=move || {
+                    state
+                        .canvas_loupe
+                        .get()
+                        .map(|(_, _, _, cx, cy)| loupe_style(cx, cy))
+                        .unwrap_or_default()
+                }
+            >
+                <canvas node_ref=canvas_ref width="480" height="360"></canvas>
+                <span class="loupe-tag">{move || tag.get()}</span>
+            </div>
+        </Show>
+    }
+}
+
 /// Drive grid hover popup: w800 thumbnail on dwell, upgrading to a panning
 /// 1:1 full-res crop once the original has been downloaded and decoded.
 /// Mirrors FocusLoupe: <Show> keeps the canvas mounted, paints happen in the
@@ -2101,30 +2480,50 @@ fn drive_refresh(state: AppState) {
                 .set(Some(format!("Drive list failed: {}", js_err(&e)))),
         }
         // The manifest lives at the granted root regardless of which
-        // subfolder is being browsed. While a debounced write is outstanding
-        // (or a change landed mid-fetch, moving save_gen) the remote copy is
-        // stale — local state wins and the pending writer overwrites remote.
+        // subfolder is being browsed. On the first load of a session the
+        // remote manifest is authoritative, but local changes made before the
+        // fetch landed (restored session recipes, a quick star) overlay it —
+        // union here and let the gated writer converge remote afterwards.
+        // After that, while a debounced write is outstanding (or a change
+        // landed mid-fetch, moving save_gen) the remote copy is stale —
+        // local state wins and the pending writer overwrites remote.
         let gen_at_read = state.drive_save_gen.get_untracked();
         match drive::find_manifest(&token, &root_id).await {
             Ok(Some(mid)) => {
                 state.drive_manifest_id.set(Some(mid.clone()));
                 if let Ok(bytes) = drive::download_file(&token, &mid).await {
-                    let fresh = !state.drive_save_pending.get_untracked()
-                        && state.drive_save_gen.get_untracked() == gen_at_read;
-                    if fresh {
-                        let (starred, edits) = drive::parse_manifest(&bytes);
-                        state.drive_shortlist.set(starred);
-                        state.drive_edits.set(edits);
+                    let (starred, edits) = drive::parse_manifest(&bytes);
+                    if !state.drive_manifest_loaded.get_untracked() {
+                        state.drive_shortlist.update(|s| s.extend(starred));
+                        state.drive_edits.update(|m| {
+                            for (k, v) in edits {
+                                m.entry(k).or_insert(v);
+                            }
+                        });
+                        state.drive_manifest_loaded.set(true);
+                    } else {
+                        let fresh = !state.drive_save_pending.get_untracked()
+                            && state.drive_save_gen.get_untracked() == gen_at_read;
+                        if fresh {
+                            state.drive_shortlist.set(starred);
+                            state.drive_edits.set(edits);
+                        }
                     }
                 }
             }
             Ok(None) => {
                 state.drive_manifest_id.set(None);
-                let fresh = !state.drive_save_pending.get_untracked()
-                    && state.drive_save_gen.get_untracked() == gen_at_read;
-                if fresh {
-                    state.drive_shortlist.set(Default::default());
-                    state.drive_edits.set(Default::default());
+                if !state.drive_manifest_loaded.get_untracked() {
+                    // No manifest on Drive yet — local state (if any) becomes
+                    // the first manifest via the pending/next writer.
+                    state.drive_manifest_loaded.set(true);
+                } else {
+                    let fresh = !state.drive_save_pending.get_untracked()
+                        && state.drive_save_gen.get_untracked() == gen_at_read;
+                    if fresh {
+                        state.drive_shortlist.set(Default::default());
+                        state.drive_edits.set(Default::default());
+                    }
                 }
             }
             Err(_) => {}
@@ -2156,6 +2555,10 @@ fn schedule_manifest_save(state: AppState) {
     state.drive_save_gen.update(|g| *g += 1);
     state.drive_save_pending.set(true);
     let gen = state.drive_save_gen.get_untracked();
+    manifest_save_attempt(state, gen, 0);
+}
+
+fn manifest_save_attempt(state: AppState, gen: u32, attempt: u32) {
     let cb = wasm_bindgen::closure::Closure::once(move || {
         spawn_local(async move {
             if state.drive_save_gen.get_untracked() != gen {
@@ -2170,6 +2573,21 @@ fn schedule_manifest_save(state: AppState) {
                 state.drive_save_pending.set(false);
                 return;
             };
+            // Never write before the manifest's first authoritative load —
+            // the shortlist is empty until then, so an early write would
+            // clobber every star on Drive. Re-arm while the load is in
+            // flight; give up (loudly) if it never lands.
+            if !state.drive_manifest_loaded.get_untracked() {
+                if attempt >= 40 {
+                    state.drive_save_pending.set(false);
+                    state
+                        .drive_error
+                        .set(Some("Shortlist not saved — the Drive manifest never loaded".into()));
+                    return;
+                }
+                manifest_save_attempt(state, gen, attempt + 1);
+                return;
+            }
             let ids = state.drive_shortlist.get_untracked();
             let edits = state.drive_edits.get_untracked();
             let body = drive::manifest_json(&ids, &edits);
@@ -3074,6 +3492,14 @@ fn DrivePanel(state: AppState) -> impl IntoView {
                     drive::save_folder(&id, &name);
                     state.drive_folder.set(Some((id, name)));
                     state.drive_path.set(Vec::new());
+                    // The manifest is per-grant: drop the previous folder's
+                    // shortlist so its stars/recipes never bleed into (or get
+                    // written to) the new root's manifest.
+                    state.drive_shortlist.set(Default::default());
+                    state.drive_edits.set(Default::default());
+                    state.drive_manifest_id.set(None);
+                    state.drive_manifest_loaded.set(false);
+                    state.drive_edits_folder.set(None);
                     drive_refresh(state);
                 }
                 Ok(None) => {}
@@ -4358,6 +4784,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                 && state.current().map(|m| m.kind == MediaKind::Photo && !crop_is_full(&m.edit.crop)).unwrap_or(false)
                         }
                         on:pointerdown=move |ev: web_sys::PointerEvent| {
+                            canvas_loupe_clear(state);
                             if tab.get() == Tab::Clone {
                                 if let Some(item) = state.current().filter(|m| m.kind == MediaKind::Photo) {
                                     if let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) {
@@ -4479,6 +4906,10 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                 }
                             });
                         }
+                        on:pointermove=move |ev: web_sys::PointerEvent| {
+                            canvas_loupe_move(state, tab, &ev);
+                        }
+                        on:pointerleave=move |_| canvas_loupe_clear(state)
                     >
                         <canvas node_ref=canvas_ref></canvas>
                         <Show when=move || tab.get() == Tab::Crop fallback=|| ()>
@@ -4488,6 +4919,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     </div>
                 }.into_view(),
             }}
+            <CanvasLoupe state=state tab=tab main_canvas=canvas_ref/>
         </div>
     }
 }
@@ -6905,16 +7337,8 @@ fn ExportTab(state: AppState) -> impl IntoView {
                 });
             }>"Apply edits to all"</button>
             <button class="btn" disabled=move || edited_count() == 0 on:click=move |_| {
-                for item in state.items.get() {
-                    if !item_edited(&item) {
-                        continue;
-                    }
-                    match item.kind {
-                        MediaKind::Photo => export_photo(state, item),
-                        MediaKind::Video => export_video(state, item),
-                    }
-                }
-            }>{move || format!("Download {} edited", edited_count())}</button>
+                download_edited_zip(state);
+            }>{move || format!("Download {} edited (zip)", edited_count())}</button>
             <Show when=drive_ready fallback=|| ()>
                 <button class="btn" disabled=move || save_count() == 0 on:click=move |_| {
                     save_edited_to_drive(state);

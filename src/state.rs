@@ -408,6 +408,13 @@ pub struct AppState {
     pub drive_edits: RwSignal<std::collections::HashMap<String, String>>,
     /// Drive id of the shortlist manifest, when it exists.
     pub drive_manifest_id: RwSignal<Option<String>>,
+    /// Cached id of the "edits" subfolder under the granted root — every
+    /// file the app writes to Drive lands there. Cleared on folder re-pick.
+    pub drive_edits_folder: RwSignal<Option<String>>,
+    /// True once the manifest has been fetched (or confirmed absent) for the
+    /// current folder grant. The debounced writer must never serialize the
+    /// shortlist before this — an empty read would clobber every star.
+    pub drive_manifest_loaded: RwSignal<bool>,
     /// Bumped on every manifest-affecting change; the debounced saver only
     /// writes the latest.
     pub drive_save_gen: RwSignal<u32>,
@@ -438,8 +445,14 @@ pub struct AppState {
     /// client y) while the cursor rests on a thumb; the crop pans with the
     /// cursor at 1:1 pixels.
     pub loupe: RwSignal<Option<(usize, f64, f64, f64, f64)>>,
+    /// Editor-canvas loupe: (item id, normalized working x, working y, client
+    /// x, client y) while the cursor rests on the main preview. Shows 1:1
+    /// pixels of the *edited* render (source pixels when untouched).
+    pub canvas_loupe: RwSignal<Option<(usize, f64, f64, f64, f64)>>,
     /// Bumped on hover enter/leave; only the latest generation opens the loupe.
     pub loupe_gen: RwSignal<u32>,
+    /// Bumped on canvas-loupe re-arm/clear; only the latest generation opens.
+    pub canvas_loupe_gen: RwSignal<u32>,
     /// Bumped on hover enter/leave; only the latest generation opens a preview.
     pub drive_hover_gen: RwSignal<u32>,
     /// Last Drive error to surface in the panel.
@@ -501,6 +514,8 @@ impl AppState {
             drive_shortlist: create_rw_signal(std::collections::HashSet::new()),
             drive_edits: create_rw_signal(std::collections::HashMap::new()),
             drive_manifest_id: create_rw_signal(None),
+            drive_edits_folder: create_rw_signal(None),
+            drive_manifest_loaded: create_rw_signal(false),
             drive_save_gen: create_rw_signal(0),
             drive_save_pending: create_rw_signal(false),
             hi_built: create_rw_signal(0),
@@ -514,7 +529,9 @@ impl AppState {
             drive_hover_ready: create_rw_signal(None),
             drive_hover_gen: create_rw_signal(0),
             loupe: create_rw_signal(None),
+            canvas_loupe: create_rw_signal(None),
             loupe_gen: create_rw_signal(0),
+            canvas_loupe_gen: create_rw_signal(0),
             drive_error: create_rw_signal(None),
             drive_open: create_rw_signal(false),
         }

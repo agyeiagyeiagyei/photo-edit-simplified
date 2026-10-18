@@ -362,6 +362,53 @@ fn json_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Name of the subfolder (under the granted root) that receives every file
+/// the app writes to Drive — the standing convention for edited exports.
+pub const EDITS_FOLDER_NAME: &str = "edits";
+
+/// Find (creating when absent) a named child folder under `parent_id`.
+pub async fn ensure_child_folder(
+    token: &str,
+    parent_id: &str,
+    name: &str,
+) -> Result<String, JsValue> {
+    let q = format!(
+        "name = '{}' and '{}' in parents and mimeType = '{}' and trashed = false",
+        name.replace('\'', "\\'"),
+        parent_id.replace('\'', "\\'"),
+        FOLDER_MIME
+    );
+    let url = format!(
+        "https://www.googleapis.com/drive/v3/files?q={}&fields=files(id)\
+         &supportsAllDrives=true&includeItemsFromAllDrives=true",
+        js_sys::encode_uri_component(&q)
+    );
+    let resp = drive_fetch(&url, token, "GET", None, None).await?;
+    let json = JsFuture::from(resp.json()?).await?;
+    let files_v = Reflect::get(&json, &JsValue::from_str("files"))?;
+    let arr: Array = files_v.unchecked_into();
+    if let Some(id) = arr.iter().next().and_then(|f| js_str(&f, "id")) {
+        return Ok(id);
+    }
+    let meta = format!(
+        "{{\"name\":\"{}\",\"mimeType\":\"{}\",\"parents\":[\"{}\"]}}",
+        json_escape(name),
+        FOLDER_MIME,
+        json_escape(parent_id)
+    );
+    let blob = crate::web::bytes_to_blob(meta.as_bytes(), "application/json")?;
+    let resp = drive_fetch(
+        "https://www.googleapis.com/drive/v3/files?supportsAllDrives=true",
+        token,
+        "POST",
+        Some(&blob),
+        Some("application/json"),
+    )
+    .await?;
+    let json = JsFuture::from(resp.json()?).await?;
+    js_str(&json, "id").ok_or_else(|| JsValue::from_str("folder create returned no id"))
+}
+
 /// Upload bytes to Drive. With `existing_id` the file's content is overwritten
 /// in place (PATCH); otherwise a new file is created inside `folder_id` (POST).
 /// Returns the file id.
