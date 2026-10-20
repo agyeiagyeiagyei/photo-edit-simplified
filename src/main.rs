@@ -6215,6 +6215,7 @@ fn RotateTab(state: AppState) -> impl IntoView {
 
 #[component]
 fn ColorTab(state: AppState) -> impl IntoView {
+    let channel = create_rw_signal(0usize); // 0=RGB, 1=R, 2=G, 3=B, shared by Levels + Curves
     let slider = move |label: &'static str,
                        get: fn(&EditParams) -> f32,
                        set: fn(&mut EditParams, f32)| {
@@ -6241,8 +6242,8 @@ fn ColorTab(state: AppState) -> impl IntoView {
         {slider("Saturation", |e| e.saturation, |e, v| e.saturation = v)}
         {slider("Warmth", |e| e.warmth, |e, v| e.warmth = v)}
         <BlurPanel state=state />
-        <LevelsPanel state=state />
-        <CurvesPanel state=state />
+        <LevelsPanel state=state channel=channel />
+        <CurvesPanel state=state channel=channel />
         <GrainPanel state=state />
         <button class="btn dim-btn" on:click=move |_| state.update_current(|e| {
             e.brightness = 0.0; e.contrast = 0.0; e.saturation = 0.0; e.warmth = 0.0;
@@ -6270,30 +6271,52 @@ fn BlurPanel(state: AppState) -> impl IntoView {
     }
 }
 
+/// Histogram fill for a levels channel: 0=RGB, 1=R, 2=G, 3=B.
+fn channel_color(ch: usize) -> &'static str {
+    match ch {
+        1 => "rgba(255,69,58,0.85)",
+        2 => "rgba(48,209,88,0.85)",
+        3 => "rgba(10,132,255,0.9)",
+        _ => "rgba(255,255,255,0.75)",
+    }
+}
+
+/// Curve stroke for a curves channel (RGB/R/G/B).
+fn curve_color(ch: usize, alpha: f64) -> String {
+    let (r, g, b) = match ch {
+        1 => (255, 69, 58),
+        2 => (48, 209, 88),
+        3 => (10, 132, 255),
+        _ => (242, 242, 247),
+    };
+    format!("rgba({r},{g},{b},{alpha})")
+}
+
 #[component]
-fn LevelsPanel(state: AppState) -> impl IntoView {
-    let channel = create_rw_signal(0usize); // 0=RGB, 1=R, 2=G, 3=B
+fn LevelsPanel(state: AppState, channel: RwSignal<usize>) -> impl IntoView {
     let hist_ref = create_node_ref::<html::Canvas>();
 
-    // Redraw the histogram whenever the photo or its edits change.
+    // Redraw the histogram whenever the photo, its edits, or the channel change.
     create_effect(move |_| {
         state.items.track();
         state.selected.track();
+        channel.track();
         let Some(canvas) = hist_ref.get() else { return };
         let Some(item) = state.current() else { return };
         if item.kind != MediaKind::Photo {
             return;
         }
         let Some(photo) = get_photo(item.id) else { return };
+        let ch = channel.get_untracked();
         let bins = levels::histogram(&photo.preview.0);
-        let scale = levels::histogram_display_scale(&bins[0]);
+        let scale = levels::histogram_display_scale(&bins[ch]);
         let ctx = web::ctx2d(&canvas);
         ctx.clear_rect(0.0, 0.0, 256.0, 64.0);
         if scale <= 0.0 {
             return;
         }
-        ctx.set_fill_style_str("rgba(255,255,255,0.75)");
-        for (i, &b) in bins[0].iter().enumerate() {
+        ctx.set_fill_style_str(channel_color(ch));
+        for (i, &b) in bins[ch].iter().enumerate() {
             let h = (b / scale * 64.0).min(64.0);
             if h >= 0.5 {
                 ctx.fill_rect(i as f64, 64.0 - h, 1.0, h);
@@ -6301,12 +6324,32 @@ fn LevelsPanel(state: AppState) -> impl IntoView {
         }
     });
 
+    let dirty = move |idx: usize| {
+        state
+            .current()
+            .map(|m| {
+                let r = &m.edit.levels.ranges;
+                if idx == 0 {
+                    (1..4).any(|ch| r[ch] != levels::LevelRange::default())
+                } else {
+                    r[idx] != levels::LevelRange::default()
+                }
+            })
+            .unwrap_or(false)
+    };
+
     let channel_btn = move |idx: usize, label: &'static str| {
         view! {
             <button
-                class=move || if channel.get() == idx { "btn small active" } else { "btn small" }
+                class=move || format!(
+                    "btn small chan-{idx}{}",
+                    if channel.get() == idx { " active" } else { "" }
+                )
                 on:click=move |_| channel.set(idx)
-            >{label}</button>
+            >
+                {label}
+                <span class=move || if dirty(idx) { "chan-dot on" } else { "chan-dot" }></span>
+            </button>
         }
     };
 
@@ -6320,9 +6363,22 @@ fn LevelsPanel(state: AppState) -> impl IntoView {
         view! {
             <label class="slider">
                 <span>{label} ": " {move || {
-                    state.current()
-                        .map(|m| fmt(get(&m.edit.levels.ranges[channel.get()])))
-                        .unwrap_or_else(|| "—".into())
+                    let Some(m) = state.current() else { return "—".into() };
+                    let ch = channel.get();
+                    let ranges = &m.edit.levels.ranges;
+                    let mut s = fmt(get(&ranges[ch]));
+                    // In the RGB view, show the per-channel values once any
+                    // channel differs from its default, so Auto color/neutral
+                    // visibly move something even when they leave ranges[0] alone.
+                    if ch == 0 && (1..4).any(|i| ranges[i] != levels::LevelRange::default()) {
+                        s.push_str(&format!(
+                            " · R {} G {} B {}",
+                            fmt(get(&ranges[1])),
+                            fmt(get(&ranges[2])),
+                            fmt(get(&ranges[3])),
+                        ));
+                    }
+                    s
                 }}</span>
                 <input
                     type="range" min=min.to_string() max=max.to_string() step=step.to_string()
@@ -6349,6 +6405,7 @@ fn LevelsPanel(state: AppState) -> impl IntoView {
 
     view! {
         <div class="levels-panel">
+            <div class="panel-title">"Levels"</div>
             <canvas node_ref=hist_ref width="256" height="64" class="levels-hist"></canvas>
             <div class="levels-channels">
                 {channel_btn(0, "RGB")}{channel_btn(1, "R")}{channel_btn(2, "G")}{channel_btn(3, "B")}
@@ -6371,8 +6428,7 @@ fn LevelsPanel(state: AppState) -> impl IntoView {
 }
 
 #[component]
-fn CurvesPanel(state: AppState) -> impl IntoView {
-    let channel = create_rw_signal(0usize); // 0=RGB, 1=R, 2=G, 3=B
+fn CurvesPanel(state: AppState, channel: RwSignal<usize>) -> impl IntoView {
     let selected = create_rw_signal(None::<usize>);
     let dragging = store_value(None::<usize>);
     let canvas_ref = create_node_ref::<html::Canvas>();
@@ -6400,7 +6456,28 @@ fn CurvesPanel(state: AppState) -> impl IntoView {
             ctx.line_to(256.0, f);
         }
         ctx.stroke();
-        ctx.set_stroke_style_str("#ffffff");
+        // Other channels as faint ghosts so an edit on one channel is
+        // distinguishable from the untouched ones.
+        for other in 0..4 {
+            if other == ch {
+                continue;
+            }
+            ctx.set_stroke_style_str(&curve_color(other, 0.22));
+            ctx.set_line_width(1.0);
+            ctx.begin_path();
+            for x in 0..=255 {
+                let y = item.edit.curves.value(x as f64, other);
+                let px = x as f64 / 255.0 * 256.0;
+                let py = (1.0 - y / 255.0) * 256.0;
+                if x == 0 {
+                    ctx.move_to(px, py);
+                } else {
+                    ctx.line_to(px, py);
+                }
+            }
+            ctx.stroke();
+        }
+        ctx.set_stroke_style_str(&curve_color(ch, 1.0));
         ctx.set_line_width(2.0);
         ctx.begin_path();
         for x in 0..=255 {
@@ -6419,8 +6496,16 @@ fn CurvesPanel(state: AppState) -> impl IntoView {
             let py = (1.0 - pt.y / 255.0) * 256.0;
             ctx.begin_path();
             let _ = ctx.arc(px, py, 4.0, 0.0, std::f64::consts::TAU);
-            ctx.set_fill_style_str(if sel == Some(i) { "#0a84ff" } else { "#ffffff" });
-            ctx.fill();
+            if sel == Some(i) {
+                ctx.set_fill_style_str("#ffffff");
+                ctx.fill();
+                ctx.set_stroke_style_str(&curve_color(ch, 1.0));
+                ctx.set_line_width(2.0);
+                ctx.stroke();
+            } else {
+                ctx.set_fill_style_str(&curve_color(ch, 1.0));
+                ctx.fill();
+            }
         }
     });
 
@@ -6484,16 +6569,35 @@ fn CurvesPanel(state: AppState) -> impl IntoView {
 
     let on_up = move |_: web_sys::PointerEvent| dragging.set_value(None);
 
+    let dirty = move |idx: usize| {
+        state
+            .current()
+            .map(|m| {
+                if idx == 0 {
+                    (1..4).any(|ch| !m.edit.curves.channel_is_identity(ch))
+                } else {
+                    !m.edit.curves.channel_is_identity(idx)
+                }
+            })
+            .unwrap_or(false)
+    };
+
     let channel_btn = move |idx: usize, label: &'static str| {
         view! {
             <button
-                class=move || if channel.get() == idx { "btn small active" } else { "btn small" }
+                class=move || format!(
+                    "btn small chan-{idx}{}",
+                    if channel.get() == idx { " active" } else { "" }
+                )
                 on:click=move |_| {
                     channel.set(idx);
                     selected.set(None);
                     dragging.set_value(None);
                 }
-            >{label}</button>
+            >
+                {label}
+                <span class=move || if dirty(idx) { "chan-dot on" } else { "chan-dot" }></span>
+            </button>
         }
     };
 
@@ -6510,6 +6614,7 @@ fn CurvesPanel(state: AppState) -> impl IntoView {
 
     view! {
         <div class="curves-panel">
+            <div class="panel-title">"Curves"</div>
             <div class="levels-channels">
                 {channel_btn(0, "RGB")}{channel_btn(1, "R")}{channel_btn(2, "G")}{channel_btn(3, "B")}
             </div>
@@ -6521,15 +6626,16 @@ fn CurvesPanel(state: AppState) -> impl IntoView {
             ></canvas>
             <div class="curves-info">
                 <span>{move || {
-                    let i = selected.get();
-                    i.and_then(|i| {
+                    let ch = channel.get();
+                    let detail = selected.get().and_then(|i| {
                         state.current().and_then(|m| {
-                            m.edit.curves.channels[channel.get()]
+                            m.edit.curves.channels[ch]
                                 .get(i)
                                 .map(|p| format!("Input {} · Output {}", p.x as i32, p.y as i32))
                         })
                     })
-                    .unwrap_or_else(|| "Click to add a point. Drag to adjust.".into())
+                    .unwrap_or_else(|| "Click to add a point. Drag to adjust.".into());
+                    format!("{} — {detail}", ["RGB", "R", "G", "B"][ch])
                 }}</span>
             </div>
             <div class="levels-auto">

@@ -43,12 +43,15 @@ impl CurvesSettings {
 
     /// Every point on the diagonal means the Hermite evaluation is the
     /// identity line (equal secant slopes -> harmonic-mean tangents == 1).
+    pub fn channel_is_identity(&self, channel: usize) -> bool {
+        let p = &self.channels[channel];
+        p.first().map(|p| (p.x, p.y)) == Some((0.0, 0.0))
+            && p.last().map(|p| (p.x, p.y)) == Some((255.0, 255.0))
+            && p.iter().all(|p| p.x == p.y)
+    }
+
     pub fn is_identity(&self) -> bool {
-        self.channels
-            .iter()
-            .all(|p| p.first().map(|p| (p.x, p.y)) == Some((0.0, 0.0))
-                && p.last().map(|p| (p.x, p.y)) == Some((255.0, 255.0))
-                && p.iter().all(|p| p.x == p.y))
+        (0..4).all(|ch| self.channel_is_identity(ch))
     }
 
     /// Curve value at input x (0..=255) for one channel, clamped to 0..=255.
@@ -157,6 +160,17 @@ mod tests {
             assert!(v >= 0.0);
             prev = v;
         }
+    }
+
+    #[test]
+    fn channel_identity_is_per_channel() {
+        let s = settings(1, vec![(0.0, 0.0), (128.0, 180.0), (255.0, 255.0)]);
+        assert!(!s.is_identity());
+        assert!(!s.channel_is_identity(1));
+        assert!(s.channel_is_identity(0));
+        assert!(s.channel_is_identity(2));
+        assert!(s.channel_is_identity(3));
+        assert!(CurvesSettings::default().channel_is_identity(3));
     }
 
     #[test]
