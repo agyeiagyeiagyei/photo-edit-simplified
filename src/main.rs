@@ -2255,9 +2255,10 @@ fn CanvasLoupe(
 }
 
 /// Drive grid hover popup: w800 thumbnail on dwell, upgrading to a panning
-/// 1:1 full-res crop once the original has been downloaded and decoded.
-/// Mirrors FocusLoupe: <Show> keeps the canvas mounted, paints happen in the
-/// effect, and the 1:1 crop is row-copied out of the cache buffer.
+/// crop once the original has been downloaded and decoded. RAW uses the
+/// embedded preview by default; after "Full res" the crop switches to sensor
+/// pixels. Mirrors FocusLoupe: <Show> keeps the canvas mounted, paints happen
+/// in the effect, and the crop is row-copied out of the cache buffer.
 #[component]
 fn DriveHoverLoupe(state: AppState) -> impl IntoView {
     let canvas_ref = create_node_ref::<html::Canvas>();
@@ -2267,12 +2268,29 @@ fn DriveHoverLoupe(state: AppState) -> impl IntoView {
     create_effect(move |_| {
         let hover = state.drive_hover.get();
         let ready = state.drive_hover_ready.get();
+        let full_ready = state.drive_full_ready.get();
         let Some((id, nx, ny, _, _, disp_w)) = hover else { return };
         let Some(canvas) = canvas_ref.get() else { return };
-        let full = if ready.as_deref() == Some(id.as_str()) {
-            DRIVE_HOVER_CACHE.with(|c| c.borrow().1.get(&id).cloned())
+        let sensor = full_ready.as_deref() == Some(id.as_str());
+        let full = if sensor {
+            DRIVE_FULL_CACHE.with(|c| {
+                c.borrow()
+                    .as_ref()
+                    .and_then(|(fid, d)| (fid == &id).then(|| d.clone()))
+            })
         } else {
             None
+        };
+        let (full, sensor) = match full {
+            Some(d) => (Some(d), true),
+            None => (
+                if ready.as_deref() == Some(id.as_str()) {
+                    DRIVE_HOVER_CACHE.with(|c| c.borrow().1.get(&id).cloned())
+                } else {
+                    None
+                },
+                false,
+            ),
         };
         let Some(full) = full else {
             tag.set(String::from("preview…"));
@@ -2297,7 +2315,16 @@ fn DriveHoverLoupe(state: AppState) -> impl IntoView {
         let ch = ((bh as f64 / (dpr * zoom)).round() as usize).max(1);
         if w >= cw && h >= ch {
             let mag = (dpr * zoom).round().max(1.0) as u32;
-            tag.set(format!("{mag}:1"));
+            // RAW defaults to the embedded preview, which is not sensor
+            // resolution — say so, so the tag can't pass for pixel-level
+            // sharpness when it is actually a resampled JPEG.
+            let preview_src =
+                !sensor && DRIVE_HOVER_PREVIEW.with(|s| s.borrow().contains(&id));
+            tag.set(if preview_src {
+                format!("{mag}:1 preview")
+            } else {
+                format!("{mag}:1")
+            });
             canvas_on.set(true);
             let sx = ((nx * w as f64 - cw as f64 / 2.0) as isize)
                 .clamp(0, (w - cw) as isize) as usize;
@@ -3213,6 +3240,86 @@ thread_local! {
         RefCell::new((Vec::new(), HashMap::new()));
     static DRIVE_HOVER_INFLIGHT: RefCell<std::collections::HashSet<String>> =
         RefCell::new(std::collections::HashSet::new());
+    /// Ids in DRIVE_HOVER_CACHE whose pixels are an embedded RAW preview, not
+    /// the full image — the loupe tag says so.
+    static DRIVE_HOVER_PREVIEW: RefCell<std::collections::HashSet<String>> =
+        RefCell::new(std::collections::HashSet::new());
+    /// Sensor-res develop for the currently popped-up RAW, single-slot: a
+    /// 24MP demosaic is ~96MB and only the open popup can use it.
+    static DRIVE_FULL_CACHE: RefCell<Option<(String, Rc<(Vec<u8>, usize, usize)>)>> =
+        RefCell::new(None);
+}
+
+fn drive_full_cached(id: &str) -> bool {
+    DRIVE_FULL_CACHE.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|(fid, _)| fid == id)
+            .unwrap_or(false)
+    })
+}
+
+/// Develop a RAW at sensor resolution on explicit request, then let the hover
+/// loupe crop real pixels instead of the embedded preview. The demosaic runs
+/// synchronously on the main thread for seconds, so the busy label is given a
+/// frame to paint first; closing or stepping the popup drops the result.
+fn drive_develop_full(state: AppState, id: String) {
+    if state.drive_full_ready.with(|r| r.as_deref() == Some(id.as_str()))
+        || state.drive_full_busy.with(|b| b.is_some())
+    {
+        return;
+    }
+    let Some(token) = state.drive_token.get_untracked() else {
+        return;
+    };
+    state.drive_error.set(None);
+    state.drive_full_busy.set(Some(id.clone()));
+    spawn_local(async move {
+        let alive = || state.drive_full_busy.with(|b| b.as_deref() == Some(id.as_str()));
+        sleep_ms(60).await;
+        if !alive() {
+            return;
+        }
+        let bytes = match drive::download_file(token.as_str(), &id).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                state.drive_full_busy.set(None);
+                state
+                    .drive_error
+                    .set(Some(format!("Full-res download failed: {}", js_err(&e))));
+                return;
+            }
+        };
+        if !alive() {
+            return;
+        }
+        match raw::decode_raw(&bytes) {
+            Ok((px, w, h)) => {
+                if !alive() {
+                    return;
+                }
+                DRIVE_FULL_CACHE.with(|c| {
+                    *c.borrow_mut() = Some((id.clone(), Rc::new((px, w, h))));
+                });
+                DRIVE_HOVER_CACHE.with(|c| {
+                    let mut c = c.borrow_mut();
+                    c.0.retain(|k| k != &id);
+                    c.1.remove(&id);
+                });
+                DRIVE_HOVER_PREVIEW.with(|s| {
+                    s.borrow_mut().remove(&id);
+                });
+                state.drive_full_busy.set(None);
+                state.drive_full_ready.set(Some(id.clone()));
+            }
+            Err(e) => {
+                state.drive_full_busy.set(None);
+                state
+                    .drive_error
+                    .set(Some(format!("Full-res develop failed: {e}")));
+            }
+        }
+    });
 }
 
 /// Download + decode a Drive photo's original for the hover loupe. Stills
@@ -3229,6 +3336,11 @@ fn drive_hover_prefetch(state: AppState, id: String, name: String) {
         None
     };
     if !raw && still_mime.is_none() {
+        return;
+    }
+    // The sensor-res buffer serves the loupe directly; don't re-fetch the
+    // embedded preview alongside it.
+    if drive_full_cached(&id) {
         return;
     }
     if DRIVE_HOVER_CACHE.with(|c| c.borrow().1.contains_key(&id)) {
@@ -3267,6 +3379,16 @@ fn drive_hover_prefetch(state: AppState, id: String, name: String) {
                 while c.0.len() > 2 {
                     let old = c.0.remove(0);
                     c.1.remove(&old);
+                    DRIVE_HOVER_PREVIEW.with(|s| {
+                        s.borrow_mut().remove(&old);
+                    });
+                }
+            });
+            DRIVE_HOVER_PREVIEW.with(|s| {
+                let mut s = s.borrow_mut();
+                s.remove(&id);
+                if raw {
+                    s.insert(id.clone());
                 }
             });
             state.drive_hover_ready.set(Some(id));
@@ -3370,6 +3492,11 @@ fn DriveLoupe(state: AppState) -> impl IntoView {
     create_effect(move |_| {
         let _ = state.drive_loupe.get();
         hi_ready.set(false);
+        // The sensor-res buffer belongs to the previous popup; a develop still
+        // in flight sees the cleared busy marker and drops its result.
+        DRIVE_FULL_CACHE.with(|c| *c.borrow_mut() = None);
+        state.drive_full_ready.set(None);
+        state.drive_full_busy.set(None);
     });
     let step = move |d: i64| {
         let n = visible_drive_files(state).len();
@@ -3488,6 +3615,34 @@ fn DriveLoupe(state: AppState) -> impl IntoView {
                                 >
                                     {if starred { "★ Starred" } else { "☆ Star" }}
                                 </button>
+                                {raw::is_raw_name(&f.name)
+                                    .then(|| {
+                                        let fid_click = f.id.clone();
+                                        let fid_label = f.id.clone();
+                                        view! {
+                                            <button
+                                                class="btn loupe-full"
+                                                title="Develop this RAW at sensor resolution for the loupe"
+                                                on:click=move |_| drive_develop_full(state, fid_click.clone())
+                                            >
+                                                {move || {
+                                                    if state
+                                                        .drive_full_ready
+                                                        .with(|r| r.as_deref() == Some(fid_label.as_str()))
+                                                    {
+                                                        "Full res ✓"
+                                                    } else if state
+                                                        .drive_full_busy
+                                                        .with(|b| b.as_deref() == Some(fid_label.as_str()))
+                                                    {
+                                                        "Developing…"
+                                                    } else {
+                                                        "Full res"
+                                                    }
+                                                }}
+                                            </button>
+                                        }
+                                    })}
                                 <button
                                     class="btn primary"
                                     disabled=!f_import.importable()

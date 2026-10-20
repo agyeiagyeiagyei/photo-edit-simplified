@@ -441,6 +441,10 @@ pub struct AppState {
     pub drive_hover: RwSignal<Option<(String, f64, f64, f64, f64, f64)>>,
     /// Drive file id whose full-res hover decode is in DRIVE_HOVER_CACHE.
     pub drive_hover_ready: RwSignal<Option<String>>,
+    /// Drive file id whose sensor-res RAW develop is in DRIVE_FULL_CACHE.
+    pub drive_full_ready: RwSignal<Option<String>>,
+    /// Drive file id currently being developed at sensor resolution.
+    pub drive_full_busy: RwSignal<Option<String>>,
     /// Filmstrip focus loupe: (item id, normalized x, normalized y, client x,
     /// client y) while the cursor rests on a thumb; the crop pans with the
     /// cursor at 1:1 pixels.
@@ -527,6 +531,8 @@ impl AppState {
             drive_loupe_seen: create_rw_signal(Vec::new()),
             drive_hover: create_rw_signal(None),
             drive_hover_ready: create_rw_signal(None),
+            drive_full_ready: create_rw_signal(None),
+            drive_full_busy: create_rw_signal(None),
             drive_hover_gen: create_rw_signal(0),
             loupe: create_rw_signal(None),
             canvas_loupe: create_rw_signal(None),
