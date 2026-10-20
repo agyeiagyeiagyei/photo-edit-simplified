@@ -3208,26 +3208,70 @@ fn drive_enter(state: AppState, folder: drive::SubFolder) {
     drive_refresh(state);
 }
 
-fn download_import(state: AppState, f: drive::DriveFile) {
+thread_local! {
+    static DRIVE_IMPORT_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Import Drive files one download at a time. A starred batch can be dozens
+/// of 25MB RAWs; firing every fetch at once buffered the whole set
+/// (1.4GB for 53 files) in the tab while the multi-second decodes ran
+/// serially, and the renderer died partway down the list. Ingest tasks still
+/// run one at a time — each decodes synchronously on the main thread.
+fn import_drive_files(state: AppState, files: Vec<drive::DriveFile>, missing: Vec<String>) {
+    if files.is_empty() && missing.is_empty() {
+        return;
+    }
+    if DRIVE_IMPORT_ACTIVE.with(|a| a.replace(true)) {
+        state
+            .drive_error
+            .set(Some("A Drive import is already running".into()));
+        return;
+    }
     spawn_local(async move {
         let Some(token) = state.drive_token.get_untracked() else {
+            DRIVE_IMPORT_ACTIVE.with(|a| a.set(false));
             return;
         };
-        state.busy.set(Some(format!("Downloading {} from Drive…", f.name)));
-        state.drive_error.set(None);
-        match drive::download_file(&token, &f.id).await {
-            Ok(bytes) => {
-                state.busy.set(None);
-                ingest_drive_bytes(state, f.id, f.parent, f.name, f.edited, bytes);
-            }
-            Err(e) => {
-                state.busy.set(None);
-                state
+        let total = files.len() + missing.len();
+        let mut done = 0;
+        for f in files {
+            done += 1;
+            import_drive_one(state, &token, f, done, total).await;
+        }
+        for id in missing {
+            match drive::get_file(&token, &id).await {
+                Ok(f) if f.importable() => {
+                    done += 1;
+                    import_drive_one(state, &token, f, done, total).await;
+                }
+                Ok(_) => {}
+                Err(e) => state
                     .drive_error
-                    .set(Some(format!("Drive download failed: {}", js_err(&e))));
+                    .set(Some(format!("Starred file lookup failed: {}", js_err(&e)))),
             }
         }
+        DRIVE_IMPORT_ACTIVE.with(|a| a.set(false));
     });
+}
+
+async fn import_drive_one(
+    state: AppState,
+    token: &str,
+    f: drive::DriveFile,
+    done: usize,
+    total: usize,
+) {
+    state.busy.set(Some(format!("Importing {done}/{total} — {}", f.name)));
+    state.drive_error.set(None);
+    match drive::download_file(token, &f.id).await {
+        Ok(bytes) => ingest_drive_bytes(state, f.id, f.parent, f.name, f.edited, bytes),
+        Err(e) => {
+            state.busy.set(None);
+            state
+                .drive_error
+                .set(Some(format!("Drive download failed: {}", js_err(&e))));
+        }
+    }
 }
 
 /// Full-res RGBA decoded on Drive hover for the 1:1 loupe; FIFO-capped at 2
@@ -3647,7 +3691,11 @@ fn DriveLoupe(state: AppState) -> impl IntoView {
                                     class="btn primary"
                                     disabled=!f_import.importable()
                                     on:click=move |_| {
-                                        download_import(state, f_import.clone());
+                                        import_drive_files(
+                                            state,
+                                            vec![f_import.clone()],
+                                            Vec::new(),
+                                        );
                                         state.drive_loupe.set(None);
                                     }
                                 >
@@ -3727,9 +3775,7 @@ fn DrivePanel(state: AppState) -> impl IntoView {
             .collect();
         state.drive_selected.set(Default::default());
         state.drive_open.set(false);
-        for f in files {
-            download_import(state, f);
-        }
+        import_drive_files(state, files, Vec::new());
     };
     // Import every starred file, including ones outside the current folder
     // (resolved by id) and ones already in the filmstrip (imported again as
@@ -3741,35 +3787,17 @@ fn DrivePanel(state: AppState) -> impl IntoView {
         }
         state.drive_open.set(false);
         let known = state.drive_files.get_untracked();
-        let mut missing: Vec<String> = Vec::new();
-        for f in known.iter().filter(|f| ids.contains(&f.id)) {
-            if f.importable() {
-                download_import(state, f.clone());
-            }
-        }
-        for id in ids.iter().filter(|id| !known.iter().any(|f| &f.id == *id)) {
-            missing.push(id.clone());
-        }
-        if missing.is_empty() {
-            return;
-        }
-        spawn_local(async move {
-            let Some(token) = state.drive_token.get_untracked() else {
-                return;
-            };
-            for id in missing {
-                match drive::get_file(&token, &id).await {
-                    Ok(f) => {
-                        if f.importable() {
-                            download_import(state, f);
-                        }
-                    }
-                    Err(e) => state
-                        .drive_error
-                        .set(Some(format!("Starred file lookup failed: {}", js_err(&e)))),
-                }
-            }
-        });
+        let files: Vec<drive::DriveFile> = known
+            .iter()
+            .filter(|f| ids.contains(&f.id) && f.importable())
+            .cloned()
+            .collect();
+        let missing: Vec<String> = ids
+            .iter()
+            .filter(|id| !known.iter().any(|f| &f.id == *id))
+            .cloned()
+            .collect();
+        import_drive_files(state, files, missing);
     };
 
     view! {
