@@ -26,12 +26,15 @@ pub fn extract_exif_tiff(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(crate::exif::tiff_from_raw_metadata(&meta))
 }
 
-/// Decode + develop a RAW file into orientation-corrected RGBA pixels.
+/// Decode + develop a RAW file into orientation-corrected RGBA pixels, then
+/// tone-match to the camera's embedded JPEG preview so the result sits on the
+/// camera's exposure and contrast instead of rawler's flat baseline.
 pub fn decode_raw(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
     let rawfile = RawSource::new_from_slice(bytes);
     let decoder = rawler::get_decoder(&rawfile).map_err(|e| format!("unsupported RAW: {e}"))?;
+    let params = RawDecodeParams { image_index: 0 };
     let rawimage = decoder
-        .raw_image(&rawfile, &RawDecodeParams { image_index: 0 }, false)
+        .raw_image(&rawfile, &params, false)
         .map_err(|e| format!("RAW decode failed: {e}"))?;
     let orientation = rawimage.orientation;
     let develop = RawDevelop::default();
@@ -69,7 +72,76 @@ pub fn decode_raw(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
             (out, p.width, p.height)
         }
     };
-    Ok(apply_orientation(rgba, w, h, orientation))
+    let (mut rgba, w, h) = apply_orientation(rgba, w, h, orientation);
+    let preview = decoder
+        .full_image(&rawfile, &params)
+        .ok()
+        .flatten()
+        .or_else(|| decoder.preview_image(&rawfile, &params).ok().flatten())
+        .or_else(|| decoder.thumbnail_image(&rawfile, &params).ok().flatten());
+    if let Some(img) = preview {
+        apply_camera_tone(&mut rgba, &img.into_rgb8().into_raw());
+    }
+    Ok((rgba, w, h))
+}
+
+/// Match the developed image's luminance to the embedded camera preview by
+/// quantile, applied as a per-channel curve — rawler develops neutrally with no
+/// exposure compensation or camera tone curve, which leaves RAW frames ~1 EV
+/// darker and flatter than the camera's own JPEG.
+fn apply_camera_tone(rgba: &mut [u8], preview_rgb: &[u8]) {
+    let (dev_h, dev_n) = luma_hist(rgba.chunks_exact(4).map(|p| (p[0], p[1], p[2])));
+    let (prev_h, prev_n) = luma_hist(preview_rgb.chunks_exact(3).map(|p| (p[0], p[1], p[2])));
+    if dev_n == 0 || prev_n == 0 {
+        return;
+    }
+    let dev_c = cdf(&dev_h, dev_n);
+    let prev_c = cdf(&prev_h, prev_n);
+    // Refuse to stretch toward a preview with almost no tonal spread (a flat
+    // frame or a broken thumbnail) — neutral develop is the safer fallback.
+    if spread(&dev_c) < 8 || spread(&prev_c) < 8 {
+        return;
+    }
+    let mut lut = [0u8; 256];
+    let mut p = 0usize;
+    for (v, lut_v) in lut.iter_mut().enumerate() {
+        while p < 255 && prev_c[p] < dev_c[v] {
+            p += 1;
+        }
+        *lut_v = p as u8;
+    }
+    for px in rgba.chunks_exact_mut(4) {
+        px[0] = lut[px[0] as usize];
+        px[1] = lut[px[1] as usize];
+        px[2] = lut[px[2] as usize];
+    }
+}
+
+fn luma_hist(px: impl Iterator<Item = (u8, u8, u8)>) -> ([u64; 256], u64) {
+    let mut h = [0u64; 256];
+    let mut n = 0u64;
+    for (r, g, b) in px {
+        let y = (2126 * r as u32 + 7152 * g as u32 + 722 * b as u32) / 10000;
+        h[y as usize] += 1;
+        n += 1;
+    }
+    (h, n)
+}
+
+fn cdf(hist: &[u64; 256], n: u64) -> [f32; 256] {
+    let mut c = [0f32; 256];
+    let mut acc = 0u64;
+    for (i, &count) in hist.iter().enumerate() {
+        acc += count;
+        c[i] = acc as f32 / n as f32;
+    }
+    c
+}
+
+fn spread(c: &[f32; 256]) -> usize {
+    let low = c.iter().position(|&v| v >= 0.01).unwrap_or(0);
+    let high = c.iter().position(|&v| v >= 0.99).unwrap_or(255);
+    high.saturating_sub(low)
 }
 
 /// Decode the largest embedded JPEG preview (no demosaic) — fast enough to run
