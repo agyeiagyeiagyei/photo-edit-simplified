@@ -72,6 +72,30 @@ pub fn decode_raw(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
     Ok(apply_orientation(rgba, w, h, orientation))
 }
 
+/// Decode the largest embedded JPEG preview (no demosaic) — fast enough to run
+/// on hover, unlike `decode_raw`. Returns orientation-corrected RGBA, or None
+/// when the file carries no usable preview.
+pub fn preview_rgba(bytes: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
+    let rawfile = RawSource::new_from_slice(bytes);
+    let decoder = rawler::get_decoder(&rawfile).ok()?;
+    let params = RawDecodeParams { image_index: 0 };
+    let img = decoder
+        .full_image(&rawfile, &params)
+        .ok()
+        .flatten()
+        .or_else(|| decoder.preview_image(&rawfile, &params).ok().flatten())
+        .or_else(|| decoder.thumbnail_image(&rawfile, &params).ok().flatten())?;
+    let orientation = decoder
+        .raw_metadata(&rawfile, &params)
+        .ok()
+        .and_then(|m| m.exif.orientation)
+        .map(rawler::decoders::Orientation::from_u16)
+        .unwrap_or(rawler::decoders::Orientation::Normal);
+    let rgba = img.to_rgba8();
+    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+    Some(apply_orientation(rgba.into_raw(), w, h, orientation))
+}
+
 /// rawler gives orientation as (transpose, flip_x, flip_y); per its docs the
 /// flips must be applied before the transpose.
 fn apply_orientation(

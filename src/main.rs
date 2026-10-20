@@ -2269,13 +2269,15 @@ fn DriveHoverLoupe(state: AppState) -> impl IntoView {
             canvas_on.set(false);
             return;
         };
-        tag.set("1:1");
-        canvas_on.set(true);
         let (px, w, h) = &*full;
         let (w, h) = (*w, *h);
         let dpr = web::window().device_pixel_ratio().max(1.0);
         let bw = (480.0 * dpr) as usize;
         let bh = (360.0 * dpr) as usize;
+        // Embedded RAW previews can be smaller than the loupe box; say so
+        // rather than claim 1:1 on a scaled-up crop.
+        tag.set(if w >= bw && h >= bh { "1:1" } else { "preview" });
+        canvas_on.set(true);
         if canvas.width() != bw as u32 || canvas.height() != bh as u32 {
             canvas.set_width(bw as u32);
             canvas.set_height(bh as u32);
@@ -3181,17 +3183,22 @@ thread_local! {
         RefCell::new(std::collections::HashSet::new());
 }
 
-/// Download + decode a Drive photo's original for the hover loupe. Only
-/// browser-decodable stills (JPEG/PNG) — RAW and HEIC keep the w800 preview.
+/// Download + decode a Drive photo's original for the hover loupe. Stills
+/// (JPEG/PNG) decode directly; RAW uses the embedded preview, since a full
+/// demosaic is far too slow for a hover. HEIC keeps the w800 preview.
 fn drive_hover_prefetch(state: AppState, id: String, name: String) {
     let lname = name.to_lowercase();
-    let mime = if lname.ends_with(".png") {
-        "image/png"
+    let raw = raw::is_raw_name(&lname);
+    let still_mime = if lname.ends_with(".png") {
+        Some("image/png")
     } else if lname.ends_with(".jpg") || lname.ends_with(".jpeg") {
-        "image/jpeg"
+        Some("image/jpeg")
     } else {
-        return;
+        None
     };
+    if !raw && still_mime.is_none() {
+        return;
+    }
     if DRIVE_HOVER_CACHE.with(|c| c.borrow().1.contains_key(&id)) {
         state.drive_hover_ready.set(Some(id));
         return;
@@ -3208,7 +3215,10 @@ fn drive_hover_prefetch(state: AppState, id: String, name: String) {
     spawn_local(async move {
         let decoded = async {
             let bytes = drive::download_file(token.as_str(), &id).await.ok()?;
-            let blob = web::bytes_to_blob(&bytes, mime).ok()?;
+            if raw {
+                return raw::preview_rgba(&bytes);
+            }
+            let blob = web::bytes_to_blob(&bytes, still_mime?).ok()?;
             let (img, _) = web::load_image(&blob).await.ok()?;
             Some(web::rgba_from_image(&img))
         }
