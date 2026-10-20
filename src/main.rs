@@ -1813,6 +1813,16 @@ fn thumb_norm_pos(ev: &web_sys::MouseEvent) -> Option<(f64, f64)> {
     norm_pos_in(ev, ".thumb")
 }
 
+/// CSS width of the hovered element matching `sel` — how large the image is
+/// already shown at, which sets the magnification the loupe needs.
+fn hovered_width(ev: &web_sys::MouseEvent, sel: &str) -> f64 {
+    ev.target()
+        .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+        .and_then(|el| el.closest(sel).ok().flatten())
+        .map(|el| el.get_bounding_client_rect().width())
+        .unwrap_or(0.0)
+}
+
 /// Resting the cursor on a thumb opens the focus loupe after a short dwell,
 /// so sweeping across the strip doesn't strobe full-res decodes.
 fn loupe_soon(state: AppState, id: usize, ev: &web_sys::MouseEvent) {
@@ -2251,13 +2261,13 @@ fn CanvasLoupe(
 #[component]
 fn DriveHoverLoupe(state: AppState) -> impl IntoView {
     let canvas_ref = create_node_ref::<html::Canvas>();
-    let tag = create_rw_signal("preview…");
+    let tag = create_rw_signal(String::from("preview…"));
     let canvas_on = create_rw_signal(false);
 
     create_effect(move |_| {
         let hover = state.drive_hover.get();
         let ready = state.drive_hover_ready.get();
-        let Some((id, nx, ny, _, _)) = hover else { return };
+        let Some((id, nx, ny, _, _, disp_w)) = hover else { return };
         let Some(canvas) = canvas_ref.get() else { return };
         let full = if ready.as_deref() == Some(id.as_str()) {
             DRIVE_HOVER_CACHE.with(|c| c.borrow().1.get(&id).cloned())
@@ -2265,7 +2275,7 @@ fn DriveHoverLoupe(state: AppState) -> impl IntoView {
             None
         };
         let Some(full) = full else {
-            tag.set("preview…");
+            tag.set(String::from("preview…"));
             canvas_on.set(false);
             return;
         };
@@ -2274,27 +2284,49 @@ fn DriveHoverLoupe(state: AppState) -> impl IntoView {
         let dpr = web::window().device_pixel_ratio().max(1.0);
         let bw = (480.0 * dpr) as usize;
         let bh = (360.0 * dpr) as usize;
-        // Embedded RAW previews can be smaller than the loupe box; say so
-        // rather than claim 1:1 on a scaled-up crop.
-        tag.set(if w >= bw && h >= bh { "1:1" } else { "preview" });
-        canvas_on.set(true);
         if canvas.width() != bw as u32 || canvas.height() != bh as u32 {
             canvas.set_width(bw as u32);
             canvas.set_height(bh as u32);
         }
-        if w >= bw && h >= bh {
-            let sx = ((nx * w as f64 - bw as f64 / 2.0) as isize)
-                .clamp(0, (w - bw) as isize) as usize;
-            let sy = ((ny * h as f64 - bh as f64 / 2.0) as isize)
-                .clamp(0, (h - bh) as isize) as usize;
-            let mut crop = vec![0u8; bw * bh * 4];
-            for row in 0..bh {
+        // Magnify to ~4x the size the hovered image is already shown at, but
+        // never below physical 1:1: a 1:1 crop of a small embedded RAW preview
+        // looks no bigger than the popup it sits on, which is useless for
+        // judging focus.
+        let zoom = (4.0 * disp_w / w as f64).max(1.0 / dpr).min(4.0);
+        let cw = ((bw as f64 / (dpr * zoom)).round() as usize).max(1);
+        let ch = ((bh as f64 / (dpr * zoom)).round() as usize).max(1);
+        if w >= cw && h >= ch {
+            let mag = (dpr * zoom).round().max(1.0) as u32;
+            tag.set(format!("{mag}:1"));
+            canvas_on.set(true);
+            let sx = ((nx * w as f64 - cw as f64 / 2.0) as isize)
+                .clamp(0, (w - cw) as isize) as usize;
+            let sy = ((ny * h as f64 - ch as f64 / 2.0) as isize)
+                .clamp(0, (h - ch) as isize) as usize;
+            let mut crop = vec![0u8; cw * ch * 4];
+            for row in 0..ch {
                 let src = ((sy + row) * w + sx) * 4;
-                crop[row * bw * 4..(row + 1) * bw * 4]
-                    .copy_from_slice(&px[src..src + bw * 4]);
+                crop[row * cw * 4..(row + 1) * cw * 4]
+                    .copy_from_slice(&px[src..src + cw * 4]);
             }
-            web::put_pixels(&canvas, &crop, bw as u32, bh as u32);
+            let scratch = web::create_canvas(cw as u32, ch as u32);
+            web::put_pixels(&scratch, &crop, cw as u32, ch as u32);
+            let ctx = web::ctx2d(&canvas);
+            ctx.set_image_smoothing_enabled(true);
+            let _ = ctx.draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+                &scratch,
+                0.0,
+                0.0,
+                cw as f64,
+                ch as f64,
+                0.0,
+                0.0,
+                bw as f64,
+                bh as f64,
+            );
         } else {
+            tag.set(String::from("preview"));
+            canvas_on.set(true);
             // Image smaller than the loupe: scale-to-fit via a scratch canvas.
             let scratch = web::create_canvas(w as u32, h as u32);
             web::put_pixels(&scratch, px, w as u32, h as u32);
@@ -2326,7 +2358,7 @@ fn DriveHoverLoupe(state: AppState) -> impl IntoView {
                     state
                         .drive_hover
                         .get()
-                        .map(|(_, _, _, cx, cy)| drive_hover_style(cx, cy))
+                        .map(|(_, _, _, cx, cy, _)| drive_hover_style(cx, cy))
                         .unwrap_or_default()
                 }
             >
@@ -3249,12 +3281,13 @@ fn drive_hover_prefetch(state: AppState, id: String, name: String) {
 fn drive_hover_soon(state: AppState, id: String, name: String, ev: &web_sys::MouseEvent, sel: &str) {
     let Some((nx, ny)) = norm_pos_in(ev, sel) else { return };
     let (cx, cy) = (ev.client_x() as f64, ev.client_y() as f64);
+    let disp_w = hovered_width(ev, sel);
     state.drive_hover_gen.update(|g| *g += 1);
     let gen = state.drive_hover_gen.get_untracked();
     let cb = wasm_bindgen::closure::Closure::once(move || {
         if state.drive_hover_gen.get_untracked() == gen {
             drive_hover_prefetch(state, id.clone(), name);
-            state.drive_hover.set(Some((id, nx, ny, cx, cy)));
+            state.drive_hover.set(Some((id, nx, ny, cx, cy, disp_w)));
         }
     });
     let _ = web::window().set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -3276,6 +3309,7 @@ fn drive_hover_move(state: AppState, id: &str, ev: &web_sys::MouseEvent, sel: &s
             ny,
             ev.client_x() as f64,
             ev.client_y() as f64,
+            hovered_width(ev, sel),
         )));
     }
 }

@@ -436,9 +436,9 @@ pub struct AppState {
     /// hidden <img> elements so their large thumbnails stay decoded in memory.
     pub drive_loupe_seen: RwSignal<Vec<String>>,
     /// Hover-zoom preview: (file id, normalized x, normalized y, client x,
-    /// client y) while hovering a tile; the crop pans with the cursor once
-    /// the original is decoded.
-    pub drive_hover: RwSignal<Option<(String, f64, f64, f64, f64)>>,
+    /// client y, hovered element width in CSS px) while hovering a tile; the
+    /// crop pans with the cursor once the original is decoded.
+    pub drive_hover: RwSignal<Option<(String, f64, f64, f64, f64, f64)>>,
     /// Drive file id whose full-res hover decode is in DRIVE_HOVER_CACHE.
     pub drive_hover_ready: RwSignal<Option<String>>,
     /// Filmstrip focus loupe: (item id, normalized x, normalized y, client x,
