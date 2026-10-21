@@ -391,6 +391,8 @@ pub struct AppState {
     pub photo_format: RwSignal<PhotoFormat>,
     /// Google Drive access token (memory only — re-auth with one click).
     pub drive_token: RwSignal<Option<std::rc::Rc<String>>>,
+    /// Token expiry as wall-clock ms since the epoch; 0 when signed out.
+    pub drive_token_expiry: RwSignal<f64>,
     /// Granted Drive folder: (id, display name).
     pub drive_folder: RwSignal<Option<(String, String)>>,
     /// Files listed from the granted Drive folder.
@@ -510,6 +512,7 @@ impl AppState {
             clone_radius: create_rw_signal(0.03),
             photo_format: create_rw_signal(PhotoFormat::Jpeg),
             drive_token: create_rw_signal(None),
+            drive_token_expiry: create_rw_signal(0.0),
             drive_folder: create_rw_signal(crate::drive::saved_folder()),
             drive_files: create_rw_signal(Vec::new()),
             drive_subfolders: create_rw_signal(Vec::new()),

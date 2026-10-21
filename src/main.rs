@@ -505,7 +505,7 @@ fn push_item(state: AppState, item: MediaItem) {
 /// Import a photo/RAW already downloaded from Drive as raw bytes.
 /// `drive_edited` is the file's pes_edited appProperty: baked pixels, so any
 /// stored recipe for the id is ignored (it would double-apply).
-fn ingest_drive_bytes(
+async fn ingest_drive_bytes(
     state: AppState,
     drive_file_id: String,
     drive_parent_id: String,
@@ -513,10 +513,9 @@ fn ingest_drive_bytes(
     drive_edited: bool,
     bytes: Vec<u8>,
 ) {
-    spawn_local(async move {
+    {
         let id = state.next_id.get_untracked();
         state.next_id.set(id + 1);
-        state.busy.set(Some(format!("Importing {name}…")));
 
         // Params describe work-in-progress on the original pixels; a file the
         // app already flattened starts from identity.
@@ -538,7 +537,6 @@ fn ingest_drive_bytes(
         if raw::is_raw_name(&name) {
             let Ok((full_rgba, fw, fh)) = raw::decode_raw(&bytes) else {
                 web::log(&format!("RAW decode failed for {name}"));
-                state.busy.set(None);
                 return;
             };
             CACHE.with(|c| c.borrow_mut().raw_bytes.insert(id, Rc::new(bytes.clone())));
@@ -598,11 +596,9 @@ fn ingest_drive_bytes(
             let taken = exif_tiff.as_deref().and_then(exif::taken_from_tiff);
             let exif = exif_tiff.map(Rc::new);
             let Ok(blob) = web::bytes_to_blob(&bytes, mime) else {
-                state.busy.set(None);
                 return;
             };
             let Ok((img, url)) = web::load_image(&blob).await else {
-                state.busy.set(None);
                 return;
             };
             let (fw, fh) = (img.natural_width() as usize, img.natural_height() as usize);
@@ -640,8 +636,7 @@ fn ingest_drive_bytes(
                 drive_baked,
             });
         }
-        state.busy.set(None);
-    });
+    }
 }
 
 async fn probe_video(url: &str) -> Option<(f64, u32, u32)> {
@@ -1286,7 +1281,7 @@ async fn edits_folder_id(state: AppState, token: &str, root_id: &str) -> Result<
 /// there. No busy indicator or panel refresh — callers own both (single save
 /// and the batch loop differ).
 async fn save_photo_to_drive_inner(state: AppState, item: MediaItem) -> Result<DriveSave, String> {
-    let Some(token) = state.drive_token.get_untracked() else {
+    let Some(token) = fresh_drive_token(state).await else {
         return Err("not signed in to Drive".into());
     };
     let Some((folder_id, _)) = state.drive_folder.get_untracked() else {
@@ -1413,7 +1408,9 @@ fn photo_needs_save(m: &MediaItem) -> bool {
 /// the end. Sequential because each upload re-encodes full-res pixels.
 fn save_edited_to_drive(state: AppState) {
     spawn_local(async move {
-        if state.drive_token.get_untracked().is_none() || state.drive_folder.get_untracked().is_none() {
+        if state.drive_token.get_untracked().is_none()
+            || state.drive_folder.get_untracked().is_none()
+        {
             return;
         }
         let targets: Vec<MediaItem> =
@@ -2518,9 +2515,34 @@ fn drive_current_folder(state: AppState) -> Option<(String, String)> {
     state.drive_folder.get_untracked()
 }
 
+/// Current token, refreshed silently when it is within a minute of expiry.
+/// GIS access tokens last ~1h; without this every Drive call in a long
+/// editing session starts failing with HTTP 401.
+async fn fresh_drive_token(state: AppState) -> Option<Rc<String>> {
+    let token = state.drive_token.get_untracked()?;
+    if state.drive_token_expiry.get_untracked() > js_sys::Date::now() + 60_000.0 {
+        return Some(token);
+    }
+    match drive::sign_in().await {
+        Ok(auth) => {
+            let fresh = Rc::new(auth.token);
+            state.drive_token.set(Some(fresh.clone()));
+            state.drive_token_expiry.set(auth.expires_at_ms);
+            Some(fresh)
+        }
+        Err(e) => {
+            state.drive_error.set(Some(format!(
+                "Drive session expired — sign in again ({})",
+                js_err(&e)
+            )));
+            None
+        }
+    }
+}
+
 fn drive_refresh(state: AppState) {
     spawn_local(async move {
-        let Some(token) = state.drive_token.get_untracked() else {
+        let Some(token) = fresh_drive_token(state).await else {
             return;
         };
         let Some((root_id, _)) = state.drive_folder.get_untracked() else {
@@ -2626,7 +2648,7 @@ fn manifest_save_attempt(state: AppState, gen: u32, attempt: u32) {
                 // Superseded by a newer change; that write owns the flag.
                 return;
             }
-            let Some(token) = state.drive_token.get_untracked() else {
+            let Some(token) = fresh_drive_token(state).await else {
                 state.drive_save_pending.set(false);
                 return;
             };
@@ -2653,7 +2675,7 @@ fn manifest_save_attempt(state: AppState, gen: u32, attempt: u32) {
             let edits = state.drive_edits.get_untracked();
             let body = drive::manifest_json(&ids, &edits);
             let existing = state.drive_manifest_id.get_untracked();
-            let result = drive::upload_file(
+            let mut result = drive::upload_file(
                 &token,
                 &root_id,
                 existing.as_deref(),
@@ -2662,6 +2684,29 @@ fn manifest_save_attempt(state: AppState, gen: u32, attempt: u32) {
                 &body,
             )
             .await;
+            // A token revoked or expired mid-request (clock skew, Google
+            // dropping it early) still gets one silent re-auth and retry.
+            if result
+                .as_ref()
+                .err()
+                .map(|e| js_err(e).contains("HTTP 401"))
+                .unwrap_or(false)
+            {
+                if let Ok(auth) = drive::sign_in().await {
+                    let retry = Rc::new(auth.token);
+                    state.drive_token.set(Some(retry.clone()));
+                    state.drive_token_expiry.set(auth.expires_at_ms);
+                    result = drive::upload_file(
+                        &retry,
+                        &root_id,
+                        existing.as_deref(),
+                        drive::MANIFEST_NAME,
+                        "application/json",
+                        &body,
+                    )
+                    .await;
+                }
+            }
             // Remote now reflects local; refreshes may apply it again.
             state.drive_save_pending.set(false);
             match result {
@@ -3228,17 +3273,24 @@ fn import_drive_files(state: AppState, files: Vec<drive::DriveFile>, missing: Ve
         return;
     }
     spawn_local(async move {
-        let Some(token) = state.drive_token.get_untracked() else {
+        let Some(mut token) = fresh_drive_token(state).await else {
             DRIVE_IMPORT_ACTIVE.with(|a| a.set(false));
             return;
         };
         let total = files.len() + missing.len();
         let mut done = 0;
         for f in files {
+            // A big batch can outlive the token it started with.
+            if let Some(t) = fresh_drive_token(state).await {
+                token = t;
+            }
             done += 1;
             import_drive_one(state, &token, f, done, total).await;
         }
         for id in missing {
+            if let Some(t) = fresh_drive_token(state).await {
+                token = t;
+            }
             match drive::get_file(&token, &id).await {
                 Ok(f) if f.importable() => {
                     done += 1;
@@ -3250,6 +3302,7 @@ fn import_drive_files(state: AppState, files: Vec<drive::DriveFile>, missing: Ve
                     .set(Some(format!("Starred file lookup failed: {}", js_err(&e)))),
             }
         }
+        state.busy.set(None);
         DRIVE_IMPORT_ACTIVE.with(|a| a.set(false));
     });
 }
@@ -3264,7 +3317,7 @@ async fn import_drive_one(
     state.busy.set(Some(format!("Importing {done}/{total} — {}", f.name)));
     state.drive_error.set(None);
     match drive::download_file(token, &f.id).await {
-        Ok(bytes) => ingest_drive_bytes(state, f.id, f.parent, f.name, f.edited, bytes),
+        Ok(bytes) => ingest_drive_bytes(state, f.id, f.parent, f.name, f.edited, bytes).await,
         Err(e) => {
             state.busy.set(None);
             state
@@ -3313,9 +3366,9 @@ fn drive_develop_full(state: AppState, id: String) {
     {
         return;
     }
-    let Some(token) = state.drive_token.get_untracked() else {
+    if state.drive_token.with(|t| t.is_none()) {
         return;
-    };
+    }
     state.drive_error.set(None);
     state.drive_full_busy.set(Some(id.clone()));
     spawn_local(async move {
@@ -3324,6 +3377,10 @@ fn drive_develop_full(state: AppState, id: String) {
         if !alive() {
             return;
         }
+        let Some(token) = fresh_drive_token(state).await else {
+            state.drive_full_busy.set(None);
+            return;
+        };
         let bytes = match drive::download_file(token.as_str(), &id).await {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -3394,14 +3451,15 @@ fn drive_hover_prefetch(state: AppState, id: String, name: String) {
     if !DRIVE_HOVER_INFLIGHT.with(|s| s.borrow_mut().insert(id.clone())) {
         return;
     }
-    let Some(token) = state.drive_token.get_untracked() else {
+    if state.drive_token.with(|t| t.is_none()) {
         DRIVE_HOVER_INFLIGHT.with(|s| {
             s.borrow_mut().remove(&id);
         });
         return;
-    };
+    }
     spawn_local(async move {
         let decoded = async {
+            let token = fresh_drive_token(state).await?;
             let bytes = drive::download_file(token.as_str(), &id).await.ok()?;
             if raw {
                 return raw::preview_rgba(&bytes);
@@ -3719,8 +3777,9 @@ fn DrivePanel(state: AppState) -> impl IntoView {
             state.busy.set(Some("Signing in to Google…".into()));
             state.drive_error.set(None);
             match drive::sign_in().await {
-                Ok(token) => {
-                    state.drive_token.set(Some(Rc::new(token)));
+                Ok(auth) => {
+                    state.drive_token.set(Some(Rc::new(auth.token)));
+                    state.drive_token_expiry.set(auth.expires_at_ms);
                     drive_refresh(state);
                 }
                 Err(e) => state.drive_error.set(Some(js_err(&e))),
@@ -3730,7 +3789,7 @@ fn DrivePanel(state: AppState) -> impl IntoView {
     };
     let do_pick_folder = move |_| {
         spawn_local(async move {
-            let Some(token) = state.drive_token.get_untracked() else {
+            let Some(token) = fresh_drive_token(state).await else {
                 return;
             };
             state.drive_error.set(None);
@@ -3758,6 +3817,7 @@ fn DrivePanel(state: AppState) -> impl IntoView {
     };
     let do_sign_out = move |_| {
         state.drive_token.set(None);
+        state.drive_token_expiry.set(0.0);
         state.drive_files.set(Vec::new());
         state.drive_subfolders.set(Vec::new());
         state.drive_path.set(Vec::new());

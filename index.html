@@ -33,14 +33,35 @@
   <script>
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('sw.js').catch(() => {});
-      // A newly activated service worker tells us to reload once, so clients
-      // pinned to stale cached HTML pick up the current build.
+      // A newly activated worker tells open pages the build moved. Offer the
+      // reload instead of forcing it — an auto-reload mid-edit loses the
+      // user's place (and re-decodes the whole session).
       navigator.serviceWorker.addEventListener('message', (e) => {
-        if (e.data === 'pes-reload' && !sessionStorage.getItem('pes-reloaded')) {
-          sessionStorage.setItem('pes-reloaded', '1');
-          location.reload();
+        if (e.data === 'pes-reload') {
+          pesOfferReload();
         }
       });
+    }
+
+    function pesOfferReload() {
+      if (document.getElementById('pes-update')) return;
+      const box = document.createElement('div');
+      box.id = 'pes-update';
+      box.style.cssText =
+        'position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:100000;' +
+        'display:flex;align-items:center;gap:12px;padding:10px 14px;border-radius:10px;' +
+        'background:#1c1c1e;color:#fff;font:14px system-ui,sans-serif;' +
+        'box-shadow:0 6px 24px rgba(0,0,0,.45)';
+      const label = document.createElement('span');
+      label.textContent = 'New version ready';
+      const btn = document.createElement('button');
+      btn.textContent = 'Reload';
+      btn.style.cssText =
+        'border:0;border-radius:7px;padding:6px 12px;background:#0a84ff;color:#fff;' +
+        'font:inherit;cursor:pointer';
+      btn.addEventListener('click', () => location.reload());
+      box.append(label, btn);
+      document.body.appendChild(box);
     }
 
     // HEIC -> JPEG blob. Called from Rust.
@@ -133,8 +154,11 @@
             client_id: clientId,
             scope,
             callback: (resp) => {
-              if (resp && resp.access_token) resolve(resp.access_token);
-              else reject(new Error('sign-in failed: ' + (resp && resp.error || 'no token')));
+              if (resp && resp.access_token) {
+                resolve({ access_token: resp.access_token, expires_in: resp.expires_in });
+              } else {
+                reject(new Error('sign-in failed: ' + (resp && resp.error || 'no token')));
+              }
             },
             error_callback: (e) => reject(new Error('sign-in failed: ' + (e && e.type || 'popup closed'))),
           });

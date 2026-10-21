@@ -90,14 +90,36 @@ async fn call_shim(name: &str, args: &Array) -> Result<JsValue, JsValue> {
     JsFuture::from(Promise::from(out)).await
 }
 
-/// Popup the GIS token flow; resolves to an access token string.
-pub async fn sign_in() -> Result<String, JsValue> {
+/// A Google access token and its wall-clock expiry (ms since the epoch).
+pub struct DriveAuth {
+    pub token: String,
+    pub expires_at_ms: f64,
+}
+
+/// Popup (or silently refresh) the GIS token flow.
+pub async fn sign_in() -> Result<DriveAuth, JsValue> {
     let args = Array::new();
     args.push(&JsValue::from_str(CLIENT_ID));
     args.push(&JsValue::from_str(SCOPE));
     let v = call_shim("pesDriveSignIn", &args).await?;
-    v.as_string()
-        .ok_or_else(|| JsValue::from_str("sign-in returned no token"))
+    // String is the pre-expiry shim contract; test stubs still use it.
+    let (token, expires_in) = if let Some(s) = v.as_string() {
+        (s, 3000.0)
+    } else {
+        let token = Reflect::get(&v, &JsValue::from_str("access_token"))?
+            .as_string()
+            .ok_or_else(|| JsValue::from_str("sign-in returned no token"))?;
+        let expires_in = Reflect::get(&v, &JsValue::from_str("expires_in"))
+            .ok()
+            .and_then(|n| n.as_f64())
+            .filter(|n| *n > 0.0)
+            .unwrap_or(3000.0);
+        (token, expires_in)
+    };
+    Ok(DriveAuth {
+        token,
+        expires_at_ms: js_sys::Date::now() + expires_in * 1000.0,
+    })
 }
 
 /// Drive Picker folder grant; resolves to Some((id, name)) or None on cancel.
