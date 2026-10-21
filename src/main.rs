@@ -6671,6 +6671,13 @@ fn curve_color(ch: usize, alpha: f64) -> String {
 #[component]
 fn LevelsPanel(state: AppState, channel: RwSignal<usize>) -> impl IntoView {
     let hist_ref = create_node_ref::<html::Canvas>();
+    // Which Auto button produced the current settings. Cleared as soon as the
+    // levels are edited by hand or the selection moves to another item.
+    let last_auto = create_rw_signal(None::<levels::AutoMode>);
+    create_effect(move |_| {
+        state.selected.track();
+        last_auto.set(None);
+    });
 
     // Redraw the histogram whenever the photo, its edits, or the channel change.
     create_effect(move |_| {
@@ -6765,6 +6772,7 @@ fn LevelsPanel(state: AppState, channel: RwSignal<usize>) -> impl IntoView {
                         let v: f64 = event_target_value(&ev).parse().unwrap_or(0.0);
                         let ch = channel.get_untracked();
                         state.update_current(|e| set(&mut e.levels.ranges[ch], v));
+                        last_auto.set(None);
                     }
                 />
             </label>
@@ -6777,6 +6785,56 @@ fn LevelsPanel(state: AppState, channel: RwSignal<usize>) -> impl IntoView {
         let hist = levels::histogram(&photo.preview.0);
         let s = levels::auto_settings(&hist, mode);
         state.update_current(|e| e.levels = s);
+        last_auto.set(Some(mode));
+    };
+
+    let auto_btn = move |mode: levels::AutoMode, label: &'static str| {
+        view! {
+            <button
+                class=move || format!(
+                    "btn small{}",
+                    if last_auto.get() == Some(mode) { " active" } else { "" }
+                )
+                on:click=move |_| auto(mode)
+            >{label}</button>
+        }
+    };
+
+    let applied = move || {
+        let Some(mode) = last_auto.get() else { return ().into_view() };
+        let Some(m) = state.current() else { return ().into_view() };
+        let r = &m.edit.levels.ranges;
+        let span = |i: usize| format!("{:.0}–{:.0}", r[i].black, r[i].white);
+        let title = match mode {
+            levels::AutoMode::Contrast => "Auto contrast applied",
+            levels::AutoMode::Color => "Auto color applied",
+            levels::AutoMode::ColorNeutral => "Auto neutral applied",
+        };
+        let detail = if mode == levels::AutoMode::Contrast {
+            format!("black {:.0} · white {:.0}", r[0].black, r[0].white).into_view()
+        } else {
+            let gamma = if mode == levels::AutoMode::ColorNeutral {
+                format!(
+                    " · gamma {:.2} / {:.2} / {:.2}",
+                    r[1].gamma, r[2].gamma, r[3].gamma
+                )
+            } else {
+                String::new()
+            };
+            view! {
+                <>
+                    <span class="las-r">{format!("R {}", span(1))}</span>" · "
+                    <span class="las-g">{format!("G {}", span(2))}</span>" · "
+                    <span class="las-b">{format!("B {}", span(3))}</span>
+                    {gamma}
+                </>
+            }.into_view()
+        };
+        view! {
+            <div class="levels-auto-status">
+                <span class="las-title">{title}</span>" · "{detail}
+            </div>
+        }.into_view()
     };
 
     view! {
@@ -6792,13 +6850,15 @@ fn LevelsPanel(state: AppState, channel: RwSignal<usize>) -> impl IntoView {
             {lslider("Output black", 0.0, 255.0, 1.0, |r| r.output_black, |r, v| r.output_black = v, |v| format!("{v:.0}"))}
             {lslider("Output white", 0.0, 255.0, 1.0, |r| r.output_white, |r, v| r.output_white = v, |v| format!("{v:.0}"))}
             <div class="levels-auto">
-                <button class="btn small" on:click=move |_| auto(levels::AutoMode::Contrast)>"Auto contrast"</button>
-                <button class="btn small" on:click=move |_| auto(levels::AutoMode::Color)>"Auto color"</button>
-                <button class="btn small" on:click=move |_| auto(levels::AutoMode::ColorNeutral)>"Auto neutral"</button>
+                {auto_btn(levels::AutoMode::Contrast, "Auto contrast")}
+                {auto_btn(levels::AutoMode::Color, "Auto color")}
+                {auto_btn(levels::AutoMode::ColorNeutral, "Auto neutral")}
                 <button class="btn small dim-btn" on:click=move |_| {
                     state.update_current(|e| e.levels = levels::LevelsSettings::default());
+                    last_auto.set(None);
                 }>"Reset levels"</button>
             </div>
+            {applied}
         </div>
     }
 }
