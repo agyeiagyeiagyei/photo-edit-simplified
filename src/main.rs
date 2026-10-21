@@ -1254,6 +1254,22 @@ fn zoom_crop(
     state::CropRect { x, y, w, h }
 }
 
+/// Largest centered exact-ratio box inside a crop box (preview and developed dims can drift).
+fn aspect_fit(cx: usize, cy: usize, cw: usize, ch: usize, aspect: Aspect) -> (usize, usize, usize, usize) {
+    let Some((rw, rh)) = aspect.ratio() else {
+        return (cx, cy, cw, ch);
+    };
+    let r = rw as f64 / rh as f64;
+    let by_h = (ch as f64 * r).round().max(1.0) as usize;
+    let (nw, nh) = if by_h <= cw {
+        (by_h, ch)
+    } else {
+        let by_w = ((cw as f64 / r).round().max(1.0) as usize).min(ch);
+        (cw, by_w)
+    };
+    (cx + (cw - nw) / 2, cy + (ch - nh) / 2, nw, nh)
+}
+
 /// Render a photo through the full edit pipeline into an encoded blob.
 /// Returns (blob, mime, filename).
 async fn render_photo_export(
@@ -1321,7 +1337,9 @@ async fn render_photo_export(
     composite_layers(&base, &item.layers, w, h);
 
     let (cx, cy, cw, ch) = crop_px(&item.edit, w, h);
-    let (ew, eh) = item.edit.aspect.export_dims(cw, ch);
+    let (cx, cy, cw, ch) = aspect_fit(cx, cy, cw, ch, item.edit.aspect);
+    // Photo exports keep the crop's native pixels; export_dims is the video cap.
+    let (ew, eh) = (cw, ch);
     let out = web::create_canvas(ew as u32, eh as u32);
     web::ctx2d(&out)
         .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
