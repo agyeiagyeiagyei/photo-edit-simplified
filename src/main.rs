@@ -1022,6 +1022,17 @@ fn content_fingerprint(item: &MediaItem, photo_gen: u64) -> u64 {
     for v in [e.fine_angle, e.brightness, e.contrast, e.saturation, e.warmth, e.blur, e.grain] {
         h.write_u32(v.to_bits());
     }
+    for v in [
+        e.raw.temp,
+        e.raw.tint,
+        e.raw.exposure,
+        e.raw.highlights,
+        e.raw.shadows,
+        e.raw.noise,
+        e.raw.sharpen,
+    ] {
+        h.write_u32(v.to_bits());
+    }
     h.write_u8(e.grain_gaussian as u8);
     h.write_u8(e.grain_mono as u8);
     match e.aspect.ratio() {
@@ -2144,6 +2155,75 @@ fn canvas_loupe_clear(state: AppState) {
     state.canvas_loupe.set(None);
 }
 
+/// Crop a hover window out of the sensor buffer and run the pointwise edit
+/// pipeline over it at source density (raw develop → blur → levels → curves →
+/// adjust → grain), mirroring render_pipeline. Local ops get a margin so the
+/// cropped window's edges do not darken against the border.
+fn source_window(
+    px: &[u8],
+    fw: usize,
+    fh: usize,
+    sx: usize,
+    sy: usize,
+    cw: usize,
+    ch: usize,
+    edit: &EditParams,
+    seed: u32,
+) -> Option<Vec<u8>> {
+    if cw == 0 || ch == 0 || sx + cw > fw || sy + ch > fh {
+        return None;
+    }
+    let margin = (edit.blur / 100.0 * 8.0 * 3.0).ceil() as usize + 2;
+    let x0 = sx.saturating_sub(margin);
+    let y0 = sy.saturating_sub(margin);
+    let x1 = (sx + cw + margin).min(fw);
+    let y1 = (sy + ch + margin).min(fh);
+    let (ew, eh) = (x1 - x0, y1 - y0);
+    let mut win = Vec::with_capacity(ew * eh * 4);
+    for row in 0..eh {
+        let start = ((y0 + row) * fw + x0) * 4;
+        win.extend_from_slice(&px[start..start + ew * 4]);
+    }
+    if !edit.raw.is_identity() {
+        rawops::apply(&mut win, ew, eh, &edit.raw);
+    }
+    blur::blur_apply(&mut win, ew, eh, edit.blur);
+    if !edit.levels.is_identity() {
+        levels::levels_apply(&mut win, &edit.levels.build_tables());
+    }
+    if !edit.curves.is_identity() {
+        edit.curves.apply(&mut win);
+    }
+    ops::adjust(&mut win, edit.brightness, edit.contrast, edit.saturation, edit.warmth);
+    noise::noise_add(&mut win, ew, eh, edit.grain, edit.grain_gaussian, edit.grain_mono, seed);
+    let (ix, iy) = (sx - x0, sy - y0);
+    let mut out = Vec::with_capacity(cw * ch * 4);
+    for row in 0..ch {
+        let start = ((iy + row) * ew + ix) * 4;
+        out.extend_from_slice(&win[start..start + cw * 4]);
+    }
+    Some(out)
+}
+
+/// Draw an RGBA buffer into the loupe backing, scaled to fill it.
+fn blit_window(canvas: &web_sys::HtmlCanvasElement, px: &[u8], w: u32, h: u32, bw: u32, bh: u32) {
+    let scratch = web::create_canvas(w, h);
+    web::put_pixels(&scratch, px, w, h);
+    let ctx = web::ctx2d(canvas);
+    ctx.set_image_smoothing_enabled(true);
+    let _ = ctx.draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+        &scratch,
+        0.0,
+        0.0,
+        w as f64,
+        h as f64,
+        0.0,
+        0.0,
+        bw as f64,
+        bh as f64,
+    );
+}
+
 /// Editor-canvas hover loupe: a floating 1:1 window into the *edited* image —
 /// a full-res render through the whole pipeline, so it shows what an export
 /// would. Untouched photos take the cheap source-pixel path instead.
@@ -2154,7 +2234,7 @@ fn CanvasLoupe(
     main_canvas: NodeRef<html::Canvas>,
 ) -> impl IntoView {
     let canvas_ref = create_node_ref::<html::Canvas>();
-    let tag = create_rw_signal("");
+    let tag = create_rw_signal(String::new());
 
     // Clear on any press inside the wrap. Capture phase: overlay children
     // (crop rect, selected text) stop propagation, so the wrap's delegated
@@ -2210,24 +2290,52 @@ fn CanvasLoupe(
             canvas.set_height(bh as u32);
         }
 
-        // Fast path: nothing alters the pixels (no geometry, color, selection
-        // or visible layers) → 1:1 row-copy straight from the source.
-        if photo_unedited(&item) {
-            if let Some((px, w, h)) = photo.full.as_ref() {
-                let (w, h) = (*w, *h);
-                if w >= bw && h >= bh {
-                    tag.set("1:1");
-                    let sx = ((nx * w as f64 - bw as f64 / 2.0) as isize)
-                        .clamp(0, (w - bw) as isize) as usize;
-                    let sy = ((ny * h as f64 - bh as f64 / 2.0) as isize)
-                        .clamp(0, (h - bh) as isize) as usize;
-                    let mut crop = vec![0u8; bw * bh * 4];
-                    for row in 0..bh {
-                        let src = ((sy + row) * w + sx) * 4;
-                        crop[row * bw * 4..(row + 1) * bw * 4]
-                            .copy_from_slice(&px[src..src + bw * 4]);
-                    }
-                    web::put_pixels(&canvas, &crop, bw as u32, bh as u32);
+        // Window size relative to what the screen already shows: magnify ~4x
+        // over the main view, never downsampling below 1 device px per source
+        // px. A fixed-size window stops being a closeup once the view is a
+        // tight crop — it would frame about the same region as the canvas.
+        let (ww, wh) = working_dims(photo.full_dims.0, photo.full_dims.1, &item.edit);
+        let cropped_view = tab.get() != Tab::Crop && !crop_is_full(&item.edit.crop);
+        let crop = item.edit.crop;
+        let (vx, vy, vw, vh) = if cropped_view {
+            (
+                crop.x as f64 * ww as f64,
+                crop.y as f64 * wh as f64,
+                (crop.w as f64 * ww as f64).max(1.0),
+                (crop.h as f64 * wh as f64).max(1.0),
+            )
+        } else {
+            (0.0, 0.0, ww as f64, wh as f64)
+        };
+        let disp_css_w = main_canvas
+            .get()
+            .map(|c| c.client_width() as f64)
+            .filter(|w| *w > 1.0)
+            .unwrap_or(480.0);
+        let zoom = (4.0 * disp_css_w / vw).max(1.0 / dpr).min(4.0);
+        let cw = ((bw as f64 / (dpr * zoom)).round() as usize).max(1).min(ww);
+        let ch = ((bh as f64 / (dpr * zoom)).round() as usize).max(1).min(wh);
+        let mag = (dpr * zoom).round().max(1.0) as u32;
+        let sx = ((nx * ww as f64 - cw as f64 / 2.0) as isize)
+            .clamp(0, (ww - cw) as isize) as usize;
+        let sy = ((ny * wh as f64 - ch as f64 / 2.0) as isize)
+            .clamp(0, (wh - ch) as isize) as usize;
+
+        // Direct path: crop the window straight out of the sensor buffer and
+        // run the pointwise pipeline over it, so the loupe shows true source
+        // pixels instead of a slice of a whole-image render. Exact only with
+        // identity geometry and no selection or visible layers.
+        let plain = item.edit.rot90 % 4 == 0
+            && item.edit.fine_angle.abs() <= 0.01
+            && item.edit.selection.is_none()
+            && !item.layers.iter().any(|l| l.visible && l.opacity > 0.01);
+        if plain {
+            if let Some((px, fw, fh)) = photo.full.as_ref() {
+                if let Some(win) =
+                    source_window(px, *fw, *fh, sx, sy, cw, ch, &item.edit, id as u32)
+                {
+                    blit_window(&canvas, &win, cw as u32, ch as u32, bw as u32, bh as u32);
+                    tag.set(format!("{mag}:1"));
                     return;
                 }
             }
@@ -2240,44 +2348,58 @@ fn CanvasLoupe(
             (hi.item_id == id && hi.fingerprint == fp).then(|| (hi.canvas.clone(), hi.w, hi.h))
         });
         if let Some((hi_canvas, hw, hh)) = hit {
-            tag.set("1:1");
+            // The cached render covers the whole working frame; map the
+            // window through its scale, then magnify it into the loupe.
+            let kx = hw as f64 / ww as f64;
+            let ky = hh as f64 / wh as f64;
             let ctx = web::ctx2d(&canvas);
-            let sw = (bw as f64).min(hw as f64);
-            let sh = (bh as f64).min(hh as f64);
-            let sx = (nx * hw as f64 - sw / 2.0).clamp(0.0, (hw as f64 - sw).max(0.0));
-            let sy = (ny * hh as f64 - sh / 2.0).clamp(0.0, (hh as f64 - sh).max(0.0));
+            ctx.set_image_smoothing_enabled(true);
             let _ = ctx
                 .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
-                    &hi_canvas, sx, sy, sw, sh, 0.0, 0.0, bw as f64, bh as f64,
+                    &hi_canvas,
+                    sx as f64 * kx,
+                    sy as f64 * ky,
+                    cw as f64 * kx,
+                    ch as f64 * ky,
+                    0.0,
+                    0.0,
+                    bw as f64,
+                    bh as f64,
                 );
+            // Whole-image renders are capped, so past that cap this is not
+            // sensor 1:1 — say so rather than overstate the detail.
+            let full_density = hw >= ww && hh >= wh;
+            tag.set(if full_density {
+                format!("{mag}:1")
+            } else {
+                format!("{mag}:1 preview")
+            });
             return;
         }
 
-        // Placeholder until the full-res render lands: magnify the on-screen
-        // canvas (~2x, display res). Its backing shows the crop region
-        // outside the Crop tab, so map working coords through the crop.
-        tag.set("rendering…");
+        // Placeholder until the full decode or the rendered window lands:
+        // show the same framing, magnified out of the on-screen canvas. Its
+        // backing shows the visible region (the crop, outside the Crop tab).
+        tag.set(String::from("rendering…"));
         if let Some(main) = main_canvas.get() {
             let (mw, mh) = (main.width() as f64, main.height() as f64);
             if mw > 1.0 && mh > 1.0 {
-                let crop = item.edit.crop;
-                let cropped_view = tab.get_untracked() != Tab::Crop && !crop_is_full(&crop);
-                let (dx, dy) = if cropped_view {
-                    (
-                        ((nx - crop.x as f64) / crop.w as f64).clamp(0.0, 1.0),
-                        ((ny - crop.y as f64) / crop.h as f64).clamp(0.0, 1.0),
-                    )
-                } else {
-                    (nx, ny)
-                };
-                let sw = bw as f64 / 2.0;
-                let sh = bh as f64 / 2.0;
-                let sx = (dx * mw - sw / 2.0).clamp(0.0, (mw - sw).max(0.0));
-                let sy = (dy * mh - sh / 2.0).clamp(0.0, (mh - sh).max(0.0));
-                let _ = web::ctx2d(&canvas)
-                    .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
-                        &main, sx, sy, sw, sh, 0.0, 0.0, bw as f64, bh as f64,
-                    );
+                let kx = mw / vw;
+                let ky = mh / vh;
+                let dx = (sx as f64 - vx) * kx;
+                let dy = (sy as f64 - vy) * ky;
+                let x0 = dx.max(0.0).min(mw);
+                let y0 = dy.max(0.0).min(mh);
+                let x1 = (dx + cw as f64 * kx).max(0.0).min(mw);
+                let y1 = (dy + ch as f64 * ky).max(0.0).min(mh);
+                if x1 > x0 && y1 > y0 {
+                    let ctx = web::ctx2d(&canvas);
+                    ctx.set_image_smoothing_enabled(true);
+                    let _ = ctx
+                        .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+                            &main, x0, y0, x1 - x0, y1 - y0, 0.0, 0.0, bw as f64, bh as f64,
+                        );
+                }
             }
         }
 
