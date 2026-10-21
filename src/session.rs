@@ -14,12 +14,17 @@ use crate::state::{
 };
 
 const DB_NAME: &str = "pes-session";
-const DB_VERSION: u32 = 1;
+const DB_VERSION: u32 = 2;
 const ITEMS: &str = "items";
 const META: &str = "meta";
 /// Raster layer pixel PNGs, keyed "itemId:layerId" — separate from item
 /// records so an edit-params write doesn't rewrite multi-MB pixel blobs.
 const LAYER_PIXELS: &str = "layer_pixels";
+/// Original RAW files and their 1024px preview PNGs, keyed by item id.
+/// Separate stores: item records stay small, so a recipe edit doesn't rewrite
+/// a 25MB RAW, and the bytes are readable on demand for a lazy develop.
+const RAW_SRC: &str = "raw_src";
+const PREVIEWS: &str = "previews";
 
 fn err(e: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&format!("session: {e}"))
@@ -41,6 +46,14 @@ pub async fn open_db() -> Result<Database, JsValue> {
         if !db.store_names().iter().any(|n| n == LAYER_PIXELS) {
             db.create_object_store(LAYER_PIXELS, Default::default())
                 .expect("create layer_pixels store");
+        }
+        if !db.store_names().iter().any(|n| n == RAW_SRC) {
+            db.create_object_store(RAW_SRC, Default::default())
+                .expect("create raw_src store");
+        }
+        if !db.store_names().iter().any(|n| n == PREVIEWS) {
+            db.create_object_store(PREVIEWS, Default::default())
+                .expect("create previews store");
         }
     });
     req.await.map_err(err)
@@ -179,6 +192,78 @@ pub async fn delete_layer_pixels(db: &Database, item_id: usize) -> Result<(), Js
     }
     tx.commit().map_err(err)?.await.map_err(err)?;
     Ok(())
+}
+
+pub async fn put_raw_src(db: &Database, id: usize, blob: &JsValue) -> Result<(), JsValue> {
+    let tx = db.transaction(&[RAW_SRC], TransactionMode::ReadWrite).map_err(err)?;
+    let store = tx.object_store(RAW_SRC).map_err(err)?;
+    store
+        .put(blob, Some(&JsValue::from_f64(id as f64)))
+        .map_err(err)?
+        .await
+        .map_err(err)?;
+    tx.commit().map_err(err)?.await.map_err(err)?;
+    Ok(())
+}
+
+pub async fn get_raw_src(db: &Database, id: usize) -> Result<Option<JsValue>, JsValue> {
+    let tx = db.transaction(&[RAW_SRC], TransactionMode::ReadOnly).map_err(err)?;
+    let store = tx.object_store(RAW_SRC).map_err(err)?;
+    store
+        .get(JsValue::from_f64(id as f64))
+        .map_err(err)?
+        .await
+        .map_err(err)
+}
+
+pub async fn delete_raw_assets(db: &Database, ids: &[usize]) -> Result<(), JsValue> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let tx = db
+        .transaction(&[RAW_SRC, PREVIEWS], TransactionMode::ReadWrite)
+        .map_err(err)?;
+    let raws = tx.object_store(RAW_SRC).map_err(err)?;
+    let previews = tx.object_store(PREVIEWS).map_err(err)?;
+    for id in ids {
+        let key = JsValue::from_f64(*id as f64);
+        raws.delete(key.clone()).map_err(err)?.await.map_err(err)?;
+        previews.delete(key).map_err(err)?.await.map_err(err)?;
+    }
+    tx.commit().map_err(err)?.await.map_err(err)?;
+    Ok(())
+}
+
+pub async fn put_preview(db: &Database, id: usize, blob: &JsValue) -> Result<(), JsValue> {
+    let tx = db.transaction(&[PREVIEWS], TransactionMode::ReadWrite).map_err(err)?;
+    let store = tx.object_store(PREVIEWS).map_err(err)?;
+    store
+        .put(blob, Some(&JsValue::from_f64(id as f64)))
+        .map_err(err)?
+        .await
+        .map_err(err)?;
+    tx.commit().map_err(err)?.await.map_err(err)?;
+    Ok(())
+}
+
+pub async fn get_preview(db: &Database, id: usize) -> Result<Option<JsValue>, JsValue> {
+    let tx = db.transaction(&[PREVIEWS], TransactionMode::ReadOnly).map_err(err)?;
+    let store = tx.object_store(PREVIEWS).map_err(err)?;
+    store
+        .get(JsValue::from_f64(id as f64))
+        .map_err(err)?
+        .await
+        .map_err(err)
+}
+
+/// Read an item's original RAW bytes back out of IndexedDB for a lazy develop.
+/// None when the record or its blob is missing.
+pub async fn load_raw_bytes(id: usize) -> Option<Vec<u8>> {
+    let db = open_db().await.ok()?;
+    let v = get_raw_src(&db, id).await.ok()??;
+    let blob = v.dyn_into::<web_sys::Blob>().ok()?;
+    let buf = wasm_bindgen_futures::JsFuture::from(blob.array_buffer()).await.ok()?;
+    Some(js_sys::Uint8Array::new(&buf).to_vec())
 }
 
 // --- JS object helpers --------------------------------------------------------

@@ -10,6 +10,7 @@ mod web;
 use pes_pixel::{blur, clone, curves, fill, heal, levels, noise, ops, stroke, wand};
 use pes_pixel::geo::{crop_px, geometry, hi_target, stamp_stroke, working_dims};
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -40,6 +41,16 @@ struct PhotoData {
     /// Bumped whenever full/preview are rebuilt in place (heal, cut, …) so the
     /// hi-res render cache knows its source pixels changed.
     gen: u64,
+    /// RAW import: full pixels are developed lazily from the original bytes,
+    /// which live in IndexedDB rather than in memory.
+    raw: bool,
+    /// Original RAW byte length — keeps the session signature stable once the
+    /// bytes are no longer held in memory.
+    raw_len: u64,
+    /// The original made it into the raw_src store. False means the fallback
+    /// is in play: full pixels were developed eagerly and the bytes stay in
+    /// `raw_fallback` so the session record can embed them.
+    raw_persisted: bool,
 }
 
 struct Cache {
@@ -49,9 +60,10 @@ struct Cache {
     photo_src: HashMap<usize, Blob>,
     video_blobs: HashMap<usize, Blob>,
     video_meta: HashMap<usize, (f64, u32, u32)>, // duration, w, h
-    /// Original RAW file bytes, kept so session persistence can store the
-    /// real source (object_url only holds a decoded 1024px preview).
-    raw_bytes: HashMap<usize, Rc<Vec<u8>>>,
+    /// RAW originals that could not be written to IndexedDB (quota, private
+    /// mode) — only kept so persistence can fall back to the old embedded-blob
+    /// record. Empty on the normal path.
+    raw_fallback: HashMap<usize, Rc<Vec<u8>>>,
 }
 
 thread_local! {
@@ -60,7 +72,7 @@ thread_local! {
         photo_src: HashMap::new(),
         video_blobs: HashMap::new(),
         video_meta: HashMap::new(),
-        raw_bytes: HashMap::new(),
+        raw_fallback: HashMap::new(),
     });
 }
 
@@ -183,7 +195,9 @@ fn ensure_full(state: AppState, id: usize, waiter: Option<Box<dyn FnOnce()>>) {
         return;
     }
     let src = CACHE.with(|c| c.borrow().photo_src.get(&id).cloned());
-    let raw = CACHE.with(|c| c.borrow().raw_bytes.get(&id).cloned());
+    let is_raw = CACHE.with(|c| {
+        c.borrow().photos.get(&id).map(|p| p.raw).unwrap_or(false)
+    });
     spawn_local(async move {
         let decoded = if let Some(blob) = src {
             match web::load_image(&blob).await {
@@ -193,8 +207,12 @@ fn ensure_full(state: AppState, id: usize, waiter: Option<Box<dyn FnOnce()>>) {
                 }
                 Err(_) => None,
             }
-        } else if let Some(bytes) = raw {
-            raw::decode_raw(&bytes).ok()
+        } else if is_raw {
+            // Lazy develop: pull the original out of IndexedDB only now.
+            match session::load_raw_bytes(id).await {
+                Some(bytes) => raw::decode_raw(&bytes).ok(),
+                None => None,
+            }
         } else {
             None
         };
@@ -257,12 +275,21 @@ fn remove_item(state: AppState, item_id: usize) {
         c.photos.remove(&item_id);
         c.photo_src.remove(&item_id);
         c.video_blobs.remove(&item_id);
-        c.raw_bytes.remove(&item_id);
         c.video_meta.remove(&item_id);
+        c.raw_fallback.remove(&item_id);
     });
     LAST_USE.with(|l| l.borrow_mut().remove(&item_id));
     FULL_WAITERS.with(|w| w.borrow_mut().remove(&item_id));
     pworker::unload(item_id);
+    // An item removed before its first session save never reaches the
+    // persist pass that purges `gone` records; clear its RAW/preview blobs
+    // here so they can't leak storage.
+    spawn_local(async move {
+        if let Ok(db) = session::open_db().await {
+            let _ = session::delete_raw_assets(&db, &[item_id]).await;
+            let _ = session::delete_layer_pixels(&db, item_id).await;
+        }
+    });
     // Hover loupes clear on mouseleave, which never fires when the hovered
     // thumb has just left the DOM — drop any loupe showing the removed item.
     if state.loupe.get_untracked().map(|(id, ..)| id) == Some(item_id) {
@@ -292,6 +319,67 @@ fn is_heic(file: &File) -> bool {
     let t = file.type_().to_lowercase();
     let n = file.name().to_lowercase();
     t.contains("heic") || t.contains("heif") || n.ends_with(".heic") || n.ends_with(".heif")
+}
+
+struct RawIngest {
+    full: Option<(Vec<u8>, usize, usize)>,
+    preview: (Vec<u8>, usize, usize),
+    dims: (usize, usize),
+    object_url: String,
+    thumb_url: String,
+    exif: Option<Rc<Vec<u8>>>,
+    taken: Option<f64>,
+    stored: bool,
+}
+
+/// Preview-first RAW ingest. Decode the embedded camera JPEG (no demosaic),
+/// persist the original bytes and preview PNG to IndexedDB, and leave the
+/// full develop for first open/export. Falls back to an eager develop when
+/// the file has no usable preview or the bytes could not be stored.
+async fn prepare_raw(id: usize, bytes: &[u8], mtime: Option<f64>) -> Option<RawIngest> {
+    let exif_tiff = raw::extract_exif_tiff(bytes);
+    let taken = exif_tiff.as_deref().and_then(exif::taken_from_tiff).or(mtime);
+    let exif = exif_tiff.map(Rc::new);
+
+    let (preview_px, pw, ph) = raw::preview_rgba(bytes)?;
+    let (pp, pw2, ph2) = downscale_pixels(&preview_px, pw, ph, 1024);
+    let canvas = web::create_canvas(pw2 as u32, ph2 as u32);
+    web::put_pixels(&canvas, &pp, pw2 as u32, ph2 as u32);
+    let png = web::canvas_to_blob(&canvas, "image/png").await.ok()?;
+
+    let stored = {
+        let db = session::open_db().await.ok()?;
+        let raw_blob = web::bytes_to_blob(bytes, "application/octet-stream").ok()?;
+        let a = session::put_raw_src(&db, id, raw_blob.as_ref()).await;
+        let b = session::put_preview(&db, id, png.as_ref()).await;
+        a.is_ok() && b.is_ok()
+    };
+
+    let full = if stored {
+        None
+    } else {
+        web::log("RAW bytes not persisted; developing eagerly");
+        raw::decode_raw(bytes).ok()
+    };
+    let (dims, preview) = match &full {
+        Some((fpx, fw, fh)) => {
+            let d = (*fw, *fh);
+            (d, downscale_pixels(fpx, *fw, *fh, 1024))
+        }
+        None => ((pw, ph), (pp, pw2, ph2)),
+    };
+    let object_url = Url::create_object_url_with_blob(&png).ok()?;
+    let thumb_url = thumb_object_url(&preview.0, preview.1, preview.2).await;
+    Some(RawIngest {
+        full,
+        preview,
+        dims,
+        object_url,
+        thumb_url,
+        exif,
+        taken,
+        stored,
+    })
 }
 
 fn main() {
@@ -341,59 +429,54 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                     web::log("video probe failed");
                 }
             } else if raw::is_raw_name(&name) {
-                state.busy.set(Some(format!("Converting RAW {name}…")));
+                state.busy.set(Some(format!("Loading RAW {name}…")));
                 let Ok(buf) = web::read_file_array_buffer(&file).await else {
                     state.busy.set(None);
                     continue;
                 };
                 let bytes = js_sys::Uint8Array::new(&buf).to_vec();
-                let Ok((full_rgba, fw, fh)) = raw::decode_raw(&bytes) else {
+                let Some(ing) = prepare_raw(id, &bytes, mtime).await else {
                     web::log(&format!("RAW decode failed for {name}"));
                     state.busy.set(None);
                     continue;
                 };
-                CACHE.with(|c| c.borrow_mut().raw_bytes.insert(id, Rc::new(bytes.clone())));
-                let exif_tiff = raw::extract_exif_tiff(&bytes);
-                let taken = exif_tiff.as_deref().and_then(exif::taken_from_tiff).or(mtime);
-                let exif = exif_tiff.map(Rc::new);
-                let (pp, pw, ph) = downscale_pixels(&full_rgba, fw, fh, 1024);
-                let canvas = web::create_canvas(pw as u32, ph as u32);
-                web::put_pixels(&canvas, &pp, pw as u32, ph as u32);
-                // Blob URL, not a data URL: a 1024px base64 PNG is multi-MB and
-                // was deep-cloned on every state read.
-                let url = match web::canvas_to_blob(&canvas, "image/png").await {
-                    Ok(b) => Url::create_object_url_with_blob(&b).unwrap_or_default(),
-                    Err(_) => String::new(),
-                };
-                let thumb_url = thumb_object_url(&pp, pw, ph).await;
-                pworker::load(id, &full_rgba, fw, fh);
+                let raw_len = bytes.len() as u64;
+                if !ing.stored {
+                    CACHE.with(|c| c.borrow_mut().raw_fallback.insert(id, Rc::new(bytes)));
+                }
+                if let Some((full_rgba, fw, fh)) = &ing.full {
+                    pworker::load(id, full_rgba, *fw, *fh);
+                    touch_full(id);
+                }
                 CACHE.with(|c| {
                     c.borrow_mut().photos.insert(
                         id,
                         Rc::new(PhotoData {
-                            full: Some((full_rgba, fw, fh)),
-                            full_dims: (fw, fh),
-                            preview: (pp, pw, ph),
+                            full: ing.full,
+                            full_dims: ing.dims,
+                            preview: ing.preview,
                             dirty: false,
                             gen: 0,
+                            raw: true,
+                            raw_len,
+                            raw_persisted: ing.stored,
                         }),
                     )
                 });
-                touch_full(id);
                 evict_full_lru();
                 push_item(state, MediaItem {
                     id,
                     kind: MediaKind::Photo,
                     name,
-                    object_url: url,
-                    thumb_url,
-                    width: fw,
-                    height: fh,
+                    object_url: ing.object_url,
+                    thumb_url: ing.thumb_url,
+                    width: ing.dims.0,
+                    height: ing.dims.1,
                     edit: EditParams::default(),
                     layers: Vec::new(),
                     next_layer_id: 0,
-                    exif,
-                    taken,
+                    exif: ing.exif,
+                    taken: ing.taken,
                     drive_file_id: None,
                     drive_parent_id: None,
                     drive_baked: false,
@@ -450,6 +533,9 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                             preview,
                             dirty: false,
                             gen: 0,
+                            raw: false,
+                            raw_len: 0,
+                            raw_persisted: true,
                         }),
                     );
                 });
@@ -535,50 +621,47 @@ async fn ingest_drive_bytes(
         };
 
         if raw::is_raw_name(&name) {
-            let Ok((full_rgba, fw, fh)) = raw::decode_raw(&bytes) else {
+            let Some(ing) = prepare_raw(id, &bytes, None).await else {
                 web::log(&format!("RAW decode failed for {name}"));
                 return;
             };
-            CACHE.with(|c| c.borrow_mut().raw_bytes.insert(id, Rc::new(bytes.clone())));
-            let exif_tiff = raw::extract_exif_tiff(&bytes);
-            let taken = exif_tiff.as_deref().and_then(exif::taken_from_tiff);
-            let exif = exif_tiff.map(Rc::new);
-            let (pp, pw, ph) = downscale_pixels(&full_rgba, fw, fh, 1024);
-            let canvas = web::create_canvas(pw as u32, ph as u32);
-            web::put_pixels(&canvas, &pp, pw as u32, ph as u32);
-            let url = match web::canvas_to_blob(&canvas, "image/png").await {
-                Ok(b) => Url::create_object_url_with_blob(&b).unwrap_or_default(),
-                Err(_) => String::new(),
-            };
-            let thumb_url = thumb_object_url(&pp, pw, ph).await;
-            pworker::load(id, &full_rgba, fw, fh);
+            let raw_len = bytes.len() as u64;
+            if !ing.stored {
+                CACHE.with(|c| c.borrow_mut().raw_fallback.insert(id, Rc::new(bytes)));
+            }
+            if let Some((full_rgba, fw, fh)) = &ing.full {
+                pworker::load(id, full_rgba, *fw, *fh);
+                touch_full(id);
+            }
             CACHE.with(|c| {
                 c.borrow_mut().photos.insert(
                     id,
                     Rc::new(PhotoData {
-                        full: Some((full_rgba, fw, fh)),
-                        full_dims: (fw, fh),
-                        preview: (pp, pw, ph),
+                        full: ing.full,
+                        full_dims: ing.dims,
+                        preview: ing.preview,
                         dirty: false,
                         gen: 0,
+                        raw: true,
+                        raw_len,
+                        raw_persisted: ing.stored,
                     }),
                 )
             });
-            touch_full(id);
             evict_full_lru();
             push_item(state, MediaItem {
                 id,
                 kind: MediaKind::Photo,
                 name,
-                object_url: url,
-                thumb_url,
-                width: fw,
-                height: fh,
+                object_url: ing.object_url,
+                thumb_url: ing.thumb_url,
+                width: ing.dims.0,
+                height: ing.dims.1,
                 edit,
                 layers: Vec::new(),
                 next_layer_id: 0,
-                exif,
-                taken,
+                exif: ing.exif,
+                taken: ing.taken,
                 drive_file_id: Some(drive_file_id),
                 drive_parent_id: Some(drive_parent_id),
                 drive_baked,
@@ -615,6 +698,9 @@ async fn ingest_drive_bytes(
                         preview,
                         dirty: false,
                         gen: 0,
+                        raw: false,
+                        raw_len: 0,
+                        raw_persisted: true,
                     }),
                 );
             });
@@ -1163,61 +1249,69 @@ async fn render_photo_export(
         return None;
     }
     let photo = get_photo(item.id)?;
-    let (pix, w, h) = photo.full.as_ref()?;
-    let (mut p, w, h) = geometry(pix, *w, *h, &item.edit);
+    let (pix, fw, fh) = photo.full.as_ref()?;
+    // A full-res export must fit a ~4 GB box: borrow the cached pixels when
+    // geometry is a no-op and only copy for color edits, so the pipeline holds
+    // one full buffer plus the canvas, not three.
+    let plain_geometry = item.edit.rot90 % 4 == 0 && item.edit.fine_angle.abs() <= 0.01;
+    let (mut p, w, h): (Cow<[u8]>, usize, usize) = if plain_geometry {
+        (Cow::Borrowed(pix.as_slice()), *fw, *fh)
+    } else {
+        let (v, w, h) = geometry(pix, *fw, *fh, &item.edit);
+        (Cow::Owned(v), w, h)
+    };
     if item.edit.is_color_touched() {
+        let p = p.to_mut();
         if let Some(sel) = &item.edit.selection {
             let mask = ops::selection_mask(sel, w, h);
-            blur::blur_apply_masked(&mut p, &mask, w, h, item.edit.blur);
+            blur::blur_apply_masked(p, &mask, w, h, item.edit.blur);
             if !item.edit.levels.is_identity() {
-                levels::levels_apply_masked(&mut p, &mask, &item.edit.levels.build_tables());
+                levels::levels_apply_masked(p, &mask, &item.edit.levels.build_tables());
             }
-            item.edit.curves.apply_masked(&mut p, &mask);
+            item.edit.curves.apply_masked(p, &mask);
             ops::adjust_masked(
-                &mut p,
+                p,
                 &mask,
                 item.edit.brightness,
                 item.edit.contrast,
                 item.edit.saturation,
                 item.edit.warmth,
             );
-            noise::noise_add_masked(&mut p, &mask, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
+            noise::noise_add_masked(p, &mask, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
         } else {
-            blur::blur_apply(&mut p, w, h, item.edit.blur);
+            blur::blur_apply(p, w, h, item.edit.blur);
             if !item.edit.levels.is_identity() {
-                levels::levels_apply(&mut p, &item.edit.levels.build_tables());
+                levels::levels_apply(p, &item.edit.levels.build_tables());
             }
-            item.edit.curves.apply(&mut p);
+            item.edit.curves.apply(p);
             ops::adjust(
-                &mut p,
+                p,
                 item.edit.brightness,
                 item.edit.contrast,
                 item.edit.saturation,
                 item.edit.warmth,
             );
-            noise::noise_add(&mut p, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
+            noise::noise_add(p, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
         }
     }
 
-    // Composite onto the full geometry-corrected canvas, then crop.
+    // Composite onto the full geometry-corrected canvas, then crop+scale
+    // straight into the export canvas (one resample instead of two).
     let base = web::create_canvas(w as u32, h as u32);
     web::put_pixels(&base, &p, w as u32, h as u32);
+    drop(p);
     composite_layers(&base, &item.layers, w, h);
 
     let (cx, cy, cw, ch) = crop_px(&item.edit, w, h);
-    let work = web::create_canvas(cw as u32, ch as u32);
-    web::ctx2d(&work)
-        .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
-            &base, cx as f64, cy as f64, cw as f64, ch as f64,
-            0.0, 0.0, cw as f64, ch as f64,
-        )
-        .unwrap();
-
     let (ew, eh) = item.edit.aspect.export_dims(cw, ch);
     let out = web::create_canvas(ew as u32, eh as u32);
     web::ctx2d(&out)
-        .draw_image_with_html_canvas_element_and_dw_and_dh(&work, 0.0, 0.0, ew as f64, eh as f64)
+        .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+            &base, cx as f64, cy as f64, cw as f64, ch as f64,
+            0.0, 0.0, ew as f64, eh as f64,
+        )
         .unwrap();
+    drop(base);
     let format = state.photo_format.get_untracked();
     let encoded = match format {
         PhotoFormat::Jpeg => web::canvas_to_jpeg_blob(&out, 0.92).await,
@@ -2772,23 +2866,19 @@ thread_local! {
 }
 
 fn item_sig(item: &MediaItem, ord: usize) -> ItemSig {
-    let (gen, is_raw) = CACHE.with(|c| {
+    let (gen, is_raw, raw_len) = CACHE.with(|c| {
         let c = c.borrow();
-        (
-            c.photos.get(&item.id).map(|p| p.gen).unwrap_or(0),
-            c.raw_bytes.contains_key(&item.id),
-        )
+        match c.photos.get(&item.id) {
+            Some(p) => (p.gen, p.raw, p.raw_len),
+            None => (0, false, 0),
+        }
     });
     let bytes = match item.kind {
         MediaKind::Video => BytesSig::Video(
             CACHE.with(|c| c.borrow().video_blobs.get(&item.id).map(|b| b.size() as u64))
                 .unwrap_or(0),
         ),
-        MediaKind::Photo if is_raw => BytesSig::Raw(
-            CACHE.with(|c| c.borrow().raw_bytes.get(&item.id).map(|b| b.len() as u64))
-                .unwrap_or(0),
-            gen,
-        ),
+        MediaKind::Photo if is_raw => BytesSig::Raw(raw_len, gen),
         MediaKind::Photo => BytesSig::Photo(item.object_url.clone(), gen),
     };
     let mut raster_layers: Vec<usize> = item
@@ -2853,6 +2943,7 @@ async fn persist_session(state: AppState) {
     for id in &gone {
         let _ = session::delete_layer_pixels(&db, *id).await;
     }
+    let _ = session::delete_raw_assets(&db, &gone).await;
     let _ = session::delete_items(&db, &gone).await;
     SESSION_SIGS.with(|s| {
         let mut s = s.borrow_mut();
@@ -2910,32 +3001,47 @@ async fn persist_session(state: AppState) {
             None => session::jset(rec_v, "taken", JsValue::NULL),
         }
 
-        // Bytes: rewrite only when the bytes signature moved; otherwise carry
-        // the stored blob over (put() replaces the whole record).
+        // Bytes: a lazy RAW's original lives in the raw_src store, so its
+        // record carries only the length. Other items embed a source blob.
+        // Rewrite only when the bytes signature moved; otherwise carry the
+        // stored blob over (put() replaces the whole record).
         let bytes_moved = prev.as_ref().map(|p| p.bytes != sig.bytes).unwrap_or(true);
         let gen = match &sig.bytes {
             BytesSig::Photo(_, g) | BytesSig::Raw(_, g) => *g,
             BytesSig::Video(_) => 0,
         };
         let healed = item.kind == MediaKind::Photo && gen > 0;
+        // A RAW whose original never reached raw_src (quota, private mode) has
+        // no lazy record to point at — it must embed its bytes like a legacy
+        // RAW or it would vanish on reload.
+        let raw_persisted = CACHE.with(|c| {
+            c.borrow().photos.get(&item.id).map(|p| p.raw_persisted).unwrap_or(true)
+        });
+        let lazy_raw = matches!(sig.bytes, BytesSig::Raw(_, 0)) && !healed && raw_persisted;
         session::jset(rec_v, "raw", matches!(sig.bytes, BytesSig::Raw(_, _)) && !healed);
         session::jset(rec_v, "raster", healed);
         let mut persisted_png: Option<Blob> = None;
-        if bytes_moved {
+        if lazy_raw {
+            let raw_len = match &sig.bytes {
+                BytesSig::Raw(l, _) => *l,
+                _ => 0,
+            };
+            session::jset(rec_v, "rawlen", raw_len as f64);
+        } else if bytes_moved {
             let blob: Option<Blob> = match &sig.bytes {
                 BytesSig::Video(_) => {
                     CACHE.with(|c| c.borrow().video_blobs.get(&item.id).cloned())
                 }
-                BytesSig::Raw(_, 0) => CACHE.with(|c| {
-                    c.borrow()
-                        .raw_bytes
-                        .get(&item.id)
-                        .and_then(|b| web::bytes_to_blob(b, "application/octet-stream").ok())
-                }),
                 BytesSig::Photo(url, 0) => match web::object_url_bytes(url).await {
                     Ok(b) => web::bytes_to_blob(&b, "application/octet-stream").ok(),
                     Err(_) => None,
                 },
+                // RAW original that never made it into raw_src: embed the
+                // bytes we kept in the cache for exactly this fallback.
+                BytesSig::Raw(_, 0) => CACHE.with(|c| {
+                    c.borrow().raw_fallback.get(&item.id).cloned()
+                })
+                .and_then(|b| web::bytes_to_blob(&b, "application/octet-stream").ok()),
                 // Healed: the cache's full-res raster is the source of truth.
                 // gen moved ⇒ the item is dirty ⇒ full is present (dirty
                 // items are eviction-exempt), so the None arm can't fire.
@@ -2980,10 +3086,17 @@ async fn persist_session(state: AppState) {
         for old in prev_rasters.iter().filter(|id| !sig.raster_layers.contains(id)) {
             let _ = session::delete_layer_pixel(&db, item.id, *old).await;
         }
+        let healed_raw = healed && matches!(sig.bytes, BytesSig::Raw(_, _));
         let _ = session::put_item(&db, item.id, rec_v).await;
         SESSION_SIGS.with(|s| {
             s.borrow_mut().insert(item.id, sig);
         });
+        // The baked PNG is now the re-decode source; the original's 25MB copy
+        // in raw_src would otherwise sit there forever.
+        if healed_raw {
+            let _ = session::delete_raw_assets(&db, &[item.id]).await;
+            CACHE.with(|c| c.borrow_mut().raw_fallback.remove(&item.id));
+        }
         // A healed raster just landed in IndexedDB — it becomes the re-decode
         // source and the cache copy is clean (evictable) again.
         if let Some(png) = persisted_png {
@@ -3029,8 +3142,6 @@ fn restore_session(state: AppState) {
         let mut max_id = 0usize;
         for (id, v) in records {
             max_id = max_id.max(id);
-            let Some(bytes_v) = state::jget(&v, "bytes") else { continue };
-            let Ok(blob) = bytes_v.dyn_into::<Blob>() else { continue };
             let name = state::jget(&v, "name")
                 .and_then(|s| s.as_string())
                 .unwrap_or_else(|| "restored".into());
@@ -3070,7 +3181,20 @@ fn restore_session(state: AppState) {
             let next_layer_id = state::jnum(&v, "nlid").unwrap_or(0.0) as usize;
             let taken = state::jnum(&v, "taken");
 
+            // A RAW added by the preview-first importer restores from its
+            // stored preview — no sensor decode, no 25MB read.
+            let lazy_preview = if is_raw && !is_video {
+                match session::get_preview(&db, id).await {
+                    Ok(Some(pv)) => pv.dyn_into::<Blob>().ok(),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
             if is_video {
+                let Some(bytes_v) = state::jget(&v, "bytes") else { continue };
+                let Ok(blob) = bytes_v.dyn_into::<Blob>() else { continue };
                 let url = Url::create_object_url_with_blob(&blob).unwrap_or_default();
                 let Some((dur, w, h)) = probe_video(&url).await else { continue };
                 CACHE.with(|c| {
@@ -3095,22 +3219,76 @@ fn restore_session(state: AppState) {
                     drive_parent_id,
                     drive_baked,
                 });
+            } else if let Some(pv) = lazy_preview {
+                let Ok((img, url)) = web::load_image(&pv).await else { continue };
+                let preview = downscale(&img, 1024);
+                let thumb_url = thumb_object_url(&preview.0, preview.1, preview.2).await;
+                let w = state::jnum(&v, "w").unwrap_or(preview.1 as f64) as usize;
+                let h = state::jnum(&v, "h").unwrap_or(preview.2 as f64) as usize;
+                let raw_len = state::jnum(&v, "rawlen").unwrap_or(0.0) as u64;
+                CACHE.with(|c| {
+                    c.borrow_mut().photos.insert(
+                        id,
+                        Rc::new(PhotoData {
+                            full: None,
+                            full_dims: (w, h),
+                            preview,
+                            dirty: false,
+                            gen: 0,
+                            raw: true,
+                            raw_len,
+                            raw_persisted: true,
+                        }),
+                    )
+                });
+                push_item(state, MediaItem {
+                    id,
+                    kind: MediaKind::Photo,
+                    name,
+                    object_url: url,
+                    thumb_url,
+                    width: w,
+                    height: h,
+                    edit,
+                    layers,
+                    next_layer_id,
+                    exif,
+                    taken,
+                    drive_file_id,
+                    drive_parent_id,
+                    drive_baked,
+                });
             } else if is_raw {
+                // Legacy RAW record: bytes live in the item record. Decode
+                // once, then migrate to the raw_src/previews stores so the
+                // next restore is preview-only.
+                let Some(bytes_v) = state::jget(&v, "bytes") else { continue };
+                let Ok(blob) = bytes_v.dyn_into::<Blob>() else { continue };
                 let Ok(buf) = wasm_bindgen_futures::JsFuture::from(blob.array_buffer()).await
                 else {
                     continue;
                 };
                 let bytes = js_sys::Uint8Array::new(&buf).to_vec();
                 let Ok((full_rgba, fw, fh)) = raw::decode_raw(&bytes) else { continue };
-                CACHE.with(|c| c.borrow_mut().raw_bytes.insert(id, Rc::new(bytes)));
                 let (pp, pw, ph) = downscale_pixels(&full_rgba, fw, fh, 1024);
                 let canvas = web::create_canvas(pw as u32, ph as u32);
                 web::put_pixels(&canvas, &pp, pw as u32, ph as u32);
-                let url = match web::canvas_to_blob(&canvas, "image/png").await {
-                    Ok(b) => Url::create_object_url_with_blob(&b).unwrap_or_default(),
-                    Err(_) => String::new(),
+                let Ok(png) = web::canvas_to_blob(&canvas, "image/png").await else {
+                    continue;
                 };
+                let raw_ok = if let Ok(raw_blob) = web::bytes_to_blob(&bytes, "application/octet-stream") {
+                    session::put_raw_src(&db, id, raw_blob.as_ref()).await.is_ok()
+                } else {
+                    false
+                };
+                let prev_ok = session::put_preview(&db, id, png.as_ref()).await.is_ok();
+                let raw_persisted = raw_ok && prev_ok;
+                let url = Url::create_object_url_with_blob(&png).unwrap_or_default();
                 let thumb_url = thumb_object_url(&pp, pw, ph).await;
+                let raw_len = bytes.len() as u64;
+                if !raw_persisted {
+                    CACHE.with(|c| c.borrow_mut().raw_fallback.insert(id, Rc::new(bytes)));
+                }
                 pworker::load(id, &full_rgba, fw, fh);
                 CACHE.with(|c| {
                     c.borrow_mut().photos.insert(
@@ -3121,6 +3299,9 @@ fn restore_session(state: AppState) {
                             preview: (pp, pw, ph),
                             dirty: false,
                             gen: 0,
+                            raw: true,
+                            raw_len,
+                            raw_persisted,
                         }),
                     )
                 });
@@ -3144,6 +3325,8 @@ fn restore_session(state: AppState) {
                     drive_baked,
                 });
             } else {
+                let Some(bytes_v) = state::jget(&v, "bytes") else { continue };
+                let Ok(blob) = bytes_v.dyn_into::<Blob>() else { continue };
                 let Ok((img, url)) = web::load_image(&blob).await else { continue };
                 let (fw, fh) = (img.natural_width() as usize, img.natural_height() as usize);
                 let preview = downscale(&img, 1024);
@@ -3159,6 +3342,9 @@ fn restore_session(state: AppState) {
                             preview,
                             dirty: false,
                             gen: 0,
+                            raw: false,
+                            raw_len: 0,
+                            raw_persisted: true,
                         }),
                     );
                 });
