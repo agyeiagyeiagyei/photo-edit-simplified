@@ -91,6 +91,50 @@ impl Default for CropRect {
     }
 }
 
+/// Target white-balance temperature that reproduces the camera's as-shot
+/// rendering — the neutral point of `RawAdjust::temp`.
+pub const NEUTRAL_K: f32 = 5500.0;
+
+/// RAW develop adjustments, applied in linear light before the normal
+/// gamma-space colour controls. Identity = camera rendering, untouched.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct RawAdjust {
+    /// White-balance temperature in Kelvin, 2500..9500; NEUTRAL_K = as-shot.
+    pub temp: f32,
+    /// Green/magenta balance -100..100; 0 = neutral, positive = magenta.
+    pub tint: f32,
+    /// Exposure compensation in stops, applied as a linear gain.
+    pub exposure: f32,
+    /// Highlight recovery 0..100 — linear shoulder above the knee.
+    pub highlights: f32,
+    /// Shadow lift 0..100 — soft toe in linear light.
+    pub shadows: f32,
+    /// Shadow chroma-noise suppression 0..100.
+    pub noise: f32,
+    /// Capture (demosaic) sharpening 0..100 — linear unsharp mask.
+    pub sharpen: f32,
+}
+
+impl Default for RawAdjust {
+    fn default() -> Self {
+        RawAdjust {
+            temp: NEUTRAL_K,
+            tint: 0.0,
+            exposure: 0.0,
+            highlights: 0.0,
+            shadows: 0.0,
+            noise: 0.0,
+            sharpen: 0.0,
+        }
+    }
+}
+
+impl RawAdjust {
+    pub fn is_identity(&self) -> bool {
+        *self == RawAdjust::default()
+    }
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct EditParams {
     pub aspect: Aspect,
@@ -115,6 +159,8 @@ pub struct EditParams {
     pub levels: LevelsSettings,
     /// Tone curves per channel + composite. Identity = off.
     pub curves: CurvesSettings,
+    /// RAW develop stages (linear light). Identity = camera rendering.
+    pub raw: RawAdjust,
     /// Active selection mask (rect, lasso, or derived from ML segmentation).
     pub selection: Option<Selection>,
     /// Video trim (start_s, end_s); None = untrimmed.
@@ -140,6 +186,7 @@ impl Default for EditParams {
             grain_mono: true,
             levels: LevelsSettings::default(),
             curves: CurvesSettings::default(),
+            raw: RawAdjust::default(),
             selection: None,
             trim: None,
             keep_audio: true,
@@ -157,5 +204,6 @@ impl EditParams {
             || self.grain > 0.0
             || !self.levels.is_identity()
             || !self.curves.is_identity()
+            || !self.raw.is_identity()
     }
 }

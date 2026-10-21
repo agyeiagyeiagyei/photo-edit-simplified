@@ -12,7 +12,7 @@ use wasm_bindgen::JsCast;
 use pes_pixel::geo::{geometry, hi_target, stamp_stroke};
 use pes_pixel::recipe::{edit_params_from_recipe, selection_from_json};
 use pes_pixel::types::EditParams;
-use pes_pixel::{blur, clone, fill, heal, levels, noise, ops};
+use pes_pixel::{blur, clone, fill, heal, levels, noise, ops, rawops};
 
 thread_local! {
     static BUFFERS: RefCell<HashMap<u32, (Vec<u8>, usize, usize)>> = RefCell::new(HashMap::new());
@@ -81,6 +81,11 @@ fn render_pipeline(
     } else {
         p
     };
+    // Develop stage first: white balance, exposure and the lighting controls
+    // run in linear light, before any gamma-space colour adjustment.
+    if !edit.raw.is_identity() {
+        rawops::apply(&mut buf, tw, th, &edit.raw);
+    }
     if !edit.is_color_touched() {
         return (buf, tw, th);
     }

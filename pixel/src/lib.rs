@@ -10,6 +10,7 @@ pub mod heal;
 pub mod levels;
 pub mod noise;
 pub mod ops;
+pub mod rawops;
 pub mod recipe;
 pub mod stroke;
 pub mod types;

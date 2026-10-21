@@ -7,8 +7,9 @@ mod session;
 mod state;
 mod web;
 
-use pes_pixel::{blur, clone, curves, fill, heal, levels, noise, ops, stroke, wand};
+use pes_pixel::{blur, clone, curves, fill, heal, levels, noise, ops, rawops, stroke, wand};
 use pes_pixel::geo::{crop_px, geometry, hi_target, stamp_stroke, working_dims};
+use pes_pixel::types::RawAdjust;
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -1155,6 +1156,9 @@ fn render_hi(item: &MediaItem, req_w: f64, req_h: f64) -> Option<HiCache> {
     } else {
         p
     };
+    if !item.edit.raw.is_identity() {
+        rawops::apply(&mut buf, tw, th, &item.edit.raw);
+    }
     if item.edit.is_color_touched() {
         if let Some(sel) = &item.edit.selection {
             let mask = ops::selection_mask(sel, tw, th);
@@ -1260,6 +1264,9 @@ async fn render_photo_export(
         let (v, w, h) = geometry(pix, *fw, *fh, &item.edit);
         (Cow::Owned(v), w, h)
     };
+    if !item.edit.raw.is_identity() {
+        rawops::apply(p.to_mut(), w, h, &item.edit.raw);
+    }
     if item.edit.is_color_touched() {
         let p = p.to_mut();
         if let Some(sel) = &item.edit.selection {
@@ -4929,6 +4936,9 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
 
         let (pix, w, h) = &photo.preview;
         let (mut p, w, h) = geometry(pix, *w, *h, &item.edit);
+        if !item.edit.raw.is_identity() {
+            rawops::apply(&mut p, w, h, &item.edit.raw);
+        }
         working.set((w, h));
         let crop = item.edit.crop;
         let cropped_view = tab.get() != Tab::Crop && !crop_is_full(&crop);
@@ -6252,6 +6262,9 @@ fn wand_select(state: AppState, nx: f32, ny: f32) {
     let Some(photo) = get_photo(item.id) else { return };
     let (pix, pw, ph) = &photo.preview;
     let (mut p, w, h) = geometry(pix, *pw, *ph, &item.edit);
+    if !item.edit.raw.is_identity() {
+        rawops::apply(&mut p, w, h, &item.edit.raw);
+    }
     if item.edit.is_color_touched() {
         blur::blur_apply(&mut p, w, h, item.edit.blur);
         if !item.edit.levels.is_identity() {
@@ -6511,6 +6524,7 @@ fn ColorTab(state: AppState) -> impl IntoView {
         }
     };
     view! {
+        <RawPanel state=state />
         {slider("Brightness", |e| e.brightness, |e, v| e.brightness = v)}
         {slider("Contrast", |e| e.contrast, |e, v| e.contrast = v)}
         {slider("Saturation", |e| e.saturation, |e, v| e.saturation = v)}
@@ -6522,6 +6536,94 @@ fn ColorTab(state: AppState) -> impl IntoView {
         <button class="btn dim-btn" on:click=move |_| state.update_current(|e| {
             e.brightness = 0.0; e.contrast = 0.0; e.saturation = 0.0; e.warmth = 0.0;
         })>"Reset color"</button>
+    }
+}
+
+/// Linear-light RAW develop controls. Shown for RAW sources and for any item
+/// carrying RAW edits (a healed RAW becomes a raster but keeps its recipe).
+/// JPEGs have no develop stage, so the panel stays hidden and their recipes
+/// never grow RAW fields.
+#[component]
+fn RawPanel(state: AppState) -> impl IntoView {
+    let is_raw = move || {
+        state
+            .current()
+            .map(|m| {
+                !m.edit.raw.is_identity()
+                    || get_photo(m.id).map(|p| p.raw).unwrap_or(false)
+            })
+            .unwrap_or(false)
+    };
+    let rslider = move |label: &'static str,
+                        min: f64,
+                        max: f64,
+                        step: f64,
+                        get: fn(&RawAdjust) -> f32,
+                        set: fn(&mut RawAdjust, f32),
+                        fmt: fn(f32) -> String| {
+        view! {
+            <label class="slider">
+                <span>{label} ": " {move || {
+                    let Some(m) = state.current() else { return "—".into() };
+                    fmt(get(&m.edit.raw))
+                }}</span>
+                <input
+                    type="range" min=min.to_string() max=max.to_string() step=step.to_string()
+                    prop:value=move || state.current()
+                        .map(|m| get(&m.edit.raw).to_string())
+                        .unwrap_or_default()
+                    on:input=move |ev| {
+                        let v: f32 = event_target_value(&ev).parse().unwrap_or(0.0);
+                        state.update_current(|e| set(&mut e.raw, v));
+                    }
+                />
+            </label>
+        }
+    };
+    view! {
+        <Show when=is_raw fallback=|| ()>
+            <div class="raw-panel">
+                <div class="panel-title">"RAW develop"</div>
+                {rslider(
+                    "Temperature", 2500.0, 9500.0, 50.0,
+                    |r| r.temp, |r, v| r.temp = v,
+                    |v| format!("{v:.0} K"),
+                )}
+                {rslider(
+                    "Tint", -100.0, 100.0, 1.0,
+                    |r| r.tint, |r, v| r.tint = v,
+                    |v| format!("{v:+.0}"),
+                )}
+                {rslider(
+                    "Exposure", -5.0, 5.0, 0.05,
+                    |r| r.exposure, |r, v| r.exposure = v,
+                    |v| format!("{v:+.2} EV"),
+                )}
+                {rslider(
+                    "Highlights", 0.0, 100.0, 1.0,
+                    |r| r.highlights, |r, v| r.highlights = v,
+                    |v| format!("{v:.0}"),
+                )}
+                {rslider(
+                    "Shadows", 0.0, 100.0, 1.0,
+                    |r| r.shadows, |r, v| r.shadows = v,
+                    |v| format!("{v:.0}"),
+                )}
+                {rslider(
+                    "Shadow NR", 0.0, 100.0, 1.0,
+                    |r| r.noise, |r, v| r.noise = v,
+                    |v| format!("{v:.0}"),
+                )}
+                {rslider(
+                    "Demosaic sharpening", 0.0, 100.0, 1.0,
+                    |r| r.sharpen, |r, v| r.sharpen = v,
+                    |v| format!("{v:.0}"),
+                )}
+                <button class="btn dim-btn" on:click=move |_| {
+                    state.update_current(|e| e.raw = RawAdjust::default());
+                }>"Reset RAW"</button>
+            </div>
+        </Show>
     }
 }
 
