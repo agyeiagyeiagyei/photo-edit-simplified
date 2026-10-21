@@ -3542,6 +3542,17 @@ fn restore_session(state: AppState) {
     });
 }
 
+/// Imported Drive files join the star set: the star persists in the manifest,
+/// so "Import starred" can treat it as "should be open" instead of a one-shot
+/// queue, and unstarring stays the way a Drive-backed item is removed again.
+fn star_drive_file(state: AppState, id: &str) {
+    let mut added = false;
+    state.drive_shortlist.update(|s| added = s.insert(id.to_string()));
+    if added {
+        schedule_manifest_save(state);
+    }
+}
+
 fn toggle_star(state: AppState, id: String) {
     let mut unstarred = false;
     state.drive_shortlist.update(|s| {
@@ -3604,6 +3615,11 @@ fn import_drive_files(state: AppState, files: Vec<drive::DriveFile>, missing: Ve
             .drive_error
             .set(Some("A Drive import is already running".into()));
         return;
+    }
+    // Everything imported from the Drive view is starred, so it can be
+    // unstarred (removed) from the filmstrip and survives as part of the set.
+    for f in &files {
+        star_drive_file(state, &f.id);
     }
     spawn_local(async move {
         let Some(mut token) = fresh_drive_token(state).await else {
@@ -4170,11 +4186,19 @@ fn DrivePanel(state: AppState) -> impl IntoView {
         state.drive_open.set(false);
         import_drive_files(state, files, Vec::new());
     };
-    // Import every starred file, including ones outside the current folder
-    // (resolved by id) and ones already in the filmstrip (imported again as
-    // duplicates, so an in-progress edit is never clobbered or skipped).
+    // Import the starred files that aren't open yet, including ones outside the
+    // current folder (resolved by id). Stars stay on imported files, so
+    // re-importing every starred id would duplicate the whole set.
     let import_starred = move |_| {
-        let ids = state.drive_shortlist.get_untracked();
+        let open: HashSet<String> = state.items.with(|v| {
+            v.iter().filter_map(|m| m.drive_file_id.clone()).collect()
+        });
+        let ids: Vec<String> = state.drive_shortlist.with(|s| {
+            s.iter()
+                .filter(|id| !open.contains(*id))
+                .cloned()
+                .collect()
+        });
         if ids.is_empty() {
             return;
         }
@@ -4331,7 +4355,12 @@ fn DrivePanel(state: AppState) -> impl IntoView {
                                     })
                                 }}
                                 {move || {
-                                    let n = state.drive_shortlist.with(|s| s.len());
+                                    let open: HashSet<String> = state.items.with(|v| {
+                                        v.iter().filter_map(|m| m.drive_file_id.clone()).collect()
+                                    });
+                                    let n = state.drive_shortlist.with(|s| {
+                                        s.iter().filter(|id| !open.contains(*id)).count()
+                                    });
                                     (n > 0).then(|| {
                                         view! {
                                             <button class="btn" on:click=import_starred>
