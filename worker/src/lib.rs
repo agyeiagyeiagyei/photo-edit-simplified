@@ -397,6 +397,35 @@ pub fn extract(
     })
 }
 
+fn proxy_result(px: Vec<u8>, w: usize, h: usize, full_w: usize, full_h: usize) -> JsValue {
+    result_obj(&[
+        ("pixels", js_buf(px)),
+        ("w", (w as u32).into()),
+        ("h", (h as u32).into()),
+        ("full_w", (full_w as u32).into()),
+        ("full_h", (full_h as u32).into()),
+    ])
+}
+
+/// Demosaic a RAW in the worker and return a display-resolution proxy, so
+/// import previews never block the main thread or need the full buffer.
+#[wasm_bindgen]
+pub fn raw_proxy(bytes: Uint8Array, max_edge: u32) -> Result<JsValue, JsValue> {
+    let (rgba, w, h) = rawcore::decode_raw(&bytes.to_vec()).map_err(|e| JsValue::from_str(&e))?;
+    let (px, pw, ph) = downscale(&rgba, w, h, max_edge);
+    Ok(proxy_result(px, pw, ph, w, h))
+}
+
+/// Decode the camera's embedded full-size JPEG (no EXIF of its own) into a
+/// display-resolution proxy, correcting orientation from the RAW metadata.
+#[wasm_bindgen]
+pub fn camera_proxy(jpeg: Uint8Array, orientation: u16, max_edge: u32) -> Result<JsValue, JsValue> {
+    let (rgba, w, h) = rawcore::camera_jpeg_rgba(&jpeg.to_vec(), orientation)
+        .ok_or_else(|| JsValue::from_str("camera JPEG decode failed"))?;
+    let (px, pw, ph) = downscale(&rgba, w, h, max_edge);
+    Ok(proxy_result(px, pw, ph, w, h))
+}
+
 fn parse_pts(v: &JsValue) -> Vec<(f32, f32)> {
     let mut out = Vec::new();
     if !Array::is_array(v) {

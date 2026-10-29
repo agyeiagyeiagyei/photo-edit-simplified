@@ -14,7 +14,7 @@ use crate::state::{
 };
 
 const DB_NAME: &str = "pes-session";
-const DB_VERSION: u32 = 2;
+const DB_VERSION: u32 = 3;
 const ITEMS: &str = "items";
 const META: &str = "meta";
 /// Raster layer pixel PNGs, keyed "itemId:layerId" — separate from item
@@ -25,6 +25,10 @@ const LAYER_PIXELS: &str = "layer_pixels";
 /// a 25MB RAW, and the bytes are readable on demand for a lazy develop.
 const RAW_SRC: &str = "raw_src";
 const PREVIEWS: &str = "previews";
+/// Display-resolution RAW proxies (camera JPEG or worker-demosaiced JPEG),
+/// keyed by item id. Let a reload show an editable preview without touching
+/// the 25MB RAW.
+const PROXIES: &str = "proxies";
 
 fn err(e: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&format!("session: {e}"))
@@ -54,6 +58,10 @@ pub async fn open_db() -> Result<Database, JsValue> {
         if !db.store_names().iter().any(|n| n == PREVIEWS) {
             db.create_object_store(PREVIEWS, Default::default())
                 .expect("create previews store");
+        }
+        if !db.store_names().iter().any(|n| n == PROXIES) {
+            db.create_object_store(PROXIES, Default::default())
+                .expect("create proxies store");
         }
     });
     req.await.map_err(err)
@@ -221,14 +229,16 @@ pub async fn delete_raw_assets(db: &Database, ids: &[usize]) -> Result<(), JsVal
         return Ok(());
     }
     let tx = db
-        .transaction(&[RAW_SRC, PREVIEWS], TransactionMode::ReadWrite)
+        .transaction(&[RAW_SRC, PREVIEWS, PROXIES], TransactionMode::ReadWrite)
         .map_err(err)?;
     let raws = tx.object_store(RAW_SRC).map_err(err)?;
     let previews = tx.object_store(PREVIEWS).map_err(err)?;
+    let proxies = tx.object_store(PROXIES).map_err(err)?;
     for id in ids {
         let key = JsValue::from_f64(*id as f64);
         raws.delete(key.clone()).map_err(err)?.await.map_err(err)?;
-        previews.delete(key).map_err(err)?.await.map_err(err)?;
+        previews.delete(key.clone()).map_err(err)?.await.map_err(err)?;
+        proxies.delete(key).map_err(err)?.await.map_err(err)?;
     }
     tx.commit().map_err(err)?.await.map_err(err)?;
     Ok(())
@@ -249,6 +259,31 @@ pub async fn put_preview(db: &Database, id: usize, blob: &JsValue) -> Result<(),
 pub async fn get_preview(db: &Database, id: usize) -> Result<Option<JsValue>, JsValue> {
     let tx = db.transaction(&[PREVIEWS], TransactionMode::ReadOnly).map_err(err)?;
     let store = tx.object_store(PREVIEWS).map_err(err)?;
+    store
+        .get(JsValue::from_f64(id as f64))
+        .map_err(err)?
+        .await
+        .map_err(err)
+}
+
+/// Proxy record: {kind, orientation, bytes, w, h, full_w, full_h}. `bytes` is
+/// a JPEG — the camera's embedded full-size one, or a worker-developed proxy
+/// re-encoded at quality 0.9.
+pub async fn put_proxy(db: &Database, id: usize, value: &JsValue) -> Result<(), JsValue> {
+    let tx = db.transaction(&[PROXIES], TransactionMode::ReadWrite).map_err(err)?;
+    let store = tx.object_store(PROXIES).map_err(err)?;
+    store
+        .put(value, Some(&JsValue::from_f64(id as f64)))
+        .map_err(err)?
+        .await
+        .map_err(err)?;
+    tx.commit().map_err(err)?.await.map_err(err)?;
+    Ok(())
+}
+
+pub async fn get_proxy(db: &Database, id: usize) -> Result<Option<JsValue>, JsValue> {
+    let tx = db.transaction(&[PROXIES], TransactionMode::ReadOnly).map_err(err)?;
+    let store = tx.object_store(PROXIES).map_err(err)?;
     store
         .get(JsValue::from_f64(id as f64))
         .map_err(err)?

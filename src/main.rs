@@ -162,6 +162,10 @@ fn evict_full_lru() {
 /// waiters and nudge items so pending hi-res renders reschedule.
 fn materialize_full(state: AppState, id: usize, pixels: Vec<u8>, w: usize, h: usize) {
     pworker::load(id, &pixels, w, h);
+    // Sensor pixels supersede the display proxy (and any render it fed).
+    if proxy_in_mem(id) {
+        drop_proxy(id);
+    }
     CACHE.with(|c| {
         if let Some(p) = c.borrow_mut().photos.get_mut(&id) {
             let p = Rc::make_mut(p);
@@ -257,6 +261,534 @@ async fn ensure_full_async(state: AppState, id: usize) -> bool {
     full_present(id)
 }
 
+// --- display proxies for lazy RAW items ---------------------------------------
+// A RAW import shows the camera's embedded JPEG immediately, then develops a
+// display-resolution proxy in a second worker. Proxies live outside PhotoData:
+// their lifetime is independent of preview rebuilds, and their worker ids sit
+// in a separate namespace so a proxy and the sensor buffer can coexist for the
+// same item while the develop lands.
+
+/// Long edge of a display proxy — the same cap as the hi-res cache, so the
+/// settled canvas renders from a proxy at full display density.
+const PROXY_EDGE: u32 = HI_MAX_EDGE as u32;
+/// Worker id namespace for proxy buffers (item ids stay small).
+const PROXY_WID: usize = 0x8000_0000;
+/// Main-side proxy budget. Each live proxy is mirrored in the worker, so the
+/// real footprint is ~2x this (three 3200×2133 proxies).
+const PROXY_BUDGET: usize = 160 << 20;
+/// A sensor develop takes seconds; let the selection settle first so flicking
+/// through the strip never starts one.
+const PROXY_DEVELOP_DELAY_MS: i32 = 2000;
+
+struct ProxyData {
+    pixels: Rc<Vec<u8>>,
+    w: usize,
+    h: usize,
+    /// True sensor-frame dims (the proxy pixels are capped below this).
+    frame: (usize, usize),
+    /// False while this is the camera JPEG, true once sensor pixels landed.
+    developed: bool,
+}
+
+thread_local! {
+    static PROXY_CACHE: RefCell<HashMap<usize, Rc<ProxyData>>> = RefCell::new(HashMap::new());
+    static PROXY_INFLIGHT: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+    static PROXY_LAST_USE: RefCell<HashMap<usize, u64>> = RefCell::new(HashMap::new());
+    /// Proxy-content version, mixed into render fingerprints. Never use
+    /// photo.gen for this — for RAW items gen > 0 means "healed".
+    static PROXY_GEN: RefCell<HashMap<usize, u64>> = RefCell::new(HashMap::new());
+    /// Item whose sensor develop the UI is waiting on.
+    static PROXY_UPGRADE_WANT: Cell<Option<usize>> = const { Cell::new(None) };
+    static PROXY_UPGRADE_BUSY: Cell<bool> = const { Cell::new(false) };
+    static PROXY_UPGRADE_TIMER: Cell<u32> = const { Cell::new(0) };
+    /// Newest hover decode. A request superseded while another decode runs is
+    /// dropped; selected-item requests are never gated.
+    static PROXY_DECODE_WANT: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+fn proxy_wid(id: usize) -> usize {
+    PROXY_WID | id
+}
+
+fn proxy_gen(id: usize) -> u64 {
+    PROXY_GEN.with(|g| g.borrow().get(&id).copied().unwrap_or(0))
+}
+
+fn bump_proxy_gen(id: usize) {
+    PROXY_GEN.with(|g| {
+        let mut g = g.borrow_mut();
+        *g.entry(id).or_insert(0) += 1;
+    });
+}
+
+fn proxy_in_mem(id: usize) -> bool {
+    PROXY_CACHE.with(|c| c.borrow().contains_key(&id))
+}
+
+fn proxy_data(id: usize) -> Option<Rc<ProxyData>> {
+    PROXY_CACHE.with(|c| c.borrow().get(&id).cloned())
+}
+
+fn proxy_developed(id: usize) -> bool {
+    PROXY_CACHE.with(|c| c.borrow().get(&id).map(|p| p.developed).unwrap_or(false))
+}
+
+fn touch_proxy(id: usize) {
+    let t = USE_TICK.with(|t| {
+        t.set(t.get() + 1);
+        t.get()
+    });
+    PROXY_LAST_USE.with(|l| l.borrow_mut().insert(id, t));
+}
+
+/// Forget an item's proxy: worker copy, cache entry, and — so any render the
+/// superseded pixels could feed is invalidated — a version bump.
+fn drop_proxy(id: usize) {
+    let had = PROXY_CACHE.with(|c| c.borrow_mut().remove(&id).is_some());
+    PROXY_LAST_USE.with(|l| l.borrow_mut().remove(&id));
+    if !had {
+        return;
+    }
+    pworker::unload(proxy_wid(id));
+    bump_proxy_gen(id);
+    LOUPE_SRC.with(|s| {
+        if matches!(&*s.borrow(), Some((sid, ..)) if *sid == id) {
+            *s.borrow_mut() = None;
+        }
+    });
+}
+
+/// Full cleanup when an item leaves the session.
+fn purge_proxy(id: usize) {
+    drop_proxy(id);
+    PROXY_GEN.with(|g| g.borrow_mut().remove(&id));
+    PROXY_UPGRADE_WANT.with(|w| {
+        if w.get() == Some(id) {
+            w.set(None);
+        }
+    });
+    PROXY_DECODE_WANT.with(|w| {
+        if w.get() == Some(id) {
+            w.set(None);
+        }
+    });
+}
+
+/// Drop least-recently-used proxies while over budget. The item just landed,
+/// the selected item, and both hover loupes are protected — evicting what the
+/// UI is about to draw would only start another decode.
+fn evict_proxy_lru(state: AppState, keep: usize) {
+    let victims: Vec<usize> = {
+        let total: usize =
+            PROXY_CACHE.with(|c| c.borrow().values().map(|p| p.pixels.len()).sum());
+        if total <= PROXY_BUDGET {
+            return;
+        }
+        let selected = state.selected.get_untracked();
+        let loupe = state.loupe.get_untracked().map(|(id, ..)| id);
+        let canvas_loupe = state.canvas_loupe.get_untracked().map(|(id, ..)| id);
+        let mut candidates: Vec<(u64, usize, usize)> = PROXY_CACHE.with(|c| {
+            c.borrow()
+                .iter()
+                .filter(|(id, _)| {
+                    **id != keep
+                        && Some(**id) != selected
+                        && Some(**id) != loupe
+                        && Some(**id) != canvas_loupe
+                })
+                .map(|(id, p)| {
+                    (
+                        PROXY_LAST_USE.with(|l| l.borrow().get(id).copied()).unwrap_or(0),
+                        *id,
+                        p.pixels.len(),
+                    )
+                })
+                .collect()
+        });
+        candidates.sort_by_key(|c| c.0);
+        let mut total = total;
+        let mut victims = Vec::new();
+        for (_, id, len) in candidates {
+            if total <= PROXY_BUDGET {
+                break;
+            }
+            victims.push(id);
+            total -= len;
+        }
+        victims
+    };
+    for id in victims {
+        drop_proxy(id);
+    }
+}
+
+struct DecodedProxy {
+    pixels: Vec<u8>,
+    w: usize,
+    h: usize,
+    frame: (usize, usize),
+    developed: bool,
+}
+
+/// Install a decoded proxy: cache, worker, dims, version bump. False when the
+/// item stopped being lazy (removed, healed, or full pixels landed) meanwhile.
+fn land_proxy(state: AppState, id: usize, decoded: DecodedProxy) -> bool {
+    let lazy = CACHE.with(|c| {
+        c.borrow()
+            .photos
+            .get(&id)
+            .map(|p| p.raw && p.full.is_none())
+            .unwrap_or(false)
+    });
+    if !lazy {
+        return false;
+    }
+    // Never downgrade a sensor develop that landed while this was decoding.
+    if !decoded.developed && proxy_developed(id) {
+        return false;
+    }
+    let px = Rc::new(decoded.pixels);
+    pworker::load(proxy_wid(id), &px, decoded.w, decoded.h);
+    CACHE.with(|c| {
+        if let Some(p) = c.borrow_mut().photos.get_mut(&id) {
+            let p = Rc::make_mut(p);
+            if p.full.is_none() && p.raw && decoded.frame.0 > 0 && decoded.frame.1 > 0 {
+                p.full_dims = decoded.frame;
+            }
+        }
+    });
+    PROXY_CACHE.with(|c| {
+        c.borrow_mut().insert(
+            id,
+            Rc::new(ProxyData {
+                pixels: px.clone(),
+                w: decoded.w,
+                h: decoded.h,
+                frame: decoded.frame,
+                developed: decoded.developed,
+            }),
+        );
+    });
+    touch_proxy(id);
+    bump_proxy_gen(id);
+    evict_proxy_lru(state, id);
+    state.items.update(|_| {});
+    true
+}
+
+struct StoredProxy {
+    kind: String,
+    orientation: u16,
+    bytes: Vec<u8>,
+    frame: (usize, usize),
+}
+
+fn camera_proxy_record(jpeg: &[u8], orientation: u16, frame: (usize, usize)) -> JsValue {
+    let o = js_sys::Object::new();
+    session::jset(&o, "kind", "camera");
+    session::jset(&o, "orientation", orientation as f64);
+    let arr = js_sys::Uint8Array::from(jpeg);
+    session::jset(&o, "bytes", arr.buffer());
+    session::jset(&o, "full_w", frame.0 as f64);
+    session::jset(&o, "full_h", frame.1 as f64);
+    o.into()
+}
+
+fn developed_proxy_record(jpeg: &[u8], frame: (usize, usize)) -> JsValue {
+    let o = js_sys::Object::new();
+    session::jset(&o, "kind", "raw");
+    session::jset(&o, "orientation", 1.0);
+    let arr = js_sys::Uint8Array::from(jpeg);
+    session::jset(&o, "bytes", arr.buffer());
+    session::jset(&o, "full_w", frame.0 as f64);
+    session::jset(&o, "full_h", frame.1 as f64);
+    o.into()
+}
+
+fn parse_proxy_record(v: &JsValue) -> Option<StoredProxy> {
+    let kind = state::jget(v, "kind")?.as_string()?;
+    let orientation = state::jnum(v, "orientation").unwrap_or(1.0) as u16;
+    let bytes = state::jget(v, "bytes")?;
+    let bytes = js_sys::Uint8Array::new(&bytes).to_vec();
+    if bytes.is_empty() {
+        return None;
+    }
+    let frame = (
+        state::jnum(v, "full_w").unwrap_or(0.0) as usize,
+        state::jnum(v, "full_h").unwrap_or(0.0) as usize,
+    );
+    Some(StoredProxy { kind, orientation, bytes, frame })
+}
+
+async fn read_proxy_record(id: usize) -> Option<StoredProxy> {
+    let db = session::open_db().await.ok()?;
+    let v = session::get_proxy(&db, id).await.ok()??;
+    parse_proxy_record(&v)
+}
+
+/// Orientation-corrected pixel dims of an embedded JPEG whose own dims are not.
+fn oriented_dims(w: usize, h: usize, orientation: u16) -> (usize, usize) {
+    if (5..=8).contains(&orientation) {
+        (h, w)
+    } else {
+        (w, h)
+    }
+}
+
+/// Poll the worker callback until it fires (the raw worker has no awaitable
+/// API). 60 s covers a slow develop on a large sensor.
+async fn await_proxy(
+    start: impl FnOnce(Box<dyn FnOnce(Option<pworker::ProxyResult>)>) -> bool,
+) -> Option<pworker::ProxyResult> {
+    let out: Rc<RefCell<Option<pworker::ProxyResult>>> = Rc::new(RefCell::new(None));
+    let done = Rc::new(Cell::new(false));
+    let (o, d) = (out.clone(), done.clone());
+    let started = start(Box::new(move |r| {
+        *o.borrow_mut() = r;
+        d.set(true);
+    }));
+    if !started {
+        return None;
+    }
+    for _ in 0..6000 {
+        if done.get() {
+            break;
+        }
+        sleep_ms(10).await;
+    }
+    let result = out.borrow_mut().take();
+    result
+}
+
+async fn camera_proxy_async(jpeg: &[u8], orientation: u16) -> Option<pworker::ProxyResult> {
+    let jpeg = jpeg.to_vec();
+    await_proxy(move |cb| pworker::camera_proxy(&jpeg, orientation, PROXY_EDGE, cb)).await
+}
+
+async fn raw_proxy_async(bytes: &[u8]) -> Option<pworker::ProxyResult> {
+    let bytes = bytes.to_vec();
+    await_proxy(move |cb| pworker::raw_proxy(&bytes, PROXY_EDGE, cb)).await
+}
+
+async fn raw_source_bytes(id: usize) -> Option<Rc<Vec<u8>>> {
+    if let Some(b) = CACHE.with(|c| c.borrow().raw_fallback.get(&id).cloned()) {
+        return Some(b);
+    }
+    session::load_raw_bytes(id).await.map(Rc::new)
+}
+
+/// Decode a stored proxy record. A "raw" record is already sensor pixels —
+/// only a JPEG decode remains; a "camera" record still needs the WASM decode.
+async fn decode_stored_proxy(rec: StoredProxy) -> Option<DecodedProxy> {
+    if rec.kind == "raw" {
+        let blob = web::bytes_to_blob(&rec.bytes, "image/jpeg").ok()?;
+        let (img, url) = web::load_image(&blob).await.ok()?;
+        let _ = Url::revoke_object_url(&url);
+        let (px, w, h) = web::rgba_from_image(&img);
+        Some(DecodedProxy { pixels: px, w, h, frame: rec.frame, developed: true })
+    } else {
+        let r = camera_proxy_async(&rec.bytes, rec.orientation).await?;
+        let frame = if rec.frame.0 > 0 { rec.frame } else { (r.full_w, r.full_h) };
+        Some(DecodedProxy { pixels: r.pixels, w: r.w, h: r.h, frame, developed: false })
+    }
+}
+
+/// First decode for an item with no proxy record: prefer the camera JPEG (and
+/// persist a record for next time), else develop fully in the worker.
+async fn decode_camera_from_raw(id: usize, bytes: &[u8]) -> Option<DecodedProxy> {
+    if let Some((jpeg, jw, jh)) = raw::largest_embedded_jpeg(bytes) {
+        let orientation = raw::orientation_code(bytes);
+        let frame = oriented_dims(jw, jh, orientation);
+        if let Some(r) = camera_proxy_async(&jpeg, orientation).await {
+            let frame = if frame.0 > 0 { frame } else { (r.full_w, r.full_h) };
+            if let Ok(db) = session::open_db().await {
+                let _ = session::put_proxy(&db, id, &camera_proxy_record(&jpeg, orientation, frame))
+                    .await;
+            }
+            return Some(DecodedProxy { pixels: r.pixels, w: r.w, h: r.h, frame, developed: false });
+        }
+    }
+    let r = raw_proxy_async(bytes).await?;
+    Some(DecodedProxy {
+        pixels: r.pixels,
+        w: r.w,
+        h: r.h,
+        frame: (r.full_w, r.full_h),
+        developed: true,
+    })
+}
+
+async fn decode_proxy_source(id: usize, priority: bool) -> Option<DecodedProxy> {
+    if !priority && PROXY_DECODE_WANT.with(|w| w.get()) != Some(id) {
+        return None;
+    }
+    if let Some(rec) = read_proxy_record(id).await {
+        return decode_stored_proxy(rec).await;
+    }
+    if !priority && PROXY_DECODE_WANT.with(|w| w.get()) != Some(id) {
+        return None;
+    }
+    let bytes = raw_source_bytes(id).await?;
+    decode_camera_from_raw(id, &bytes).await
+}
+
+/// Ask for sensor pixels for `id`, debounced so a develop only starts after
+/// the selection has been stable for a moment.
+fn request_upgrade(state: AppState, id: usize) {
+    PROXY_UPGRADE_WANT.with(|w| w.set(Some(id)));
+    schedule_pump(state, PROXY_DEVELOP_DELAY_MS);
+}
+
+fn schedule_pump(state: AppState, ms: i32) {
+    PROXY_UPGRADE_TIMER.with(|t| t.set(t.get() + 1));
+    let gen = PROXY_UPGRADE_TIMER.with(|t| t.get());
+    let cb = Closure::once(move || {
+        if PROXY_UPGRADE_TIMER.with(|t| t.get()) != gen {
+            return;
+        }
+        pump_upgrade(state);
+    });
+    let _ = web::window().set_timeout_with_callback_and_timeout_and_arguments_0(
+        cb.as_ref().unchecked_ref(),
+        ms,
+    );
+    cb.forget();
+}
+
+/// Start the single in-flight sensor develop if the UI still wants it.
+fn pump_upgrade(state: AppState) {
+    if PROXY_UPGRADE_BUSY.with(|b| b.get()) {
+        return;
+    }
+    let Some(id) = PROXY_UPGRADE_WANT.with(|w| w.get()) else { return };
+    let Some(photo) = get_photo(id) else { return };
+    if !photo.raw || photo.full.is_some() {
+        return;
+    }
+    // The user moved on; a new selection re-arms the request.
+    if state.selected.get_untracked() != Some(id) {
+        return;
+    }
+    if !proxy_in_mem(id) {
+        // Still decoding the camera proxy: it anchors the frame dims and is
+        // the fallback if the develop fails, so wait for it.
+        if PROXY_INFLIGHT.with(|f| f.borrow().contains(&id)) {
+            schedule_pump(state, 600);
+        }
+        return;
+    }
+    if proxy_developed(id) {
+        return;
+    }
+    if pworker::raw_busy() {
+        schedule_pump(state, 700);
+        return;
+    }
+    PROXY_UPGRADE_BUSY.with(|b| b.set(true));
+    spawn_local(async move {
+        let decoded = match raw_source_bytes(id).await {
+            Some(bytes) => raw_proxy_async(&bytes).await,
+            None => None,
+        };
+        PROXY_UPGRADE_BUSY.with(|b| b.set(false));
+        if let Some(r) = decoded {
+            let frame = if r.full_w > 0 && r.full_h > 0 {
+                (r.full_w, r.full_h)
+            } else {
+                photo.full_dims
+            };
+            let landed = land_proxy(
+                state,
+                id,
+                DecodedProxy { pixels: r.pixels, w: r.w, h: r.h, frame, developed: true },
+            );
+            if landed {
+                if let Some(p) = proxy_data(id) {
+                    persist_developed_proxy(id, p.pixels.clone(), p.w, p.h, p.frame);
+                }
+            }
+        }
+        pump_upgrade(state);
+    });
+}
+
+/// Persist a sensor-developed proxy as a q0.9 JPEG, so a reload skips both the
+/// RAW read and the demosaic. Skipped if the item stopped being lazy while the
+/// encode ran (heal/cut bake new pixels and purge proxy records).
+fn persist_developed_proxy(id: usize, px: Rc<Vec<u8>>, w: usize, h: usize, frame: (usize, usize)) {
+    spawn_local(async move {
+        let canvas = web::create_canvas(w as u32, h as u32);
+        web::put_pixels(&canvas, &px, w as u32, h as u32);
+        let Ok(blob) = web::canvas_to_jpeg_blob(&canvas, 0.9).await else { return };
+        let still_lazy = CACHE.with(|c| {
+            c.borrow()
+                .photos
+                .get(&id)
+                .map(|p| p.raw && p.full.is_none())
+                .unwrap_or(false)
+        });
+        if !still_lazy {
+            return;
+        }
+        let Ok(bytes) = web::blob_to_bytes(&blob).await else { return };
+        let Ok(db) = session::open_db().await else { return };
+        let _ = session::put_proxy(&db, id, &developed_proxy_record(&bytes, frame)).await;
+    });
+}
+
+/// Make a display proxy available. Non-RAW items use the ordinary full decode.
+/// `develop` marks calls that want sensor pixels (selection, settled render) —
+/// it queues the background develop; hover-only calls just load the JPEG.
+fn ensure_proxy(state: AppState, id: usize, develop: bool) {
+    let Some(photo) = get_photo(id) else { return };
+    if !photo.raw {
+        ensure_full(state, id, None);
+        return;
+    }
+    if photo.full.is_some() {
+        return;
+    }
+    touch_proxy(id);
+    if proxy_in_mem(id) {
+        if develop && !proxy_developed(id) {
+            request_upgrade(state, id);
+        }
+        return;
+    }
+    if develop {
+        request_upgrade(state, id);
+    }
+    if !pworker::proxy_worker_available() {
+        // No worker: decode on the main thread rather than stall on a proxy
+        // that can never upgrade.
+        ensure_full(state, id, None);
+        return;
+    }
+    PROXY_DECODE_WANT.with(|w| w.set(Some(id)));
+    if !PROXY_INFLIGHT.with(|f| f.borrow_mut().insert(id)) {
+        return;
+    }
+    spawn_local(async move {
+        let decoded = decode_proxy_source(id, develop).await;
+        PROXY_INFLIGHT.with(|f| f.borrow_mut().remove(&id));
+        if let Some(d) = decoded {
+            land_proxy(state, id, d);
+        }
+    });
+}
+
+/// Worker id + pixel dims to render from: sensor pixels when loaded, else the
+/// display proxy.
+fn render_source(id: usize, photo: &PhotoData) -> (usize, (usize, usize)) {
+    if let Some((_, w, h)) = &photo.full {
+        (id, (*w, *h))
+    } else if let Some(p) = proxy_data(id) {
+        (proxy_wid(id), (p.w, p.h))
+    } else {
+        (id, photo.full_dims)
+    }
+}
+
 /// Drop an item from the filmstrip: revoke its object URLs and free its
 /// cached pixels/video blob.
 fn remove_item(state: AppState, item_id: usize) {
@@ -281,6 +813,7 @@ fn remove_item(state: AppState, item_id: usize) {
     });
     LAST_USE.with(|l| l.borrow_mut().remove(&item_id));
     FULL_WAITERS.with(|w| w.borrow_mut().remove(&item_id));
+    purge_proxy(item_id);
     pworker::unload(item_id);
     // An item removed before its first session save never reaches the
     // persist pass that purges `gone` records; clear its RAW/preview blobs
@@ -348,12 +881,26 @@ async fn prepare_raw(id: usize, bytes: &[u8], mtime: Option<f64>) -> Option<RawI
     web::put_pixels(&canvas, &pp, pw2 as u32, ph2 as u32);
     let png = web::canvas_to_blob(&canvas, "image/png").await.ok()?;
 
+    // The camera's full-size JPEG is the instant display proxy; storing it
+    // lets a reload open editable at 3200px without touching the RAW.
+    let camera = raw::largest_embedded_jpeg(bytes).map(|(jpeg, jw, jh)| {
+        let orientation = raw::orientation_code(bytes);
+        (jpeg, orientation, oriented_dims(jw, jh, orientation))
+    });
+
     let stored = {
         let db = session::open_db().await.ok()?;
         let raw_blob = web::bytes_to_blob(bytes, "application/octet-stream").ok()?;
         let a = session::put_raw_src(&db, id, raw_blob.as_ref()).await;
         let b = session::put_preview(&db, id, png.as_ref()).await;
-        a.is_ok() && b.is_ok()
+        let ok = a.is_ok() && b.is_ok();
+        if ok {
+            if let Some((jpeg, orientation, frame)) = &camera {
+                let rec = camera_proxy_record(jpeg, *orientation, *frame);
+                let _ = session::put_proxy(&db, id, &rec).await;
+            }
+        }
+        ok
     };
 
     let full = if stored {
@@ -367,7 +914,12 @@ async fn prepare_raw(id: usize, bytes: &[u8], mtime: Option<f64>) -> Option<RawI
             let d = (*fw, *fh);
             (d, downscale_pixels(fpx, *fw, *fh, 1024))
         }
-        None => ((pw, ph), (pp, pw2, ph2)),
+        // Camera frame dims keep the hi-res target sized to the sensor, not
+        // the small embedded preview rawler exposes.
+        None => (
+            camera.as_ref().map(|(_, _, f)| *f).unwrap_or((pw, ph)),
+            (pp, pw2, ph2),
+        ),
     };
     let object_url = Url::create_object_url_with_blob(&png).ok()?;
     let thumb_url = thumb_object_url(&preview.0, preview.1, preview.2).await;
@@ -1013,10 +1565,11 @@ thread_local! {
 
 /// Content identity for the hi cache: everything that changes the rendered
 /// pixels EXCEPT the crop rect (crop only reframes the blit).
-fn content_fingerprint(item: &MediaItem, photo_gen: u64) -> u64 {
+fn content_fingerprint(item: &MediaItem, photo_gen: u64, proxy_gen: u64) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     h.write_u64(photo_gen);
+    h.write_u64(proxy_gen);
     let e = &item.edit;
     h.write_u8(e.rot90);
     for v in [e.fine_angle, e.brightness, e.contrast, e.saturation, e.warmth, e.blur, e.grain] {
@@ -1158,7 +1711,7 @@ fn resample_pixels(pixels: &[u8], w: usize, h: usize, tw: usize, th: usize) -> V
 /// resolution. Mirrors the preview pipeline and export.
 fn render_hi(item: &MediaItem, req_w: f64, req_h: f64) -> Option<HiCache> {
     let photo = get_photo(item.id)?;
-    let fingerprint = content_fingerprint(item, photo.gen);
+    let fingerprint = content_fingerprint(item, photo.gen, proxy_gen(item.id));
     let (fpix, fw, fh) = photo.full.as_ref()?;
     let (p, ww, wh) = geometry(fpix, *fw, *fh, &item.edit);
     let (tw, th) = hi_target(req_w, req_h, ww, wh, HI_MAX_EDGE as u32);
@@ -1815,15 +2368,16 @@ fn App() -> impl IntoView {
         schedule_session_save(state);
     });
 
-    // Decode the selected photo's full-res pixels on demand; unselected
-    // photos stay preview-only and their decoded buffers are LRU-evicted.
+    // Load the selected photo's display pixels on demand: a RAW gets its
+    // camera proxy first, then a background sensor develop; unselected photos
+    // stay preview-only and their buffers are LRU-evicted.
     create_effect(move |_| {
         let Some(id) = state.selected.get() else { return };
         let is_photo = state
             .items
             .with(|v| v.iter().any(|m| m.id == id && m.kind == MediaKind::Photo));
         if is_photo {
-            ensure_full(state, id, None);
+            ensure_proxy(state, id, true);
         }
     });
 
@@ -1959,7 +2513,7 @@ fn loupe_soon(state: AppState, id: usize, ev: &web_sys::MouseEvent) {
     let gen = state.loupe_gen.get_untracked();
     let cb = wasm_bindgen::closure::Closure::once(move || {
         if state.loupe_gen.get_untracked() == gen {
-            ensure_full(state, id, None);
+            ensure_proxy(state, id, false);
             state.loupe.set(Some((id, nx, ny, cx, cy)));
         }
     });
@@ -1985,11 +2539,12 @@ fn loupe_clear(state: AppState) {
     state.loupe.set(None);
 }
 
-// Preview-res scratch canvas for the loupe's pre-decode placeholder (full-res
-// paints copy the 1:1 crop straight out of the cache instead, so hovering a
-// 25MP photo never materializes a third full-size buffer).
+// Scratch canvas for the loupe's pre-decode placeholder (native-res paints
+// copy the 1:1 crop straight out of the cache instead, so hovering a 25MP
+// photo never materializes a third full-size buffer). Keyed by item and a
+// source version so a proxy upgrade rebuilds it.
 thread_local! {
-    static LOUPE_SRC: RefCell<Option<(usize, web_sys::HtmlCanvasElement, u32, u32)>> =
+    static LOUPE_SRC: RefCell<Option<(usize, u64, web_sys::HtmlCanvasElement, u32, u32)>> =
         RefCell::new(None);
 }
 
@@ -2015,24 +2570,33 @@ fn FocusLoupe(state: AppState) -> impl IntoView {
             canvas.set_height(bh as u32);
         }
         let Some(photo) = get_photo(id) else { return };
-        let has_full = photo.full.is_some();
-        if has_full {
+        let proxy = proxy_data(id);
+        // Native-resolution crop copied row-wise out of whichever buffer the
+        // item has: sensor pixels when loaded, else the display proxy.
+        let copy_crop = |px: &[u8], w: usize, h: usize| -> bool {
+            if w < bw || h < bh {
+                return false;
+            }
+            let sx = ((nx * w as f64 - bw as f64 / 2.0) as isize)
+                .clamp(0, (w - bw) as isize) as usize;
+            let sy = ((ny * h as f64 - bh as f64 / 2.0) as isize)
+                .clamp(0, (h - bh) as isize) as usize;
+            let mut crop = vec![0u8; bw * bh * 4];
+            for row in 0..bh {
+                let src = ((sy + row) * w + sx) * 4;
+                crop[row * bw * 4..(row + 1) * bw * 4].copy_from_slice(&px[src..src + bw * 4]);
+            }
+            web::put_pixels(&canvas, &crop, bw as u32, bh as u32);
+            true
+        };
+        if let Some((px, w, h)) = &photo.full {
             tag.set("1:1");
-            let (px, w, h) = photo.full.as_ref().unwrap();
-            let (w, h) = (*w, *h);
-            if w >= bw && h >= bh {
-                // 1:1 crop copied row-wise out of the cache buffer.
-                let sx = ((nx * w as f64 - bw as f64 / 2.0) as isize)
-                    .clamp(0, (w - bw) as isize) as usize;
-                let sy = ((ny * h as f64 - bh as f64 / 2.0) as isize)
-                    .clamp(0, (h - bh) as isize) as usize;
-                let mut crop = vec![0u8; bw * bh * 4];
-                for row in 0..bh {
-                    let src = ((sy + row) * w + sx) * 4;
-                    crop[row * bw * 4..(row + 1) * bw * 4]
-                        .copy_from_slice(&px[src..src + bw * 4]);
-                }
-                web::put_pixels(&canvas, &crop, bw as u32, bh as u32);
+            if copy_crop(px, *w, *h) {
+                return;
+            }
+        } else if let Some(p) = &proxy {
+            tag.set("1:1 proxy");
+            if copy_crop(&p.pixels, p.w, p.h) {
                 return;
             }
         } else {
@@ -2040,19 +2604,23 @@ fn FocusLoupe(state: AppState) -> impl IntoView {
         }
         // Placeholder path (preview-res, or image smaller than the loupe):
         // paint from a small scratch canvas with scaling.
-        let rebuild = LOUPE_SRC.with(|s| !matches!(&*s.borrow(), Some((sid, ..)) if *sid == id));
+        let ver = photo.gen ^ (proxy_gen(id) << 32);
+        let rebuild = LOUPE_SRC.with(|s| {
+            !matches!(&*s.borrow(), Some((sid, sver, ..)) if *sid == id && *sver == ver)
+        });
         if rebuild {
-            let (px, w, h) = match (&photo.full, has_full) {
-                (Some((px, w, h)), true) => (px.clone(), *w, *h),
-                _ => (photo.preview.0.clone(), photo.preview.1, photo.preview.2),
+            let (px, w, h) = match (&photo.full, &proxy) {
+                (Some((px, w, h)), _) => (px.clone(), *w, *h),
+                (None, Some(p)) => (p.pixels.as_ref().clone(), p.w, p.h),
+                (None, None) => (photo.preview.0.clone(), photo.preview.1, photo.preview.2),
             };
             let scratch = web::create_canvas(w as u32, h as u32);
             web::put_pixels(&scratch, &px, w as u32, h as u32);
-            LOUPE_SRC.with(|s| *s.borrow_mut() = Some((id, scratch, w as u32, h as u32)));
+            LOUPE_SRC.with(|s| *s.borrow_mut() = Some((id, ver, scratch, w as u32, h as u32)));
         }
         LOUPE_SRC.with(|s| {
             let b = s.borrow();
-            let Some((_, scratch, w, h)) = &*b else { return };
+            let Some((_, _, scratch, w, h)) = &*b else { return };
             let (w, h) = (*w as f64, *h as f64);
             let sw = (bw as f64).min(w);
             let sh = (bh as f64).min(h);
@@ -2135,7 +2703,7 @@ fn canvas_loupe_soon(state: AppState, tab: RwSignal<Tab>, ev: &web_sys::PointerE
     let gen = state.canvas_loupe_gen.get_untracked();
     let cb = Closure::once(move || {
         if state.canvas_loupe_gen.get_untracked() == gen {
-            ensure_full(state, id, None);
+            ensure_proxy(state, id, false);
             state.canvas_loupe.set(Some((id, nx, ny, cx, cy)));
         }
     });
@@ -2356,10 +2924,25 @@ fn CanvasLoupe(
                     tag.set(format!("{mag}:1"));
                     return;
                 }
+            } else if let Some(p) = proxy_data(id) {
+                // The proxy covers the same frame at reduced density: map the
+                // window into proxy pixels and let the blit upscale it.
+                let (kx, ky) = (p.w as f64 / ww as f64, p.h as f64 / wh as f64);
+                let px = ((sx as f64 * kx).round() as usize).min(p.w.saturating_sub(1));
+                let py = ((sy as f64 * ky).round() as usize).min(p.h.saturating_sub(1));
+                let pw = ((cw as f64 * kx).round() as usize).max(1).min(p.w - px);
+                let phh = ((ch as f64 * ky).round() as usize).max(1).min(p.h - py);
+                if let Some(win) = source_window(
+                    &p.pixels, p.w, p.h, px, py, pw, phh, &item.edit, id as u32,
+                ) {
+                    blit_window(&canvas, &win, pw as u32, phh as u32, bw as u32, bh as u32);
+                    tag.set(format!("{mag}:1 proxy"));
+                    return;
+                }
             }
         }
 
-        let fp = content_fingerprint(&item, photo.gen);
+        let fp = content_fingerprint(&item, photo.gen, proxy_gen(id));
         let hit = CANVAS_LOUPE_HI.with(|c| {
             let b = c.borrow();
             let hi = b.as_ref()?;
@@ -2423,18 +3006,21 @@ fn CanvasLoupe(
 
         // Kick the full-res edited render. Every kick invalidates the one
         // before it; the store nudges items, re-running this effect.
-        if !full_present(id) {
-            ensure_full(state, id, None);
+        if !full_present(id) && !proxy_in_mem(id) {
+            ensure_proxy(state, id, true);
             return;
         }
         CANVAS_LOUPE_REQ.with(|c| c.set(c.get() + 1));
         let rgen = CANVAS_LOUPE_REQ.with(|c| c.get());
-        let (fw, fh) = working_dims(photo.full_dims.0, photo.full_dims.1, &item.edit);
+        // Size from the source actually being rendered — a proxy render must
+        // not be asked for sensor dimensions it can never produce.
+        let (src_id, (sw, sh)) = render_source(id, &photo);
+        let (fw, fh) = working_dims(sw, sh, &item.edit);
         let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
         let sel = item.edit.selection.clone();
         let item_cb = item.clone();
         let accepted = pworker::render(
-            id,
+            src_id,
             &recipe,
             fw as f64,
             fh as f64,
@@ -5162,14 +5748,16 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         } else {
             (need_w, need_h)
         };
-        // Exact size render_hi would produce for this request — the cache is
-        // sufficient iff it matches, which keeps rebuilds from looping.
-        let (fw, fh) = working_dims(photo.full_dims.0, photo.full_dims.1, &item.edit);
+        // Exact size the render will produce for this request, sized from the
+        // source actually loaded (sensor pixels or the display proxy) — the
+        // cache is sufficient iff it matches, which keeps rebuilds from looping.
+        let (_, (sw, sh)) = render_source(item.id, &photo);
+        let (fw, fh) = working_dims(sw, sh, &item.edit);
         let target = hi_target(req_w, req_h, fw, fh, HI_MAX_EDGE as u32);
 
         let mut hi_dims: Option<(usize, usize)> = None;
         if want_hi {
-            let fp = content_fingerprint(&item, photo.gen);
+            let fp = content_fingerprint(&item, photo.gen, proxy_gen(item.id));
             hi_dims = HI_CACHE.with(|c| {
                 let b = c.borrow();
                 let hi = b.as_ref()?;
@@ -5267,22 +5855,24 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     if item.kind != MediaKind::Photo {
                         return;
                     }
-                    if !full_present(item.id) {
+                    if !full_present(item.id) && !proxy_in_mem(item.id) {
                         // Pixels not decoded yet — kick the loader; its
                         // completion nudge retriggers this effect and
                         // reschedules the hi-res render.
-                        ensure_full(state, item.id, None);
+                        ensure_proxy(state, item.id, true);
                         return;
                     }
+                    let Some(photo) = get_photo(item.id) else { return };
+                    let (src_id, _) = render_source(item.id, &photo);
                     HI_REQ_GEN.with(|d| d.set(d.get() + 1));
                     let rgen = HI_REQ_GEN.with(|d| d.get());
                     let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
                     let sel = item.edit.selection.clone();
-                    let fp = get_photo(item.id).map(|p| content_fingerprint(&item, p.gen));
+                    let fp = Some(content_fingerprint(&item, photo.gen, proxy_gen(item.id)));
                     let item_id = item.id;
                     let item_cb = item.clone();
                     let accepted = pworker::render(
-                        item_id,
+                        src_id,
                         &recipe,
                         req_w,
                         req_h,

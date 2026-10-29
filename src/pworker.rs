@@ -24,6 +24,12 @@ thread_local! {
     /// execution time, so a queued stroke sees the pixels of the prior one.
     static OP_QUEUE: RefCell<VecDeque<Box<dyn FnOnce()>>> = RefCell::new(VecDeque::new());
     static OP_BUSY: Cell<bool> = const { Cell::new(false) };
+    /// Second worker instance for RAW/camera proxy develops — a multi-second
+    /// demosaic there must not block interactive renders on the main worker.
+    static RAW_WORKER: RefCell<Option<Worker>> = const { RefCell::new(None) };
+    static RAW_PENDING: RefCell<HashMap<u32, Box<dyn FnOnce(Reply)>>> = RefCell::new(HashMap::new());
+    static RAW_NEXT_REQ: Cell<u32> = const { Cell::new(1) };
+    static RAW_DEAD: Cell<bool> = const { Cell::new(false) };
 }
 
 pub fn init() {
@@ -104,6 +110,157 @@ fn call(op: &str, args: &[JsValue], transfer: &[JsValue], cb: Box<dyn FnOnce(Rep
         return false;
     }
     true
+}
+
+fn raw_init() -> bool {
+    let started = RAW_WORKER.with(|w| w.borrow().is_some()) || RAW_DEAD.with(|d| d.get());
+    if started {
+        return RAW_WORKER.with(|w| w.borrow().is_some());
+    }
+    let Some(win) = web_sys::window() else { return false };
+    let Ok(href) = win.location().href() else { return false };
+    let Some(i) = href.rfind('/') else { return false };
+    let url = format!("{}pixel-worker/run.js", &href[..=i]);
+    let opts = WorkerOptions::new();
+    opts.set_type(WorkerType::Module);
+    let worker = match Worker::new_with_options(&url, &opts) {
+        Ok(w) => w,
+        Err(_) => {
+            RAW_DEAD.with(|d| d.set(true));
+            return false;
+        }
+    };
+    let onmsg = Closure::<dyn FnMut(MessageEvent)>::new(|e: MessageEvent| {
+        let data = e.data();
+        let Some(id) = Reflect::get(&data, &JsValue::from_str("id"))
+            .ok()
+            .and_then(|v| v.as_f64())
+        else {
+            return;
+        };
+        let ok = Reflect::get(&data, &JsValue::from_str("ok"))
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let key = if ok { "result" } else { "error" };
+        let val = Reflect::get(&data, &JsValue::from_str(key)).unwrap_or(JsValue::UNDEFINED);
+        let cb = RAW_PENDING.with(|p| p.borrow_mut().remove(&(id as u32)));
+        if let Some(cb) = cb {
+            cb(if ok { Ok(val) } else { Err(val) });
+        }
+    });
+    worker.set_onmessage(Some(onmsg.as_ref().unchecked_ref()));
+    onmsg.forget();
+    let onerr = Closure::<dyn FnMut(ErrorEvent)>::new(|_| {
+        RAW_DEAD.with(|d| d.set(true));
+        RAW_WORKER.with(|w| *w.borrow_mut() = None);
+        let cbs: Vec<_> = RAW_PENDING.with(|p| p.borrow_mut().drain().map(|(_, c)| c).collect());
+        for cb in cbs {
+            cb(Err(JsValue::from_str("worker error")));
+        }
+    });
+    worker.set_onerror(Some(onerr.as_ref().unchecked_ref()));
+    onerr.forget();
+    RAW_WORKER.with(|w| *w.borrow_mut() = Some(worker));
+    true
+}
+
+fn raw_call(op: &str, args: &[JsValue], transfer: &[JsValue], cb: Box<dyn FnOnce(Reply)>) -> bool {
+    let worker = RAW_WORKER.with(|w| w.borrow().clone());
+    let Some(worker) = worker else { return false };
+    let id = RAW_NEXT_REQ.with(|n| {
+        let i = n.get();
+        n.set(i + 1);
+        i
+    });
+    RAW_PENDING.with(|p| p.borrow_mut().insert(id, cb));
+    let msg = Object::new();
+    let _ = Reflect::set(&msg, &JsValue::from_str("id"), &JsValue::from(id));
+    let _ = Reflect::set(&msg, &JsValue::from_str("op"), &JsValue::from_str(op));
+    let arr = Array::new();
+    for a in args {
+        arr.push(a);
+    }
+    let _ = Reflect::set(&msg, &JsValue::from_str("args"), &arr);
+    let t = Array::new();
+    for x in transfer {
+        t.push(x);
+    }
+    if worker.post_message_with_transfer(&msg, &t).is_err() {
+        RAW_PENDING.with(|p| p.borrow_mut().remove(&id));
+        return false;
+    }
+    true
+}
+
+pub struct ProxyResult {
+    pub pixels: Vec<u8>,
+    pub w: usize,
+    pub h: usize,
+    pub full_w: usize,
+    pub full_h: usize,
+}
+
+fn parse_proxy(v: &JsValue) -> Option<ProxyResult> {
+    Some(ProxyResult {
+        pixels: get_buf(v, "pixels")?.to_vec(),
+        w: get_u32(v, "w")? as usize,
+        h: get_u32(v, "h")? as usize,
+        full_w: get_u32(v, "full_w")? as usize,
+        full_h: get_u32(v, "full_h")? as usize,
+    })
+}
+
+/// True while a proxy decode is queued or running on the raw worker.
+pub fn raw_busy() -> bool {
+    RAW_PENDING.with(|p| !p.borrow().is_empty())
+}
+
+/// Ensure the raw worker is up; false when it is unavailable (callers fall
+/// back to main-thread decoding).
+pub fn proxy_worker_available() -> bool {
+    raw_init()
+}
+
+/// Develop a RAW to a display-resolution proxy in the dedicated worker.
+/// Returns false when the worker is unavailable (caller falls back).
+pub fn raw_proxy(
+    bytes: &[u8],
+    max_edge: u32,
+    cb: impl FnOnce(Option<ProxyResult>) + 'static,
+) -> bool {
+    if !raw_init() {
+        return false;
+    }
+    let arr = Uint8Array::from(bytes);
+    let buf = arr.buffer();
+    raw_call(
+        "raw_proxy",
+        &[arr.into(), JsValue::from(max_edge)],
+        &[buf.into()],
+        Box::new(move |reply| cb(reply.ok().and_then(|v| parse_proxy(&v)))),
+    )
+}
+
+/// Decode the camera's embedded full-size JPEG into a proxy (orientation from
+/// the RAW metadata code, since the JPEG carries no EXIF of its own).
+pub fn camera_proxy(
+    jpeg: &[u8],
+    orientation: u16,
+    max_edge: u32,
+    cb: impl FnOnce(Option<ProxyResult>) + 'static,
+) -> bool {
+    if !raw_init() {
+        return false;
+    }
+    let arr = Uint8Array::from(jpeg);
+    let buf = arr.buffer();
+    raw_call(
+        "camera_proxy",
+        &[arr.into(), JsValue::from(orientation), JsValue::from(max_edge)],
+        &[buf.into()],
+        Box::new(move |reply| cb(reply.ok().and_then(|v| parse_proxy(&v)))),
+    )
 }
 
 fn get_buf(v: &JsValue, key: &str) -> Option<Uint8Array> {

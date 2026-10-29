@@ -1889,6 +1889,7 @@ dependencies = [
  "js-sys",
  "leptos",
  "pes-pixel",
+ "rawcore",
  "rawler",
  "uuid",
  "wasm-bindgen",
@@ -1926,8 +1927,11 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 name = "pixel-worker"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.3.4",
  "js-sys",
  "pes-pixel",
+ "rawcore",
+ "uuid",
  "wasm-bindgen",
  "web-sys",
 ]
@@ -2139,6 +2143,14 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
+name = "rawcore"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "rawler",
+]
 
 [[package]]
 name = "rawler"
