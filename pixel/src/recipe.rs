@@ -114,6 +114,9 @@ pub fn edit_recipe_json(e: &EditParams) -> Option<String> {
         if e.raw.noise != d.noise {
             f.push(format!("\"nr\":{}", e.raw.noise));
         }
+        if e.raw.denoise != d.denoise {
+            f.push(format!("\"dn\":{}", e.raw.denoise));
+        }
         if e.raw.sharpen != d.sharpen {
             f.push(format!("\"sp\":{}", e.raw.sharpen));
         }
@@ -256,6 +259,9 @@ pub fn edit_params_from_recipe(json: &str) -> Option<EditParams> {
         }
         if let Some(t) = jnum(&r, "nr") {
             ra.noise = (t as f32).clamp(0.0, 100.0);
+        }
+        if let Some(t) = jnum(&r, "dn") {
+            ra.denoise = (t as f32).clamp(0.0, 100.0);
         }
         if let Some(t) = jnum(&r, "sp") {
             ra.sharpen = (t as f32).clamp(0.0, 100.0);

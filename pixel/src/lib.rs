@@ -4,6 +4,7 @@
 pub mod blur;
 pub mod clone;
 pub mod curves;
+pub mod denoise;
 pub mod fill;
 pub mod geo;
 pub mod heal;

@@ -6676,7 +6676,6 @@ fn selection_to_layer_sync(state: AppState, cut: bool) {
         state.update_current(|e| {
             e.rot90 = 0;
             e.fine_angle = 0.0;
-            e.crop = state::CropRect::default();
             e.selection = None;
         });
     }
@@ -6741,7 +6740,6 @@ fn delete_selection_sync(state: AppState) {
     state.update_current(|e| {
         e.rot90 = 0;
         e.fine_angle = 0.0;
-        e.crop = state::CropRect::default();
         e.selection = None;
     });
 }
@@ -6806,13 +6804,13 @@ fn content_fill_selection_sync(state: AppState) {
     state.update_current(|e| {
         e.rot90 = 0;
         e.fine_angle = 0.0;
-        e.crop = state::CropRect::default();
         e.selection = None;
     });
 }
 
-/// Swap an item's cached pixels after a destructive op (worker or sync) and
-/// reset the baked geometry/selection on its edit.
+/// Swap an item's cached pixels after a destructive op (worker or sync).
+/// Rotation is baked into the new pixels, so it resets; the crop rect is a
+/// render-time window over the working frame and is deliberately preserved.
 fn destructive_apply(state: AppState, item_id: usize, r: pworker::DestructiveResult) {
     CACHE.with(|c| {
         if let Some(pd) = c.borrow_mut().photos.get_mut(&item_id) {
@@ -6828,7 +6826,6 @@ fn destructive_apply(state: AppState, item_id: usize, r: pworker::DestructiveRes
         if let Some(m) = v.iter_mut().find(|m| m.id == item_id) {
             m.edit.rot90 = 0;
             m.edit.fine_angle = 0.0;
-            m.edit.crop = state::CropRect::default();
             m.edit.selection = None;
         }
     });
@@ -6917,7 +6914,6 @@ fn apply_heal_sync(state: AppState, pts: &[(f32, f32)]) {
     state.update_current(|e| {
         e.rot90 = 0;
         e.fine_angle = 0.0;
-        e.crop = state::CropRect::default();
         e.selection = None;
     });
 }
@@ -7030,7 +7026,6 @@ fn apply_clone_sync(state: AppState, pts: &[(f32, f32)]) {
     state.update_current(|e| {
         e.rot90 = 0;
         e.fine_angle = 0.0;
-        e.crop = state::CropRect::default();
         e.selection = None;
     });
 }
@@ -7395,6 +7390,11 @@ fn RawPanel(state: AppState) -> impl IntoView {
                 {rslider(
                     "Shadow NR", 0.0, 100.0, 1.0,
                     |r| r.noise, |r, v| r.noise = v,
+                    |v| format!("{v:.0}"),
+                )}
+                {rslider(
+                    "Smart denoise", 0.0, 100.0, 1.0,
+                    |r| r.denoise, |r, v| r.denoise = v,
                     |v| format!("{v:.0}"),
                 )}
                 {rslider(

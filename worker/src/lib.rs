@@ -227,8 +227,9 @@ fn downscale(pixels: &[u8], w: usize, h: usize, long_edge: u32) -> (Vec<u8>, usi
     (resample(pixels, w, h, tw, th), tw, th)
 }
 
-/// Destructive ops make their result the item's new stored buffer (the app
-/// resets crop/rotation to identity on apply, so base dims become full dims).
+/// Destructive ops make their result the item's new stored buffer. The app
+/// bakes rotation into the result and keeps the crop, which is applied at
+/// render time over the working frame.
 fn commit(full: &mut Vec<u8>, fw: &mut usize, fh: &mut usize, base: &[u8], w: usize, h: usize) {
     full.clear();
     full.extend_from_slice(base);

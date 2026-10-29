@@ -1,11 +1,13 @@
-//! RAW develop adjustments: white balance, exposure, highlight recovery,
-//! shadow lift / noise suppression, and capture sharpening.
+//! RAW develop adjustments: edge-aware denoise, white balance, exposure,
+//! highlight recovery, shadow lift / noise suppression, and capture
+//! sharpening.
 //!
-//! All of it runs in linear light — sRGB is decoded in, adjusted, re-encoded
-//! out — and happens before the gamma-space colour controls. The base image
-//! is the camera's rendering, so temperature is a relative correction: the
-//! neutral point (5500 K) reproduces the camera's as-shot white balance, and
-//! moving away from it applies a blackbody-derived von Kries gain.
+//! The tone stages run in linear light — sRGB is decoded in, adjusted,
+//! re-encoded out — and happen before the gamma-space colour controls. The
+//! base image is the camera's rendering, so temperature is a relative
+//! correction: the neutral point (5500 K) reproduces the camera's as-shot
+//! white balance, and moving away from it applies a blackbody-derived von
+//! Kries gain.
 
 use crate::types::{RawAdjust, NEUTRAL_K};
 
@@ -121,6 +123,11 @@ fn blur_luma(buf: &[u8], w: usize, h: usize) -> Vec<u8> {
 pub fn apply(buf: &mut [u8], w: usize, h: usize, adj: &RawAdjust) {
     if adj.is_identity() || w == 0 || h == 0 {
         return;
+    }
+    // Spatial denoise first, so sharpening and the tone curves act on the
+    // cleaned image rather than amplifying sensor noise.
+    if adj.denoise > 0.0 {
+        crate::denoise::smart_denoise(buf, w, h, (adj.denoise / 100.0).clamp(0.0, 1.0));
     }
     let sharp = (adj.sharpen / 100.0).clamp(0.0, 1.0);
     let hl = (adj.highlights / 100.0).clamp(0.0, 1.0);

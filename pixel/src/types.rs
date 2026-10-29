@@ -111,6 +111,9 @@ pub struct RawAdjust {
     pub shadows: f32,
     /// Shadow chroma-noise suppression 0..100.
     pub noise: f32,
+    /// Edge-aware whole-frame denoise 0..100 — separable bilateral on luma
+    /// and chroma; detail and edges are preserved.
+    pub denoise: f32,
     /// Capture (demosaic) sharpening 0..100 — linear unsharp mask.
     pub sharpen: f32,
 }
@@ -124,6 +127,7 @@ impl Default for RawAdjust {
             highlights: 0.0,
             shadows: 0.0,
             noise: 0.0,
+            denoise: 0.0,
             sharpen: 0.0,
         }
     }
