@@ -3774,10 +3774,13 @@ fn drive_develop_full(state: AppState, id: String) {
 
 /// Download + decode a Drive photo's original for the hover loupe. Stills
 /// (JPEG/PNG) decode directly; RAW uses the embedded preview, since a full
-/// demosaic is far too slow for a hover. HEIC keeps the w800 preview.
+/// demosaic is far too slow for a hover. Sony ARWs embed a full-size camera
+/// JPEG that rawler never reads — decode that for sensor-resolution crops.
+/// HEIC keeps the w800 preview.
 fn drive_hover_prefetch(state: AppState, id: String, name: String) {
     let lname = name.to_lowercase();
     let raw = raw::is_raw_name(&lname);
+    let arw = lname.ends_with(".arw");
     let still_mime = if lname.ends_with(".png") {
         Some("image/png")
     } else if lname.ends_with(".jpg") || lname.ends_with(".jpeg") {
@@ -3811,17 +3814,29 @@ fn drive_hover_prefetch(state: AppState, id: String, name: String) {
             let token = fresh_drive_token(state).await?;
             let bytes = drive::download_file(token.as_str(), &id).await.ok()?;
             if raw {
-                return raw::preview_rgba(&bytes);
+                if arw {
+                    if let Some((jpeg, jw, _)) = raw::largest_embedded_jpeg(&bytes) {
+                        // Below ~3k wide the largest JPEG is still a preview,
+                        // not sensor resolution — keep the preview tag.
+                        if jw >= 3000 {
+                            if let Some((px, w, h)) = camera_jpeg_rgba(&jpeg).await {
+                                let (px, w, h) = raw::orientation_corrected(px, w, h, &bytes);
+                                return Some(((px, w, h), false));
+                            }
+                        }
+                    }
+                }
+                return raw::preview_rgba(&bytes).map(|(px, w, h)| ((px, w, h), true));
             }
             let blob = web::bytes_to_blob(&bytes, still_mime?).ok()?;
             let (img, _) = web::load_image(&blob).await.ok()?;
-            Some(web::rgba_from_image(&img))
+            Some((web::rgba_from_image(&img), false))
         }
         .await;
         DRIVE_HOVER_INFLIGHT.with(|s| {
             s.borrow_mut().remove(&id);
         });
-        if let Some((px, w, h)) = decoded {
+        if let Some(((px, w, h), preview)) = decoded {
             DRIVE_HOVER_CACHE.with(|c| {
                 let mut c = c.borrow_mut();
                 c.0.retain(|k| k != &id);
@@ -3838,13 +3853,22 @@ fn drive_hover_prefetch(state: AppState, id: String, name: String) {
             DRIVE_HOVER_PREVIEW.with(|s| {
                 let mut s = s.borrow_mut();
                 s.remove(&id);
-                if raw {
+                if preview {
                     s.insert(id.clone());
                 }
             });
             state.drive_hover_ready.set(Some(id));
         }
     });
+}
+
+/// Decode an embedded camera JPEG through the browser's image pipeline.
+async fn camera_jpeg_rgba(jpeg: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
+    let blob = web::bytes_to_blob(jpeg, "image/jpeg").ok()?;
+    let (img, url) = web::load_image(&blob).await.ok()?;
+    let out = web::rgba_from_image(&img);
+    let _ = web_sys::Url::revoke_object_url(&url);
+    Some(out)
 }
 
 /// Hover-zoom: open the floating preview after a short rest on a tile, so

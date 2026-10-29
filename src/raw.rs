@@ -157,15 +157,168 @@ pub fn preview_rgba(bytes: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
         .flatten()
         .or_else(|| decoder.preview_image(&rawfile, &params).ok().flatten())
         .or_else(|| decoder.thumbnail_image(&rawfile, &params).ok().flatten())?;
-    let orientation = decoder
-        .raw_metadata(&rawfile, &params)
-        .ok()
-        .and_then(|m| m.exif.orientation)
-        .map(rawler::decoders::Orientation::from_u16)
-        .unwrap_or(rawler::decoders::Orientation::Normal);
     let rgba = img.to_rgba8();
     let (w, h) = (rgba.width() as usize, rgba.height() as usize);
-    Some(apply_orientation(rgba.into_raw(), w, h, orientation))
+    Some(apply_orientation(rgba.into_raw(), w, h, raw_orientation(bytes)))
+}
+
+/// Largest JPEG embedded in a TIFF-based RAW's main IFD chain, with its pixel
+/// size. rawler reads only IFD0 — the 1616×1080 preview on Sony bodies — while
+/// the full-size camera JPEG sits in a later IFD of the same chain.
+pub fn largest_embedded_jpeg(bytes: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
+    let endian = match bytes.get(0..2)? {
+        b"II" => Endian::Little,
+        b"MM" => Endian::Big,
+        _ => return None,
+    };
+    if rd16(bytes, 2, endian)? != 42 {
+        return None;
+    }
+    let mut ifd = rd32(bytes, 4, endian)? as usize;
+    let mut seen = Vec::new();
+    let mut best: Option<(usize, usize)> = None;
+    while ifd >= 8 && seen.len() < 32 && !seen.contains(&ifd) {
+        seen.push(ifd);
+        let Some(entries) = ifd.checked_add(2) else { break };
+        if entries + 2 > bytes.len() {
+            break;
+        }
+        let count = rd16(bytes, ifd, endian)? as usize;
+        let Some(next_at) = entries.checked_add(count * 12) else {
+            break;
+        };
+        if next_at + 4 > bytes.len() {
+            break;
+        }
+        let (mut joff, mut jlen) = (None, None);
+        for i in 0..count {
+            let e = entries + i * 12;
+            let tag = rd16(bytes, e, endian)?;
+            if tag != 0x0201 && tag != 0x0202 {
+                continue;
+            }
+            let typ = rd16(bytes, e + 2, endian)?;
+            if rd32(bytes, e + 4, endian)? != 1 {
+                continue;
+            }
+            let value = match typ {
+                3 => rd16(bytes, e + 8, endian)? as usize,
+                4 => rd32(bytes, e + 8, endian)? as usize,
+                _ => continue,
+            };
+            if tag == 0x0201 {
+                joff = Some(value);
+            } else {
+                jlen = Some(value);
+            }
+        }
+        if let (Some(o), Some(l)) = (joff, jlen) {
+            let in_file = l >= 4
+                && o >= 8
+                && o.checked_add(l).map_or(false, |end| end <= bytes.len());
+            if in_file
+                && bytes[o] == 0xFF
+                && bytes[o + 1] == 0xD8
+                && best.map_or(true, |(_, bl)| l > bl)
+            {
+                best = Some((o, l));
+            }
+        }
+        ifd = rd32(bytes, next_at, endian)? as usize;
+    }
+    let (o, l) = best?;
+    let (w, h) = jpeg_dimensions(&bytes[o..o + l])?;
+    Some((bytes[o..o + l].to_vec(), w, h))
+}
+
+#[derive(Clone, Copy)]
+enum Endian {
+    Little,
+    Big,
+}
+
+fn rd16(bytes: &[u8], at: usize, endian: Endian) -> Option<u16> {
+    let s = bytes.get(at..at + 2)?;
+    Some(match endian {
+        Endian::Little => u16::from_le_bytes([s[0], s[1]]),
+        Endian::Big => u16::from_be_bytes([s[0], s[1]]),
+    })
+}
+
+fn rd32(bytes: &[u8], at: usize, endian: Endian) -> Option<u32> {
+    let s = bytes.get(at..at + 4)?;
+    Some(match endian {
+        Endian::Little => u32::from_le_bytes([s[0], s[1], s[2], s[3]]),
+        Endian::Big => u32::from_be_bytes([s[0], s[1], s[2], s[3]]),
+    })
+}
+
+/// Dimensions from the first Start-Of-Frame segment, without decoding pixels.
+fn jpeg_dimensions(j: &[u8]) -> Option<(usize, usize)> {
+    if j.get(0..2)? != [0xFF, 0xD8] {
+        return None;
+    }
+    let mut i = 2;
+    while i + 4 <= j.len() {
+        if j[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        let marker = j[i + 1];
+        if marker == 0xFF {
+            i += 1;
+            continue;
+        }
+        if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            i += 2;
+            continue;
+        }
+        if marker == 0xD9 || marker == 0xDA {
+            return None;
+        }
+        let len = u16::from_be_bytes([j[i + 2], j[i + 3]]) as usize;
+        if len < 2 || i + 2 + len > j.len() {
+            return None;
+        }
+        let sof = (0xC0..=0xCF).contains(&marker)
+            && marker != 0xC4
+            && marker != 0xC8
+            && marker != 0xCC;
+        if sof {
+            if i + 9 > j.len() {
+                return None;
+            }
+            let h = u16::from_be_bytes([j[i + 5], j[i + 6]]) as usize;
+            let w = u16::from_be_bytes([j[i + 7], j[i + 8]]) as usize;
+            return (w > 0 && h > 0).then_some((w, h));
+        }
+        i += 2 + len;
+    }
+    None
+}
+
+fn raw_orientation(bytes: &[u8]) -> rawler::decoders::Orientation {
+    let rawfile = RawSource::new_from_slice(bytes);
+    rawler::get_decoder(&rawfile)
+        .ok()
+        .and_then(|d| {
+            d.raw_metadata(&rawfile, &RawDecodeParams { image_index: 0 })
+                .ok()
+        })
+        .and_then(|m| m.exif.orientation)
+        .map(rawler::decoders::Orientation::from_u16)
+        .unwrap_or(rawler::decoders::Orientation::Normal)
+}
+
+/// Apply the RAW's metadata orientation to pixels decoded from an embedded
+/// JPEG, which carries no EXIF of its own.
+pub fn orientation_corrected(
+    rgba: Vec<u8>,
+    w: usize,
+    h: usize,
+    raw_bytes: &[u8],
+) -> (Vec<u8>, usize, usize) {
+    apply_orientation(rgba, w, h, raw_orientation(raw_bytes))
 }
 
 /// rawler gives orientation as (transpose, flip_x, flip_y); per its docs the
@@ -289,5 +442,58 @@ mod tests {
     #[test]
     fn empty_bytes_error_not_panic() {
         assert!(decode_raw(&[]).is_err());
+    }
+
+    fn fake_jpeg(w: u16, h: u16, pad: usize) -> Vec<u8> {
+        let mut v = vec![0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08];
+        v.extend_from_slice(&h.to_be_bytes());
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&[0x01, 0x01, 0x11, 0x00]);
+        v.extend(std::iter::repeat(0u8).take(pad));
+        v.extend_from_slice(&[0xFF, 0xD9]);
+        v
+    }
+
+    fn put_entry(b: &mut [u8], at: usize, tag: u16, typ: u16, value: u32) {
+        b[at..at + 2].copy_from_slice(&tag.to_le_bytes());
+        b[at + 2..at + 4].copy_from_slice(&typ.to_le_bytes());
+        b[at + 4..at + 8].copy_from_slice(&1u32.to_le_bytes());
+        b[at + 8..at + 12].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn finds_largest_jpeg_across_tiff_ifds() {
+        let small = fake_jpeg(160, 120, 4);
+        let large = fake_jpeg(6000, 4000, 40);
+        let small_at = 200usize;
+        let large_at = small_at + small.len();
+        let mut b = vec![0u8; large_at + large.len()];
+        b[0..2].copy_from_slice(b"II");
+        b[2..4].copy_from_slice(&42u16.to_le_bytes());
+        b[4..8].copy_from_slice(&8u32.to_le_bytes());
+        // IFD0: the 160x120 preview + link to IFD1.
+        let ifd0 = 8usize;
+        let ifd1 = 38usize;
+        b[ifd0..ifd0 + 2].copy_from_slice(&2u16.to_le_bytes());
+        put_entry(&mut b, ifd0 + 2, 0x0201, 4, small_at as u32);
+        put_entry(&mut b, ifd0 + 14, 0x0202, 4, small.len() as u32);
+        b[ifd0 + 26..ifd0 + 30].copy_from_slice(&(ifd1 as u32).to_le_bytes());
+        // IFD1: the full-size camera JPEG + end of chain.
+        b[ifd1..ifd1 + 2].copy_from_slice(&2u16.to_le_bytes());
+        put_entry(&mut b, ifd1 + 2, 0x0201, 4, large_at as u32);
+        put_entry(&mut b, ifd1 + 14, 0x0202, 4, large.len() as u32);
+        b[ifd1 + 26..ifd1 + 30].copy_from_slice(&0u32.to_le_bytes());
+        b[small_at..small_at + small.len()].copy_from_slice(&small);
+        b[large_at..large_at + large.len()].copy_from_slice(&large);
+
+        let (jpeg, w, h) = largest_embedded_jpeg(&b).unwrap();
+        assert_eq!((w, h), (6000, 4000));
+        assert_eq!(jpeg, large);
+    }
+
+    #[test]
+    fn embedded_jpeg_lookup_rejects_garbage() {
+        assert!(largest_embedded_jpeg(b"not a tiff").is_none());
+        assert!(largest_embedded_jpeg(&[]).is_none());
     }
 }
