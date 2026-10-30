@@ -29,11 +29,7 @@ jobs:
           tool: trunk
 
       - name: Build pixel worker
-        run: |
-          WB_VERSION=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | grep '^version' | head -1 | sed 's/version = "\(.*\)"/\1/')
-          curl -sL "https://github.com/rustwasm/wasm-bindgen/releases/download/${WB_VERSION}/wasm-bindgen-${WB_VERSION}-x86_64-unknown-linux-musl.tar.gz" | tar xz
-          cargo build -p pixel-worker --release --target wasm32-unknown-unknown
-          "./wasm-bindgen-${WB_VERSION}-x86_64-unknown-linux-musl/wasm-bindgen" --target web --out-dir public/pixel-worker target/wasm32-unknown-unknown/release/pixel_worker.wasm
+        run: ./build.sh
 
       - name: Build
         run: trunk build --release --public-url /photo-edit-simplified/
@@ -60,11 +56,7 @@ jobs:
         run: cargo test --workspace
 
       - name: Build pixel worker
-        run: |
-          WB_VERSION=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | grep '^version' | head -1 | sed 's/version = "\(.*\)"/\1/')
-          curl -sL "https://github.com/rustwasm/wasm-bindgen/releases/download/${WB_VERSION}/wasm-bindgen-${WB_VERSION}-x86_64-unknown-linux-musl.tar.gz" | tar xz
-          cargo build -p pixel-worker --release --target wasm32-unknown-unknown
-          "./wasm-bindgen-${WB_VERSION}-x86_64-unknown-linux-musl/wasm-bindgen" --target web --out-dir public/pixel-worker target/wasm32-unknown-unknown/release/pixel_worker.wasm
+        run: ./build.sh
 
       - name: Build (served at /)
         run: trunk build --release --public-url /

@@ -1,4 +1,4 @@
 {
   "main_wasm_gzip_bytes": 1750000,
-  "worker_wasm_gzip_bytes": 1380000
+  "worker_wasm_gzip_bytes": 1300000
 }
