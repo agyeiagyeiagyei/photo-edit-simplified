@@ -6,3 +6,8 @@ node_modules/
 public/pixel-worker/pixel_worker.js
 public/pixel-worker/pixel_worker_bg.wasm
 public/pixel-worker/*.d.ts
+tests/e2e/node_modules/
+tests/e2e/fixtures/
+tests/e2e/results/
+tests/e2e/results-*
+dl-raw/
