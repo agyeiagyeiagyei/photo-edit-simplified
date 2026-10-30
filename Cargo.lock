@@ -1876,6 +1876,7 @@ name = "pes-pixel"
 version = "0.1.0"
 dependencies = [
  "js-sys",
+ "rawcore",
  "wasm-bindgen",
 ]
 
