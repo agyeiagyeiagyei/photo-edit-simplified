@@ -1,6 +1,7 @@
 mod drive;
 mod exif;
 mod zip;
+mod perf;
 mod pworker;
 mod raw;
 mod session;
@@ -436,6 +437,7 @@ struct DecodedProxy {
 /// Install a decoded proxy: cache, worker, dims, version bump. False when the
 /// item stopped being lazy (removed, healed, or full pixels landed) meanwhile.
 fn land_proxy(state: AppState, id: usize, decoded: DecodedProxy) -> bool {
+    let _land = perf::Span::new("proxy.land").detail(id.to_string());
     let lazy = CACHE.with(|c| {
         c.borrow()
             .photos
@@ -565,12 +567,18 @@ async fn await_proxy(
 
 async fn camera_proxy_async(jpeg: &[u8], orientation: u16) -> Option<pworker::ProxyResult> {
     let jpeg = jpeg.to_vec();
-    await_proxy(move |cb| pworker::camera_proxy(&jpeg, orientation, PROXY_EDGE, cb)).await
+    let t0 = perf::now();
+    let r = await_proxy(move |cb| pworker::camera_proxy(&jpeg, orientation, PROXY_EDGE, cb)).await;
+    perf::record("proxy.camera_decode", perf::now() - t0);
+    r
 }
 
 async fn raw_proxy_async(bytes: &[u8]) -> Option<pworker::ProxyResult> {
     let bytes = bytes.to_vec();
-    await_proxy(move |cb| pworker::raw_proxy(&bytes, PROXY_EDGE, cb)).await
+    let t0 = perf::now();
+    let r = await_proxy(move |cb| pworker::raw_proxy(&bytes, PROXY_EDGE, cb)).await;
+    perf::record("proxy.raw_develop", perf::now() - t0);
+    r
 }
 
 async fn raw_source_bytes(id: usize) -> Option<Rc<Vec<u8>>> {
@@ -941,7 +949,9 @@ async fn prepare_raw(id: usize, bytes: &[u8], mtime: Option<f64>) -> Option<RawI
 
 fn main() {
     console_error_panic_hook::set_once();
+    perf::install();
     pworker::init();
+    let _mount = perf::Span::new("app.mount");
     mount_to_body(|| view! { <App/> });
 }
 
@@ -959,12 +969,16 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                 state.busy.set(Some(format!("Loading {name}…")));
                 let blob: Blob = file.into();
                 let url = Url::create_object_url_with_blob(&blob).unwrap();
-                if let Some((dur, w, h)) = probe_video(&url).await {
+                let probe = perf::Span::new("ingest.decode").detail(name.clone());
+                let probed = probe_video(&url).await;
+                drop(probe);
+                if let Some((dur, w, h)) = probed {
                     CACHE.with(|c| {
                         let mut c = c.borrow_mut();
                         c.video_blobs.insert(id, blob);
                         c.video_meta.insert(id, (dur, w, h));
                     });
+                    let push = perf::Span::new("ingest.push").detail(name.clone());
                     push_item(state, MediaItem {
                         id,
                         kind: MediaKind::Video,
@@ -982,17 +996,24 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                         drive_parent_id: None,
                         drive_baked: false,
                     });
+                    drop(push);
                 } else {
                     web::log("video probe failed");
                 }
             } else if raw::is_raw_name(&name) {
                 state.busy.set(Some(format!("Loading RAW {name}…")));
-                let Ok(buf) = web::read_file_array_buffer(&file).await else {
+                let read = perf::Span::new("ingest.read").detail(name.clone());
+                let read_res = web::read_file_array_buffer(&file).await;
+                drop(read);
+                let Ok(buf) = read_res else {
                     state.busy.set(None);
                     continue;
                 };
                 let bytes = js_sys::Uint8Array::new(&buf).to_vec();
-                let Some(ing) = prepare_raw(id, &bytes, mtime).await else {
+                let decode = perf::Span::new("ingest.decode").detail(name.clone());
+                let prepared = prepare_raw(id, &bytes, mtime).await;
+                drop(decode);
+                let Some(ing) = prepared else {
                     web::log(&format!("RAW decode failed for {name}"));
                     state.busy.set(None);
                     continue;
@@ -1021,6 +1042,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                     )
                 });
                 evict_full_lru();
+                let push = perf::Span::new("ingest.push").detail(name.clone());
                 push_item(state, MediaItem {
                     id,
                     kind: MediaKind::Photo,
@@ -1038,6 +1060,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                     drive_parent_id: None,
                     drive_baked: false,
                 });
+                drop(push);
             } else {
                 state.busy.set(Some(format!("Loading {name}…")));
                 let mut blob: Blob = file.clone().into();
@@ -1045,6 +1068,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                 let is_jpeg = !is_heic(&file)
                     && (lname.ends_with(".jpg") || lname.ends_with(".jpeg"));
                 let is_png = lname.ends_with(".png");
+                let read = perf::Span::new("ingest.read").detail(name.clone());
                 let exif_tiff = if is_jpeg || is_png {
                     web::read_file_array_buffer(&file)
                         .await
@@ -1060,11 +1084,15 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                 } else {
                     None
                 };
+                drop(read);
                 let taken = exif_tiff.as_deref().and_then(exif::taken_from_tiff).or(mtime);
                 let exif = exif_tiff.map(Rc::new);
                 if is_heic(&file) {
                     state.busy.set(Some(format!("Converting HEIC {name}…")));
-                    match web::heic_to_jpeg(blob).await {
+                    let decode = perf::Span::new("ingest.decode").detail(name.clone());
+                    let converted = web::heic_to_jpeg(blob).await;
+                    drop(decode);
+                    match converted {
                         Ok(b) => blob = b,
                         Err(_) => {
                             state.busy.set(None);
@@ -1072,13 +1100,20 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                         }
                     }
                 }
-                let Ok((img, url)) = web::load_image(&blob).await else {
+                let decode = perf::Span::new("ingest.decode").detail(name.clone());
+                let loaded = web::load_image(&blob).await;
+                drop(decode);
+                let Ok((img, url)) = loaded else {
                     state.busy.set(None);
                     continue;
                 };
                 let (fw, fh) = (img.natural_width() as usize, img.natural_height() as usize);
+                let preview_span = perf::Span::new("ingest.preview").detail(name.clone());
                 let preview = downscale(&img, 1024);
+                drop(preview_span);
+                let thumb_span = perf::Span::new("ingest.thumb").detail(name.clone());
                 let thumb_url = thumb_object_url(&preview.0, preview.1, preview.2).await;
+                drop(thumb_span);
                 CACHE.with(|c| {
                     let mut c = c.borrow_mut();
                     c.photo_src.insert(id, blob);
@@ -1096,6 +1131,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                         }),
                     );
                 });
+                let push = perf::Span::new("ingest.push").detail(name.clone());
                 push_item(state, MediaItem {
                     id,
                     kind: MediaKind::Photo,
@@ -1113,6 +1149,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                     drive_parent_id: None,
                     drive_baked: false,
                 });
+                drop(push);
             }
             state.busy.set(None);
         }
@@ -1833,7 +1870,11 @@ async fn render_photo_export(
     state: AppState,
     item: &MediaItem,
 ) -> Option<(Blob, &'static str, String)> {
-    if !ensure_full_async(state, item.id).await {
+    let _total = perf::Span::new("export.total").detail(item.name.clone());
+    let ensure = perf::Span::new("export.ensure_full");
+    let ensured = ensure_full_async(state, item.id).await;
+    drop(ensure);
+    if !ensured {
         return None;
     }
     let photo = get_photo(item.id)?;
@@ -1841,6 +1882,7 @@ async fn render_photo_export(
     // A full-res export must fit a ~4 GB box: borrow the cached pixels when
     // geometry is a no-op and only copy for color edits, so the pipeline holds
     // one full buffer plus the canvas, not three.
+    let mut geometry_span = perf::Span::new("export.geometry");
     let plain_geometry = item.edit.rot90 % 4 == 0 && item.edit.fine_angle.abs() <= 0.01;
     let (mut p, w, h): (Cow<[u8]>, usize, usize) = if plain_geometry {
         (Cow::Borrowed(pix.as_slice()), *fw, *fh)
@@ -1848,6 +1890,9 @@ async fn render_photo_export(
         let (v, w, h) = geometry(pix, *fw, *fh, &item.edit);
         (Cow::Owned(v), w, h)
     };
+    geometry_span.set_detail(format!("{}x{}", w, h));
+    drop(geometry_span);
+    let color_span = perf::Span::new("export.color");
     if !item.edit.raw.is_identity() {
         rawops::apply(p.to_mut(), w, h, &item.edit.raw);
     }
@@ -1885,9 +1930,11 @@ async fn render_photo_export(
             noise::noise_add(p, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
         }
     }
+    drop(color_span);
 
     // Composite onto the full geometry-corrected canvas, then crop+scale
     // straight into the export canvas (one resample instead of two).
+    let mut encode_span = perf::Span::new("export.encode");
     let base = web::create_canvas(w as u32, h as u32);
     web::put_pixels(&base, &p, w as u32, h as u32);
     drop(p);
@@ -1897,6 +1944,7 @@ async fn render_photo_export(
     let (cx, cy, cw, ch) = aspect_fit(cx, cy, cw, ch, item.edit.aspect);
     // Photo exports keep the crop's native pixels; export_dims is the video cap.
     let (ew, eh) = (cw, ch);
+    encode_span.set_detail(format!("{}x{}", ew, eh));
     let out = web::create_canvas(ew as u32, eh as u32);
     web::ctx2d(&out)
         .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
@@ -1930,6 +1978,7 @@ async fn render_photo_export(
         },
         None => blob,
     };
+    drop(encode_span);
     let base = item.name.rsplitn(2, '.').last().unwrap_or("photo");
     let filename = format!("edited-{}-{}.{}", item.edit.aspect.label(), base, ext);
     Some((blob, mime, filename))
@@ -3789,7 +3838,9 @@ async fn persist_session(state: AppState) {
     if !SESSION_READY.with(|r| r.get()) {
         return;
     }
+    let mut persist_span = perf::Span::new("session.persist");
     let items = state.items.get_untracked();
+    persist_span.set_detail(format!("{} items", items.len()));
     let Ok(db) = session::open_db().await else { return };
     let live: std::collections::HashSet<usize> = items.iter().map(|i| i.id).collect();
     let gone: Vec<usize> = SESSION_SIGS.with(|s| {
@@ -3980,6 +4031,7 @@ async fn persist_session(state: AppState) {
 /// photos come back as plain photos from their baked PNG.
 fn restore_session(state: AppState) {
     spawn_local(async move {
+        let mut restore_span = perf::Span::new("restore.session");
         let db = match session::open_db().await {
             Ok(db) => db,
             Err(_) => {
@@ -3993,6 +4045,7 @@ fn restore_session(state: AppState) {
             SESSION_READY.with(|r| r.set(true));
             return;
         }
+        restore_span.set_detail(format!("{} items", records.len()));
         state.busy.set(Some("Restoring session…".into()));
         let mut max_id = 0usize;
         for (id, v) in records {
@@ -4000,6 +4053,8 @@ fn restore_session(state: AppState) {
             let name = state::jget(&v, "name")
                 .and_then(|s| s.as_string())
                 .unwrap_or_else(|| "restored".into());
+            let _item_span =
+                perf::Span::new("restore.item").detail(format!("{name} #{id}"));
             let is_video = state::jnum(&v, "kind").unwrap_or(0.0) == 1.0;
             let is_raw = state::jbool(&v, "raw").unwrap_or(false);
             let recipe = state::jget(&v, "recipe").and_then(|s| s.as_string());
@@ -5834,6 +5889,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         }
         let Some(photo) = get_photo(item.id) else { return };
         let Some(canvas) = canvas_ref.get() else { return };
+        let mut render_span = perf::Span::new("preview.render");
 
         let (pix, w, h) = &photo.preview;
         let (mut p, w, h) = geometry(pix, *w, *h, &item.edit);
@@ -5993,6 +6049,9 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     let fp = Some(content_fingerprint(&item, photo.gen, proxy_gen(item.id)));
                     let item_id = item.id;
                     let item_cb = item.clone();
+                    let request =
+                        perf::Span::new("hi.request").detail(format!("{}x{}", req_w, req_h));
+                    let hi_t0 = perf::now();
                     let accepted = pworker::render(
                         src_id,
                         &recipe,
@@ -6006,6 +6065,8 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                             }
                             match (reply, fp) {
                                 (Ok(r), Some(fp)) => {
+                                    perf::record("hi.worker_reply", perf::now() - hi_t0);
+                                    let blit = perf::Span::new("hi.blit");
                                     let canvas = web::create_canvas(r.w, r.h);
                                     web::put_pixels_view(&canvas, &r.pixels, r.w, r.h);
                                     composite_layers(
@@ -6024,8 +6085,10 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                         })
                                     });
                                     state.hi_built.update(|g| *g += 1);
+                                    drop(blit);
                                 }
                                 _ => {
+                                    perf::record("hi.worker_reply", perf::now() - hi_t0);
                                     if let Some(hi) = render_hi(&item_cb, req_w, req_h) {
                                         HI_CACHE.with(|c| *c.borrow_mut() = Some(hi));
                                         state.hi_built.update(|g| *g += 1);
@@ -6034,6 +6097,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                             }
                         },
                     );
+                    drop(request);
                     if !accepted {
                         if let Some(hi) = render_hi(&item, req_w, req_h) {
                             HI_CACHE.with(|c| *c.borrow_mut() = Some(hi));
@@ -6129,6 +6193,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         if overlay_open {
             ctx.restore();
         }
+        render_span.set_detail(format!("{}x{}", canvas.width(), canvas.height()));
     });
 
     view! {

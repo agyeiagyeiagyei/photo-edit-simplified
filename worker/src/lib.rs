@@ -73,21 +73,25 @@ fn render_pipeline(
     max_edge: u32,
     sel_json: Option<String>,
     sel_mask: Option<Uint8Array>,
-) -> (Vec<u8>, usize, usize) {
+) -> (Vec<u8>, usize, usize, [f64; 4]) {
+    let t0 = js_sys::Date::now();
     let (p, ww, wh) = geometry(full, fw, fh, edit);
     let (tw, th) = hi_target(req_w, req_h, ww, wh, max_edge);
+    let t1 = js_sys::Date::now();
     let mut buf = if (tw, th) != (ww, wh) {
         resample(&p, ww, wh, tw, th)
     } else {
         p
     };
+    let t2 = js_sys::Date::now();
     // Develop stage first: white balance, exposure and the lighting controls
     // run in linear light, before any gamma-space colour adjustment.
     if !edit.raw.is_identity() {
         rawops::apply(&mut buf, tw, th, &edit.raw);
     }
+    let t3 = js_sys::Date::now();
     if !edit.is_color_touched() {
-        return (buf, tw, th);
+        return (buf, tw, th, [t1 - t0, t2 - t1, t3 - t2, 0.0]);
     }
     let selection = sel_json.and_then(|j| selection_from_json(&j, sel_mask.map(|m| m.to_vec())));
     if let Some(sel) = selection {
@@ -138,7 +142,8 @@ fn render_pipeline(
             seed,
         );
     }
-    (buf, tw, th)
+    let t4 = js_sys::Date::now();
+    (buf, tw, th, [t1 - t0, t2 - t1, t3 - t2, t4 - t3])
 }
 
 /// Render the hi-res frame. Returns {pixels, w, h}.
@@ -154,12 +159,19 @@ pub fn render(
 ) -> Result<JsValue, JsValue> {
     with_buffer(id, |(full, fw, fh)| {
         let edit = parse_edit(recipe);
-        let (buf, tw, th) =
+        let (buf, tw, th, t) =
             render_pipeline(full, *fw, *fh, &edit, id, req_w, req_h, max_edge, sel_json, sel_mask);
+        let timings = result_obj(&[
+            ("geometry", t[0].into()),
+            ("resample", t[1].into()),
+            ("develop", t[2].into()),
+            ("color", t[3].into()),
+        ]);
         result_obj(&[
             ("pixels", js_buf(buf)),
             ("w", (tw as u32).into()),
             ("h", (th as u32).into()),
+            ("timings", timings),
         ])
     })
 }

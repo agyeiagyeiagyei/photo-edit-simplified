@@ -12,11 +12,14 @@ use web_sys::{ErrorEvent, MessageEvent, Worker, WorkerOptions, WorkerType};
 use pes_pixel::recipe::selection_json;
 use pes_pixel::types::{Selection, SelectionKind};
 
+use crate::perf;
+
 type Reply = Result<JsValue, JsValue>;
 
 thread_local! {
     static WORKER: RefCell<Option<Worker>> = const { RefCell::new(None) };
     static PENDING: RefCell<HashMap<u32, Box<dyn FnOnce(Reply)>>> = RefCell::new(HashMap::new());
+    static PENDING_OP: RefCell<HashMap<u32, String>> = RefCell::new(HashMap::new());
     static NEXT_REQ: Cell<u32> = const { Cell::new(1) };
     /// Worker failed to load or errored — ops use the caller's sync fallback.
     static DEAD: Cell<bool> = const { Cell::new(false) };
@@ -28,6 +31,7 @@ thread_local! {
     /// demosaic there must not block interactive renders on the main worker.
     static RAW_WORKER: RefCell<Option<Worker>> = const { RefCell::new(None) };
     static RAW_PENDING: RefCell<HashMap<u32, Box<dyn FnOnce(Reply)>>> = RefCell::new(HashMap::new());
+    static RAW_PENDING_OP: RefCell<HashMap<u32, String>> = RefCell::new(HashMap::new());
     static RAW_NEXT_REQ: Cell<u32> = const { Cell::new(1) };
     static RAW_DEAD: Cell<bool> = const { Cell::new(false) };
 }
@@ -64,8 +68,12 @@ pub fn init() {
             .unwrap_or(false);
         let key = if ok { "result" } else { "error" };
         let val = Reflect::get(&data, &JsValue::from_str(key)).unwrap_or(JsValue::UNDEFINED);
+        let op = PENDING_OP.with(|m| m.borrow_mut().remove(&(id as u32)));
         let cb = PENDING.with(|p| p.borrow_mut().remove(&(id as u32)));
         if let Some(cb) = cb {
+            if let Some(op) = op {
+                record_worker_reply(&op, &data, &val);
+            }
             cb(if ok { Ok(val) } else { Err(val) });
         }
     });
@@ -74,6 +82,7 @@ pub fn init() {
     let onerr = Closure::<dyn FnMut(ErrorEvent)>::new(|_| {
         DEAD.with(|d| d.set(true));
         WORKER.with(|w| *w.borrow_mut() = None);
+        PENDING_OP.with(|m| m.borrow_mut().clear());
         let cbs: Vec<_> = PENDING.with(|p| p.borrow_mut().drain().map(|(_, c)| c).collect());
         for cb in cbs {
             cb(Err(JsValue::from_str("worker error")));
@@ -93,6 +102,7 @@ fn call(op: &str, args: &[JsValue], transfer: &[JsValue], cb: Box<dyn FnOnce(Rep
         i
     });
     PENDING.with(|p| p.borrow_mut().insert(id, cb));
+    PENDING_OP.with(|m| m.borrow_mut().insert(id, op.to_string()));
     let msg = Object::new();
     let _ = Reflect::set(&msg, &JsValue::from_str("id"), &JsValue::from(id));
     let _ = Reflect::set(&msg, &JsValue::from_str("op"), &JsValue::from_str(op));
@@ -107,9 +117,36 @@ fn call(op: &str, args: &[JsValue], transfer: &[JsValue], cb: Box<dyn FnOnce(Rep
     }
     if worker.post_message_with_transfer(&msg, &t).is_err() {
         PENDING.with(|p| p.borrow_mut().remove(&id));
+        PENDING_OP.with(|m| m.borrow_mut().remove(&id));
         return false;
     }
     true
+}
+
+/// Record `worker.<op>` from the reply's `ms` (measured inside run.js), plus
+/// the render pipeline's own stage breakdown when present.
+fn record_worker_reply(op: &str, data: &JsValue, result: &JsValue) {
+    if let Some(ms) = Reflect::get(data, &JsValue::from_str("ms"))
+        .ok()
+        .and_then(|v| v.as_f64())
+    {
+        perf::record(&format!("worker.{op}"), ms);
+    }
+    if op != "render" {
+        return;
+    }
+    let Ok(timings) = Reflect::get(result, &JsValue::from_str("timings")) else { return };
+    if !timings.is_object() {
+        return;
+    }
+    for stage in ["geometry", "resample", "develop", "color"] {
+        if let Some(ms) = Reflect::get(&timings, &JsValue::from_str(stage))
+            .ok()
+            .and_then(|v| v.as_f64())
+        {
+            perf::record(&format!("worker.render.{stage}"), ms);
+        }
+    }
 }
 
 fn raw_init() -> bool {
@@ -144,8 +181,12 @@ fn raw_init() -> bool {
             .unwrap_or(false);
         let key = if ok { "result" } else { "error" };
         let val = Reflect::get(&data, &JsValue::from_str(key)).unwrap_or(JsValue::UNDEFINED);
+        let op = RAW_PENDING_OP.with(|m| m.borrow_mut().remove(&(id as u32)));
         let cb = RAW_PENDING.with(|p| p.borrow_mut().remove(&(id as u32)));
         if let Some(cb) = cb {
+            if let Some(op) = op {
+                record_worker_reply(&op, &data, &val);
+            }
             cb(if ok { Ok(val) } else { Err(val) });
         }
     });
@@ -154,6 +195,7 @@ fn raw_init() -> bool {
     let onerr = Closure::<dyn FnMut(ErrorEvent)>::new(|_| {
         RAW_DEAD.with(|d| d.set(true));
         RAW_WORKER.with(|w| *w.borrow_mut() = None);
+        RAW_PENDING_OP.with(|m| m.borrow_mut().clear());
         let cbs: Vec<_> = RAW_PENDING.with(|p| p.borrow_mut().drain().map(|(_, c)| c).collect());
         for cb in cbs {
             cb(Err(JsValue::from_str("worker error")));
@@ -174,6 +216,7 @@ fn raw_call(op: &str, args: &[JsValue], transfer: &[JsValue], cb: Box<dyn FnOnce
         i
     });
     RAW_PENDING.with(|p| p.borrow_mut().insert(id, cb));
+    RAW_PENDING_OP.with(|m| m.borrow_mut().insert(id, op.to_string()));
     let msg = Object::new();
     let _ = Reflect::set(&msg, &JsValue::from_str("id"), &JsValue::from(id));
     let _ = Reflect::set(&msg, &JsValue::from_str("op"), &JsValue::from_str(op));
@@ -188,6 +231,7 @@ fn raw_call(op: &str, args: &[JsValue], transfer: &[JsValue], cb: Box<dyn FnOnce
     }
     if worker.post_message_with_transfer(&msg, &t).is_err() {
         RAW_PENDING.with(|p| p.borrow_mut().remove(&id));
+        RAW_PENDING_OP.with(|m| m.borrow_mut().remove(&id));
         return false;
     }
     true
