@@ -14,7 +14,7 @@ use toml::value::Table;
 
 use super::Camera;
 
-const MAGIC: &[u8; 8] = b"PESCDB3\n";
+const MAGIC: &[u8; 8] = b"PESCDB4\n";
 
 static DB_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/camera_db.bin"));
 
@@ -270,7 +270,9 @@ impl<'a> Reader<'a> {
   fn value(&mut self) -> Value {
     match self.u8() {
       0 => Value::Integer(self.i32() as i64),
-      1 => Value::Float(self.f64()),
+      // f32: every non-params float is read from Camera as f32, so this
+      // reproduces the exact same Camera field bits at half the bytes.
+      1 => Value::Float(self.f32() as f64),
       2 => Value::String(self.str().to_string()),
       3 => Value::Boolean(self.u8() != 0),
       4 => {
@@ -283,8 +285,15 @@ impl<'a> Reader<'a> {
       }
       5 => Value::Table(self.table()),
       6 => Value::Integer(self.i64()),
+      7 => Value::Float(self.f64()),
       tag => panic!("Unknown value tag {} in camera db", tag),
     }
+  }
+
+  fn f32(&mut self) -> f32 {
+    let v = f32::from_le_bytes(self.bytes[self.pos..self.pos + 4].try_into().expect("truncated camera db"));
+    self.pos += 4;
+    v
   }
 
   fn i32(&mut self) -> i32 {

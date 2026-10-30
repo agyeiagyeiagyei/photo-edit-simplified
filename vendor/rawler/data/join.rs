@@ -142,7 +142,7 @@ fn join_cameras() {
     }
   }
 
-  let mut out: Vec<u8> = b"PESCDB3\n".to_vec();
+  let mut out: Vec<u8> = b"PESCDB4\n".to_vec();
   out.extend((entries.len() as u32).to_le_bytes());
   for e in &entries {
     write_str(&mut out, &e.make);
@@ -158,12 +158,12 @@ fn join_cameras() {
     for (name, table) in &e.modes {
       write_str(&mut out, name);
       let mut payload = Vec::new();
-      write_table(&mut payload, table);
+      write_table(&mut payload, table, false);
       out.extend((payload.len() as u32).to_le_bytes());
       out.extend(payload);
     }
     let mut payload = Vec::new();
-    write_table(&mut payload, &e.base);
+    write_table(&mut payload, &e.base, false);
     out.extend((payload.len() as u32).to_le_bytes());
     out.extend(payload);
   }
@@ -201,16 +201,20 @@ fn write_str(out: &mut Vec<u8>, s: &str) {
   out.extend(s.as_bytes());
 }
 
-fn write_table(out: &mut Vec<u8>, table: &toml::value::Table) {
+/// `exact_floats` is set for `params` subtrees: `Camera::params` stores the
+/// raw `toml::Value`, so those floats must round-trip exactly. Every other
+/// float in a camera table is consumed as f32 by `Camera::update_from_toml`
+/// (the color matrix), so storing f32 there is bit-identical and half the size.
+fn write_table(out: &mut Vec<u8>, table: &toml::value::Table, exact_floats: bool) {
   assert!(table.len() <= u16::MAX as usize, "camera db table too large");
   out.extend((table.len() as u16).to_le_bytes());
   for (key, value) in table {
     write_str(out, key);
-    write_value(out, value);
+    write_value(out, value, exact_floats || key == "params");
   }
 }
 
-fn write_value(out: &mut Vec<u8>, value: &Value) {
+fn write_value(out: &mut Vec<u8>, value: &Value, exact_floats: bool) {
   match value {
     Value::Integer(i) if *i >= i32::MIN as i64 && *i <= i32::MAX as i64 => {
       out.push(0);
@@ -220,9 +224,13 @@ fn write_value(out: &mut Vec<u8>, value: &Value) {
       out.push(6);
       out.extend(i.to_le_bytes());
     }
+    Value::Float(f) if exact_floats => {
+      out.push(7);
+      out.extend(f.to_le_bytes());
+    }
     Value::Float(f) => {
       out.push(1);
-      out.extend(f.to_le_bytes());
+      out.extend((*f as f32).to_le_bytes());
     }
     Value::String(s) => {
       out.push(2);
@@ -237,12 +245,12 @@ fn write_value(out: &mut Vec<u8>, value: &Value) {
       out.push(4);
       out.extend((items.len() as u16).to_le_bytes());
       for item in items {
-        write_value(out, item);
+        write_value(out, item, exact_floats);
       }
     }
     Value::Table(table) => {
       out.push(5);
-      write_table(out, table);
+      write_table(out, table, exact_floats);
     }
     other => panic!("Unsupported TOML value in camera db: {:?}", other),
   }

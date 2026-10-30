@@ -35,6 +35,7 @@ use crate::decompressors::decompress_lines_fn;
 use crate::decompressors::decompress_strips_fn;
 use crate::decompressors::deflate::DeflateDecompressor;
 use crate::decompressors::jpeg::JpegDecompressor;
+#[cfg(feature = "jpegxl")]
 use crate::decompressors::jpegxl::JpegXLDecompressor;
 use crate::decompressors::ljpeg::LJpegDecompressor;
 use crate::decompressors::packed::PackedDecompressor;
@@ -649,7 +650,9 @@ pub fn plain_image_from_ifd(ifd: &IFD, rawsource: &RawSource) -> Result<RawImage
         }
         (CompressionMethod::LossyJPEG, DataMode::Strips) => decode_strips::<u16>(rawsource, ifd, JpegDecompressor::new(), dummy)?,
         (CompressionMethod::LossyJPEG, DataMode::Tiles) => decode_tiles::<u16>(rawsource, ifd, JpegDecompressor::new(), dummy)?,
+        #[cfg(feature = "jpegxl")]
         (CompressionMethod::JPEGXL, DataMode::Strips) => decode_strips::<u16>(rawsource, ifd, JpegXLDecompressor::new(bits), dummy)?,
+        #[cfg(feature = "jpegxl")]
         (CompressionMethod::JPEGXL, DataMode::Tiles) => decode_tiles::<u16>(rawsource, ifd, JpegXLDecompressor::new(bits), dummy)?,
         _ => {
           return Err(RawlerError::DecoderFailed(format!(

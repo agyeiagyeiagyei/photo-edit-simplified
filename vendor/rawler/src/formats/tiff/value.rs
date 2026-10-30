@@ -445,12 +445,10 @@ impl Value {
       Ok(Some(v)) => v,
       Ok(None) => {
         log::error!("TIFF value index out of range, index is {} but length is {}", idx, self.count());
-        log::error!("Backtrace:\n{:?}", backtrace::Backtrace::new());
         Default::default()
       }
       Err(_) => {
         log::error!("TIFF value cast error, but forced to default value!");
-        log::error!("Backtrace:\n{:?}", backtrace::Backtrace::new());
         Default::default()
       }
     }
@@ -461,12 +459,10 @@ impl Value {
       Ok(Some(v)) => v,
       Ok(None) => {
         log::error!("TIFF value index out of range, index is {} but length is {}", idx, self.count());
-        log::error!("Backtrace:\n{:?}", backtrace::Backtrace::new());
         Default::default()
       }
       Err(_) => {
         log::error!("TIFF value cast error, but forced to default value!");
-        log::error!("Backtrace:\n{:?}", backtrace::Backtrace::new());
         Default::default()
       }
     }
@@ -477,12 +473,10 @@ impl Value {
       Ok(Some(v)) => v,
       Ok(None) => {
         log::error!("TIFF value index out of range, index is {} but length is {}", idx, self.count());
-        log::error!("Backtrace:\n{:?}", backtrace::Backtrace::new());
         Default::default()
       }
       Err(_) => {
         log::error!("TIFF value cast error, but forced to default value!");
-        log::error!("Backtrace:\n{:?}", backtrace::Backtrace::new());
         Default::default()
       }
     }
@@ -493,12 +487,10 @@ impl Value {
       Ok(Some(v)) => v,
       Ok(None) => {
         log::error!("TIFF value index out of range, index is {} but length is {}", idx, self.count());
-        log::error!("Backtrace:\n{:?}", backtrace::Backtrace::new());
         Default::default()
       }
       Err(_) => {
         log::error!("TIFF value cast error, but forced to default value!");
-        log::error!("Backtrace:\n{:?}", backtrace::Backtrace::new());
         Default::default()
       }
     }
@@ -509,12 +501,10 @@ impl Value {
       Ok(Some(v)) => v,
       Ok(None) => {
         log::error!("TIFF value index out of range, index is {} but length is {}", idx, self.count());
-        log::error!("Backtrace:\n{:?}", backtrace::Backtrace::new());
         Default::default()
       }
       Err(_) => {
         log::error!("TIFF value cast error, but forced to default value!");
-        log::error!("Backtrace:\n{:?}", backtrace::Backtrace::new());
         Default::default()
       }
     }
@@ -525,12 +515,10 @@ impl Value {
       Ok(Some(v)) => v,
       Ok(None) => {
         log::error!("TIFF value index out of range, index is {} but length is {}", idx, self.count());
-        log::error!("Backtrace:\n{:?}", backtrace::Backtrace::new());
         Default::default()
       }
       Err(_) => {
         log::error!("TIFF value cast error, but forced to default value!");
-        log::error!("Backtrace:\n{:?}", backtrace::Backtrace::new());
         Default::default()
       }
     }
@@ -541,12 +529,10 @@ impl Value {
       Ok(Some(v)) => v,
       Ok(None) => {
         log::error!("TIFF value index out of range, index is {} but length is {}", idx, self.count());
-        log::error!("Backtrace:\n{:?}", backtrace::Backtrace::new());
         Default::default()
       }
       Err(_) => {
         log::error!("TIFF value cast error, but forced to default value!");
-        log::error!("Backtrace:\n{:?}", backtrace::Backtrace::new());
         Default::default()
       }
     }
@@ -557,12 +543,10 @@ impl Value {
       Ok(Some(v)) => v,
       Ok(None) => {
         log::error!("TIFF value index out of range, index is {} but length is {}", idx, self.count());
-        log::error!("Backtrace:\n{:?}", backtrace::Backtrace::new());
         Default::default()
       }
       Err(_) => {
         log::error!("TIFF value cast error, but forced to default value!");
-        log::error!("Backtrace:\n{:?}", backtrace::Backtrace::new());
         Default::default()
       }
     }
@@ -573,12 +557,10 @@ impl Value {
       Ok(Some(v)) => v,
       Ok(None) => {
         log::error!("TIFF value index out of range, index is {} but length is {}", idx, self.count());
-        log::error!("Backtrace:\n{:?}", backtrace::Backtrace::new());
         Default::default()
       }
       Err(_) => {
         log::error!("TIFF value cast error, but forced to default value!");
-        log::error!("Backtrace:\n{:?}", backtrace::Backtrace::new());
         Default::default()
       }
     }
@@ -589,12 +571,10 @@ impl Value {
       Ok(Some(v)) => v,
       Ok(None) => {
         log::error!("TIFF value index out of range, index is {} but length is {}", idx, self.count());
-        log::error!("Backtrace:\n{:?}", backtrace::Backtrace::new());
         Default::default()
       }
       Err(_) => {
         log::error!("TIFF value cast error, but forced to default value!");
-        log::error!("Backtrace:\n{:?}", backtrace::Backtrace::new());
         Default::default()
       }
     }

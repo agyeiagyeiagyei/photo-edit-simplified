@@ -151,7 +151,6 @@ impl RawlerError {
 impl From<std::io::Error> for RawlerError {
   fn from(err: std::io::Error) -> Self {
     log::error!("I/O error: {}", err.to_string());
-    log::error!("Backtrace:\n{:?}", backtrace::Backtrace::new());
     Self::DecoderFailed(format!("I/O Error without context: {}", err))
   }
 }

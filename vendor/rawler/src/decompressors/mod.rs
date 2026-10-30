@@ -44,6 +44,7 @@ pub mod arw6;
 pub mod crx;
 pub mod deflate;
 pub mod jpeg;
+#[cfg(feature = "jpegxl")]
 pub mod jpegxl;
 pub mod ljpeg;
 pub mod packed;

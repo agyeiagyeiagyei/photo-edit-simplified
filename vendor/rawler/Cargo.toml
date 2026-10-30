@@ -39,6 +39,9 @@ resolver = "2"
 [features]
 clap = ["dep:clap"]
 inspector = []
+# PES patch: JPEG-XL-compressed DNG strips/tiles are rare; the worker drops
+# jxl-oxide to stay inside its wasm budget. Unsure RAWs report unsupported.
+jpegxl = ["dep:jxl-oxide"]
 rawdb = [
     "dep:ureq",
     "dep:percent-encoding",
@@ -80,9 +83,6 @@ name = "raw_decoder"
 path = "benches/raw_decoder.rs"
 harness = false
 
-[dependencies.backtrace]
-version = "0.3"
-
 [dependencies.bitstream-io]
 version = "4.1"
 
@@ -112,6 +112,7 @@ version = "0.14"
 
 [dependencies.jxl-oxide]
 version = "0.12.2"
+optional = true
 
 [dependencies.lazy_static]
 version = "1"
