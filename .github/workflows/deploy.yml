@@ -85,7 +85,7 @@ jobs:
         run: npx playwright install --with-deps chromium
 
       - name: Install Pillow (fixture generator)
-        run: python3 -m pip install --user pillow
+        run: sudo apt-get update && sudo apt-get install -y python3-pil
 
       - name: Generate fixtures
         working-directory: tests/e2e
@@ -103,12 +103,13 @@ jobs:
           mkdir -p dl-raw
           if [ -n "$(ls -A dl-raw)" ]; then echo "cached"; exit 0; fi
           URL=$(curl -fsSL "https://raw.pixls.us/json/getrepository.php?set=all" | python3 -c '
-import json, sys
-for row in json.load(sys.stdin).get("data", []):
-    url = row[7] if isinstance(row, list) and len(row) > 7 else ""
-    if "ILCE-5000" in url and "12bit compressed" in url:
-        print(url); break
-')
+          import json, sys, urllib.parse
+          for row in json.load(sys.stdin).get("data", []):
+              url = row[7] if isinstance(row, list) and len(row) > 7 else ""
+              name = urllib.parse.unquote(url)
+              if "ILCE-5000" in name and "12bit compressed" in name:
+                  print(url); break
+          ')
           if [ -z "$URL" ]; then echo "no RAW URL in the index"; exit 0; fi
           curl -fL --retry 3 -o "dl-raw/$(basename "$URL")" "$URL"
 
