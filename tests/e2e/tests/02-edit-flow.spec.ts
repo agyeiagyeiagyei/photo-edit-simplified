@@ -2,7 +2,7 @@ import { test, expect } from '@playwright/test';
 import * as fs from 'fs';
 import {
   openApp, trackErrors, recordMetrics, importFiles, thumbs, canvas, canvasSize, canvasMean,
-  clickTab, setRange, imageDims, zipEntryCount, jpegSegments, JPEG_A, JPEG_B,
+  clickTab, setRange, imageDims, zipEntryCount, jpegSegments, waitCanvasWidthAbove, perfMarks, JPEG_A, JPEG_B,
 } from './helpers';
 
 test.describe('24MP JPEG: import → edit → export', () => {
@@ -14,12 +14,12 @@ test.describe('24MP JPEG: import → edit → export', () => {
     const size0 = await canvasSize(page);
     // Hi-res backing: viewport 1600 @ DPR2 needs > 1024 px, so the worker render must land.
     const t0 = Date.now();
-    await expect.poll(async () => (await canvasSize(page)).w, { timeout: 15_000, message: 'hi-res frame never landed' }).toBeGreaterThan(1200);
+    await waitCanvasWidthAbove(page, 1200, 15_000);
     const hiMs = Date.now() - t0;
     const size1 = await canvasSize(page);
     recordMetrics(testInfo, {
       import2_to_thumbs_ms: imp.thumbsMs, import2_to_canvas_ms: imp.canvasMs,
-      first_canvas_w: size0.w, hires_canvas_w: size1.w, hires_after_import_ms: hiMs,
+      first_canvas_w: size0.w, hires_canvas_w: size1.w, hires_after_import_ms: hiMs, ...(await perfMarks(page)),
     });
     expect(errors, errors.join('\n')).toEqual([]);
   });
@@ -27,16 +27,19 @@ test.describe('24MP JPEG: import → edit → export', () => {
   test('brightness slider updates the preview within a frame budget', async ({ page }, testInfo) => {
     await openApp(page);
     await importFiles(page, [JPEG_A]);
+    // Steady state: the full-res pixels are decoded and the first sharp frame has landed before we edit.
+    await waitCanvasWidthAbove(page, 1200, 20_000);
     await clickTab(page, 'Color');
     const before = await canvasMean(page);
     const t0 = Date.now();
     await setRange(page, /^Brightness/, 0.6);
     await expect.poll(() => canvasMean(page).then((m) => m.luma), { timeout: 5_000 }).toBeGreaterThan(before.luma + 15);
     const previewMs = Date.now() - t0;
-    // Settled: hi-res frame for the edited state must arrive and stay bright.
-    const t1 = Date.now();
-    await page.waitForTimeout(400);
-    await expect.poll(async () => (await canvasSize(page)).w, { timeout: 10_000 }).toBeGreaterThan(1200);
+    // Settled: hi-res frame for the edited state must arrive and stay bright. Measured from the slider change.
+    const t1 = t0;
+    // The 1024px preview tier blits first (width 1024); the sharp frame arrives when the backing exceeds 1200.
+    await waitCanvasWidthAbove(page, 1200, 10_000);
+    const hiEditMs = Date.now() - t1; // stamp immediately: everything below is outside the timed window
     const after = await canvasMean(page);
     expect(after.luma).toBeGreaterThan(before.luma + 15);
     // Ten rapid slider ticks: measure average main-thread cost per tick via long tasks.
@@ -57,8 +60,30 @@ test.describe('24MP JPEG: import → edit → export', () => {
       return { total_ms: Math.round(total), long_tasks: tasks.length, longest_ms: Math.round(Math.max(0, ...tasks)) };
     });
     recordMetrics(testInfo, {
-      slider_to_preview_ms: previewMs, hires_after_edit_ms: Date.now() - t1,
+      slider_to_preview_ms: previewMs, hires_after_edit_ms: hiEditMs, ...(await perfMarks(page)),
       ten_ticks_total_ms: longTasks.total_ms, ten_ticks_long_tasks: longTasks.long_tasks, ten_ticks_longest_ms: longTasks.longest_ms,
+    });
+  });
+
+  test('edit immediately after import (cold: full-res not yet decoded) still lands a sharp frame', async ({ page }, testInfo) => {
+    await openApp(page);
+    await importFiles(page, [JPEG_A]);
+    await clickTab(page, 'Color');
+    await page.evaluate(() => {
+      (window as any).__qaLong = [] as number[];
+      const obs = new PerformanceObserver((l) => l.getEntries().forEach((e) => (window as any).__qaLong.push(Math.round(e.duration))));
+      obs.observe({ type: 'longtask', buffered: false }); (window as any).__qaLongObs = obs;
+    });
+    const t0 = Date.now();
+    await setRange(page, /^Brightness/, 0.6);
+    await waitCanvasWidthAbove(page, 1200, 20_000);
+    const coldMs = Date.now() - t0;
+    const longTasks: number[] = await page.evaluate(() => { (window as any).__qaLongObs?.disconnect(); return (window as any).__qaLong; });
+    const after = await canvasMean(page);
+    expect(after.luma).toBeGreaterThan(60);
+    recordMetrics(testInfo, {
+      hires_after_edit_cold_ms: coldMs, cold_edit_longest_task_ms: Math.max(0, ...longTasks), cold_edit_blocked_ms: longTasks.reduce((a, b) => a + b, 0),
+      ...(await perfMarks(page, /^(hi\.|worker\.(load|render)|ingest\.)/)),
     });
   });
 

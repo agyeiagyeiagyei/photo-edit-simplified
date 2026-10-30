@@ -91,6 +91,10 @@ jobs:
         working-directory: tests/e2e
         run: mkdir -p fixtures && python3 gen_fixtures.py fixtures
 
+      - name: Generate synthetic RAW fixture
+        working-directory: tests/e2e
+        run: python3 gen_dng.py ../../dl-raw/synthetic.dng
+
       - name: Cache RAW fixture
         uses: actions/cache@v4
         with:
@@ -102,7 +106,7 @@ jobs:
         run: |
           mkdir -p dl-raw
           if [ -n "$(ls -A dl-raw)" ]; then echo "cached"; exit 0; fi
-          URL=$(curl -fsSL "https://raw.pixls.us/json/getrepository.php?set=all" | python3 -c '
+          URL=$(curl -fsSL --connect-timeout 15 --max-time 120 "https://raw.pixls.us/json/getrepository.php?set=all" | python3 -c '
           import json, sys, urllib.parse
           for row in json.load(sys.stdin).get("data", []):
               url = row[7] if isinstance(row, list) and len(row) > 7 else ""
@@ -111,7 +115,7 @@ jobs:
                   print(url); break
           ')
           if [ -z "$URL" ]; then echo "no RAW URL in the index"; exit 0; fi
-          curl -fL --retry 3 -o "dl-raw/$(basename "$URL")" "$URL"
+          curl -fL --retry 2 --connect-timeout 15 --max-time 300 -o "dl-raw/$(basename "$URL")" "$URL"
 
       - name: Playwright suite
         working-directory: tests/e2e

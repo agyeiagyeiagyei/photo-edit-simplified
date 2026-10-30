@@ -7,10 +7,12 @@ export const JPEG_A = path.join(FIX, 'bird-a-24mp.jpg');
 export const JPEG_B = path.join(FIX, 'bird-b-24mp.jpg');
 export const PNG_SMALL = path.join(FIX, 'small.png');
 export const RAW_DIR = path.resolve(__dirname, '..', '..', '..', 'dl-raw');
-export function rawFixture(): string | null {
-  if (!fs.existsSync(RAW_DIR)) return null;
-  const f = fs.readdirSync(RAW_DIR).find((n) => /\.(arw|dng|nef|cr2|cr3|raf|orf|rw2)$/i.test(n));
-  return f ? path.join(RAW_DIR, f) : null;
+export function rawFixtures(): string[] {
+  if (!fs.existsSync(RAW_DIR)) return [];
+  return fs.readdirSync(RAW_DIR)
+    .filter((n) => /\.(arw|dng|nef|cr2|cr3|raf|orf|rw2)$/i.test(n))
+    .sort()
+    .map((n) => path.join(RAW_DIR, n));
 }
 
 export type Metrics = Record<string, number | string | boolean>;
@@ -132,4 +134,19 @@ export function jpegSegments(buf: Buffer): { marker: number; data: Buffer }[] {
     i += 2 + len;
   }
   return out;
+}
+
+/** Frame-granular wait for the canvas backing width to exceed `min` (rAF polling, not expect.poll intervals). */
+export async function waitCanvasWidthAbove(page: Page, min: number, timeout = 20_000) {
+  await page.waitForFunction((m) => { const c = document.querySelector('.canvas-wrap canvas') as HTMLCanvasElement | null; return !!c && c.width > m; }, min, { timeout, polling: 'raf' });
+}
+
+/** Perf marks from the app (WS1+ builds); {} on older builds. Last occurrence of each name. */
+export async function perfMarks(page: Page, re = /^(hi\.|worker\.(load|render)|preview\.render|ingest\.|export\.)/) {
+  return page.evaluate((src) => {
+    const w = window as any; if (!w.__pes || !w.__pes.perf) return {} as Record<string, number>;
+    const r = new RegExp(src); const out: Record<string, number> = {};
+    for (const e of w.__pes.perf()) if (r.test(e.name)) out['mark_' + e.name.replace(/\./g, '_')] = Math.round(e.dur_ms * 10) / 10;
+    return out;
+  }, re.source);
 }
