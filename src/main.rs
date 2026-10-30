@@ -219,7 +219,7 @@ fn ensure_full(state: AppState, id: usize, waiter: Option<Box<dyn FnOnce()>>) {
         } else if is_raw {
             // Lazy develop: pull the original out of IndexedDB only now.
             match session::load_raw_bytes(id).await {
-                Some(bytes) => raw::decode_raw(&bytes).ok(),
+                Some(bytes) => raw_develop_async(&bytes).await,
                 None => None,
             }
         } else {
@@ -540,12 +540,12 @@ fn oriented_dims(w: usize, h: usize, orientation: u16) -> (usize, usize) {
     }
 }
 
-/// Poll the worker callback until it fires (the raw worker has no awaitable
+/// Poll a worker callback until it fires (the raw worker has no awaitable
 /// API). 60 s covers a slow develop on a large sensor.
-async fn await_proxy(
-    start: impl FnOnce(Box<dyn FnOnce(Option<pworker::ProxyResult>)>) -> bool,
-) -> Option<pworker::ProxyResult> {
-    let out: Rc<RefCell<Option<pworker::ProxyResult>>> = Rc::new(RefCell::new(None));
+async fn await_worker<T: 'static>(
+    start: impl FnOnce(Box<dyn FnOnce(Option<T>)>) -> bool,
+) -> Option<T> {
+    let out: Rc<RefCell<Option<T>>> = Rc::new(RefCell::new(None));
     let done = Rc::new(Cell::new(false));
     let (o, d) = (out.clone(), done.clone());
     let started = start(Box::new(move |r| {
@@ -568,7 +568,7 @@ async fn await_proxy(
 async fn camera_proxy_async(jpeg: &[u8], orientation: u16) -> Option<pworker::ProxyResult> {
     let jpeg = jpeg.to_vec();
     let t0 = perf::now();
-    let r = await_proxy(move |cb| pworker::camera_proxy(&jpeg, orientation, PROXY_EDGE, cb)).await;
+    let r = await_worker(move |cb| pworker::camera_proxy(&jpeg, orientation, PROXY_EDGE, cb)).await;
     perf::record("proxy.camera_decode", perf::now() - t0);
     r
 }
@@ -576,8 +576,35 @@ async fn camera_proxy_async(jpeg: &[u8], orientation: u16) -> Option<pworker::Pr
 async fn raw_proxy_async(bytes: &[u8]) -> Option<pworker::ProxyResult> {
     let bytes = bytes.to_vec();
     let t0 = perf::now();
-    let r = await_proxy(move |cb| pworker::raw_proxy(&bytes, PROXY_EDGE, cb)).await;
+    let r = await_worker(move |cb| pworker::raw_proxy(&bytes, PROXY_EDGE, cb)).await;
     perf::record("proxy.raw_develop", perf::now() - t0);
+    r
+}
+
+/// RAW header metadata + preview from the raw worker.
+async fn raw_meta_async(bytes: &[u8], preview_edge: u32) -> Option<pworker::RawMeta> {
+    let bytes = bytes.to_vec();
+    let t0 = perf::now();
+    let r = await_worker(move |cb| pworker::raw_meta(&bytes, preview_edge, cb)).await;
+    perf::record("proxy.raw_meta", perf::now() - t0);
+    r
+}
+
+/// Full sensor develop in the raw worker.
+async fn raw_develop_async(bytes: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
+    let bytes = bytes.to_vec();
+    let t0 = perf::now();
+    let r = await_worker(move |cb| pworker::raw_develop(&bytes, cb)).await;
+    perf::record("proxy.raw_develop_full", perf::now() - t0);
+    r.map(|f| (f.pixels, f.w, f.h))
+}
+
+/// Embedded preview (no demosaic) at display resolution.
+async fn raw_preview_async(bytes: &[u8]) -> Option<pworker::ProxyResult> {
+    let bytes = bytes.to_vec();
+    let t0 = perf::now();
+    let r = await_worker(move |cb| pworker::raw_preview(&bytes, PROXY_EDGE, cb)).await;
+    perf::record("proxy.raw_preview", perf::now() - t0);
     r
 }
 
@@ -607,16 +634,28 @@ async fn decode_stored_proxy(rec: StoredProxy) -> Option<DecodedProxy> {
 /// First decode for an item with no proxy record: prefer the camera JPEG (and
 /// persist a record for next time), else develop fully in the worker.
 async fn decode_camera_from_raw(id: usize, bytes: &[u8]) -> Option<DecodedProxy> {
-    if let Some((jpeg, jw, jh)) = raw::largest_embedded_jpeg(bytes) {
-        let orientation = raw::orientation_code(bytes);
-        let frame = oriented_dims(jw, jh, orientation);
-        if let Some(r) = camera_proxy_async(&jpeg, orientation).await {
-            let frame = if frame.0 > 0 { frame } else { (r.full_w, r.full_h) };
-            if let Ok(db) = session::open_db().await {
-                let _ = session::put_proxy(&db, id, &camera_proxy_record(&jpeg, orientation, frame))
+    if let Some(meta) = raw_meta_async(bytes, 0).await {
+        if let Some(jpeg) = meta.camera_jpeg {
+            let orientation = meta.orientation;
+            let frame = oriented_dims(meta.camera_w, meta.camera_h, orientation);
+            if let Some(r) = camera_proxy_async(&jpeg, orientation).await {
+                let frame = if frame.0 > 0 { frame } else { (r.full_w, r.full_h) };
+                if let Ok(db) = session::open_db().await {
+                    let _ = session::put_proxy(
+                        &db,
+                        id,
+                        &camera_proxy_record(&jpeg, orientation, frame),
+                    )
                     .await;
+                }
+                return Some(DecodedProxy {
+                    pixels: r.pixels,
+                    w: r.w,
+                    h: r.h,
+                    frame,
+                    developed: false,
+                });
             }
-            return Some(DecodedProxy { pixels: r.pixels, w: r.w, h: r.h, frame, developed: false });
         }
     }
     let r = raw_proxy_async(bytes).await?;
@@ -883,21 +922,20 @@ struct RawIngest {
 /// full develop for first open/export. Falls back to an eager develop when
 /// the file has no usable preview or the bytes could not be stored.
 async fn prepare_raw(id: usize, bytes: &[u8], mtime: Option<f64>) -> Option<RawIngest> {
-    let exif_tiff = raw::extract_exif_tiff(bytes);
-    let taken = exif_tiff.as_deref().and_then(exif::taken_from_tiff).or(mtime);
-    let exif = exif_tiff.map(Rc::new);
+    let meta = raw_meta_async(bytes, 1024).await?;
+    let taken = meta.taken.or(mtime);
+    let exif = meta.exif_tiff.map(Rc::new);
 
-    let (preview_px, pw, ph) = raw::preview_rgba(bytes)?;
-    let (pp, pw2, ph2) = downscale_pixels(&preview_px, pw, ph, 1024);
+    let (pp, pw2, ph2) = meta.preview?;
     let canvas = web::create_canvas(pw2 as u32, ph2 as u32);
     web::put_pixels(&canvas, &pp, pw2 as u32, ph2 as u32);
     let png = web::canvas_to_blob(&canvas, "image/png").await.ok()?;
 
     // The camera's full-size JPEG is the instant display proxy; storing it
     // lets a reload open editable at 3200px without touching the RAW.
-    let camera = raw::largest_embedded_jpeg(bytes).map(|(jpeg, jw, jh)| {
-        let orientation = raw::orientation_code(bytes);
-        (jpeg, orientation, oriented_dims(jw, jh, orientation))
+    let camera = meta.camera_jpeg.map(|jpeg| {
+        let orientation = meta.orientation;
+        (jpeg, orientation, oriented_dims(meta.camera_w, meta.camera_h, orientation))
     });
 
     let stored = {
@@ -919,7 +957,7 @@ async fn prepare_raw(id: usize, bytes: &[u8], mtime: Option<f64>) -> Option<RawI
         None
     } else {
         web::log("RAW bytes not persisted; developing eagerly");
-        raw::decode_raw(bytes).ok()
+        raw_develop_async(bytes).await
     };
     let (dims, preview) = match &full {
         Some((fpx, fw, fh)) => {
@@ -929,7 +967,7 @@ async fn prepare_raw(id: usize, bytes: &[u8], mtime: Option<f64>) -> Option<RawI
         // Camera frame dims keep the hi-res target sized to the sensor, not
         // the small embedded preview rawler exposes.
         None => (
-            camera.as_ref().map(|(_, _, f)| *f).unwrap_or((pw, ph)),
+            camera.as_ref().map(|(_, _, f)| *f).unwrap_or((pw2, ph2)),
             (pp, pw2, ph2),
         ),
     };
@@ -2782,14 +2820,15 @@ fn request_camera_loupe(state: AppState, id: usize) {
     spawn_local(async move {
         let decoded = async {
             let bytes = session::load_raw_bytes(id).await?;
-            let (jpeg, jw, _) = raw::largest_embedded_jpeg(&bytes)?;
+            let meta = raw_meta_async(&bytes, 0).await?;
+            let jpeg = meta.camera_jpeg?;
             // Below ~3k wide the largest JPEG is still a preview, not sensor
             // resolution.
-            if jw < 3000 {
+            if meta.camera_w < 3000 {
                 return None;
             }
             let (px, w, h) = camera_jpeg_rgba(&jpeg).await?;
-            let (px, w, h) = raw::orientation_corrected(px, w, h, &bytes);
+            let (px, w, h) = raw::apply_orientation_code(px, w, h, meta.orientation);
             Some(Rc::new((px, w, h)))
         }
         .await;
@@ -4179,7 +4218,7 @@ fn restore_session(state: AppState) {
                     continue;
                 };
                 let bytes = js_sys::Uint8Array::new(&buf).to_vec();
-                let Ok((full_rgba, fw, fh)) = raw::decode_raw(&bytes) else { continue };
+                let Some((full_rgba, fw, fh)) = raw_develop_async(&bytes).await else { continue };
                 let (pp, pw, ph) = downscale_pixels(&full_rgba, fw, fh, 1024);
                 let canvas = web::create_canvas(pw as u32, ph as u32);
                 web::put_pixels(&canvas, &pp, pw as u32, ph as u32);
@@ -4506,8 +4545,8 @@ fn drive_develop_full(state: AppState, id: String) {
         if !alive() {
             return;
         }
-        match raw::decode_raw(&bytes) {
-            Ok((px, w, h)) => {
+        match raw_develop_async(&bytes).await {
+            Some((px, w, h)) => {
                 if !alive() {
                     return;
                 }
@@ -4525,11 +4564,11 @@ fn drive_develop_full(state: AppState, id: String) {
                 state.drive_full_busy.set(None);
                 state.drive_full_ready.set(Some(id.clone()));
             }
-            Err(e) => {
+            None => {
                 state.drive_full_busy.set(None);
                 state
                     .drive_error
-                    .set(Some(format!("Full-res develop failed: {e}")));
+                    .set(Some("Full-res develop failed: unsupported or corrupt RAW".to_string()));
             }
         }
     });
@@ -4578,18 +4617,23 @@ fn drive_hover_prefetch(state: AppState, id: String, name: String) {
             let bytes = drive::download_file(token.as_str(), &id).await.ok()?;
             if raw {
                 if arw {
-                    if let Some((jpeg, jw, _)) = raw::largest_embedded_jpeg(&bytes) {
+                    if let Some(meta) = raw_meta_async(&bytes, 0).await {
                         // Below ~3k wide the largest JPEG is still a preview,
                         // not sensor resolution — keep the preview tag.
-                        if jw >= 3000 {
-                            if let Some((px, w, h)) = camera_jpeg_rgba(&jpeg).await {
-                                let (px, w, h) = raw::orientation_corrected(px, w, h, &bytes);
-                                return Some(((px, w, h), false));
+                        if meta.camera_w >= 3000 {
+                            if let Some(jpeg) = meta.camera_jpeg {
+                                if let Some((px, w, h)) = camera_jpeg_rgba(&jpeg).await {
+                                    let (px, w, h) =
+                                        raw::apply_orientation_code(px, w, h, meta.orientation);
+                                    return Some(((px, w, h), false));
+                                }
                             }
                         }
                     }
                 }
-                return raw::preview_rgba(&bytes).map(|(px, w, h)| ((px, w, h), true));
+                return raw_preview_async(&bytes)
+                    .await
+                    .map(|r| ((r.pixels, r.w, r.h), true));
             }
             let blob = web::bytes_to_blob(&bytes, still_mime?).ok()?;
             let (img, _) = web::load_image(&blob).await.ok()?;

@@ -307,6 +307,102 @@ pub fn camera_proxy(
     )
 }
 
+pub struct RawMeta {
+    pub exif_tiff: Option<Vec<u8>>,
+    pub orientation: u16,
+    pub taken: Option<f64>,
+    pub camera_jpeg: Option<Vec<u8>>,
+    pub camera_w: usize,
+    pub camera_h: usize,
+    pub preview: Option<(Vec<u8>, usize, usize)>,
+}
+
+fn parse_raw_meta(v: &JsValue) -> Option<RawMeta> {
+    let pw = get_u32(v, "preview_w")? as usize;
+    let ph = get_u32(v, "preview_h")? as usize;
+    let preview = if pw > 0 && ph > 0 {
+        Some((get_buf(v, "preview")?.to_vec(), pw, ph))
+    } else {
+        None
+    };
+    Some(RawMeta {
+        exif_tiff: get_buf(v, "exif_tiff").map(|b| b.to_vec()),
+        orientation: get_u32(v, "orientation")? as u16,
+        taken: get_f64(v, "taken"),
+        camera_jpeg: get_buf(v, "camera_jpeg").map(|b| b.to_vec()),
+        camera_w: get_u32(v, "camera_w")? as usize,
+        camera_h: get_u32(v, "camera_h")? as usize,
+        preview,
+    })
+}
+
+/// RAW header metadata + optional preview, decoded in the raw worker.
+pub fn raw_meta(
+    bytes: &[u8],
+    preview_edge: u32,
+    cb: impl FnOnce(Option<RawMeta>) + 'static,
+) -> bool {
+    if !raw_init() {
+        return false;
+    }
+    let arr = Uint8Array::from(bytes);
+    let buf = arr.buffer();
+    raw_call(
+        "raw_meta",
+        &[arr.into(), JsValue::from(preview_edge)],
+        &[buf.into()],
+        Box::new(move |reply| cb(reply.ok().and_then(|v| parse_raw_meta(&v)))),
+    )
+}
+
+pub struct FullResult {
+    pub pixels: Vec<u8>,
+    pub w: usize,
+    pub h: usize,
+}
+
+/// Full sensor develop in the raw worker.
+pub fn raw_develop(bytes: &[u8], cb: impl FnOnce(Option<FullResult>) + 'static) -> bool {
+    if !raw_init() {
+        return false;
+    }
+    let arr = Uint8Array::from(bytes);
+    let buf = arr.buffer();
+    raw_call(
+        "raw_develop",
+        &[arr.into()],
+        &[buf.into()],
+        Box::new(move |reply| {
+            cb(reply.ok().and_then(|v| {
+                Some(FullResult {
+                    pixels: get_buf(&v, "pixels")?.to_vec(),
+                    w: get_u32(&v, "w")? as usize,
+                    h: get_u32(&v, "h")? as usize,
+                })
+            }))
+        }),
+    )
+}
+
+/// Embedded preview (no demosaic) at display resolution.
+pub fn raw_preview(
+    bytes: &[u8],
+    max_edge: u32,
+    cb: impl FnOnce(Option<ProxyResult>) + 'static,
+) -> bool {
+    if !raw_init() {
+        return false;
+    }
+    let arr = Uint8Array::from(bytes);
+    let buf = arr.buffer();
+    raw_call(
+        "raw_preview",
+        &[arr.into(), JsValue::from(max_edge)],
+        &[buf.into()],
+        Box::new(move |reply| cb(reply.ok().and_then(|v| parse_proxy(&v)))),
+    )
+}
+
 fn get_buf(v: &JsValue, key: &str) -> Option<Uint8Array> {
     let b = Reflect::get(v, &JsValue::from_str(key)).ok()?;
     if b.is_undefined() || b.is_null() {
@@ -320,6 +416,10 @@ fn get_u32(v: &JsValue, key: &str) -> Option<u32> {
         .ok()?
         .as_f64()
         .map(|n| n as u32)
+}
+
+fn get_f64(v: &JsValue, key: &str) -> Option<f64> {
+    Reflect::get(v, &JsValue::from_str(key)).ok()?.as_f64()
 }
 
 /// Ship an item's full-res buffer to the worker (transfer, no copy on send).

@@ -439,6 +439,51 @@ pub fn camera_proxy(jpeg: Uint8Array, orientation: u16, max_edge: u32) -> Result
     Ok(proxy_result(px, pw, ph, w, h))
 }
 
+/// RAW metadata in one round-trip: EXIF payload, orientation, capture time,
+/// the camera JPEG, and (when `preview_edge` > 0) a display-resolution
+/// preview. Keeps rawler out of the app bundle.
+#[wasm_bindgen]
+pub fn raw_meta(bytes: Uint8Array, preview_edge: u32) -> Result<JsValue, JsValue> {
+    let m = rawcore::raw_meta(&bytes.to_vec())
+        .ok_or_else(|| JsValue::from_str("unsupported RAW"))?;
+    let (pv, pw, ph) = match (&m.preview, preview_edge) {
+        (Some((px, w, h)), e) if e > 0 => downscale(px, *w, *h, e),
+        _ => (Vec::new(), 0, 0),
+    };
+    Ok(result_obj(&[
+        ("exif_tiff", m.exif_tiff.map(js_buf).unwrap_or(JsValue::NULL)),
+        ("orientation", (m.orientation as u32).into()),
+        ("taken", m.taken.map(JsValue::from_f64).unwrap_or(JsValue::NULL)),
+        ("camera_jpeg", m.camera_jpeg.map(js_buf).unwrap_or(JsValue::NULL)),
+        ("camera_w", (m.camera_w as u32).into()),
+        ("camera_h", (m.camera_h as u32).into()),
+        ("preview", js_buf(pv)),
+        ("preview_w", (pw as u32).into()),
+        ("preview_h", (ph as u32).into()),
+    ]))
+}
+
+/// Full sensor develop — the multi-second demosaic. Runs here so the app
+/// thread never blocks on RAW decoding.
+#[wasm_bindgen]
+pub fn raw_develop(bytes: Uint8Array) -> Result<JsValue, JsValue> {
+    let (rgba, w, h) = rawcore::decode_raw(&bytes.to_vec()).map_err(|e| JsValue::from_str(&e))?;
+    Ok(result_obj(&[
+        ("pixels", js_buf(rgba)),
+        ("w", (w as u32).into()),
+        ("h", (h as u32).into()),
+    ]))
+}
+
+/// Embedded preview (no demosaic) at display resolution.
+#[wasm_bindgen]
+pub fn raw_preview(bytes: Uint8Array, max_edge: u32) -> Result<JsValue, JsValue> {
+    let (rgba, w, h) = rawcore::preview_rgba(&bytes.to_vec())
+        .ok_or_else(|| JsValue::from_str("no embedded preview"))?;
+    let (px, pw, ph) = downscale(&rgba, w, h, max_edge);
+    Ok(proxy_result(px, pw, ph, w, h))
+}
+
 fn parse_pts(v: &JsValue) -> Vec<(f32, f32)> {
     let mut out = Vec::new();
     if !Array::is_array(v) {

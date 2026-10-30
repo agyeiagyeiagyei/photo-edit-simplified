@@ -6,4 +6,8 @@ license = "Apache-2.0"
 
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+rawmeta = { path = "../rawmeta" }
+# rawler is the pure-Rust decoder from the dnglab project. Vendored: upstream
+# calls std::time::Instant::now() in demosaic timing logs, which panics on
+# wasm32-unknown-unknown; the vendored copy strips those calls.
 rawler = { path = "../vendor/rawler" }

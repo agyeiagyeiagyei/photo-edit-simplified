@@ -1885,14 +1885,11 @@ name = "photo-edit-simplified"
 version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
- "getrandom 0.3.4",
  "idb",
  "js-sys",
  "leptos",
  "pes-pixel",
- "rawcore",
- "rawler",
- "uuid",
+ "rawmeta",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -2151,6 +2148,7 @@ version = "0.1.0"
 dependencies = [
  "image",
  "rawler",
+ "rawmeta",
 ]
 
 [[package]]
@@ -2192,6 +2190,10 @@ dependencies = [
  "weezl",
  "zerocopy",
 ]
+
+[[package]]
+name = "rawmeta"
+version = "0.1.0"
 
 [[package]]
 name = "rayon"

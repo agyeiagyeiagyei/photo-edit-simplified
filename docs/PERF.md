@@ -33,6 +33,9 @@ cleared right after the measure so the timeline never accumulates marks.
 | `hi.blit` | worker pixels → canvas → layer composite | — |
 | `proxy.camera_decode` | camera-JPEG proxy decode in the raw worker | — |
 | `proxy.raw_develop` | sensor develop to a 3200px display proxy | — |
+| `proxy.raw_develop_full` | full-size sensor develop in the raw worker | — |
+| `proxy.raw_meta` | one raw-worker round-trip: EXIF, capture time, preview, camera JPEG | — |
+| `proxy.raw_preview` | embedded RAW preview (no demosaic) at display size | — |
 | `proxy.land` | installing a decoded proxy (cache, worker load, LRU) | item id |
 | `export.ensure_full` | waiting for full-res pixels to materialise | — |
 | `export.geometry` | geometry stage of the export pipeline | working `WxH` |
@@ -50,7 +53,7 @@ cleared right after the measure so the timeline never accumulates marks.
 
 | Name | Measures |
 |---|---|
-| `worker.<op>` | worker execution of `op` (`load`, `unload`, `render`, `raw_proxy`, `camera_proxy`, `heal_stroke`, `clone_stamp`, `cut`, `fill_selection`, `extract`) |
+| `worker.<op>` | worker execution of `op` (`load`, `unload`, `render`, `raw_proxy`, `raw_meta`, `raw_develop`, `raw_preview`, `camera_proxy`, `heal_stroke`, `clone_stamp`, `cut`, `fill_selection`, `extract`) |
 
 `render` additionally returns a `timings` object, recorded as:
 

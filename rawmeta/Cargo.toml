@@ -1,0 +1,9 @@
+[package]
+name = "rawmeta"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+# No dependencies on purpose: the app links this crate, the full RAW decoder
+# (rawler) only ships in the pixel worker.
+[dependencies]

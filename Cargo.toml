@@ -5,11 +5,11 @@ edition = "2021"
 license = "Apache-2.0"
 
 [workspace]
-members = ["pixel", "worker", "rawcore"]
+members = ["pixel", "worker", "rawcore", "rawmeta"]
 
 [dependencies]
 pes-pixel = { path = "pixel" }
-rawcore = { path = "rawcore" }
+rawmeta = { path = "rawmeta" }
 leptos = { version = "0.6", features = ["csr"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
@@ -32,13 +32,6 @@ web-sys = { version = "0.3", features = [
 
 console_error_panic_hook = "0.1"
 
-# RAW import (rawler is the pure-Rust decoder from the dnglab project).
-# Vendored: upstream calls std::time::Instant::now() in demosaic timing logs,
-# which panics on wasm32-unknown-unknown; the vendored copy strips those calls.
-rawler = { path = "vendor/rawler" }
-# rawler's transitive deps need wasm-aware randomness sources.
-uuid = { version = "1", features = ["js"] }
-getrandom = { version = "0.3", features = ["wasm_js"] }
 idb = "0.6"
 
 [profile.release]
