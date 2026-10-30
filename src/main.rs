@@ -187,6 +187,9 @@ fn materialize_full(state: AppState, id: usize, pixels: Vec<u8>, w: usize, h: us
 /// `waiter` runs once the buffer lands.
 fn ensure_full(state: AppState, id: usize, waiter: Option<Box<dyn FnOnce()>>) {
     touch_full(id);
+    // The develop is about to take ~100MB; the camera loupe copy is moot
+    // once these pixels exist, so don't let them stack.
+    camera_loupe_drop(id);
     if full_present(id) {
         if let Some(w) = waiter {
             w();
@@ -832,6 +835,7 @@ fn remove_item(state: AppState, item_id: usize) {
     if state.canvas_loupe.get_untracked().map(|(id, ..)| id) == Some(item_id) {
         canvas_loupe_clear(state);
     }
+    camera_loupe_clear(item_id);
     if state.selected.get_untracked() == Some(item_id) {
         let pos = removed.map(|(_, _, p)| p).unwrap_or(0);
         let next = state.items.with(|v| v.get(pos).or_else(|| v.last()).map(|m| m.id));
@@ -2660,6 +2664,102 @@ fn FocusLoupe(state: AppState) -> impl IntoView {
 thread_local! {
     static CANVAS_LOUPE_HI: RefCell<Option<HiCache>> = RefCell::new(None);
     static CANVAS_LOUPE_REQ: Cell<u32> = const { Cell::new(0) };
+    /// Native-resolution camera JPEG for an item whose sensor pixels were not
+    /// developed (lazy RAW). One entry — a 26MP frame is ~100MB of RGBA.
+    static CAMERA_LOUPE: RefCell<Option<(usize, Rc<(Vec<u8>, usize, usize)>)>> = RefCell::new(None);
+    static CAMERA_LOUPE_INFLIGHT: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+    /// Items with no usable camera JPEG (or no stored original) — don't
+    /// re-read a 29MB blob on every repaint.
+    static CAMERA_LOUPE_FAILED: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+}
+
+fn camera_loupe_source(id: usize) -> Option<Rc<(Vec<u8>, usize, usize)>> {
+    CAMERA_LOUPE.with(|c| {
+        c.borrow()
+            .as_ref()
+            .filter(|(cid, _)| *cid == id)
+            .map(|(_, px)| px.clone())
+    })
+}
+
+fn camera_loupe_drop(id: usize) {
+    CAMERA_LOUPE.with(|c| {
+        let hit = c.borrow().as_ref().map(|(cid, _)| *cid == id).unwrap_or(false);
+        if hit {
+            *c.borrow_mut() = None;
+        }
+    });
+}
+
+fn camera_loupe_clear(id: usize) {
+    camera_loupe_drop(id);
+    CAMERA_LOUPE_INFLIGHT.with(|s| {
+        s.borrow_mut().remove(&id);
+    });
+    CAMERA_LOUPE_FAILED.with(|s| {
+        s.borrow_mut().remove(&id);
+    });
+}
+
+/// A destructive op baked new pixels for the item: its embedded JPEG no
+/// longer describes what is on screen, so drop the decode and never serve
+/// it again (the regenerated proxy covers the evicted-full case).
+fn camera_loupe_invalidate(id: usize) {
+    camera_loupe_drop(id);
+    CAMERA_LOUPE_FAILED.with(|s| {
+        s.borrow_mut().insert(id);
+    });
+}
+
+/// Decode the camera's full-size embedded JPEG for the loupe. Import defers
+/// the sensor develop, so without this the loupe would upscale the 3200px
+/// display proxy. Reads the original from IndexedDB, keeps only the decoded
+/// pixels, and lets the effect repaint when they land.
+fn request_camera_loupe(state: AppState, id: usize) {
+    if camera_loupe_source(id).is_some() {
+        return;
+    }
+    if CAMERA_LOUPE_FAILED.with(|s| s.borrow().contains(&id)) {
+        return;
+    }
+    // A sensor develop is running; its pixels are about to supersede the
+    // camera JPEG, and adding ~100MB alongside it buys nothing.
+    if FULL_INFLIGHT.with(|f| f.borrow().contains(&id)) {
+        return;
+    }
+    if !CAMERA_LOUPE_INFLIGHT.with(|s| s.borrow_mut().insert(id)) {
+        return;
+    }
+    spawn_local(async move {
+        let decoded = async {
+            let bytes = session::load_raw_bytes(id).await?;
+            let (jpeg, jw, _) = raw::largest_embedded_jpeg(&bytes)?;
+            // Below ~3k wide the largest JPEG is still a preview, not sensor
+            // resolution.
+            if jw < 3000 {
+                return None;
+            }
+            let (px, w, h) = camera_jpeg_rgba(&jpeg).await?;
+            let (px, w, h) = raw::orientation_corrected(px, w, h, &bytes);
+            Some(Rc::new((px, w, h)))
+        }
+        .await;
+        CAMERA_LOUPE_INFLIGHT.with(|s| {
+            s.borrow_mut().remove(&id);
+        });
+        if let Some(px) = decoded {
+            // The sensor develop landed while we were decoding; the loupe
+            // reads those pixels now, so don't hold a second full frame.
+            if !full_present(id) {
+                CAMERA_LOUPE.with(|c| *c.borrow_mut() = Some((id, px)));
+                state.items.update(|_| {});
+            }
+        } else {
+            CAMERA_LOUPE_FAILED.with(|s| {
+                s.borrow_mut().insert(id);
+            });
+        }
+    });
 }
 
 /// Normalized working-image coords of a pointer over the editor canvas. The
@@ -2924,7 +3024,29 @@ fn CanvasLoupe(
                     tag.set(format!("{mag}:1"));
                     return;
                 }
-            } else if let Some(p) = proxy_data(id) {
+            }
+            if photo.raw {
+                // The sensor develop is deferred on import, so without this
+                // the loupe would upscale the 3200px display proxy. The
+                // camera's own full-size JPEG is one decode away and covers
+                // the same frame.
+                request_camera_loupe(state, id);
+                if let Some(cam) = camera_loupe_source(id) {
+                    let (kx, ky) = (cam.1 as f64 / ww as f64, cam.2 as f64 / wh as f64);
+                    let px = ((sx as f64 * kx).round() as usize).min(cam.1.saturating_sub(1));
+                    let py = ((sy as f64 * ky).round() as usize).min(cam.2.saturating_sub(1));
+                    let pw = ((cw as f64 * kx).round() as usize).max(1).min(cam.1 - px);
+                    let phh = ((ch as f64 * ky).round() as usize).max(1).min(cam.2 - py);
+                    if let Some(win) =
+                        source_window(&cam.0, cam.1, cam.2, px, py, pw, phh, &item.edit, id as u32)
+                    {
+                        blit_window(&canvas, &win, pw as u32, phh as u32, bw as u32, bh as u32);
+                        tag.set(format!("{mag}:1 camera"));
+                        return;
+                    }
+                }
+            }
+            if let Some(p) = proxy_data(id) {
                 // The proxy covers the same frame at reduced density: map the
                 // window into proxy pixels and let the blit upscale it.
                 let (kx, ky) = (p.w as f64 / ww as f64, p.h as f64 / wh as f64);
@@ -6812,6 +6934,7 @@ fn content_fill_selection_sync(state: AppState) {
 /// Rotation is baked into the new pixels, so it resets; the crop rect is a
 /// render-time window over the working frame and is deliberately preserved.
 fn destructive_apply(state: AppState, item_id: usize, r: pworker::DestructiveResult) {
+    camera_loupe_invalidate(item_id);
     CACHE.with(|c| {
         if let Some(pd) = c.borrow_mut().photos.get_mut(&item_id) {
             let pd = Rc::make_mut(pd);
