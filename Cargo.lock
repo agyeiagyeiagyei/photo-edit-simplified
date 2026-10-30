@@ -2147,6 +2147,7 @@ name = "rawcore"
 version = "0.1.0"
 dependencies = [
  "image",
+ "js-sys",
  "rawler",
  "rawmeta",
 ]

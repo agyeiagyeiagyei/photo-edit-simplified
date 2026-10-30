@@ -315,6 +315,8 @@ pub struct RawMeta {
     pub camera_w: usize,
     pub camera_h: usize,
     pub preview: Option<(Vec<u8>, usize, usize)>,
+    pub get_decoder_ms: f64,
+    pub get_decoder_first: bool,
 }
 
 fn parse_raw_meta(v: &JsValue) -> Option<RawMeta> {
@@ -333,6 +335,8 @@ fn parse_raw_meta(v: &JsValue) -> Option<RawMeta> {
         camera_w: get_u32(v, "camera_w")? as usize,
         camera_h: get_u32(v, "camera_h")? as usize,
         preview,
+        get_decoder_ms: get_f64(v, "get_decoder_ms").unwrap_or(0.0),
+        get_decoder_first: get_bool(v, "get_decoder_first").unwrap_or(false),
     })
 }
 
@@ -416,6 +420,10 @@ fn get_u32(v: &JsValue, key: &str) -> Option<u32> {
         .ok()?
         .as_f64()
         .map(|n| n as u32)
+}
+
+fn get_bool(v: &JsValue, key: &str) -> Option<bool> {
+    Reflect::get(v, &JsValue::from_str(key)).ok()?.as_bool()
 }
 
 fn get_f64(v: &JsValue, key: &str) -> Option<f64> {

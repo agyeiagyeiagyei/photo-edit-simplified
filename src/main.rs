@@ -587,6 +587,11 @@ async fn raw_meta_async(bytes: &[u8], preview_edge: u32) -> Option<pworker::RawM
     let t0 = perf::now();
     let r = await_worker(move |cb| pworker::raw_meta(&bytes, preview_edge, cb)).await;
     perf::record("proxy.raw_meta", perf::now() - t0);
+    if let Some(m) = &r {
+        if m.get_decoder_first {
+            perf::record("raw.get_decoder", m.get_decoder_ms);
+        }
+    }
     r
 }
 

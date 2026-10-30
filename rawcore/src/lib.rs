@@ -1,6 +1,7 @@
 //! RAW decode core for the pixel worker: demosaic via rawler, embedded-JPEG
 //! previews, EXIF orientation, and the metadata payload the app requests.
-//! No browser APIs, so it compiles for both wasm32 targets unchanged.
+//! No browser APIs outside the wasm-only perf clock, so it compiles for both
+//! wasm32 targets unchanged.
 
 use rawler::decoders::{RawDecodeParams, RawMetadata};
 use rawler::imgop::develop::{Intermediate, RawDevelop};
@@ -9,6 +10,19 @@ use rawler::rawsource::RawSource;
 use rawmeta::tiff as tw;
 
 pub use rawmeta::{is_raw_name, largest_embedded_jpeg, RAW_EXTENSIONS};
+
+/// Milliseconds for perf marks. wasm32 has no std clock; host builds only run
+/// this in tests, where the value is never asserted.
+fn now_ms() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::now()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        0.0
+    }
+}
 
 /// Decode + develop a RAW file into orientation-corrected RGBA pixels, then
 /// tone-match to the camera's embedded JPEG preview so the result sits on the
@@ -161,11 +175,16 @@ pub struct RawMeta {
     pub camera_w: usize,
     pub camera_h: usize,
     pub preview: Option<(Vec<u8>, usize, usize)>,
+    /// `rawler::get_decoder` alone. The first call in a worker also builds
+    /// rawler's camera database; that is the number the ≤50 ms gate measures.
+    pub get_decoder_ms: f64,
 }
 
 pub fn raw_meta(bytes: &[u8]) -> Option<RawMeta> {
     let rawfile = RawSource::new_from_slice(bytes);
+    let t0 = now_ms();
     let decoder = rawler::get_decoder(&rawfile).ok()?;
+    let get_decoder_ms = now_ms() - t0;
     let params = RawDecodeParams { image_index: 0 };
     let meta = decoder.raw_metadata(&rawfile, &params).ok()?;
     let orientation = meta.exif.orientation.unwrap_or(1);
@@ -176,7 +195,16 @@ pub fn raw_meta(bytes: &[u8]) -> Option<RawMeta> {
         None => (None, 0, 0),
     };
     let preview = preview_rgba(bytes);
-    Some(RawMeta { exif_tiff, orientation, taken, camera_jpeg, camera_w, camera_h, preview })
+    Some(RawMeta {
+        exif_tiff,
+        orientation,
+        taken,
+        camera_jpeg,
+        camera_w,
+        camera_h,
+        preview,
+        get_decoder_ms,
+    })
 }
 
 fn raw_orientation(bytes: &[u8]) -> u16 {

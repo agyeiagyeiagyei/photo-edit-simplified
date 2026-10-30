@@ -2,7 +2,7 @@
 //! The app ships pixels in via `load`, then issues render/destructive ops;
 //! results come back as JS objects with transferable ArrayBuffers.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use js_sys::{Array, Object, Reflect, Uint8Array, Uint8ClampedArray};
@@ -16,6 +16,9 @@ use pes_pixel::{blur, clone, fill, heal, levels, noise, ops, rawops};
 
 thread_local! {
     static BUFFERS: RefCell<HashMap<u32, (Vec<u8>, usize, usize)>> = RefCell::new(HashMap::new());
+    /// `get_decoder_ms` of the first RAW opened in this worker. The first call
+    /// pays rawler's camera-database build; later calls are the steady state.
+    static DECODER_FIRST_MS: Cell<Option<f64>> = const { Cell::new(None) };
 }
 
 fn with_buffer<R>(id: u32, f: impl FnOnce(&mut (Vec<u8>, usize, usize)) -> R) -> Result<R, JsValue> {
@@ -450,6 +453,13 @@ pub fn raw_meta(bytes: Uint8Array, preview_edge: u32) -> Result<JsValue, JsValue
         (Some((px, w, h)), e) if e > 0 => downscale(px, *w, *h, e),
         _ => (Vec::new(), 0, 0),
     };
+    let first = DECODER_FIRST_MS.with(|c| {
+        let first = c.get().is_none();
+        if first {
+            c.set(Some(m.get_decoder_ms));
+        }
+        first
+    });
     Ok(result_obj(&[
         ("exif_tiff", m.exif_tiff.map(js_buf).unwrap_or(JsValue::NULL)),
         ("orientation", (m.orientation as u32).into()),
@@ -460,6 +470,8 @@ pub fn raw_meta(bytes: Uint8Array, preview_edge: u32) -> Result<JsValue, JsValue
         ("preview", js_buf(pv)),
         ("preview_w", (pw as u32).into()),
         ("preview_h", (ph as u32).into()),
+        ("get_decoder_ms", m.get_decoder_ms.into()),
+        ("get_decoder_first", first.into()),
     ]))
 }
 

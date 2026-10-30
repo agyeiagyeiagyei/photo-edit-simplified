@@ -105,6 +105,7 @@ macro_rules! fetch_ifd {
 pub mod ari;
 pub mod arw;
 mod camera;
+mod camera_db;
 pub mod cr2;
 pub mod cr3;
 pub mod crw;
@@ -131,6 +132,7 @@ mod unwrapped;
 pub mod x3f;
 
 pub use camera::Camera;
+use camera_db::CameraDb;
 
 use crate::RawlerError;
 use crate::formats::bmff::Bmff;
@@ -139,7 +141,7 @@ use crate::tags::TiffCommonTag;
 
 pub use super::rawimage::*;
 
-pub static CAMERAS_TOML: &str = include_str!(concat!(env!("OUT_DIR"), "/cameras.toml"));
+// PES patch: cameras.toml is no longer embedded; see camera_db.rs.
 pub static SAMPLE: &str = "\nPlease submit samples at https://raw.pixls.us/";
 pub static BUG: &str = "\nPlease file a bug with a sample file at https://github.com/dnglab/dnglab/issues";
 
@@ -830,79 +832,24 @@ pub(crate) fn apply_linearization(image: &mut PixU16, tbl: &Value, bits: u32) {
 }
 
 /// The struct that holds all the info about the cameras and is able to decode a file
+///
+/// PES patch: backed by the precompiled camera database. `new()` no longer
+/// parses cameras.toml, so the first `get_decoder` no longer pays a 127 ms
+/// database build; camera entries are decoded one at a time on lookup.
 #[derive(Debug, Clone, Default)]
 pub struct RawLoader {
-  cameras: HashMap<(String, String, String), Camera>,
-  #[allow(dead_code)] // TODO: remove once naked cams supported again
-  naked: HashMap<usize, Camera>,
+  db: CameraDb,
 }
 
 impl RawLoader {
   /// Creates a new raw loader using the camera information included in the library
   pub fn new() -> RawLoader {
-    let toml = match CAMERAS_TOML.parse::<toml::Value>() {
-      Ok(val) => val,
-      Err(e) => panic!("{}", format!("Error parsing cameras.toml: {:?}", e)),
-    };
-
-    let mut cams = Vec::new();
-    for camera in toml
-      .get("cameras")
-      .expect("cameras.toml missing 'cameras' key")
-      .as_array()
-      .expect("'cameras' must be an array")
-    {
-      // Create a list of all the camera modes including the base one
-      let mut cammodes = Vec::new();
-      let ct = camera.as_table().expect("each camera entry must be a table");
-      cammodes.push(ct);
-      if let Some(val) = ct.get("modes") {
-        for mode in val.as_array().expect("'modes' must be an array") {
-          cammodes.push(mode.as_table().expect("each mode entry must be a table"));
-        }
-      }
-
-      // Start with the basic camera
-      let mut cam = Camera::new();
-      cam.update_from_toml(cammodes[0]);
-      // Create a list of alias names including the base one
-      let mut camnames = vec![(cam.model.clone(), cam.clean_model.clone())];
-      if let Some(val) = ct.get("model_aliases") {
-        for alias in val.as_array().expect("'model_aliases' must be an array") {
-          camnames.push((
-            alias[0].as_str().expect("model alias name must be a string").to_string().clone(),
-            alias[1].as_str().expect("model alias clean_name must be a string").to_string().clone(),
-          ));
-        }
-      }
-
-      // For each combination of alias and mode (including the base ones) create Camera
-      for (model, clean_model) in camnames {
-        for ct in cammodes.clone() {
-          let mut mcam = cam.clone();
-          mcam.update_from_toml(ct);
-          mcam.model = model.clone();
-          mcam.clean_model = clean_model.clone();
-          cams.push(mcam);
-        }
-      }
-    }
-
-    let mut map = HashMap::new();
-    let mut naked = HashMap::new();
-    for cam in cams {
-      map.insert((cam.make.clone(), cam.model.clone(), cam.mode.clone()), cam.clone());
-      if cam.filesize > 0 {
-        naked.insert(cam.filesize, cam);
-      }
-    }
-
-    RawLoader { cameras: map, naked }
+    RawLoader { db: CameraDb::new() }
   }
 
-  /// Get list of cameras
-  pub fn get_cameras(&self) -> &HashMap<(String, String, String), Camera> {
-    &self.cameras
+  /// Get list of cameras. Materialises the whole database; not on the decode path.
+  pub fn get_cameras(&self) -> HashMap<(String, String, String), Camera> {
+    self.db.all()
   }
 
   /// Returns a decoder for a given buffer
@@ -1048,8 +995,8 @@ impl RawLoader {
 
     // If all else fails see if we match by filesize to one of those CHDK style files
     let data = rawfile.as_vec()?;
-    if let Some(cam) = self.naked.get(&data.len()) {
-      return Ok(Box::new(nkd::NakedDecoder::new(cam.clone(), self)?));
+    if let Some(cam) = self.db.by_filesize(data.len()) {
+      return Ok(Box::new(nkd::NakedDecoder::new(cam, self)?));
     }
 
     Err(RawlerError::Unsupported {
@@ -1062,8 +1009,8 @@ impl RawLoader {
 
   /// Check support
   fn check_supported_with_everything<'a>(&'a self, make: &str, model: &str, mode: &str) -> Result<Camera> {
-    match self.cameras.get(&(make.to_string(), model.to_string(), mode.to_string())) {
-      Some(cam) => Ok(cam.clone()),
+    match self.db.lookup(make, model, mode) {
+      Some(cam) => Ok(cam),
       None => Err(RawlerError::Unsupported {
         what: String::from("Unknown camera"),
         model: model.to_string(),

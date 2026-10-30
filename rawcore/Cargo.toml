@@ -11,3 +11,8 @@ rawmeta = { path = "../rawmeta" }
 # calls std::time::Instant::now() in demosaic timing logs, which panics on
 # wasm32-unknown-unknown; the vendored copy strips those calls.
 rawler = { path = "../vendor/rawler" }
+
+# First-call timing for the worker's perf marks (std::time has no clock on
+# wasm32-unknown-unknown). Host tests skip the clock entirely.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"

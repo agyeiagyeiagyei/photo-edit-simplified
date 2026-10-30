@@ -35,6 +35,7 @@ cleared right after the measure so the timeline never accumulates marks.
 | `proxy.raw_develop` | sensor develop to a 3200px display proxy | — |
 | `proxy.raw_develop_full` | full-size sensor develop in the raw worker | — |
 | `proxy.raw_meta` | one raw-worker round-trip: EXIF, capture time, preview, camera JPEG | — |
+| `raw.get_decoder` | first `rawler::get_decoder` in this worker (includes the camera-DB build) | — |
 | `proxy.raw_preview` | embedded RAW preview (no demosaic) at display size | — |
 | `proxy.land` | installing a decoded proxy (cache, worker load, LRU) | item id |
 | `export.ensure_full` | waiting for full-res pixels to materialise | — |
