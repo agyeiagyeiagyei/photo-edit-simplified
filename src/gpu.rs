@@ -245,6 +245,7 @@ uniform uint  u_seed;
 uniform vec2  u_size;
 uniform int   u_pass;
 uniform int   u_rad;
+uniform int   u_raw_identity;
 uniform float u_k[49];
 
 out vec4 o_col;
@@ -344,6 +345,14 @@ vec3 sample_u8(sampler2D tex, vec2 uv) {
     return floor(texture(tex, uv).rgb * 255.0 + 0.5);
 }
 
+// rawops::apply returns early on an identity adjust, so the untouched base
+// must reach the screen without the linear-light round trip: tone() costs up
+// to 3 levels on dark values even with neutral gains.
+vec3 develop(vec2 uv) {
+    vec3 c = sample_u8(u_tex, vec2(uv.x, 1.0 - uv.y));
+    return u_raw_identity == 1 ? c : tone(c);
+}
+
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     vec2 uv = gl_FragCoord.xy / u_size;
@@ -364,15 +373,15 @@ void main() {
 
     vec3 t;
     if (u_pass == 1) {
-        // Base is uploaded top-down; flip so canvas top = CPU row 0.
-        t = tone(sample_u8(u_tex, vec2(uv.x, 1.0 - uv.y)));
+        // Base is uploaded top-down; develop() flips so canvas top = CPU row 0.
+        t = develop(uv);
         o_col = vec4(t / 255.0, 1.0);
         return;
     }
     if (u_pass == 4) {
         t = floor(texelFetch(u_tex, p, 0).rgb * 255.0 + 0.5);
     } else {
-        t = tone(sample_u8(u_tex, vec2(uv.x, 1.0 - uv.y)));
+        t = develop(uv);
     }
 
     vec3 v = adjust(lut3(t));
@@ -496,7 +505,7 @@ impl Gpu {
         for name in [
             "u_tex", "u_lut", "u_gains", "u_exp", "u_hl", "u_sh", "u_nr", "u_adj",
             "u_grain", "u_grain_gauss", "u_grain_mono", "u_seed", "u_size", "u_pass",
-            "u_rad", "u_k",
+            "u_rad", "u_raw_identity", "u_k",
         ] {
             if let Some(l) = gl.get_uniform_location(&program, name) {
                 map.insert(name, l);
@@ -623,6 +632,7 @@ impl Gpu {
             gl.uniform1ui(Some(loc), seed);
         }
         u2f(gl, l("u_size"), w as f32, h as f32);
+        u1i(gl, l("u_raw_identity"), if edit.raw.is_identity() { 1 } else { 0 });
 
         let tables = color::compose_tables(&edit.levels, &edit.curves);
         let mut lut = [0u8; 768];

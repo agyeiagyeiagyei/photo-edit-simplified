@@ -1,4 +1,5 @@
 import { test, expect, Page } from '@playwright/test';
+import * as path from 'path';
 import {
   importFiles,
   clickTab,
@@ -6,8 +7,11 @@ import {
   recordMetrics,
   trackErrors,
   waitCanvasWidthAbove,
+  rawFixtures,
   JPEG_A,
 } from './helpers';
+
+const RAWS = rawFixtures();
 
 // ?gpu=1 forces the WebGL2 path even on software renderers (test env),
 // ?gpu=0 forces the CPU pipeline. Auto (no query) is the shipping default.
@@ -60,6 +64,14 @@ async function downscaled(page: Page, width = 512) {
     }
     return { w: W, h, b64: btoa(s) };
   }, width);
+}
+
+function maxDelta(a: Buffer, b: Buffer) {
+  let max = 0;
+  for (let i = 0; i < a.length; i += 4) {
+    for (let c = 0; c < 3; c++) max = Math.max(max, Math.abs(a[i + c] - b[i + c]));
+  }
+  return max;
 }
 
 function psnr(a: Buffer, b: Buffer) {
@@ -115,7 +127,110 @@ async function applyColorEdit(page: Page) {
   await setRange(page, /^Black point/, 6);
 }
 
+async function applyRawDevelop(page: Page) {
+  await setRange(page, /^Temperature/, 6500);
+  await setRange(page, /^Exposure/, 0.35);
+  await setRange(page, /^Highlights/, 40);
+  await setRange(page, /^Shadows/, 30);
+}
+
+/** Wait for a new visible frame on `name`, then for the canvas to settle. */
+async function waitRenderTick(page: Page, name: string, before: number) {
+  await expect.poll(async () => (await markNames(page)).filter((n) => n === name).length, {
+    timeout: 60_000,
+    intervals: [100, 200, 400],
+  }).toBeGreaterThan(before);
+  await waitStableSharpCanvas(page);
+}
+
 test.describe('WebGL2 parametric preview (docs/GPU.md)', () => {
+  // qa-regression #13: RAW items on the GPU path were 29-32 dB against the
+  // CPU/export pipeline because the shader always ran its linear-light tone
+  // round trip, even when the develop stage was identity. Untouched RAW must
+  // now pass through bit-exactly; develop and colour sliders stay above the
+  // 45 dB gate.
+  test('RAW preview matches the CPU pipeline within 45 dB', async ({ browser }, testInfo) => {
+    test.skip(RAWS.length === 0, 'no RAW fixture in dl-raw; run gen_dng.py to create one');
+    const raw = RAWS[0];
+    // One context at a time: the two full-res pipelines together crash the
+    // renderer in the 64 MB-/dev/shm container. A fresh context per mode also
+    // keeps both pages from restoring the persisted developed proxy (a q0.9
+    // JPEG), so both develop from the same raw and the bases are comparable.
+    const contextOpts = {
+      viewport: { width: 1600, height: 1000 },
+      deviceScaleFactor: 2,
+      baseURL: process.env.PES_BASE_URL || 'http://127.0.0.1:8787/',
+    };
+    const renderMark = (mode: '0' | '1') => (mode === '1' ? 'gpu.render' : 'hi.blit');
+    const capture = async (mode: '0' | '1') => {
+      const ctx = await browser.newContext(contextOpts);
+      try {
+        const page = await ctx.newPage();
+        const errors = trackErrors(page);
+        await openMode(page, mode);
+        await importFiles(page, [raw]);
+        await waitCanvasWidthAbove(page, 1200);
+        await waitMark(page, 'proxy.raw_develop');
+        await waitStableSharpCanvas(page);
+        const out = { errors, frames: {} as Record<string, { w: number; h: number; b64: string }> };
+        out.frames.untouched = await downscaled(page, 512);
+
+        // Let the tab switch (which may itself redraw) land before taking the
+        // baseline, so the tick we wait for is the sliders' own.
+        await clickTab(page, 'Color');
+        await page.waitForTimeout(250);
+        await waitStableSharpCanvas(page);
+        let before = (await markNames(page)).filter((n) => n === renderMark(mode)).length;
+        await applyRawDevelop(page);
+        await waitRenderTick(page, renderMark(mode), before);
+        out.frames.develop = await downscaled(page, 512);
+
+        before = (await markNames(page)).filter((n) => n === renderMark(mode)).length;
+        await setRange(page, /^Saturation/, 0.4);
+        await waitRenderTick(page, renderMark(mode), before);
+        out.frames.develop_saturation = await downscaled(page, 512);
+        return out;
+      } finally {
+        await ctx.close();
+      }
+    };
+
+    const gpu = await capture('1');
+    const cpu = await capture('0');
+
+    for (const name of ['untouched', 'develop', 'develop_saturation']) {
+      const g = gpu.frames[name];
+      const c = cpu.frames[name];
+      expect(c.w).toBe(g.w);
+      expect(c.h).toBe(g.h);
+      const db = psnr(Buffer.from(g.b64, 'base64'), Buffer.from(c.b64, 'base64'));
+      const max = maxDelta(Buffer.from(g.b64, 'base64'), Buffer.from(c.b64, 'base64'));
+      recordMetrics(testInfo, {
+        raw_fixture: path.basename(raw),
+        raw_canvas: `${g.w}x${g.h}`,
+        [`raw_parity_${name}_psnr_db`]: Math.round(db * 100) / 100,
+        [`raw_parity_${name}_max_delta`]: max,
+      });
+      expect(db, `${name} parity PSNR ${db.toFixed(2)} dB < 45 dB`).toBeGreaterThanOrEqual(45);
+      if (name === 'untouched') {
+        expect(max, 'untouched RAW preview moved pixels').toBeLessThanOrEqual(1);
+      }
+    }
+
+    const gpuFrame = (n: string) => Buffer.from(gpu.frames[n].b64, 'base64');
+    const staged = maxDelta(gpuFrame('untouched'), gpuFrame('develop'));
+    const saturated = maxDelta(gpuFrame('develop'), gpuFrame('develop_saturation'));
+    recordMetrics(testInfo, {
+      raw_parity_develop_delta_vs_untouched: staged,
+      raw_parity_saturation_delta: saturated,
+    });
+    expect(staged, 'RAW develop sliders did not change the preview').toBeGreaterThan(5);
+    expect(saturated, 'Saturation did not change the preview').toBeGreaterThan(2);
+
+    expect(gpu.errors, gpu.errors.join('\n')).toEqual([]);
+    expect(cpu.errors, cpu.errors.join('\n')).toEqual([]);
+  });
+
   test('gpu render matches the CPU pipeline within 45 dB', async ({ page }, testInfo) => {
     const gpuPage = page;
     const gpuErrors = trackErrors(gpuPage);
