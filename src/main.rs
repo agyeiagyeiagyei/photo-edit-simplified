@@ -280,9 +280,9 @@ const PROXY_WID: usize = 0x8000_0000;
 /// Main-side proxy budget. Each live proxy is mirrored in the worker, so the
 /// real footprint is ~2x this (three 3200×2133 proxies).
 const PROXY_BUDGET: usize = 160 << 20;
-/// A sensor develop takes seconds; let the selection settle first so flicking
-/// through the strip never starts one.
-const PROXY_DEVELOP_DELAY_MS: i32 = 2000;
+/// The half-size sensor proxy develops in ~1 s; wait only briefly so the
+/// selection settles without making a wasted develop expensive.
+const PROXY_DEVELOP_DELAY_MS: i32 = 750;
 
 struct ProxyData {
     pixels: Rc<Vec<u8>>,

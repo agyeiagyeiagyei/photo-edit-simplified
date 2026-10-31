@@ -47,6 +47,20 @@ cleared right after the measure so the timeline never accumulates marks.
 | `restore.session` | whole startup restore | item count |
 | `restore.item` | restoring one item | `name #id` |
 
+## RAW display proxy
+
+`rawcore::decode_raw_proxy` chooses the demosaic for the 3200px display proxy:
+
+- Bayer RGB sensors whose binned long edge covers at least 90% of the target
+  (`SUPERPIXEL_MIN_COVER`, e.g. 6192/2 = 3096 ≥ 0.9 × 3200) use
+  `RawDevelop::superpixel()`: 2×2 binning to a half-size RGB proxy. Small
+  sensors, X-Trans and 4-colour CFAs keep the normal demosaic.
+- The proxy's tone curve is fitted once against the camera preview and stored
+  with it; the export develop (`decode_raw_with_tone`) reuses the same 256-byte
+  LUT, so display and export share one tone response.
+- `PROXY_DEVELOP_DELAY_MS` (750 ms) debounces selection changes before the
+  sensor develop starts; a changed selection drops any in-flight result.
+
 ## Worker marks
 
 The worker bootstrap (built from `scripts/pixel-worker-run.js` into
