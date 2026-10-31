@@ -219,7 +219,7 @@ fn ensure_full(state: AppState, id: usize, waiter: Option<Box<dyn FnOnce()>>) {
         } else if is_raw {
             // Lazy develop: pull the original out of IndexedDB only now.
             match session::load_raw_bytes(id).await {
-                Some(bytes) => raw_develop_async(&bytes).await,
+                Some(bytes) => raw_develop_async(id, &bytes).await,
                 None => None,
             }
         } else {
@@ -573,10 +573,10 @@ async fn camera_proxy_async(jpeg: &[u8], orientation: u16) -> Option<pworker::Pr
     r
 }
 
-async fn raw_proxy_async(bytes: &[u8]) -> Option<pworker::ProxyResult> {
+async fn raw_proxy_async(id: usize, bytes: &[u8]) -> Option<pworker::ProxyResult> {
     let bytes = bytes.to_vec();
     let t0 = perf::now();
-    let r = await_worker(move |cb| pworker::raw_proxy(&bytes, PROXY_EDGE, cb)).await;
+    let r = await_worker(move |cb| pworker::raw_proxy(id, &bytes, PROXY_EDGE, cb)).await;
     perf::record("proxy.raw_develop", perf::now() - t0);
     r
 }
@@ -596,10 +596,10 @@ async fn raw_meta_async(bytes: &[u8], preview_edge: u32) -> Option<pworker::RawM
 }
 
 /// Full sensor develop in the raw worker.
-async fn raw_develop_async(bytes: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
+async fn raw_develop_async(id: usize, bytes: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
     let bytes = bytes.to_vec();
     let t0 = perf::now();
-    let r = await_worker(move |cb| pworker::raw_develop(&bytes, cb)).await;
+    let r = await_worker(move |cb| pworker::raw_develop(id, &bytes, cb)).await;
     perf::record("proxy.raw_develop_full", perf::now() - t0);
     r.map(|f| (f.pixels, f.w, f.h))
 }
@@ -663,7 +663,7 @@ async fn decode_camera_from_raw(id: usize, bytes: &[u8]) -> Option<DecodedProxy>
             }
         }
     }
-    let r = raw_proxy_async(bytes).await?;
+    let r = raw_proxy_async(id, bytes).await?;
     Some(DecodedProxy {
         pixels: r.pixels,
         w: r.w,
@@ -742,7 +742,7 @@ fn pump_upgrade(state: AppState) {
     PROXY_UPGRADE_BUSY.with(|b| b.set(true));
     spawn_local(async move {
         let decoded = match raw_source_bytes(id).await {
-            Some(bytes) => raw_proxy_async(&bytes).await,
+            Some(bytes) => raw_proxy_async(id, &bytes).await,
             None => None,
         };
         PROXY_UPGRADE_BUSY.with(|b| b.set(false));
@@ -962,7 +962,7 @@ async fn prepare_raw(id: usize, bytes: &[u8], mtime: Option<f64>) -> Option<RawI
         None
     } else {
         web::log("RAW bytes not persisted; developing eagerly");
-        raw_develop_async(bytes).await
+        raw_develop_async(id, bytes).await
     };
     let (dims, preview) = match &full {
         Some((fpx, fw, fh)) => {
@@ -4223,7 +4223,7 @@ fn restore_session(state: AppState) {
                     continue;
                 };
                 let bytes = js_sys::Uint8Array::new(&buf).to_vec();
-                let Some((full_rgba, fw, fh)) = raw_develop_async(&bytes).await else { continue };
+                let Some((full_rgba, fw, fh)) = raw_develop_async(id, &bytes).await else { continue };
                 let (pp, pw, ph) = downscale_pixels(&full_rgba, fw, fh, 1024);
                 let canvas = web::create_canvas(pw as u32, ph as u32);
                 web::put_pixels(&canvas, &pp, pw as u32, ph as u32);
@@ -4550,7 +4550,8 @@ fn drive_develop_full(state: AppState, id: String) {
         if !alive() {
             return;
         }
-        match raw_develop_async(&bytes).await {
+        // Drive files have no numeric item id; 0 never matches a cached frame.
+        match raw_develop_async(0, &bytes).await {
             Some((px, w, h)) => {
                 if !alive() {
                     return;

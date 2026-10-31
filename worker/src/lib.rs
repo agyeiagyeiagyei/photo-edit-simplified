@@ -19,6 +19,10 @@ thread_local! {
     /// `get_decoder_ms` of the first RAW opened in this worker. The first call
     /// pays rawler's camera-database build; later calls are the steady state.
     static DECODER_FIRST_MS: Cell<Option<f64>> = const { Cell::new(None) };
+    /// Full sensor frame from the last proxy develop. The display upgrade and
+    /// the export otherwise demosaic the same file twice; the export takes
+    /// this instead. One slot: the app exports what it just selected.
+    static RAW_FULL: RefCell<Option<(u32, Vec<u8>, usize, usize)>> = RefCell::new(None);
 }
 
 fn with_buffer<R>(id: u32, f: impl FnOnce(&mut (Vec<u8>, usize, usize)) -> R) -> Result<R, JsValue> {
@@ -424,11 +428,13 @@ fn proxy_result(px: Vec<u8>, w: usize, h: usize, full_w: usize, full_h: usize) -
 }
 
 /// Demosaic a RAW in the worker and return a display-resolution proxy, so
-/// import previews never block the main thread or need the full buffer.
+/// import previews never block the main thread or need the full buffer. The
+/// full frame stays here for `raw_develop` to reuse.
 #[wasm_bindgen]
-pub fn raw_proxy(bytes: Uint8Array, max_edge: u32) -> Result<JsValue, JsValue> {
+pub fn raw_proxy(id: u32, bytes: Uint8Array, max_edge: u32) -> Result<JsValue, JsValue> {
     let (rgba, w, h) = rawcore::decode_raw(&bytes.to_vec()).map_err(|e| JsValue::from_str(&e))?;
     let (px, pw, ph) = downscale(&rgba, w, h, max_edge);
+    RAW_FULL.with(|c| *c.borrow_mut() = Some((id, rgba, w, h)));
     Ok(proxy_result(px, pw, ph, w, h))
 }
 
@@ -476,10 +482,24 @@ pub fn raw_meta(bytes: Uint8Array, preview_edge: u32) -> Result<JsValue, JsValue
 }
 
 /// Full sensor develop — the multi-second demosaic. Runs here so the app
-/// thread never blocks on RAW decoding.
+/// thread never blocks on RAW decoding. Reuses the last proxy develop's frame
+/// when it is the same item; a stale frame is dropped before developing.
 #[wasm_bindgen]
-pub fn raw_develop(bytes: Uint8Array) -> Result<JsValue, JsValue> {
-    let (rgba, w, h) = rawcore::decode_raw(&bytes.to_vec()).map_err(|e| JsValue::from_str(&e))?;
+pub fn raw_develop(id: u32, bytes: Uint8Array) -> Result<JsValue, JsValue> {
+    let cached = RAW_FULL.with(|c| {
+        let mut slot = c.borrow_mut();
+        let hit = slot.as_ref().map(|(cid, _, _, _)| *cid == id).unwrap_or(false);
+        let taken = slot.take();
+        if hit {
+            taken
+        } else {
+            None
+        }
+    });
+    let (rgba, w, h) = match cached {
+        Some((_, rgba, w, h)) => (rgba, w, h),
+        None => rawcore::decode_raw(&bytes.to_vec()).map_err(|e| JsValue::from_str(&e))?,
+    };
     Ok(result_obj(&[
         ("pixels", js_buf(rgba)),
         ("w", (w as u32).into()),

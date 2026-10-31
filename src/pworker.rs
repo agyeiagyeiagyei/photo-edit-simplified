@@ -296,6 +296,7 @@ pub fn proxy_worker_available() -> bool {
 /// Develop a RAW to a display-resolution proxy in the dedicated worker.
 /// Returns false when the worker is unavailable (caller falls back).
 pub fn raw_proxy(
+    id: usize,
     bytes: &[u8],
     max_edge: u32,
     cb: impl FnOnce(Option<ProxyResult>) + 'static,
@@ -307,7 +308,7 @@ pub fn raw_proxy(
     let buf = arr.buffer();
     raw_call(
         "raw_proxy",
-        &[arr.into(), JsValue::from(max_edge)],
+        &[JsValue::from(id as u32), arr.into(), JsValue::from(max_edge)],
         &[buf.into()],
         Box::new(move |reply| cb(reply.ok().and_then(|v| parse_proxy(&v)))),
     )
@@ -393,7 +394,7 @@ pub struct FullResult {
 }
 
 /// Full sensor develop in the raw worker.
-pub fn raw_develop(bytes: &[u8], cb: impl FnOnce(Option<FullResult>) + 'static) -> bool {
+pub fn raw_develop(id: usize, bytes: &[u8], cb: impl FnOnce(Option<FullResult>) + 'static) -> bool {
     if !raw_init() {
         return false;
     }
@@ -401,7 +402,7 @@ pub fn raw_develop(bytes: &[u8], cb: impl FnOnce(Option<FullResult>) + 'static) 
     let buf = arr.buffer();
     raw_call(
         "raw_develop",
-        &[arr.into()],
+        &[JsValue::from(id as u32), arr.into()],
         &[buf.into()],
         Box::new(move |reply| {
             cb(reply.ok().and_then(|v| {
