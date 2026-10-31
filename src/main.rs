@@ -8,7 +8,7 @@ mod session;
 mod state;
 mod web;
 
-use pes_pixel::{blur, clone, curves, fill, heal, levels, noise, ops, rawops, stroke, wand};
+use pes_pixel::{blur, clone, color, curves, fill, heal, levels, ops, rawops, stroke, wand};
 use pes_pixel::geo::{crop_px, geometry, hi_target, stamp_stroke, working_dims};
 use pes_pixel::types::RawAdjust;
 
@@ -49,14 +49,6 @@ impl Pixels {
         match self {
             Pixels::View(v) => v.length() as usize,
             Pixels::Owned(v) => v.len(),
-        }
-    }
-
-    /// Materialise a Rust buffer (owned buffers clone; views copy).
-    fn to_vec(&self) -> Vec<u8> {
-        match self {
-            Pixels::View(v) => v.to_vec(),
-            Pixels::Owned(v) => v.as_ref().clone(),
         }
     }
 
@@ -126,6 +118,18 @@ impl Pixels {
             .unwrap();
         web::image_data_from_ctx(&ctx, tw, th)
     }
+}
+
+/// Geometry on a cached source, materialised for callers that mutate.
+fn owned_geometry(
+    full: &Pixels,
+    fw: usize,
+    fh: usize,
+    edit: &EditParams,
+) -> (Vec<u8>, usize, usize) {
+    let src = full.as_cow();
+    let (p, w, h) = geometry(&src, fw, fh, edit);
+    (p.into_owned(), w, h)
 }
 
 // --- media cache (non-reactive) ---------------------------------------------
@@ -1149,6 +1153,9 @@ fn remove_item(state: AppState, item_id: usize) {
             removed = Some((m.object_url, m.thumb_url, pos));
         }
     });
+    if removed.is_some() {
+        state.list_gen.update(|g| *g += 1);
+    }
     if let Some((url, thumb, _)) = &removed {
         let _ = Url::revoke_object_url(url);
         let _ = Url::revoke_object_url(thumb);
@@ -1522,6 +1529,7 @@ fn push_item(state: AppState, item: MediaItem) {
                 .unwrap_or(v.len());
             v.insert(pos, item);
         });
+        state.list_gen.update(|g| *g += 1);
         if state.selected.get_untracked().is_none() {
             state.selected.set(Some(id));
         }
@@ -1945,8 +1953,21 @@ struct HiCache {
     h: usize,
 }
 
+struct PreviewGeo {
+    item_id: usize,
+    gen: u64,
+    rot90: u8,
+    fine_bits: u32,
+    pixels: Rc<Vec<u8>>,
+    w: usize,
+    h: usize,
+}
+
 thread_local! {
     static HI_CACHE: RefCell<Option<HiCache>> = const { RefCell::new(None) };
+    /// Rotated/fine-angle preview, reused across colour-only renders. The
+    /// identity transform is not cached — callers borrow the source directly.
+    static PREVIEW_GEO: RefCell<Option<PreviewGeo>> = const { RefCell::new(None) };
     /// Generation guard for the debounced hi rebuild; only the latest fires.
     static HI_DEBOUNCE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// Generation guard for an in-flight worker render; only the latest may
@@ -1955,6 +1976,47 @@ thread_local! {
     /// Last nonzero canvas display need (CSS px × DPR). Reactive remounts
     /// briefly hand us a not-yet-inserted canvas with zero client size.
     static LAST_NEED: std::cell::Cell<(f64, f64)> = const { std::cell::Cell::new((0.0, 0.0)) };
+    /// A trailing rAF pass is armed; further changes this frame only set DIRTY.
+    static PREVIEW_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Changes arrived since the leading-edge paint; the trailing pass runs.
+    static PREVIEW_DIRTY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Geometry applied to the 1024px preview, cached across renders.
+fn preview_geometry_cached(
+    item_id: usize,
+    photo_gen: u64,
+    preview: &(Vec<u8>, usize, usize),
+    edit: &EditParams,
+) -> Option<(Rc<Vec<u8>>, usize, usize)> {
+    if edit.rot90 % 4 == 0 && edit.fine_angle.abs() <= 0.01 {
+        return None;
+    }
+    let (rot90, fine_bits) = (edit.rot90, edit.fine_angle.to_bits());
+    PREVIEW_GEO.with(|c| {
+        let mut c = c.borrow_mut();
+        if let Some(g) = c.as_ref() {
+            if g.item_id == item_id
+                && g.gen == photo_gen
+                && g.rot90 == rot90
+                && g.fine_bits == fine_bits
+            {
+                return Some((g.pixels.clone(), g.w, g.h));
+            }
+        }
+        let (p, w, h) = geometry(&preview.0, preview.1, preview.2, edit);
+        let pixels = Rc::new(p.into_owned());
+        *c = Some(PreviewGeo {
+            item_id,
+            gen: photo_gen,
+            rot90,
+            fine_bits,
+            pixels: pixels.clone(),
+            w,
+            h,
+        });
+        Some((pixels, w, h))
+    })
 }
 
 /// Content identity for the hi cache: everything that changes the rendered
@@ -2107,12 +2169,13 @@ fn render_hi(item: &MediaItem, req_w: f64, req_h: f64) -> Option<HiCache> {
     let photo = get_photo(item.id)?;
     let fingerprint = content_fingerprint(item, photo.gen, proxy_gen(item.id));
     let (fpix, fw, fh) = photo.full.as_ref()?;
-    let (p, ww, wh) = fpix.with_slice(|s| geometry(s, *fw, *fh, &item.edit));
+    let src = fpix.as_cow();
+    let (p, ww, wh) = geometry(&src, *fw, *fh, &item.edit);
     let (tw, th) = hi_target(req_w, req_h, ww, wh, HI_MAX_EDGE as u32);
     let mut buf = if (tw, th) != (ww, wh) {
         resample_pixels(&p, ww, wh, tw, th)
     } else {
-        p
+        p.into_owned()
     };
     if !item.edit.raw.is_identity() {
         rawops::apply(&mut buf, tw, th, &item.edit.raw);
@@ -2120,34 +2183,9 @@ fn render_hi(item: &MediaItem, req_w: f64, req_h: f64) -> Option<HiCache> {
     if item.edit.is_color_touched() {
         if let Some(sel) = &item.edit.selection {
             let mask = ops::selection_mask(sel, tw, th);
-            blur::blur_apply_masked(&mut buf, &mask, tw, th, item.edit.blur);
-            if !item.edit.levels.is_identity() {
-                levels::levels_apply_masked(&mut buf, &mask, &item.edit.levels.build_tables());
-            }
-            item.edit.curves.apply_masked(&mut buf, &mask);
-            ops::adjust_masked(
-                &mut buf,
-                &mask,
-                item.edit.brightness,
-                item.edit.contrast,
-                item.edit.saturation,
-                item.edit.warmth,
-            );
-            noise::noise_add_masked(&mut buf, &mask, tw, th, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
+            color::apply_color_effects_masked(&mut buf, &mask, tw, th, &item.edit, item.id as u32);
         } else {
-            blur::blur_apply(&mut buf, tw, th, item.edit.blur);
-            if !item.edit.levels.is_identity() {
-                levels::levels_apply(&mut buf, &item.edit.levels.build_tables());
-            }
-            item.edit.curves.apply(&mut buf);
-            ops::adjust(
-                &mut buf,
-                item.edit.brightness,
-                item.edit.contrast,
-                item.edit.saturation,
-                item.edit.warmth,
-            );
-            noise::noise_add(&mut buf, tw, th, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
+            color::apply_color_effects(&mut buf, tw, th, &item.edit, item.id as u32);
         }
     }
     let canvas = web::create_canvas(tw as u32, th as u32);
@@ -2242,7 +2280,10 @@ async fn render_photo_export(
     let geometry = if plain_geometry {
         None
     } else {
-        Some(pix.with_slice(|s| geometry(s, *fw, *fh, &item.edit)))
+        Some(pix.with_slice(|s| {
+            let (p, w, h) = geometry(s, *fw, *fh, &item.edit);
+            (p.into_owned(), w, h)
+        }))
     };
     let (w, h) = match &geometry {
         Some((_, w, h)) => (*w, *h),
@@ -2258,34 +2299,9 @@ async fn render_photo_export(
         if item.edit.is_color_touched() {
             if let Some(sel) = &item.edit.selection {
                 let mask = ops::selection_mask(sel, w, h);
-                blur::blur_apply_masked(p, &mask, w, h, item.edit.blur);
-                if !item.edit.levels.is_identity() {
-                    levels::levels_apply_masked(p, &mask, &item.edit.levels.build_tables());
-                }
-                item.edit.curves.apply_masked(p, &mask);
-                ops::adjust_masked(
-                    p,
-                    &mask,
-                    item.edit.brightness,
-                    item.edit.contrast,
-                    item.edit.saturation,
-                    item.edit.warmth,
-                );
-                noise::noise_add_masked(p, &mask, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
+                color::apply_color_effects_masked(p, &mask, w, h, &item.edit, item.id as u32);
             } else {
-                blur::blur_apply(p, w, h, item.edit.blur);
-                if !item.edit.levels.is_identity() {
-                    levels::levels_apply(p, &item.edit.levels.build_tables());
-                }
-                item.edit.curves.apply(p);
-                ops::adjust(
-                    p,
-                    item.edit.brightness,
-                    item.edit.contrast,
-                    item.edit.saturation,
-                    item.edit.warmth,
-                );
-                noise::noise_add(p, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
+                color::apply_color_effects(p, w, h, &item.edit, item.id as u32);
             }
         }
     };
@@ -2792,6 +2808,7 @@ fn App() -> impl IntoView {
     // mirror every later state change back — debounced, diffed per item.
     restore_session(state);
     create_effect(move |_| {
+        perf::record("session.effect", 0.0);
         state.items.track();
         state.selected.track();
         schedule_session_save(state);
@@ -3302,15 +3319,7 @@ fn source_window(
     if !edit.raw.is_identity() {
         rawops::apply(&mut win, ew, eh, &edit.raw);
     }
-    blur::blur_apply(&mut win, ew, eh, edit.blur);
-    if !edit.levels.is_identity() {
-        levels::levels_apply(&mut win, &edit.levels.build_tables());
-    }
-    if !edit.curves.is_identity() {
-        edit.curves.apply(&mut win);
-    }
-    ops::adjust(&mut win, edit.brightness, edit.contrast, edit.saturation, edit.warmth);
-    noise::noise_add(&mut win, ew, eh, edit.grain, edit.grain_gaussian, edit.grain_mono, seed);
+    color::apply_color_effects(&mut win, ew, eh, edit, seed);
     let (ix, iy) = (sx - x0, sy - y0);
     let mut out = Vec::with_capacity(cw * ch * 4);
     for row in 0..ch {
@@ -3820,13 +3829,18 @@ fn FilmStrip(state: AppState) -> impl IntoView {
     view! {
         <div class="filmstrip">
             <For
-                each=move || state.items.get()
+                each=move || {
+                    perf::record("filmstrip.each", 0.0);
+                    // Membership only: edit ticks touch `items` but must not
+                    // rebuild this list.
+                    state.list_gen.track();
+                    state.items.get_untracked()
+                }
                 key=|m| m.id
                 children=move |m: MediaItem| {
                     let id = m.id;
                     let is_photo = m.kind == MediaKind::Photo;
                     let badge = if m.kind == MediaKind::Video { "▶" } else { "" };
-                    let drive_id = m.drive_file_id.clone();
                     view! {
                         <div
                             class="thumb"
@@ -3852,9 +3866,12 @@ fn FilmStrip(state: AppState) -> impl IntoView {
                                 })
                             }}
                             {move || {
-                                let Some(did) = drive_id.clone() else {
-                                    return None;
-                                };
+                                // Read live: an item gains its drive id after
+                                // the first successful save, and this tile is
+                                // not rebuilt on item-content changes.
+                                let did = state.items.with(|v| {
+                                    v.iter().find(|m| m.id == id).and_then(|m| m.drive_file_id.clone())
+                                })?;
                                 if !state.drive_shortlist.with(|s| s.contains(&did)) {
                                     return None;
                                 }
@@ -6079,8 +6096,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     // --- clone stamp stroke ----------------------------------------------------
     window_event_listener(leptos::ev::pointermove, move |ev| {
         let Some(Some(mut pts)) = clone_drag.try_get() else { return };
-        let Some(item) = state.current() else { return };
-        let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) else { return };
+        let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop)).flatten() else { return };
         if pts.last().map(|last| dist2(*last, (nx, ny)) > 0.00005).unwrap_or(true) {
             pts.push((nx, ny));
             clone_drag.set(Some(pts));
@@ -6096,8 +6112,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     // --- heal brush stroke -----------------------------------------------------
     window_event_listener(leptos::ev::pointermove, move |ev| {
         let Some(Some(mut pts)) = heal_drag.try_get() else { return };
-        let Some(item) = state.current() else { return };
-        let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) else { return };
+        let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop)).flatten() else { return };
         if pts.last().map(|last| dist2(*last, (nx, ny)) > 0.00005).unwrap_or(true) {
             pts.push((nx, ny));
             heal_drag.set(Some(pts));
@@ -6113,8 +6128,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     // --- text/image layer drag ---------------------------------------------------
     window_event_listener(leptos::ev::pointermove, move |ev| {
         let Some(Some((id, nx0, ny0, x0, y0))) = layer_drag.try_get() else { return };
-        let Some(item) = state.current() else { return };
-        let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) else { return };
+        let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop)).flatten() else { return };
         let dx = nx - nx0;
         let dy = ny - ny0;
         state.update_current_item(|m| {
@@ -6141,8 +6155,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     // --- pen tool drag ---------------------------------------------------------
     window_event_listener(leptos::ev::pointermove, move |ev| {
         let Some(Some((id, drag, nx0, ny0))) = pen_drag.try_get() else { return };
-        let Some(item) = state.current() else { return };
-        let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) else { return };
+        let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop)).flatten() else { return };
         let dx = nx - nx0;
         let dy = ny - ny0;
         state.update_current_item(|m| {
@@ -6189,8 +6202,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     // --- brush tool drawing ----------------------------------------------------
     window_event_listener(leptos::ev::pointermove, move |ev| {
         let Some(id) = brush_draw.try_get().flatten() else { return };
-        let Some(item) = state.current() else { return };
-        let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) else { return };
+        let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop)).flatten() else { return };
         state.update_current_item(|m| {
             let Some(l) = m.layers.iter_mut().find(|l| l.id == id) else { return };
             let LayerKind::Brush(b) = &mut l.kind else { return };
@@ -6207,8 +6219,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     // --- select tool drag --------------------------------------------------------
     window_event_listener(leptos::ev::pointermove, move |ev| {
         let Some(Some(drag)) = select_drag.try_get() else { return };
-        let Some(item) = state.current() else { return };
-        let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) else { return };
+        let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop)).flatten() else { return };
         match drag {
             SelectDrag::Rect(start, _) => {
                 select_drag.set(Some(SelectDrag::Rect(start, (nx, ny))));
@@ -6257,6 +6268,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     });
 
     create_effect(move |_| {
+        perf::record("preview.effect", 0.0);
         state.items.track();
         state.selected.track();
         state.selected_layer.track();
@@ -6270,18 +6282,28 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         state.clone_source.track();
         state.clone_offset.track();
         state.clone_radius.track();
-        let Some(item) = state.current() else { return };
-        if item.kind != MediaKind::Photo {
-            return;
-        }
-        let Some(photo) = get_photo(item.id) else { return };
-        let Some(canvas) = canvas_ref.get() else { return };
-        let mut render_span = perf::Span::new("preview.render");
+        tab.track();
+        select_drag.track();
+        // Paint on the leading edge so the change that opened this frame shows
+        // in it; a burst of further changes this frame coalesces into one
+        // trailing rAF pass, so there is still at most one extra paint/frame.
+        let render: Rc<dyn Fn()> = Rc::new(move || {
+            let Some(item) = state.current() else { return };
+            if item.kind != MediaKind::Photo {
+                return;
+            }
+            let Some(photo) = get_photo(item.id) else { return };
+            let Some(canvas) = canvas_ref.get() else { return };
+            let mut render_span = perf::Span::new("preview.render");
 
         let (pix, w, h) = &photo.preview;
-        let (mut p, w, h) = geometry(pix, *w, *h, &item.edit);
+        let geo = preview_geometry_cached(item.id, photo.gen, &photo.preview, &item.edit);
+        let (mut p, w, h) = match &geo {
+            Some((px, gw, gh)) => (Cow::Borrowed(px.as_slice()), *gw, *gh),
+            None => geometry(pix, *w, *h, &item.edit),
+        };
         if !item.edit.raw.is_identity() {
-            rawops::apply(&mut p, w, h, &item.edit.raw);
+            rawops::apply(p.to_mut(), w, h, &item.edit.raw);
         }
         working.set((w, h));
         let crop = item.edit.crop;
@@ -6357,34 +6379,16 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             if item.edit.is_color_touched() {
                 if let Some(sel) = &item.edit.selection {
                     let mask = ops::selection_mask(sel, w, h);
-                    blur::blur_apply_masked(&mut p, &mask, w, h, item.edit.blur);
-                    if !item.edit.levels.is_identity() {
-                        levels::levels_apply_masked(&mut p, &mask, &item.edit.levels.build_tables());
-                    }
-                    item.edit.curves.apply_masked(&mut p, &mask);
-                    ops::adjust_masked(
-                        &mut p,
+                    color::apply_color_effects_masked(
+                        p.to_mut(),
                         &mask,
-                        item.edit.brightness,
-                        item.edit.contrast,
-                        item.edit.saturation,
-                        item.edit.warmth,
+                        w,
+                        h,
+                        &item.edit,
+                        item.id as u32,
                     );
-                    noise::noise_add_masked(&mut p, &mask, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
                 } else {
-                    blur::blur_apply(&mut p, w, h, item.edit.blur);
-                    if !item.edit.levels.is_identity() {
-                        levels::levels_apply(&mut p, &item.edit.levels.build_tables());
-                    }
-                    item.edit.curves.apply(&mut p);
-                    ops::adjust(
-                        &mut p,
-                        item.edit.brightness,
-                        item.edit.contrast,
-                        item.edit.saturation,
-                        item.edit.warmth,
-                    );
-                    noise::noise_add(&mut p, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
+                    color::apply_color_effects(p.to_mut(), w, h, &item.edit, item.id as u32);
                 }
             }
             if cropped_view {
@@ -6408,8 +6412,10 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 composite_layers(&canvas, &item.layers, w, h);
             }
             if want_hi {
-                // Sharp frame lands 150ms after edits settle; until then the
-                // cheap preview render keeps drags responsive.
+                // Sharp frame lands 60ms after edits settle; until then the
+                // cheap preview render keeps drags responsive. The worker's
+                // base cache makes the follow-up render cheap, so a short
+                // debounce no longer buys a costly re-decode of the frame.
                 HI_DEBOUNCE.with(|d| d.set(d.get() + 1));
                 let gen = HI_DEBOUNCE.with(|d| d.get());
                 let cb = Closure::once(move || {
@@ -6494,7 +6500,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 });
                 let _ = web::window().set_timeout_with_callback_and_timeout_and_arguments_0(
                     cb.as_ref().unchecked_ref(),
-                    150,
+                    60,
                 );
                 cb.forget();
             }
@@ -6580,7 +6586,23 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         if overlay_open {
             ctx.restore();
         }
-        render_span.set_detail(format!("{}x{}", canvas.width(), canvas.height()));
+            render_span.set_detail(format!("{}x{}", canvas.width(), canvas.height()));
+        });
+        PREVIEW_DIRTY.with(|d| d.set(true));
+        if !PREVIEW_PENDING.with(|p| p.get()) {
+            PREVIEW_PENDING.with(|p| p.set(true));
+            PREVIEW_DIRTY.with(|d| d.set(false));
+            render();
+            let trailing = render.clone();
+            let cb = Closure::once(move || {
+                PREVIEW_PENDING.with(|p| p.set(false));
+                if PREVIEW_DIRTY.with(|d| d.replace(false)) {
+                    trailing();
+                }
+            });
+            web::request_animation_frame(cb.as_ref().unchecked_ref());
+            cb.forget();
+        }
     });
 
     view! {
@@ -6904,14 +6926,14 @@ fn CropOverlay(
                 if d0 <= f32::EPSILON {
                     return;
                 }
-                let Some(item) = state.current() else { return };
+                let Some(ratio) = state.with_current(|m| m.edit.aspect.ratio().map(|(rw, rh)| rw / rh)) else { return };
                 let Some((ww, wh)) = working.try_get() else { return };
                 let c = zoom_crop(
                     orig,
                     mid0,
                     (mid.0 - mid0.0, mid.1 - mid0.1),
                     spread / d0,
-                    item.edit.aspect.ratio().map(|(rw, rh)| rw / rh),
+                    ratio,
                     ww as f32 / wh as f32,
                 );
                 state.update_current(|e| e.crop = c);
@@ -6921,14 +6943,13 @@ fn CropOverlay(
         // Signals are disposed when the Crop tab unmounts, but this window
         // listener outlives them — bail out instead of touching dead signals.
         let Some(Some((handle, sx, sy, orig))) = drag.try_get() else { return };
-        let Some(item) = state.current() else { return };
+        let Some(ratio) = state.with_current(|m| m.edit.aspect.ratio().map(|(rw, rh)| rw / rh)) else { return };
         let Some((ww, wh)) = working.try_get() else { return };
         let Some((nx, ny)) = norm_pos(&ev) else { return };
         let dx = nx - sx;
         let dy = ny - sy;
 
         let mut c = orig;
-        let ratio = item.edit.aspect.ratio().map(|(rw, rh)| rw / rh);
         let img_aspect = ww as f32 / wh as f32;
 
         match handle {
@@ -7221,7 +7242,7 @@ fn selection_to_layer_sync(state: AppState, cut: bool) {
     let Some(sel) = item.edit.selection.clone() else { return; };
     let Some(photo) = get_photo(item.id) else { return; };
     let Some((full, fw, fh)) = photo.full.clone() else { return };
-    let (base, w, h) = full.with_slice(|s| geometry(s, fw, fh, &item.edit));
+    let (base, w, h) = owned_geometry(&full, fw, fh, &item.edit);
     let mask = ops::selection_mask(&sel, w, h);
     let extracted = ops::extract_masked(&base, &mask);
     let next_id = item.next_layer_id;
@@ -7293,7 +7314,7 @@ fn delete_selection_sync(state: AppState) {
     let Some(sel) = item.edit.selection.clone() else { return; };
     let Some(photo) = get_photo(item.id) else { return; };
     let Some((full, fw, fh)) = photo.full.clone() else { return };
-    let (mut base, w, h) = full.with_slice(|s| geometry(s, fw, fh, &item.edit));
+    let (mut base, w, h) = owned_geometry(&full, fw, fh, &item.edit);
     let mask = ops::selection_mask(&sel, w, h);
     for (px, m) in base.chunks_exact_mut(4).zip(mask.iter()) {
         let a = *m as f32 / 255.0;
@@ -7358,7 +7379,7 @@ fn content_fill_selection_sync(state: AppState) {
     let Some(sel) = item.edit.selection.clone() else { return; };
     let Some(photo) = get_photo(item.id) else { return; };
     let Some((full, fw, fh)) = photo.full.clone() else { return };
-    let (mut base, w, h) = full.with_slice(|s| geometry(s, fw, fh, &item.edit));
+    let (mut base, w, h) = owned_geometry(&full, fw, fh, &item.edit);
     let mask = ops::selection_mask(&sel, w, h);
     if !fill::content_fill(&mut base, &mask, w, h) {
         return;
@@ -7465,7 +7486,7 @@ fn apply_heal_sync(state: AppState, pts: &[(f32, f32)]) {
     }
     let Some(photo) = get_photo(item.id) else { return };
     let Some((full, fw, fh)) = photo.full.clone() else { return };
-    let (mut base, w, h) = full.with_slice(|s| geometry(s, fw, fh, &item.edit));
+    let (mut base, w, h) = owned_geometry(&full, fw, fh, &item.edit);
     let diag = ((w * w + h * h) as f32).sqrt();
     let r = (state.heal_radius.get_untracked() * diag).max(1.0);
     let mut coverage = vec![0u8; w * h];
@@ -7565,7 +7586,7 @@ fn apply_clone_sync(state: AppState, pts: &[(f32, f32)]) {
     let Some(src) = state.clone_source.get_untracked() else { return };
     let Some(photo) = get_photo(item.id) else { return };
     let Some((full, fw, fh)) = photo.full.clone() else { return };
-    let (mut base, w, h) = full.with_slice(|s| geometry(s, fw, fh, &item.edit));
+    let (mut base, w, h) = owned_geometry(&full, fw, fh, &item.edit);
     let aligned = state.clone_aligned.get_untracked();
     let offset = if aligned {
         match state.clone_offset.get_untracked() {
@@ -7616,21 +7637,11 @@ fn wand_select(state: AppState, nx: f32, ny: f32) {
     let (pix, pw, ph) = &photo.preview;
     let (mut p, w, h) = geometry(pix, *pw, *ph, &item.edit);
     if !item.edit.raw.is_identity() {
-        rawops::apply(&mut p, w, h, &item.edit.raw);
+        rawops::apply(p.to_mut(), w, h, &item.edit.raw);
     }
     if item.edit.is_color_touched() {
-        blur::blur_apply(&mut p, w, h, item.edit.blur);
-        if !item.edit.levels.is_identity() {
-            levels::levels_apply(&mut p, &item.edit.levels.build_tables());
-        }
-        item.edit.curves.apply(&mut p);
-        ops::adjust(
-            &mut p,
-            item.edit.brightness,
-            item.edit.contrast,
-            item.edit.saturation,
-            item.edit.warmth,
-        );
+        blur::blur_apply(p.to_mut(), w, h, item.edit.blur);
+        color::apply_color(p.to_mut(), &item.edit);
     }
     let sx = ((nx * w as f32) as usize).min(w - 1);
     let sy = ((ny * h as f32) as usize).min(h - 1);

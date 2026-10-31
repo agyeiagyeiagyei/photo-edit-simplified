@@ -174,7 +174,7 @@ fn record_worker_reply(op: &str, data: &JsValue, result: &JsValue) {
     if !timings.is_object() {
         return;
     }
-    for stage in ["geometry", "resample", "develop", "color"] {
+    for stage in ["geometry", "resample", "develop", "color", "cache"] {
         if let Some(ms) = Reflect::get(&timings, &JsValue::from_str(stage))
             .ok()
             .and_then(|v| v.as_f64())

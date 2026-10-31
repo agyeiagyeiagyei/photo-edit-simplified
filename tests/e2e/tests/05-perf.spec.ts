@@ -20,6 +20,7 @@ test.describe('perf marks (docs/PERF.md)', () => {
       'preview.render', 'hi.request', 'hi.worker_reply', 'hi.blit',
       'worker.load', 'worker.render',
       'worker.render.geometry', 'worker.render.resample', 'worker.render.develop', 'worker.render.color',
+      'worker.render.cache',
     ]) {
       expect(names, `missing perf mark ${n}`).toContain(n);
     }

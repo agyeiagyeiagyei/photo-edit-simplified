@@ -360,6 +360,9 @@ pub struct MediaItem {
 #[derive(Clone, Copy)]
 pub struct AppState {
     pub items: RwSignal<Vec<MediaItem>>,
+    /// Bumped only when the list's membership or order changes, so views that
+    /// rebuild the filmstrip don't re-run on every slider tick.
+    pub list_gen: RwSignal<u32>,
     pub selected: RwSignal<Option<usize>>,
     pub selected_layer: RwSignal<Option<usize>>,
     pub selected_tool: RwSignal<Tool>,
@@ -493,6 +496,7 @@ impl AppState {
     pub fn new() -> Self {
         AppState {
             items: create_rw_signal(Vec::new()),
+            list_gen: create_rw_signal(0),
             selected: create_rw_signal(None),
             selected_layer: create_rw_signal(None),
             selected_tool: create_rw_signal(Tool::Select),
@@ -549,6 +553,12 @@ impl AppState {
     pub fn current(self) -> Option<MediaItem> {
         let sel = self.selected.get()?;
         self.items.with(|v| v.iter().find(|m| m.id == sel).cloned())
+    }
+
+    /// Borrow the current item; for hot paths that would otherwise clone it.
+    pub fn with_current<R>(self, f: impl FnOnce(&MediaItem) -> R) -> Option<R> {
+        let sel = self.selected.get()?;
+        self.items.with(|v| v.iter().find(|m| m.id == sel).map(f))
     }
 
     pub fn update_current(self, f: impl FnOnce(&mut EditParams)) {

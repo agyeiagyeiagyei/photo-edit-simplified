@@ -9,10 +9,10 @@ use js_sys::{Array, Object, Reflect, Uint8Array, Uint8ClampedArray};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
-use pes_pixel::geo::{geometry, hi_target, stamp_stroke};
+use pes_pixel::geo::{geometry, hi_target, stamp_stroke, working_dims};
 use pes_pixel::recipe::{edit_params_from_recipe, selection_from_json};
 use pes_pixel::types::EditParams;
-use pes_pixel::{blur, clone, fill, heal, levels, noise, ops, rawops};
+use pes_pixel::{clone, color, fill, heal, ops, rawops};
 
 thread_local! {
     static BUFFERS: RefCell<HashMap<u32, (Vec<u8>, usize, usize)>> = RefCell::new(HashMap::new());
@@ -27,6 +27,27 @@ thread_local! {
     /// Tone curve from the last proxy develop. A half-size proxy cannot serve
     /// the export, but the full develop reuses this curve so both match.
     static RAW_TONE: RefCell<Option<(u32, [u8; 256])>> = RefCell::new(None);
+    /// Post-geometry, post-resample pixels for the last render. Colour-only
+    /// edits (a slider drag) restore this instead of rotating and downscaling
+    /// the full frame again. Cleared whenever the stored full buffer changes
+    /// (load, unload, destructive commit), so an entry can never outlive the
+    /// pixels it was derived from.
+    static BASE_CACHE: RefCell<Option<BaseCache>> = const { RefCell::new(None) };
+}
+
+struct BaseCache {
+    id: u32,
+    rot90: u8,
+    fine_bits: u32,
+    tw: usize,
+    th: usize,
+    /// Pre-develop, pre-colour: `rawops` runs on a copy every render so
+    /// exposure changes never compound into the cached pixels.
+    pixels: Vec<u8>,
+}
+
+fn clear_base_cache() {
+    BASE_CACHE.with(|c| *c.borrow_mut() = None);
 }
 
 fn with_buffer<R>(id: u32, f: impl FnOnce(&mut (Vec<u8>, usize, usize)) -> R) -> Result<R, JsValue> {
@@ -67,6 +88,7 @@ fn wasm_mem_bytes() -> f64 {
 /// Store (or replace) an item's full-res RGBA buffer.
 #[wasm_bindgen]
 pub fn load(id: u32, pixels: Uint8Array, w: u32, h: u32) {
+    clear_base_cache();
     BUFFERS.with(|b| {
         b.borrow_mut()
             .insert(id, (pixels.to_vec(), w as usize, h as usize));
@@ -75,6 +97,7 @@ pub fn load(id: u32, pixels: Uint8Array, w: u32, h: u32) {
 
 #[wasm_bindgen]
 pub fn unload(id: u32) {
+    clear_base_cache();
     BUFFERS.with(|b| {
         b.borrow_mut().remove(&id);
     });
@@ -99,6 +122,7 @@ fn parse_edit(recipe: &str) -> EditParams {
 /// Parametric pipeline (geometry → resample → color ops), mirroring the app's
 /// render_hi. Selection comes as JSON + optional mask buffer.
 fn render_pipeline(
+    id: u32,
     full: &[u8],
     fw: usize,
     fh: usize,
@@ -109,77 +133,71 @@ fn render_pipeline(
     max_edge: u32,
     sel_json: Option<String>,
     sel_mask: Option<Uint8Array>,
-) -> (Vec<u8>, usize, usize, [f64; 4]) {
+) -> (Vec<u8>, usize, usize, [f64; 5]) {
     let t0 = js_sys::Date::now();
-    let (p, ww, wh) = geometry(full, fw, fh, edit);
+    // Target dims are pure arithmetic, so the cache key is computable without
+    // rotating anything.
+    let (ww, wh) = working_dims(fw, fh, edit);
     let (tw, th) = hi_target(req_w, req_h, ww, wh, max_edge);
-    let t1 = js_sys::Date::now();
-    let mut buf = if (tw, th) != (ww, wh) {
-        resample(&p, ww, wh, tw, th)
+    let fine_bits = edit.fine_angle.to_bits();
+    let cached = BASE_CACHE.with(|c| {
+        c.borrow().as_ref().is_some_and(|b| {
+            b.id == id
+                && b.rot90 == edit.rot90
+                && b.fine_bits == fine_bits
+                && b.tw == tw
+                && b.th == th
+        })
+    });
+    let (mut buf, t1, t2) = if cached {
+        // A tonal edit only needs a fresh copy of the base; the ~27 MB
+        // memcpy is far cheaper than geometry over the sensor frame.
+        let v = BASE_CACHE.with(|c| {
+            c.borrow().as_ref().map(|b| b.pixels.clone()).unwrap_or_default()
+        });
+        let t = js_sys::Date::now();
+        (v, t, t)
     } else {
-        p
+        let (p, gw, gh) = geometry(full, fw, fh, edit);
+        let t = js_sys::Date::now();
+        let buf = if (tw, th) != (gw, gh) {
+            resample(&p, gw, gh, tw, th)
+        } else {
+            p.into_owned()
+        };
+        // Store the pre-develop base: later renders re-run rawops on the
+        // copy, so exposure edits never compound into the cached pixels.
+        BASE_CACHE.with(|c| {
+            *c.borrow_mut() = Some(BaseCache {
+                id,
+                rot90: edit.rot90,
+                fine_bits,
+                tw,
+                th,
+                pixels: buf.clone(),
+            })
+        });
+        (buf, t, js_sys::Date::now())
     };
-    let t2 = js_sys::Date::now();
     // Develop stage first: white balance, exposure and the lighting controls
     // run in linear light, before any gamma-space colour adjustment.
     if !edit.raw.is_identity() {
         rawops::apply(&mut buf, tw, th, &edit.raw);
     }
     let t3 = js_sys::Date::now();
+    let hit = if cached { 1.0 } else { 0.0 };
     if !edit.is_color_touched() {
-        return (buf, tw, th, [t1 - t0, t2 - t1, t3 - t2, 0.0]);
+        return (buf, tw, th, [t1 - t0, t2 - t1, t3 - t2, 0.0, hit]);
     }
     let selection = sel_json.and_then(|j| selection_from_json(&j, sel_mask.map(|m| m.to_vec())));
     if let Some(sel) = selection {
         let mask = ops::selection_mask(&sel, tw, th);
-        blur::blur_apply_masked(&mut buf, &mask, tw, th, edit.blur);
-        if !edit.levels.is_identity() {
-            levels::levels_apply_masked(&mut buf, &mask, &edit.levels.build_tables());
-        }
-        edit.curves.apply_masked(&mut buf, &mask);
-        ops::adjust_masked(
-            &mut buf,
-            &mask,
-            edit.brightness,
-            edit.contrast,
-            edit.saturation,
-            edit.warmth,
-        );
-        noise::noise_add_masked(
-            &mut buf,
-            &mask,
-            tw,
-            th,
-            edit.grain,
-            edit.grain_gaussian,
-            edit.grain_mono,
-            seed,
-        );
+        color::apply_color_effects_masked(&mut buf, &mask, tw, th, edit, seed);
     } else {
-        blur::blur_apply(&mut buf, tw, th, edit.blur);
-        if !edit.levels.is_identity() {
-            levels::levels_apply(&mut buf, &edit.levels.build_tables());
-        }
-        edit.curves.apply(&mut buf);
-        ops::adjust(
-            &mut buf,
-            edit.brightness,
-            edit.contrast,
-            edit.saturation,
-            edit.warmth,
-        );
-        noise::noise_add(
-            &mut buf,
-            tw,
-            th,
-            edit.grain,
-            edit.grain_gaussian,
-            edit.grain_mono,
-            seed,
-        );
+        color::apply_color_effects(&mut buf, tw, th, edit, seed);
     }
     let t4 = js_sys::Date::now();
-    (buf, tw, th, [t1 - t0, t2 - t1, t3 - t2, t4 - t3])
+    (buf, tw, th, [t1 - t0, t2 - t1, t3 - t2, t4 - t3, hit])
 }
 
 /// Render the hi-res frame. Returns {pixels, w, h}.
@@ -195,13 +213,15 @@ pub fn render(
 ) -> Result<JsValue, JsValue> {
     with_buffer(id, |(full, fw, fh)| {
         let edit = parse_edit(recipe);
-        let (buf, tw, th, t) =
-            render_pipeline(full, *fw, *fh, &edit, id, req_w, req_h, max_edge, sel_json, sel_mask);
+        let (buf, tw, th, t) = render_pipeline(
+            id, full, *fw, *fh, &edit, id, req_w, req_h, max_edge, sel_json, sel_mask,
+        );
         let timings = result_obj(&[
             ("geometry", t[0].into()),
             ("resample", t[1].into()),
             ("develop", t[2].into()),
             ("color", t[3].into()),
+            ("cache", t[4].into()),
         ]);
         result_obj(&[
             ("pixels", js_buf(buf)),
@@ -279,6 +299,7 @@ fn downscale(pixels: &[u8], w: usize, h: usize, long_edge: u32) -> (Vec<u8>, usi
 /// bakes rotation into the result and keeps the crop, which is applied at
 /// render time over the working frame.
 fn commit(full: &mut Vec<u8>, fw: &mut usize, fh: &mut usize, base: &[u8], w: usize, h: usize) {
+    clear_base_cache();
     full.clear();
     full.extend_from_slice(base);
     *fw = w;
@@ -317,7 +338,8 @@ pub fn heal_stroke(
 ) -> Result<JsValue, JsValue> {
     with_buffer(id, |(full, fw, fh)| {
         let edit = parse_edit(recipe);
-        let (mut base, w, h) = geometry(full, *fw, *fh, &edit);
+        let (base, w, h) = geometry(full, *fw, *fh, &edit);
+        let mut base = base.into_owned();
         let diag = ((w * w + h * h) as f32).sqrt();
         let r = (radius_frac * diag).max(1.0);
         let pts = parse_pts(pts);
@@ -344,7 +366,8 @@ pub fn clone_stamp(
 ) -> Result<JsValue, JsValue> {
     with_buffer(id, |(full, fw, fh)| {
         let edit = parse_edit(recipe);
-        let (mut base, w, h) = geometry(full, *fw, *fh, &edit);
+        let (base, w, h) = geometry(full, *fw, *fh, &edit);
+        let mut base = base.into_owned();
         let diag = ((w * w + h * h) as f32).sqrt();
         let r = (radius_frac * diag).max(1.0);
         let pts = parse_pts(pts);
@@ -373,7 +396,8 @@ pub fn cut(
 ) -> Result<JsValue, JsValue> {
     with_buffer(id, |(full, fw, fh)| {
         let edit = parse_edit(recipe);
-        let (mut base, w, h) = geometry(full, *fw, *fh, &edit);
+        let (base, w, h) = geometry(full, *fw, *fh, &edit);
+        let mut base = base.into_owned();
         let Some(sel) = selection_from_json(sel_json, sel_mask.map(|m| m.to_vec())) else {
             return JsValue::NULL;
         };
@@ -394,7 +418,8 @@ pub fn fill_selection(
 ) -> Result<JsValue, JsValue> {
     with_buffer(id, |(full, fw, fh)| {
         let edit = parse_edit(recipe);
-        let (mut base, w, h) = geometry(full, *fw, *fh, &edit);
+        let (base, w, h) = geometry(full, *fw, *fh, &edit);
+        let mut base = base.into_owned();
         let Some(sel) = selection_from_json(sel_json, sel_mask.map(|m| m.to_vec())) else {
             return JsValue::NULL;
         };
@@ -420,7 +445,8 @@ pub fn extract(
 ) -> Result<JsValue, JsValue> {
     with_buffer(id, |(full, fw, fh)| {
         let edit = parse_edit(recipe);
-        let (mut base, w, h) = geometry(full, *fw, *fh, &edit);
+        let (base, w, h) = geometry(full, *fw, *fh, &edit);
+        let mut base = base.into_owned();
         let Some(sel) = selection_from_json(sel_json, sel_mask.map(|m| m.to_vec())) else {
             return JsValue::NULL;
         };

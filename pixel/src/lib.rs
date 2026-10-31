@@ -3,6 +3,7 @@
 
 pub mod blur;
 pub mod clone;
+pub mod color;
 pub mod curves;
 pub mod denoise;
 pub mod fill;

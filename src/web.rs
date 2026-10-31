@@ -10,6 +10,10 @@ pub fn window() -> web_sys::Window {
     web_sys::window().expect("no window")
 }
 
+pub fn request_animation_frame(cb: &js_sys::Function) {
+    let _ = web_sys::Window::request_animation_frame(&window(), cb);
+}
+
 pub fn document() -> web_sys::Document {
     window().document().expect("no document")
 }

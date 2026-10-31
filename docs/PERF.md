@@ -153,16 +153,26 @@ returns `ms` with the reply; the app records it as:
 
 | Name | Stage |
 |---|---|
-| `worker.render.geometry` | geometry transform |
-| `worker.render.resample` | resample to the hi-res target |
+| `worker.render.geometry` | geometry transform (on a cache hit: restoring the base) |
+| `worker.render.resample` | resample to the hi-res target (`0` on a cache hit) |
 | `worker.render.develop` | raw develop (`rawops::apply`) |
 | `worker.render.color` | blur/levels/curves/adjust/grain (includes selection mask) |
+| `worker.render.cache` | base-cache lookup: `dur_ms` is `1` (hit) or `0` (rebuilt) |
+
+The worker keeps one base slot — the most recent item's post-geometry,
+post-resample pixels — keyed by `(id, rot90, fine_angle, target w, target h)`.
+A colour-only edit (a slider drag) copies that base instead of rotating and
+downscaling the full frame again, so `geometry` measures the base copy (about
+27 MB for a 2888×1925 target) and `resample` is `0`. The base is stored before
+`rawops` and colour run, so exposure edits never compound into it, and it is
+dropped whenever the stored full frame changes (`load`, `unload`, and
+destructive ops, which `commit`).
 
 ## Reading them
 
 - `hi.worker_reply` minus `worker.render` is message transit + queueing.
 - `preview.render` is the main-thread cost of one edit tick; the settled
-  hi-res path is `hi.request`-to-`hi.blit` plus the 150 ms debounce.
+  hi-res path is `hi.request`-to-`hi.blit` plus the 60 ms debounce.
 - `worker.*` values are executed off the main thread; they show where a slow
   op spends its time, not UI jank.
 - Worker stage timings use `Date.now()` (ms resolution); the op-level `ms`

@@ -31,18 +31,40 @@ test.describe('24MP JPEG: import → edit → export', () => {
     await waitCanvasWidthAbove(page, 1200, 20_000);
     await clickTab(page, 'Color');
     const before = await canvasMean(page);
-    const t0 = Date.now();
-    await setRange(page, /^Brightness/, 0.6);
+    // Hi-res timing starts at the slider change; the timestamp is taken just
+    // before the dispatch below.
+    const t1 = Date.now();
+    // Slider latency measured in-page: dispatch → the coalesced render completing.
+    // Driven from Node, Playwright's request/poll overhead would dominate (the
+    // old definition measured 57–120 ms for the same 8 ms render).
+    const sliderFrame = await page.evaluate(async () => {
+      const input = Array.from(document.querySelectorAll('label.slider'))
+        .find((l) => l.textContent?.startsWith('Brightness'))!
+        .querySelector('input') as HTMLInputElement;
+      const perf = () => ((window as any).__pes?.perf() as any[] | undefined) ?? [];
+      const t0 = performance.now();
+      input.value = '0.6';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      for (let i = 0; i < 120; i++) {
+        await new Promise((r) => requestAnimationFrame(() => r(null)));
+        const hit = perf().find((e) => e.name === 'preview.render' && e.at - e.dur_ms >= t0);
+        if (hit) return { ms: Math.round(hit.at - t0), frames: i + 1 };
+      }
+      return { ms: -1, frames: -1 };
+    });
+    const pollT0 = Date.now();
     await expect.poll(() => canvasMean(page).then((m) => m.luma), { timeout: 5_000 }).toBeGreaterThan(before.luma + 15);
-    const previewMs = Date.now() - t0;
+    const pollMs = Date.now() - pollT0;
+    const previewMs = sliderFrame.ms;
     // Settled: hi-res frame for the edited state must arrive and stay bright. Measured from the slider change.
-    const t1 = t0;
     // The 1024px preview tier blits first (width 1024); the sharp frame arrives when the backing exceeds 1200.
     await waitCanvasWidthAbove(page, 1200, 10_000);
     const hiEditMs = Date.now() - t1; // stamp immediately: everything below is outside the timed window
     const after = await canvasMean(page);
     expect(after.luma).toBeGreaterThan(before.luma + 15);
     // Ten rapid slider ticks: measure average main-thread cost per tick via long tasks.
+    const perfLen0 = await page.evaluate(() => ((window as any).__pes?.perf() as any[] | undefined)?.length ?? 0);
     const longTasks = await page.evaluate(async () => {
       const tasks: number[] = [];
       const obs = new PerformanceObserver((l) => l.getEntries().forEach((e) => tasks.push(e.duration)));
@@ -59,10 +81,51 @@ test.describe('24MP JPEG: import → edit → export', () => {
       obs.disconnect();
       return { total_ms: Math.round(total), long_tasks: tasks.length, longest_ms: Math.round(Math.max(0, ...tasks)) };
     });
+    const tickRuns = await page.evaluate((from) => {
+      const p = ((window as any).__pes?.perf() as any[] | undefined)?.slice(from) ?? [];
+      const count = (n: string) => p.filter((e) => e.name === n).length;
+      return { preview: count('preview.effect'), filmstrip: count('filmstrip.each'), session: count('session.effect') };
+    }, perfLen0);
     recordMetrics(testInfo, {
-      slider_to_preview_ms: previewMs, hires_after_edit_ms: hiEditMs, ...(await perfMarks(page)),
+      slider_to_preview_ms: previewMs, slider_frames: sliderFrame.frames, slider_poll_ms: pollMs,
+      hires_after_edit_ms: hiEditMs, ...(await perfMarks(page)),
       ten_ticks_total_ms: longTasks.total_ms, ten_ticks_long_tasks: longTasks.long_tasks, ten_ticks_longest_ms: longTasks.longest_ms,
+      tick_preview_effects: tickRuns.preview, tick_filmstrip_renders: tickRuns.filmstrip, tick_session_effects: tickRuns.session,
     });
+  });
+
+  test('worker base cache: a cached base renders byte-identically to a fresh one', async ({ page }, testInfo) => {
+    await openApp(page);
+    await importFiles(page, [JPEG_A]);
+    await waitCanvasWidthAbove(page, 1200, 20_000);
+    const s = await canvasSize(page);
+    const target = { w: s.w, h: s.h };
+    await clickTab(page, 'Color');
+    await setRange(page, /^Brightness/, 0.6);
+    // The edited hi frame lands at the same dims, served from the worker's base.
+    await expect.poll(() => canvasSize(page).then((r) => ({ w: r.w, h: r.h })), { timeout: 20_000 }).toEqual(target);
+    const hash = () => canvas(page).evaluate((c: HTMLCanvasElement) => {
+      const d = new Uint8Array(c.getContext('2d')!.getImageData(0, 0, c.width, c.height).data.buffer);
+      let h = 2166136261 >>> 0;
+      for (let i = 0; i < d.length; i++) { h ^= d[i]; h = Math.imul(h, 16777619) >>> 0; }
+      return { w: c.width, h: c.height, hash: h >>> 0 };
+    });
+    const cacheMarks = () => page.evaluate(() =>
+      (((window as any).__pes?.perf() as any[]) ?? [])
+        .filter((e) => e.name === 'worker.render.cache').map((e) => Math.round(e.dur_ms)));
+    const hit = await hash();
+    expect(await cacheMarks(), 'edited render should hit the worker base').toContain(1);
+    // Rotate away and back: the single base slot now holds a rotated base, so
+    // this render recomputes geometry+resample from the stored full frame.
+    await clickTab(page, 'Rotate');
+    await page.locator('button.btn', { hasText: '⟳ 90°' }).click();
+    await waitCanvasWidthAbove(page, 1200, 20_000);
+    await page.locator('button.btn', { hasText: '⟲ 90°' }).click();
+    await expect.poll(() => canvasSize(page).then((r) => ({ w: r.w, h: r.h })), { timeout: 20_000 }).toEqual(target);
+    const miss = await hash();
+    expect(await cacheMarks(), 'round-trip render should miss the cache').toContain(0);
+    expect(miss, 'cache hit and fresh base must render byte-identically').toEqual(hit);
+    recordMetrics(testInfo, { cache_parity_w: target.w, cache_parity_h: target.h });
   });
 
   test('edit immediately after import (cold: full-res not yet decoded) still lands a sharp frame', async ({ page }, testInfo) => {

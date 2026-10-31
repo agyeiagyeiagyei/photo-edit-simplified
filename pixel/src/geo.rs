@@ -2,18 +2,29 @@
 //! sizing, stroke rasterization. Pure Rust — canvas resampling lives in the
 //! caller (DOM canvas in the app, OffscreenCanvas in the worker).
 
+use std::borrow::Cow;
+
 use crate::ops;
 use crate::types::EditParams;
 
 /// Apply rotation (quarter-turns then fine angle with auto-crop) to a buffer.
-pub fn geometry(pixels: &[u8], w: usize, h: usize, edit: &EditParams) -> (Vec<u8>, usize, usize) {
-    let (p, w, h) = if edit.rot90 % 4 != 0 {
-        ops::rotate_90(pixels, w, h, edit.rot90)
+/// The identity case borrows the source instead of copying it; callers that
+/// need to mutate convert with `to_mut`/`into_owned`.
+pub fn geometry<'a>(
+    pixels: &'a [u8],
+    w: usize,
+    h: usize,
+    edit: &EditParams,
+) -> (Cow<'a, [u8]>, usize, usize) {
+    let (p, w, h): (Cow<'a, [u8]>, usize, usize) = if edit.rot90 % 4 != 0 {
+        let (v, w, h) = ops::rotate_90(pixels, w, h, edit.rot90);
+        (Cow::Owned(v), w, h)
     } else {
-        (pixels.to_vec(), w, h)
+        (Cow::Borrowed(pixels), w, h)
     };
     if edit.fine_angle.abs() > 0.01 {
-        ops::rotate_auto_crop(&p, w, h, edit.fine_angle)
+        let (v, w, h) = ops::rotate_auto_crop(&p, w, h, edit.fine_angle);
+        (Cow::Owned(v), w, h)
     } else {
         (p, w, h)
     }
