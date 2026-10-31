@@ -94,6 +94,32 @@ of serially behind the selected item:
 - Pool develops do not retain frames (`retain: false`); the pool is terminated
   when the import's jobs drain, releasing its wasm high-water.
 
+### Threads inside one develop (evaluated, not adopted)
+
+The service worker can inject `Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: credentialless` on every response, and the app
+then reports `crossOriginIsolated` with `SharedArrayBuffer` available; the
+pixel worker still runs. It is not shippable because cross-origin isolation
+breaks the Drive integration (verified in Chromium 151 against a local copy of
+the app):
+
+- GIS token sign-in opens a popup; under `COOP: same-origin` the popup has no
+  `window.opener`, so the token callback never reaches the page.
+- The Drive Picker is a `docs.google.com` iframe. A COEP page refuses to commit
+  cross-origin frames that do not set COEP themselves — they land on
+  `chrome-error://`, even with a `Cross-Origin-Resource-Policy: cross-origin`
+  response.
+- Drive thumbnails are cookie-authenticated `<img>` loads; COEP
+  `credentialless` strips the cookie (the server sees no `Cookie` header) and
+  the endpoint answers 403.
+
+Drive REST calls (CORS with an `Authorization` header) are unaffected, but
+sign-in, picker and thumbnails are core flows. For reference, native rayon on
+the real 26 MP ARW scales the 3200 px superpixel proxy only 1.3× from one to
+six threads (322 → 245 ms; demosaic is a small share of the proxy), while the
+full PPG export develop scales 2.7× (1.74 → 0.65 s). The batch pool is the
+parallelism that ships.
+
 ### Zero-copy RAW sources
 
 RAW originals never become a main-thread `Vec<u8>` on the normal path. The
