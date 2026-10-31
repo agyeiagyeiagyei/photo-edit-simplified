@@ -477,6 +477,11 @@ pub fn load(id: usize, pixels: &[u8], w: usize, h: usize) {
 
 pub fn unload(id: usize) {
     call("unload", &[JsValue::from(id as u32)], &[], Box::new(|_| {}));
+    // The RAW worker holds the last proxy's full frame / tone curve for the
+    // export reuse; drop that item there too.
+    if RAW_WORKER.with(|w| w.borrow().is_some()) {
+        raw_call("unload", &[JsValue::from(id as u32)], &[], Box::new(|_| {}));
+    }
 }
 
 /// Selection wire args: (sel_json, sel_mask) + transfer list for mask bytes.

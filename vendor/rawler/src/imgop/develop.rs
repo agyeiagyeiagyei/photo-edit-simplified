@@ -25,7 +25,7 @@ use crate::{
 use super::{
   Dim2, Rect, convert_from_f32_scaled_u16,
   raw::{map_3ch_to_rgb, map_4ch_to_rgb},
-  sensor::bayer::{bilinear::Bilinear4Channel, ppg::PPGDemosaic},
+  sensor::bayer::{bilinear::Bilinear4Channel, ppg::PPGDemosaic, superpixel::Superpixel3Channel},
   xyz::Illuminant,
 };
 
@@ -68,6 +68,9 @@ pub fn process_raw_image<W: Write + Seek + Send>(raw: &Path, image_file: &mut W,
 pub enum ProcessingStep {
   Rescale,
   Demosaic,
+  /// Bayer RGB only: 2×2 binning to half-size RGB instead of PPG. Other
+  /// sensors keep their normal demosaic.
+  DemosaicSuperpixel,
   FujiRotate,
   CropActiveArea,
   WhiteBalance,
@@ -147,6 +150,23 @@ impl RawDevelop {
     Self { steps: Vec::from(steps) }
   }
 
+  /// Half-size develop for display proxies: 2×2 superpixel binning on Bayer
+  /// RGB sensors, the normal path everywhere else.
+  pub fn superpixel() -> Self {
+    Self {
+      steps: vec![
+        ProcessingStep::Rescale,
+        ProcessingStep::DemosaicSuperpixel,
+        ProcessingStep::FujiRotate,
+        ProcessingStep::CropActiveArea,
+        ProcessingStep::WhiteBalance,
+        ProcessingStep::Calibrate,
+        ProcessingStep::CropDefault,
+        ProcessingStep::SRgb,
+      ],
+    }
+  }
+
   /*
   pub fn linearize(rawimage: &RawImage) -> crate::Result<RgbF32> {
     todo!()
@@ -185,7 +205,9 @@ impl RawDevelop {
       _ => todo!(),
     };
 
-    if self.steps.contains(&ProcessingStep::Demosaic) {
+    let demosaic = self.steps.contains(&ProcessingStep::Demosaic);
+    let superpixel = self.steps.contains(&ProcessingStep::DemosaicSuperpixel);
+    if demosaic || superpixel {
       intermediate = match &rawimage.photometric {
         RawPhotometricInterpretation::Cfa(config) => {
           if let Intermediate::Monochrome(pixels) = intermediate {
@@ -198,8 +220,11 @@ impl RawDevelop {
               pixels.rect()
             };
             if config.cfa.is_rgb() && config.sensor == SensorType::Bayer {
-              let ppg = PPGDemosaic::new();
-              let mut rgb = ppg.demosaic(&pixels, &config.cfa, &config.colors, roi);
+              let mut rgb = if superpixel {
+                Superpixel3Channel::new().demosaic(&pixels, &config.cfa, &config.colors, roi)
+              } else {
+                PPGDemosaic::new().demosaic(&pixels, &config.cfa, &config.colors, roi)
+              };
 
               // Fuji Rotate
               if self.steps.contains(&ProcessingStep::FujiRotate)
@@ -290,7 +315,7 @@ impl RawDevelop {
       log::debug!("Crop: {:?}", rawimage.crop_area);
       log::debug!("active_area: {:?}", rawimage.active_area);
       if let Some(mut crop) = rawimage.crop_area.or(rawimage.active_area) {
-        if self.steps.contains(&ProcessingStep::Demosaic) && self.steps.contains(&ProcessingStep::CropActiveArea) {
+        if (demosaic || superpixel) && self.steps.contains(&ProcessingStep::CropActiveArea) {
           // If active area crop was already applied during demosaic, we need to
           // adapt default crop to active area crop.
           if let Some(active_area) = &rawimage.active_area {

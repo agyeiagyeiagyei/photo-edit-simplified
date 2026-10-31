@@ -3,8 +3,10 @@
 //! No browser APIs outside the wasm-only perf clock, so it compiles for both
 //! wasm32 targets unchanged.
 
-use rawler::decoders::{RawDecodeParams, RawMetadata};
+use rawler::decoders::{Decoder, RawDecodeParams, RawMetadata};
 use rawler::imgop::develop::{Intermediate, RawDevelop};
+use rawler::imgop::sensor::SensorType;
+use rawler::rawimage::{RawImage, RawPhotometricInterpretation};
 use rawler::rawsource::RawSource;
 
 use rawmeta::tiff as tw;
@@ -28,6 +30,22 @@ fn now_ms() -> f64 {
 /// tone-match to the camera's embedded JPEG preview so the result sits on the
 /// camera's exposure and contrast instead of rawler's flat baseline.
 pub fn decode_raw(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
+    develop_rgba(bytes, None)
+}
+
+/// Full develop reusing a tone curve computed by an earlier proxy develop, so
+/// the export renders on the same curve as the proxy.
+pub fn decode_raw_with_tone(
+    bytes: &[u8],
+    tone: Option<&[u8; 256]>,
+) -> Result<(Vec<u8>, usize, usize), String> {
+    develop_rgba(bytes, tone)
+}
+
+fn develop_rgba(
+    bytes: &[u8],
+    tone: Option<&[u8; 256]>,
+) -> Result<(Vec<u8>, usize, usize), String> {
     let rawfile = RawSource::new_from_slice(bytes);
     let decoder = rawler::get_decoder(&rawfile).map_err(|e| format!("unsupported RAW: {e}"))?;
     let params = RawDecodeParams { image_index: 0 };
@@ -39,8 +57,80 @@ pub fn decode_raw(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
     let intermediate = develop
         .develop_intermediate(&rawimage)
         .map_err(|e| format!("RAW develop failed: {e}"))?;
+    let (rgba, w, h) = intermediate_rgba(intermediate);
+    let (mut rgba, w, h) = rawmeta::apply_orientation_code(rgba, w, h, orientation);
+    match tone {
+        Some(lut) => apply_tone_lut(&mut rgba, lut),
+        None => {
+            if let Some(preview) = camera_preview_rgb(decoder.as_ref(), &rawfile, &params) {
+                if let Some(lut) = camera_tone_lut(&rgba, &preview) {
+                    apply_tone_lut(&mut rgba, &lut);
+                }
+            }
+        }
+    }
+    Ok((rgba, w, h))
+}
 
-    let (rgba, w, h) = match intermediate {
+/// A display proxy develop: pixels plus the tone curve used, the true sensor
+/// dims, and whether the 2×2 superpixel binning produced half-size output.
+pub struct RawProxy {
+    pub rgba: Vec<u8>,
+    pub w: usize,
+    pub h: usize,
+    pub full_w: usize,
+    pub full_h: usize,
+    pub tone: Option<[u8; 256]>,
+    pub half: bool,
+}
+
+/// Half-size develop when the sensor's binned frame still covers the display
+/// cap; otherwise the normal full develop. The tone curve is computed here and
+/// returned so a later full develop for export reuses it.
+pub fn decode_raw_proxy(bytes: &[u8], max_edge: u32) -> Result<RawProxy, String> {
+    let rawfile = RawSource::new_from_slice(bytes);
+    let decoder = rawler::get_decoder(&rawfile).map_err(|e| format!("unsupported RAW: {e}"))?;
+    let params = RawDecodeParams { image_index: 0 };
+    let rawimage = decoder
+        .raw_image(&rawfile, &params, false)
+        .map_err(|e| format!("RAW decode failed: {e}"))?;
+    let orientation = rawimage.orientation.to_u16();
+    // Binning halves the long edge. A 26 MP body lands at 3 096 px for a
+    // 3 200 px cap — close enough to keep display density — while a 10 MP
+    // body would drop to ~1 900 px and visibly soften the proxy.
+    let half = max_edge > 0
+        && is_bayer_rgb(&rawimage)
+        && (rawimage.width.max(rawimage.height) as f64) * 0.5
+            >= max_edge as f64 * SUPERPIXEL_MIN_COVER;
+    let develop = if half { RawDevelop::superpixel() } else { RawDevelop::default() };
+    let intermediate = develop
+        .develop_intermediate(&rawimage)
+        .map_err(|e| format!("RAW develop failed: {e}"))?;
+    let (rgba, w, h) = intermediate_rgba(intermediate);
+    let (mut rgba, w, h) = rawmeta::apply_orientation_code(rgba, w, h, orientation);
+    let tone = camera_preview_rgb(decoder.as_ref(), &rawfile, &params)
+        .and_then(|preview| camera_tone_lut(&rgba, &preview));
+    if let Some(lut) = &tone {
+        apply_tone_lut(&mut rgba, lut);
+    }
+    let (full_w, full_h) = if half { (w * 2, h * 2) } else { (w, h) };
+    Ok(RawProxy { rgba, w, h, full_w, full_h, tone, half })
+}
+
+/// Minimum fraction of the display cap a half-size proxy must cover.
+const SUPERPIXEL_MIN_COVER: f64 = 0.9;
+
+fn is_bayer_rgb(rawimage: &RawImage) -> bool {
+    match &rawimage.photometric {
+        RawPhotometricInterpretation::Cfa(config) => {
+            config.cfa.is_rgb() && config.sensor == SensorType::Bayer
+        }
+        _ => false,
+    }
+}
+
+fn intermediate_rgba(intermediate: Intermediate) -> (Vec<u8>, usize, usize) {
+    match intermediate {
         Intermediate::ThreeColor(rgb) => {
             let mut out = Vec::with_capacity(rgb.data.len() * 4);
             for px in &rgb.data {
@@ -69,36 +159,39 @@ pub fn decode_raw(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
             }
             (out, p.width, p.height)
         }
-    };
-    let (mut rgba, w, h) = rawmeta::apply_orientation_code(rgba, w, h, orientation);
-    let preview = decoder
-        .full_image(&rawfile, &params)
+    }
+}
+
+fn camera_preview_rgb(
+    decoder: &dyn Decoder,
+    rawfile: &RawSource,
+    params: &RawDecodeParams,
+) -> Option<Vec<u8>> {
+    let img = decoder
+        .full_image(rawfile, params)
         .ok()
         .flatten()
-        .or_else(|| decoder.preview_image(&rawfile, &params).ok().flatten())
-        .or_else(|| decoder.thumbnail_image(&rawfile, &params).ok().flatten());
-    if let Some(img) = preview {
-        apply_camera_tone(&mut rgba, &img.into_rgb8().into_raw());
-    }
-    Ok((rgba, w, h))
+        .or_else(|| decoder.preview_image(rawfile, params).ok().flatten())
+        .or_else(|| decoder.thumbnail_image(rawfile, params).ok().flatten())?;
+    Some(img.into_rgb8().into_raw())
 }
 
 /// Match the developed image's luminance to the embedded camera preview by
 /// quantile, applied as a per-channel curve — rawler develops neutrally with no
 /// exposure compensation or camera tone curve, which leaves RAW frames ~1 EV
 /// darker and flatter than the camera's own JPEG.
-fn apply_camera_tone(rgba: &mut [u8], preview_rgb: &[u8]) {
+fn camera_tone_lut(rgba: &[u8], preview_rgb: &[u8]) -> Option<[u8; 256]> {
     let (dev_h, dev_n) = luma_hist(rgba.chunks_exact(4).map(|p| (p[0], p[1], p[2])));
     let (prev_h, prev_n) = luma_hist(preview_rgb.chunks_exact(3).map(|p| (p[0], p[1], p[2])));
     if dev_n == 0 || prev_n == 0 {
-        return;
+        return None;
     }
     let dev_c = cdf(&dev_h, dev_n);
     let prev_c = cdf(&prev_h, prev_n);
     // Refuse to stretch toward a preview with almost no tonal spread (a flat
     // frame or a broken thumbnail) — neutral develop is the safer fallback.
     if spread(&dev_c) < 8 || spread(&prev_c) < 8 {
-        return;
+        return None;
     }
     let mut lut = [0u8; 256];
     let mut p = 0usize;
@@ -108,6 +201,10 @@ fn apply_camera_tone(rgba: &mut [u8], preview_rgb: &[u8]) {
         }
         *lut_v = p as u8;
     }
+    Some(lut)
+}
+
+fn apply_tone_lut(rgba: &mut [u8], lut: &[u8; 256]) {
     for px in rgba.chunks_exact_mut(4) {
         px[0] = lut[px[0] as usize];
         px[1] = lut[px[1] as usize];
@@ -408,5 +505,134 @@ mod tests {
     #[test]
     fn empty_bytes_error_not_panic() {
         assert!(decode_raw(&[]).is_err());
+    }
+
+    #[test]
+    fn tone_lut_identity_for_matching_histograms() {
+        let mut rgba = Vec::new();
+        for v in 0..=255u8 {
+            for _ in 0..4 {
+                rgba.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let lut = camera_tone_lut(&rgba, &rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect::<Vec<_>>())
+            .unwrap();
+        for (v, mapped) in lut.iter().enumerate() {
+            assert!((*mapped as i32 - v as i32).abs() <= 1, "lut[{v}] = {mapped}");
+        }
+    }
+
+    #[test]
+    fn tone_lut_brightens_toward_preview() {
+        let dark: Vec<u8> = (0..=255u8)
+            .flat_map(|v| [v, v, v, 255].repeat(4))
+            .collect();
+        let bright: Vec<u8> = (0..=255u8)
+            .flat_map(|v| {
+                let b = (v as u32 * 2).min(255) as u8;
+                [b, b, b].repeat(4)
+            })
+            .collect();
+        let lut = camera_tone_lut(&dark, &bright).unwrap();
+        assert!(lut[128] > 128);
+        assert!(lut[200] >= 200);
+        assert!(lut.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    #[test]
+    fn tone_lut_none_for_flat_frames() {
+        let flat = vec![120u8, 120, 120, 255].repeat(1024);
+        let preview = vec![200u8, 200, 200].repeat(1024);
+        assert!(camera_tone_lut(&flat, &preview).is_none());
+    }
+
+    #[test]
+    fn tone_lut_leaves_alpha_untouched() {
+        let mut rgba: Vec<u8> = (0..=255u8).flat_map(|v| [v, v / 2, 255 - v, 7]).collect();
+        let lut = [255u8; 256];
+        apply_tone_lut(&mut rgba, &lut);
+        assert!(rgba.chunks_exact(4).all(|p| p == [255, 255, 255, 7]));
+    }
+
+    /// Best PSNR between a half-size image and a 2×2 box-binned full-size
+    /// image. The default crop is scaled with `(x * 0.5) as usize`, so an odd
+    /// crop origin can shift the binning grid by one sensor pixel; the four
+    /// block alignments are tried and the best one wins.
+    fn best_block_psnr(half: &[u8], hw: usize, hh: usize, full: &[u8], fw: usize, fh: usize) -> f64 {
+        let w = (fw / 2).min(hw);
+        let h = (fh / 2).min(hh);
+        assert!(w > 0 && h > 0, "frames too small: {hw}x{hh} vs {fw}x{fh}");
+        let psnr_at = |ox: usize, oy: usize| {
+            let w = w.min((fw - ox) / 2);
+            let h = h.min((fh - oy) / 2);
+            let mut se = 0.0f64;
+            let mut n = 0u64;
+            for y in 0..h {
+                for x in 0..w {
+                    for c in 0..3 {
+                        let mut sum = 0u32;
+                        for dy in 0..2 {
+                            for dx in 0..2 {
+                                sum += full[((y * 2 + dy + oy) * fw + x * 2 + dx + ox) * 4 + c] as u32;
+                            }
+                        }
+                        let down = (sum as f64 / 4.0).round() as i32;
+                        let diff = down - half[(y * hw + x) * 4 + c] as i32;
+                        se += (diff * diff) as f64;
+                        n += 1;
+                    }
+                }
+            }
+            let mse = se / n as f64;
+            if mse == 0.0 {
+                f64::INFINITY
+            } else {
+                10.0 * (255.0f64 * 255.0 / mse).log10()
+            }
+        };
+        let mut psnr = f64::NEG_INFINITY;
+        for oy in 0..2 {
+            for ox in 0..2 {
+                psnr = psnr.max(psnr_at(ox, oy));
+            }
+        }
+        psnr
+    }
+
+    /// Proxy vs export parity on a real file: `RAW_FILE=<path>` where the
+    /// sensor's half-size develop still covers the 3 200 px cap.
+    #[test]
+    fn superpixel_proxy_matches_export() {
+        let Ok(path) = std::env::var("RAW_FILE") else {
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read RAW_FILE");
+        let proxy = decode_raw_proxy(&bytes, 3200).expect("proxy develop");
+        if !proxy.half {
+            eprintln!("RAW_FILE {} is too small for the superpixel path; skipped", path);
+            return;
+        }
+
+        // Demosaic-only parity: develop the same sensor half-size (superpixel)
+        // and full-size (PPG) with no tone curve. This isolates the fine-detail
+        // difference between the two demosaics.
+        let rawfile = RawSource::new_from_slice(&bytes);
+        let decoder = rawler::get_decoder(&rawfile).expect("decoder");
+        let params = RawDecodeParams { image_index: 0 };
+        let rawimage = decoder.raw_image(&rawfile, &params, false).expect("raw image");
+        let (hp, hw, hh) = intermediate_rgba(RawDevelop::superpixel().develop_intermediate(&rawimage).expect("superpixel develop"));
+        let (fp, fw, fh) = intermediate_rgba(RawDevelop::default().develop_intermediate(&rawimage).expect("full develop"));
+        let demosaic_psnr = best_block_psnr(&hp, hw, hh, &fp, fw, fh);
+        eprintln!("demosaic-only PSNR: {demosaic_psnr:.2} dB ({hw}x{hh})");
+        assert!(demosaic_psnr >= 40.0, "demosaic-only PSNR {demosaic_psnr:.2} dB below 40");
+
+        // End to end: the export reuses the proxy's tone curve, as the worker does.
+        let (full, fw, fh) = decode_raw_with_tone(&bytes, proxy.tone.as_ref()).expect("full develop");
+        let e2e_psnr = best_block_psnr(&proxy.rgba, proxy.w, proxy.h, &full, fw, fh);
+        eprintln!("toned proxy vs toned export PSNR: {e2e_psnr:.2} dB ({}x{})", proxy.w, proxy.h);
+        // A steep tone curve amplifies residual demosaic differences: on the
+        // synthetic stress fixture it costs ~3 dB (40.2 → 36.9). Much lower
+        // means the LUT or the crop alignment broke.
+        assert!(e2e_psnr >= 30.0, "toned PSNR {e2e_psnr:.2} dB below 30");
     }
 }

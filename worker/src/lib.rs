@@ -21,8 +21,12 @@ thread_local! {
     static DECODER_FIRST_MS: Cell<Option<f64>> = const { Cell::new(None) };
     /// Full sensor frame from the last proxy develop. The display upgrade and
     /// the export otherwise demosaic the same file twice; the export takes
-    /// this instead. One slot: the app exports what it just selected.
+    /// this instead. One slot: the app exports what it just selected. Empty
+    /// when the proxy was a half-size superpixel develop.
     static RAW_FULL: RefCell<Option<(u32, Vec<u8>, usize, usize)>> = RefCell::new(None);
+    /// Tone curve from the last proxy develop. A half-size proxy cannot serve
+    /// the export, but the full develop reuses this curve so both match.
+    static RAW_TONE: RefCell<Option<(u32, [u8; 256])>> = RefCell::new(None);
 }
 
 fn with_buffer<R>(id: u32, f: impl FnOnce(&mut (Vec<u8>, usize, usize)) -> R) -> Result<R, JsValue> {
@@ -60,6 +64,18 @@ pub fn load(id: u32, pixels: Uint8Array, w: u32, h: u32) {
 pub fn unload(id: u32) {
     BUFFERS.with(|b| {
         b.borrow_mut().remove(&id);
+    });
+    RAW_FULL.with(|c| {
+        let mut slot = c.borrow_mut();
+        if slot.as_ref().is_some_and(|(cid, _, _, _)| *cid == id) {
+            *slot = None;
+        }
+    });
+    RAW_TONE.with(|c| {
+        let mut slot = c.borrow_mut();
+        if slot.as_ref().is_some_and(|(cid, _)| *cid == id) {
+            *slot = None;
+        }
     });
 }
 
@@ -428,14 +444,23 @@ fn proxy_result(px: Vec<u8>, w: usize, h: usize, full_w: usize, full_h: usize) -
 }
 
 /// Demosaic a RAW in the worker and return a display-resolution proxy, so
-/// import previews never block the main thread or need the full buffer. The
-/// full frame stays here for `raw_develop` to reuse.
+/// import previews never block the main thread or need the full buffer. Large
+/// Bayer sensors develop at half size (2×2 binning); a full-size frame stays
+/// here for `raw_develop` to reuse, and either way the tone curve does.
 #[wasm_bindgen]
 pub fn raw_proxy(id: u32, bytes: Uint8Array, max_edge: u32) -> Result<JsValue, JsValue> {
-    let (rgba, w, h) = rawcore::decode_raw(&bytes.to_vec()).map_err(|e| JsValue::from_str(&e))?;
-    let (px, pw, ph) = downscale(&rgba, w, h, max_edge);
-    RAW_FULL.with(|c| *c.borrow_mut() = Some((id, rgba, w, h)));
-    Ok(proxy_result(px, pw, ph, w, h))
+    let p = rawcore::decode_raw_proxy(&bytes.to_vec(), max_edge)
+        .map_err(|e| JsValue::from_str(&e))?;
+    let (px, pw, ph) = downscale(&p.rgba, p.w, p.h, max_edge);
+    RAW_FULL.with(|c| {
+        *c.borrow_mut() = if p.half {
+            None
+        } else {
+            Some((id, p.rgba, p.w, p.h))
+        }
+    });
+    RAW_TONE.with(|c| *c.borrow_mut() = p.tone.map(|t| (id, t)));
+    Ok(proxy_result(px, pw, ph, p.full_w, p.full_h))
 }
 
 /// Decode the camera's embedded full-size JPEG (no EXIF of its own) into a
@@ -483,7 +508,8 @@ pub fn raw_meta(bytes: Uint8Array, preview_edge: u32) -> Result<JsValue, JsValue
 
 /// Full sensor develop — the multi-second demosaic. Runs here so the app
 /// thread never blocks on RAW decoding. Reuses the last proxy develop's frame
-/// when it is the same item; a stale frame is dropped before developing.
+/// when it is the same item, or its tone curve when the proxy was half-size; a
+/// stale frame is dropped before developing.
 #[wasm_bindgen]
 pub fn raw_develop(id: u32, bytes: Uint8Array) -> Result<JsValue, JsValue> {
     let cached = RAW_FULL.with(|c| {
@@ -498,7 +524,20 @@ pub fn raw_develop(id: u32, bytes: Uint8Array) -> Result<JsValue, JsValue> {
     });
     let (rgba, w, h) = match cached {
         Some((_, rgba, w, h)) => (rgba, w, h),
-        None => rawcore::decode_raw(&bytes.to_vec()).map_err(|e| JsValue::from_str(&e))?,
+        None => {
+            let tone = RAW_TONE.with(|c| {
+                let mut slot = c.borrow_mut();
+                let hit = slot.as_ref().is_some_and(|(cid, _)| *cid == id);
+                let taken = slot.take();
+                if hit {
+                    taken.map(|(_, t)| t)
+                } else {
+                    None
+                }
+            });
+            rawcore::decode_raw_with_tone(&bytes.to_vec(), tone.as_ref())
+                .map_err(|e| JsValue::from_str(&e))?
+        }
     };
     Ok(result_obj(&[
         ("pixels", js_buf(rgba)),
