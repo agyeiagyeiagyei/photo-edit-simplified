@@ -51,6 +51,19 @@ fn result_obj(pairs: &[(&str, JsValue)]) -> JsValue {
     o.into()
 }
 
+/// Linear memory currently committed by this wasm instance. RAW develops are
+/// the memory peak, so replies carry it and the app tracks the high-water.
+fn wasm_mem_bytes() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        std::arch::wasm32::memory_size(0) as f64 * 65536.0
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        0.0
+    }
+}
+
 /// Store (or replace) an item's full-res RGBA buffer.
 #[wasm_bindgen]
 pub fn load(id: u32, pixels: Uint8Array, w: u32, h: u32) {
@@ -440,6 +453,7 @@ fn proxy_result(px: Vec<u8>, w: usize, h: usize, full_w: usize, full_h: usize) -
         ("h", (h as u32).into()),
         ("full_w", (full_w as u32).into()),
         ("full_h", (full_h as u32).into()),
+        ("mem", wasm_mem_bytes().into()),
     ])
 }
 
@@ -503,6 +517,7 @@ pub fn raw_meta(bytes: Uint8Array, preview_edge: u32) -> Result<JsValue, JsValue
         ("preview_h", (ph as u32).into()),
         ("get_decoder_ms", m.get_decoder_ms.into()),
         ("get_decoder_first", first.into()),
+        ("mem", wasm_mem_bytes().into()),
     ]))
 }
 
@@ -543,6 +558,7 @@ pub fn raw_develop(id: u32, bytes: Uint8Array) -> Result<JsValue, JsValue> {
         ("pixels", js_buf(rgba)),
         ("w", (w as u32).into()),
         ("h", (h as u32).into()),
+        ("mem", wasm_mem_bytes().into()),
     ]))
 }
 

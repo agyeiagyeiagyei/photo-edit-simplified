@@ -57,8 +57,7 @@ fn develop_rgba(
     let intermediate = develop
         .develop_intermediate(&rawimage)
         .map_err(|e| format!("RAW develop failed: {e}"))?;
-    let (rgba, w, h) = intermediate_rgba(intermediate);
-    let (mut rgba, w, h) = rawmeta::apply_orientation_code(rgba, w, h, orientation);
+    let (mut rgba, w, h) = intermediate_rgba(intermediate, orientation);
     match tone {
         Some(lut) => apply_tone_lut(&mut rgba, lut),
         None => {
@@ -106,8 +105,7 @@ pub fn decode_raw_proxy(bytes: &[u8], max_edge: u32) -> Result<RawProxy, String>
     let intermediate = develop
         .develop_intermediate(&rawimage)
         .map_err(|e| format!("RAW develop failed: {e}"))?;
-    let (rgba, w, h) = intermediate_rgba(intermediate);
-    let (mut rgba, w, h) = rawmeta::apply_orientation_code(rgba, w, h, orientation);
+    let (mut rgba, w, h) = intermediate_rgba(intermediate, orientation);
     let tone = camera_preview_rgb(decoder.as_ref(), &rawfile, &params)
         .and_then(|preview| camera_tone_lut(&rgba, &preview));
     if let Some(lut) = &tone {
@@ -129,37 +127,88 @@ fn is_bayer_rgb(rawimage: &RawImage) -> bool {
     }
 }
 
-fn intermediate_rgba(intermediate: Intermediate) -> (Vec<u8>, usize, usize) {
+/// 0..1 float → 0..255 byte table (12-bit quantised). Beats a per-channel
+/// round().clamp() in the develop's innermost loop.
+fn px_table() -> &'static [u8; 4097] {
+    use std::sync::OnceLock;
+    static LUT: OnceLock<[u8; 4097]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t = [0u8; 4097];
+        for (i, v) in t.iter_mut().enumerate() {
+            *v = ((i as f32 / 4096.0) * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+        t
+    })
+}
+
+#[inline]
+fn to_u8(v: f32) -> u8 {
+    px_table()[(v.clamp(0.0, 1.0) * 4096.0) as usize]
+}
+
+/// Float intermediate → orientation-corrected RGBA in one write. Folding the
+/// EXIF orientation into the destination index avoids a second full-frame
+/// copy (and the transpose allocation) after the develop.
+fn intermediate_rgba(intermediate: Intermediate, code: u16) -> (Vec<u8>, usize, usize) {
+    let (transpose, flip_x, flip_y) = rawmeta::orientation_flips(code);
     match intermediate {
         Intermediate::ThreeColor(rgb) => {
-            let mut out = Vec::with_capacity(rgb.data.len() * 4);
-            for px in &rgb.data {
-                out.push((px[0] * 255.0).round().clamp(0.0, 255.0) as u8);
-                out.push((px[1] * 255.0).round().clamp(0.0, 255.0) as u8);
-                out.push((px[2] * 255.0).round().clamp(0.0, 255.0) as u8);
-                out.push(255);
-            }
-            (out, rgb.width, rgb.height)
+            let out = write_pixels(&rgb.data, rgb.width, rgb.height, transpose, flip_x, flip_y, |px| {
+                (px[0], px[1], px[2])
+            });
+            let (ow, oh) = rawmeta::oriented_dims(rgb.width, rgb.height, code);
+            (out, ow, oh)
         }
         Intermediate::Monochrome(p) => {
-            let mut out = Vec::with_capacity(p.data.len() * 4);
-            for &v in &p.data {
-                let g = (v * 255.0).round().clamp(0.0, 255.0) as u8;
-                out.extend_from_slice(&[g, g, g, 255]);
-            }
-            (out, p.width, p.height)
+            let out = write_pixels(&p.data, p.width, p.height, transpose, flip_x, flip_y, |&v| (v, v, v));
+            let (ow, oh) = rawmeta::oriented_dims(p.width, p.height, code);
+            (out, ow, oh)
         }
         Intermediate::FourColor(p) => {
-            let mut out = Vec::with_capacity(p.data.len() * 4);
-            for px in &p.data {
-                out.push((px[0] * 255.0).round().clamp(0.0, 255.0) as u8);
-                out.push((px[1] * 255.0).round().clamp(0.0, 255.0) as u8);
-                out.push((px[2] * 255.0).round().clamp(0.0, 255.0) as u8);
-                out.push(255);
-            }
-            (out, p.width, p.height)
+            let out = write_pixels(&p.data, p.width, p.height, transpose, flip_x, flip_y, |px| {
+                (px[0], px[1], px[2])
+            });
+            let (ow, oh) = rawmeta::oriented_dims(p.width, p.height, code);
+            (out, ow, oh)
         }
     }
+}
+
+fn write_pixels<T: Copy>(
+    data: &[T],
+    w: usize,
+    h: usize,
+    transpose: bool,
+    flip_x: bool,
+    flip_y: bool,
+    rgb: impl Fn(&T) -> (f32, f32, f32),
+) -> Vec<u8> {
+    let mut out = vec![0u8; w * h * 4];
+    let ow = if transpose { h } else { w };
+    if !transpose && !flip_x && !flip_y {
+        for (dst, px) in out.chunks_exact_mut(4).zip(data.iter()) {
+            let (r, g, b) = rgb(px);
+            dst[0] = to_u8(r);
+            dst[1] = to_u8(g);
+            dst[2] = to_u8(b);
+            dst[3] = 255;
+        }
+        return out;
+    }
+    for (i, px) in data.iter().enumerate() {
+        let x = i % w;
+        let y = i / w;
+        let xf = if flip_x { w - 1 - x } else { x };
+        let yf = if flip_y { h - 1 - y } else { y };
+        let (dx, dy) = if transpose { (yf, xf) } else { (xf, yf) };
+        let d = (dy * ow + dx) * 4;
+        let (r, g, b) = rgb(px);
+        out[d] = to_u8(r);
+        out[d + 1] = to_u8(g);
+        out[d + 2] = to_u8(b);
+        out[d + 3] = 255;
+    }
+    out
 }
 
 fn camera_preview_rgb(
@@ -507,6 +556,94 @@ mod tests {
         assert!(decode_raw(&[]).is_err());
     }
 
+    /// Pre-WS3B writer: round().clamp() per pixel, then a separate orientation
+    /// pass. The fused writer quantises through a 12-bit LUT and folds the
+    /// orientation into the write, so its output must agree within 1 LSB —
+    /// the A/B tolerance signed off for WS3 #7.
+    fn reference_rgba(intermediate: Intermediate) -> (Vec<u8>, usize, usize) {
+        let (data, w, h): (Vec<[f32; 4]>, usize, usize) = match intermediate {
+            Intermediate::ThreeColor(c) => (
+                c.data.iter().map(|p| [p[0], p[1], p[2], 255.0]).collect(),
+                c.width,
+                c.height,
+            ),
+            Intermediate::Monochrome(c) => (
+                c.data.iter().map(|&v| [v, v, v, 255.0]).collect(),
+                c.width,
+                c.height,
+            ),
+            Intermediate::FourColor(c) => (
+                c.data.iter().map(|p| [p[0], p[1], p[2], 255.0]).collect(),
+                c.width,
+                c.height,
+            ),
+        };
+        let mut out = Vec::with_capacity(data.len() * 4);
+        for px in &data {
+            for &v in px {
+                out.push((v * 255.0).round().clamp(0.0, 255.0) as u8);
+            }
+        }
+        (out, w, h)
+    }
+
+    fn sample_cells(n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let v = ((i * 7919) % 4096) as f32 / 4095.0;
+                if i % 97 == 0 {
+                    -0.05
+                } else if i % 89 == 0 {
+                    1.05
+                } else {
+                    v
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fused_writer_matches_reference_writer() {
+        use rawler::pixarray::{Color2D, PixF32};
+        let (w, h) = (37usize, 23usize);
+        let n = w * h;
+        let rgb: Vec<[f32; 3]> = sample_cells(n * 3).chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+        let mono = sample_cells(n);
+        let four: Vec<[f32; 4]> =
+            sample_cells(n * 4).chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
+
+        for code in 1..=8u16 {
+            let cases = [
+                Intermediate::ThreeColor(Color2D { width: w, height: h, data: rgb.clone() }),
+                Intermediate::Monochrome(PixF32 { width: w, height: h, data: mono.clone(), initialized: true }),
+                Intermediate::FourColor(Color2D { width: w, height: h, data: four.clone() }),
+            ];
+            for case in cases {
+                let (got, gw, gh) = intermediate_rgba(case.clone(), code);
+                let (want, ww, wh) = rawmeta::apply_orientation_code(
+                    reference_rgba(case).0,
+                    w,
+                    h,
+                    code,
+                );
+                assert_eq!((gw, gh), (ww, wh), "dims differ for code {code}");
+                assert_eq!(got.len(), want.len());
+                let mut sum = 0u64;
+                let mut max = 0u8;
+                for (a, b) in got.iter().zip(want.iter()) {
+                    let d = a.abs_diff(*b);
+                    sum += d as u64;
+                    max = max.max(d);
+                }
+                let mean = sum as f64 / got.len() as f64;
+                assert!(max <= 1, "code {code}: {max} LSB max deviation");
+                assert!(mean <= 1.0, "code {code}: mean deviation {mean} above 1/255");
+                // Alpha stays opaque everywhere.
+                assert!(got.chunks_exact(4).all(|p| p[3] == 255));
+            }
+        }
+    }
+
     #[test]
     fn tone_lut_identity_for_matching_histograms() {
         let mut rgba = Vec::new();
@@ -620,8 +757,8 @@ mod tests {
         let decoder = rawler::get_decoder(&rawfile).expect("decoder");
         let params = RawDecodeParams { image_index: 0 };
         let rawimage = decoder.raw_image(&rawfile, &params, false).expect("raw image");
-        let (hp, hw, hh) = intermediate_rgba(RawDevelop::superpixel().develop_intermediate(&rawimage).expect("superpixel develop"));
-        let (fp, fw, fh) = intermediate_rgba(RawDevelop::default().develop_intermediate(&rawimage).expect("full develop"));
+        let (hp, hw, hh) = intermediate_rgba(RawDevelop::superpixel().develop_intermediate(&rawimage).expect("superpixel develop"), 1);
+        let (fp, fw, fh) = intermediate_rgba(RawDevelop::default().develop_intermediate(&rawimage).expect("full develop"), 1);
         let demosaic_psnr = best_block_psnr(&hp, hw, hh, &fp, fw, fh);
         eprintln!("demosaic-only PSNR: {demosaic_psnr:.2} dB ({hw}x{hh})");
         assert!(demosaic_psnr >= 40.0, "demosaic-only PSNR {demosaic_psnr:.2} dB below 40");

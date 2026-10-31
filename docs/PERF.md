@@ -8,7 +8,12 @@ in-memory ring buffer.
 ```js
 window.__pes.perf()   // → [{ name, dur_ms, at, detail }, …], oldest first
 window.__pes.reset()  // clears the ring (the DevTools timeline is untouched)
+window.__pes.mem()    // → { main, raw_worker } wasm linear-memory bytes
 ```
+
+`__pes.mem()` is the memory high-water probe: wasm memory never shrinks, so
+`main` is the app worker's peak, and `raw_worker` is the max `mem` reported by
+RAW develop replies (0 until the first one).
 
 `at` is `performance.now()` when the measure closed. `detail` is a free-form
 string (dimensions, item names) or `null`. Names are stable; the e2e suite and
@@ -22,7 +27,7 @@ cleared right after the measure so the timeline never accumulates marks.
 | Name | Measures | Detail |
 |---|---|---|
 | `app.mount` | `main()` through the first `mount_to_body` | — |
-| `ingest.read` | reading a file's bytes (RAW original / EXIF) | file name |
+| `ingest.read` | reading a JPEG/PNG for EXIF (RAW sources skip this: the Blob crosses to the worker) | file name |
 | `ingest.decode` | decoding: `prepare_raw`, HEIC conversion, `load_image`, video probe | file name |
 | `ingest.preview` | 1024px preview downscale | file name |
 | `ingest.thumb` | thumbnail encode + object URL | file name |
@@ -60,6 +65,25 @@ cleared right after the measure so the timeline never accumulates marks.
   LUT, so display and export share one tone response.
 - `PROXY_DEVELOP_DELAY_MS` (750 ms) debounces selection changes before the
   sensor develop starts; a changed selection drops any in-flight result.
+
+### Zero-copy RAW sources
+
+RAW originals never become a main-thread `Vec<u8>` on the normal path. The
+IndexedDB `raw_src` Blob is posted to the RAW worker as-is (Blob structured
+clone is by reference); the worker bootstrap calls `blob.arrayBuffer()` and
+hands the wasm call a `Uint8Array`. Worker results (proxy and full RGBA)
+come back as transferred `ArrayBuffer`s and are kept on the main thread as
+`Uint8Array` views (`Pixels::View`) — no `to_vec()`. Only the fallback path
+(RAW that could not be persisted to IndexedDB) still reads bytes on the main
+thread, because the session record has to embed them; ingest proxies there are
+stored as Blobs instead of byte arrays.
+
+Once a full develop has delivered its pixels, the RAW worker is terminated:
+its wasm memory never shrinks while it lives, and a 24 MP develop peaks near
+1 GB — memory that would otherwise sit idle through composite + encode, the
+peak of an export. The next RAW op re-creates the worker lazily. `__pes.mem()`
+keeps reporting the develop high-water after termination, so read `raw_worker`
+as a peak, not current usage.
 
 ## Worker marks
 

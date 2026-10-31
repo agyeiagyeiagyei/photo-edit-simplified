@@ -35,6 +35,14 @@ thread_local! {
     static RAW_PENDING_OP: RefCell<HashMap<u32, String>> = RefCell::new(HashMap::new());
     static RAW_NEXT_REQ: Cell<u32> = const { Cell::new(1) };
     static RAW_DEAD: Cell<bool> = const { Cell::new(false) };
+    /// High-water of the RAW worker's wasm linear memory (bytes). Raw replies
+    /// carry `mem`, measured after the develop.
+    static RAW_MEM_HIGH: Cell<f64> = const { Cell::new(0.0) };
+}
+
+/// Bytes of the RAW worker's wasm memory high-water (0 until the first reply).
+pub fn raw_mem_high() -> f64 {
+    RAW_MEM_HIGH.with(|m| m.get())
 }
 
 /// Worker instance index.html created at parse time so its bundle downloads
@@ -159,6 +167,14 @@ fn record_worker_reply(op: &str, data: &JsValue, result: &JsValue) {
     {
         perf::record(&format!("worker.{op}"), ms);
     }
+    if let Some(mem) = Reflect::get(result, &JsValue::from_str("mem"))
+        .ok()
+        .and_then(|v| v.as_f64())
+    {
+        if mem > RAW_MEM_HIGH.with(|m| m.get()) {
+            RAW_MEM_HIGH.with(|m| m.set(mem));
+        }
+    }
     if op != "render" {
         return;
     }
@@ -265,7 +281,8 @@ fn raw_call(op: &str, args: &[JsValue], transfer: &[JsValue], cb: Box<dyn FnOnce
 }
 
 pub struct ProxyResult {
-    pub pixels: Vec<u8>,
+    /// Transferred from the worker — a JS view, never copied into Rust.
+    pub pixels: Uint8Array,
     pub w: usize,
     pub h: usize,
     pub full_w: usize,
@@ -274,7 +291,7 @@ pub struct ProxyResult {
 
 fn parse_proxy(v: &JsValue) -> Option<ProxyResult> {
     Some(ProxyResult {
-        pixels: get_buf(v, "pixels")?.to_vec(),
+        pixels: get_buf(v, "pixels")?,
         w: get_u32(v, "w")? as usize,
         h: get_u32(v, "h")? as usize,
         full_w: get_u32(v, "full_w")? as usize,
@@ -287,29 +304,45 @@ pub fn raw_busy() -> bool {
     RAW_PENDING.with(|p| !p.borrow().is_empty())
 }
 
+/// Terminate the raw worker and free its wasm memory (which never shrinks
+/// while it lives). The worker is recreated lazily by the next RAW op, so this
+/// costs one decoder init + develop if the item is edited again. Callers must
+/// check `raw_busy()` first; queued replies are failed rather than dropped.
+pub fn raw_shutdown() {
+    let worker = RAW_WORKER.with(|w| w.borrow_mut().take());
+    if let Some(worker) = worker {
+        worker.terminate();
+    }
+    let cbs: Vec<_> = RAW_PENDING.with(|p| p.borrow_mut().drain().map(|(_, c)| c).collect());
+    RAW_PENDING_OP.with(|m| m.borrow_mut().clear());
+    for cb in cbs {
+        cb(Err(JsValue::from_str("worker shutdown")));
+    }
+}
+
 /// Ensure the raw worker is up; false when it is unavailable (callers fall
 /// back to main-thread decoding).
 pub fn proxy_worker_available() -> bool {
     raw_init()
 }
 
-/// Develop a RAW to a display-resolution proxy in the dedicated worker.
-/// Returns false when the worker is unavailable (caller falls back).
+/// Develop a RAW to a display-resolution proxy in the dedicated worker. `src`
+/// is a Blob (the IndexedDB original — structured-cloned by reference) or a
+/// Uint8Array of bytes the app already holds. Returns false when the worker is
+/// unavailable (caller falls back).
 pub fn raw_proxy(
     id: usize,
-    bytes: &[u8],
+    src: &JsValue,
     max_edge: u32,
     cb: impl FnOnce(Option<ProxyResult>) + 'static,
 ) -> bool {
     if !raw_init() {
         return false;
     }
-    let arr = Uint8Array::from(bytes);
-    let buf = arr.buffer();
     raw_call(
         "raw_proxy",
-        &[JsValue::from(id as u32), arr.into(), JsValue::from(max_edge)],
-        &[buf.into()],
+        &[JsValue::from(id as u32), src.clone(), JsValue::from(max_edge)],
+        &[],
         Box::new(move |reply| cb(reply.ok().and_then(|v| parse_proxy(&v)))),
     )
 }
@@ -317,7 +350,7 @@ pub fn raw_proxy(
 /// Decode the camera's embedded full-size JPEG into a proxy (orientation from
 /// the RAW metadata code, since the JPEG carries no EXIF of its own).
 pub fn camera_proxy(
-    jpeg: &[u8],
+    jpeg: &JsValue,
     orientation: u16,
     max_edge: u32,
     cb: impl FnOnce(Option<ProxyResult>) + 'static,
@@ -325,12 +358,10 @@ pub fn camera_proxy(
     if !raw_init() {
         return false;
     }
-    let arr = Uint8Array::from(jpeg);
-    let buf = arr.buffer();
     raw_call(
         "camera_proxy",
-        &[arr.into(), JsValue::from(orientation), JsValue::from(max_edge)],
-        &[buf.into()],
+        &[jpeg.clone(), JsValue::from(orientation), JsValue::from(max_edge)],
+        &[],
         Box::new(move |reply| cb(reply.ok().and_then(|v| parse_proxy(&v)))),
     )
 }
@@ -339,7 +370,8 @@ pub struct RawMeta {
     pub exif_tiff: Option<Vec<u8>>,
     pub orientation: u16,
     pub taken: Option<f64>,
-    pub camera_jpeg: Option<Vec<u8>>,
+    /// Transferred from the worker — a JS view, never copied into Rust.
+    pub camera_jpeg: Option<Uint8Array>,
     pub camera_w: usize,
     pub camera_h: usize,
     pub preview: Option<(Vec<u8>, usize, usize)>,
@@ -359,7 +391,7 @@ fn parse_raw_meta(v: &JsValue) -> Option<RawMeta> {
         exif_tiff: get_buf(v, "exif_tiff").map(|b| b.to_vec()),
         orientation: get_u32(v, "orientation")? as u16,
         taken: get_f64(v, "taken"),
-        camera_jpeg: get_buf(v, "camera_jpeg").map(|b| b.to_vec()),
+        camera_jpeg: get_buf(v, "camera_jpeg"),
         camera_w: get_u32(v, "camera_w")? as usize,
         camera_h: get_u32(v, "camera_h")? as usize,
         preview,
@@ -368,46 +400,45 @@ fn parse_raw_meta(v: &JsValue) -> Option<RawMeta> {
     })
 }
 
-/// RAW header metadata + optional preview, decoded in the raw worker.
+/// `src` is a Blob (the IndexedDB original — structured-cloned by reference,
+/// so the app thread never materialises it) or a Uint8Array of bytes the app
+/// already holds. run.js turns a Blob into a Uint8Array inside the worker.
 pub fn raw_meta(
-    bytes: &[u8],
+    src: &JsValue,
     preview_edge: u32,
     cb: impl FnOnce(Option<RawMeta>) + 'static,
 ) -> bool {
     if !raw_init() {
         return false;
     }
-    let arr = Uint8Array::from(bytes);
-    let buf = arr.buffer();
     raw_call(
         "raw_meta",
-        &[arr.into(), JsValue::from(preview_edge)],
-        &[buf.into()],
+        &[src.clone(), JsValue::from(preview_edge)],
+        &[],
         Box::new(move |reply| cb(reply.ok().and_then(|v| parse_raw_meta(&v)))),
     )
 }
 
 pub struct FullResult {
-    pub pixels: Vec<u8>,
+    /// Transferred from the worker — a JS view, never copied into Rust.
+    pub pixels: Uint8Array,
     pub w: usize,
     pub h: usize,
 }
 
 /// Full sensor develop in the raw worker.
-pub fn raw_develop(id: usize, bytes: &[u8], cb: impl FnOnce(Option<FullResult>) + 'static) -> bool {
+pub fn raw_develop(id: usize, src: &JsValue, cb: impl FnOnce(Option<FullResult>) + 'static) -> bool {
     if !raw_init() {
         return false;
     }
-    let arr = Uint8Array::from(bytes);
-    let buf = arr.buffer();
     raw_call(
         "raw_develop",
-        &[JsValue::from(id as u32), arr.into()],
-        &[buf.into()],
+        &[JsValue::from(id as u32), src.clone()],
+        &[],
         Box::new(move |reply| {
             cb(reply.ok().and_then(|v| {
                 Some(FullResult {
-                    pixels: get_buf(&v, "pixels")?.to_vec(),
+                    pixels: get_buf(&v, "pixels")?,
                     w: get_u32(&v, "w")? as usize,
                     h: get_u32(&v, "h")? as usize,
                 })
@@ -418,19 +449,17 @@ pub fn raw_develop(id: usize, bytes: &[u8], cb: impl FnOnce(Option<FullResult>) 
 
 /// Embedded preview (no demosaic) at display resolution.
 pub fn raw_preview(
-    bytes: &[u8],
+    src: &JsValue,
     max_edge: u32,
     cb: impl FnOnce(Option<ProxyResult>) + 'static,
 ) -> bool {
     if !raw_init() {
         return false;
     }
-    let arr = Uint8Array::from(bytes);
-    let buf = arr.buffer();
     raw_call(
         "raw_preview",
-        &[arr.into(), JsValue::from(max_edge)],
-        &[buf.into()],
+        &[src.clone(), JsValue::from(max_edge)],
+        &[],
         Box::new(move |reply| cb(reply.ok().and_then(|v| parse_proxy(&v)))),
     )
 }
@@ -471,6 +500,23 @@ pub fn load(id: usize, pixels: &[u8], w: usize, h: usize) {
             JsValue::from(h as u32),
         ],
         &[buf.into()],
+        Box::new(|_| {}),
+    );
+}
+
+/// Ship pixels the app only holds as a JS view. The view stays owned by the
+/// caller, so this is a structured-clone copy into the worker rather than a
+/// transfer — still one copy fewer than materialising a Rust Vec first.
+pub fn load_view(id: usize, pixels: &Uint8Array, w: usize, h: usize) {
+    call(
+        "load",
+        &[
+            JsValue::from(id as u32),
+            pixels.clone().into(),
+            JsValue::from(w as u32),
+            JsValue::from(h as u32),
+        ],
+        &[],
         Box::new(|_| {}),
     );
 }

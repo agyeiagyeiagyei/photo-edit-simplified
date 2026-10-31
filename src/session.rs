@@ -291,14 +291,13 @@ pub async fn get_proxy(db: &Database, id: usize) -> Result<Option<JsValue>, JsVa
         .map_err(err)
 }
 
-/// Read an item's original RAW bytes back out of IndexedDB for a lazy develop.
-/// None when the record or its blob is missing.
-pub async fn load_raw_bytes(id: usize) -> Option<Vec<u8>> {
+/// The item's original RAW Blob out of IndexedDB — handed straight to a
+/// developer worker, so the app thread never materialises the file. None when
+/// the record or its blob is missing.
+pub async fn load_raw_blob(id: usize) -> Option<web_sys::Blob> {
     let db = open_db().await.ok()?;
     let v = get_raw_src(&db, id).await.ok()??;
-    let blob = v.dyn_into::<web_sys::Blob>().ok()?;
-    let buf = wasm_bindgen_futures::JsFuture::from(blob.array_buffer()).await.ok()?;
-    Some(js_sys::Uint8Array::new(&buf).to_vec())
+    v.dyn_into::<web_sys::Blob>().ok()
 }
 
 // --- JS object helpers --------------------------------------------------------

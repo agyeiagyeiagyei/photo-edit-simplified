@@ -20,11 +20,113 @@ use std::rc::Rc;
 use leptos::leptos_dom::helpers::window_event_listener;
 use leptos::*;
 use leptos::batch;
+use js_sys::Uint8Array;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{Blob, File, Url};
 
 use state::{AppState, Aspect, BrushStroke, DriveFilter, DriveSort, EditParams, Layer, LayerKind, MediaItem, MediaKind, PathPoint, PhotoFormat, SelectTool, Selection, SelectionKind, TextAlign, Tool};
+
+/// RGBA pixels the app holds without copying them into Rust when they came
+/// back from a worker: a view over the transferred ArrayBuffer, or an owned
+/// buffer for main-thread decodes and destructive-op results.
+#[derive(Clone)]
+enum Pixels {
+    View(Uint8Array),
+    Owned(Rc<Vec<u8>>),
+}
+
+impl Pixels {
+    fn view(v: Uint8Array) -> Pixels {
+        Pixels::View(v)
+    }
+
+    fn owned(v: Vec<u8>) -> Pixels {
+        Pixels::Owned(Rc::new(v))
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Pixels::View(v) => v.length() as usize,
+            Pixels::Owned(v) => v.len(),
+        }
+    }
+
+    /// Materialise a Rust buffer (owned buffers clone; views copy).
+    fn to_vec(&self) -> Vec<u8> {
+        match self {
+            Pixels::View(v) => v.to_vec(),
+            Pixels::Owned(v) => v.as_ref().clone(),
+        }
+    }
+
+    /// Borrow owned pixels; a view has to be materialised first.
+    fn as_cow(&self) -> Cow<'_, [u8]> {
+        match self {
+            Pixels::Owned(v) => Cow::Borrowed(v.as_slice()),
+            Pixels::View(v) => Cow::Owned(v.to_vec()),
+        }
+    }
+
+    /// Run a slice-based routine without cloning owned pixels.
+    fn with_slice<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        match self {
+            Pixels::Owned(v) => f(v.as_slice()),
+            Pixels::View(v) => f(&v.to_vec()),
+        }
+    }
+
+    fn put_on_canvas(&self, canvas: &web_sys::HtmlCanvasElement, w: u32, h: u32) {
+        match self {
+            Pixels::View(v) => web::put_pixels_view(canvas, v, w, h),
+            Pixels::Owned(v) => web::put_pixels(canvas, v, w, h),
+        }
+    }
+
+    fn load_into_worker(&self, id: usize, w: usize, h: usize) {
+        match self {
+            Pixels::View(v) => pworker::load_view(id, v, w, h),
+            Pixels::Owned(v) => pworker::load(id, v, w, h),
+        }
+    }
+
+    /// Copy a window of rows out of the buffer without materialising the whole
+    /// image (the focus loupe runs this on every pointer move).
+    fn crop_rows(&self, w: usize, sy: usize, sx: usize, cw: usize, ch: usize) -> Vec<u8> {
+        let mut crop = vec![0u8; cw * ch * 4];
+        for row in 0..ch {
+            let start = ((sy + row) * w + sx) * 4;
+            let dst = &mut crop[row * cw * 4..(row + 1) * cw * 4];
+            match self {
+                Pixels::View(v) => {
+                    let seg = v.subarray(start as u32, (start + cw * 4) as u32);
+                    seg.copy_to(dst);
+                }
+                Pixels::Owned(v) => dst.copy_from_slice(&v[start..start + cw * 4]),
+            }
+        }
+        crop
+    }
+
+    async fn to_png_blob(&self, w: usize, h: usize) -> Result<Blob, JsValue> {
+        let canvas = web::create_canvas(w as u32, h as u32);
+        self.put_on_canvas(&canvas, w as u32, h as u32);
+        web::canvas_to_blob(&canvas, "image/png").await
+    }
+
+    fn downscale(&self, w: usize, h: usize, long_edge: u32) -> (Vec<u8>, usize, usize) {
+        let scale = (long_edge as f32 / w.max(h) as f32).min(1.0);
+        let tw = (w as f32 * scale).max(1.0) as u32;
+        let th = (h as f32 * scale).max(1.0) as u32;
+        let src = web::create_canvas(w as u32, h as u32);
+        self.put_on_canvas(&src, w as u32, h as u32);
+        let dst = web::create_canvas(tw, th);
+        let ctx = web::ctx2d(&dst);
+        ctx.draw_image_with_html_canvas_element_and_dw_and_dh(&src, 0.0, 0.0, tw as f64, th as f64)
+            .unwrap();
+        web::image_data_from_ctx(&ctx, tw, th)
+    }
+}
 
 // --- media cache (non-reactive) ---------------------------------------------
 
@@ -32,7 +134,7 @@ use state::{AppState, Aspect, BrushStroke, DriveFilter, DriveSort, EditParams, L
 struct PhotoData {
     /// Full-res RGBA. None until materialized (imports decode preview-only);
     /// may be evicted under memory pressure, but never while `dirty`.
-    full: Option<(Vec<u8>, usize, usize)>,
+    full: Option<(Pixels, usize, usize)>,
     /// Source dimensions, known without holding the pixels.
     full_dims: (usize, usize),
     preview: (Vec<u8>, usize, usize),
@@ -161,8 +263,8 @@ fn evict_full_lru() {
 
 /// Install a freshly decoded full-res buffer: cache + worker + LRU, then run
 /// waiters and nudge items so pending hi-res renders reschedule.
-fn materialize_full(state: AppState, id: usize, pixels: Vec<u8>, w: usize, h: usize) {
-    pworker::load(id, &pixels, w, h);
+fn materialize_full(state: AppState, id: usize, pixels: Pixels, w: usize, h: usize) {
+    pixels.load_into_worker(id, w, h);
     // Sensor pixels supersede the display proxy (and any render it fed).
     if proxy_in_mem(id) {
         drop_proxy(id);
@@ -212,19 +314,28 @@ fn ensure_full(state: AppState, id: usize, waiter: Option<Box<dyn FnOnce()>>) {
             match web::load_image(&blob).await {
                 Ok((img, url)) => {
                     let _ = Url::revoke_object_url(&url);
-                    Some(web::rgba_from_image(&img))
+                    let (px, w, h) = web::rgba_from_image(&img);
+                    Some((Pixels::owned(px), w, h))
                 }
                 Err(_) => None,
             }
         } else if is_raw {
-            // Lazy develop: pull the original out of IndexedDB only now.
-            match session::load_raw_bytes(id).await {
-                Some(bytes) => raw_develop_async(id, &bytes).await,
+            // Lazy develop: hand the stored Blob to the worker, which reads it
+            // itself — the app thread never sees the file bytes.
+            match session::load_raw_blob(id).await {
+                Some(blob) => raw_develop_async(id, blob.as_ref()).await,
                 None => None,
             }
         } else {
             None
         };
+        if is_raw && decoded.is_some() && !pworker::raw_busy() {
+            // The full frame is on this thread now; the RAW worker's wasm
+            // (hundreds of MB after a 24 MP develop, and never shrinking)
+            // would otherwise sit idle through composite + encode — the
+            // peak of the whole export. Recreated lazily on the next RAW op.
+            pworker::raw_shutdown();
+        }
         FULL_INFLIGHT.with(|f| f.borrow_mut().remove(&id));
         let still_tracked = CACHE.with(|c| c.borrow().photos.contains_key(&id));
         match (decoded, still_tracked) {
@@ -285,7 +396,7 @@ const PROXY_BUDGET: usize = 160 << 20;
 const PROXY_DEVELOP_DELAY_MS: i32 = 750;
 
 struct ProxyData {
-    pixels: Rc<Vec<u8>>,
+    pixels: Pixels,
     w: usize,
     h: usize,
     /// True sensor-frame dims (the proxy pixels are capped below this).
@@ -427,7 +538,7 @@ fn evict_proxy_lru(state: AppState, keep: usize) {
 }
 
 struct DecodedProxy {
-    pixels: Vec<u8>,
+    pixels: Pixels,
     w: usize,
     h: usize,
     frame: (usize, usize),
@@ -452,8 +563,7 @@ fn land_proxy(state: AppState, id: usize, decoded: DecodedProxy) -> bool {
     if !decoded.developed && proxy_developed(id) {
         return false;
     }
-    let px = Rc::new(decoded.pixels);
-    pworker::load(proxy_wid(id), &px, decoded.w, decoded.h);
+    decoded.pixels.load_into_worker(proxy_wid(id), decoded.w, decoded.h);
     CACHE.with(|c| {
         if let Some(p) = c.borrow_mut().photos.get_mut(&id) {
             let p = Rc::make_mut(p);
@@ -466,7 +576,7 @@ fn land_proxy(state: AppState, id: usize, decoded: DecodedProxy) -> bool {
         c.borrow_mut().insert(
             id,
             Rc::new(ProxyData {
-                pixels: px.clone(),
+                pixels: decoded.pixels,
                 w: decoded.w,
                 h: decoded.h,
                 frame: decoded.frame,
@@ -484,27 +594,31 @@ fn land_proxy(state: AppState, id: usize, decoded: DecodedProxy) -> bool {
 struct StoredProxy {
     kind: String,
     orientation: u16,
-    bytes: Vec<u8>,
+    /// Blob for records written since the zero-copy change; an ArrayBuffer for
+    /// records persisted before it. Both are handed to the worker as-is.
+    bytes: JsValue,
     frame: (usize, usize),
 }
 
-fn camera_proxy_record(jpeg: &[u8], orientation: u16, frame: (usize, usize)) -> JsValue {
+fn camera_proxy_record(jpeg: &Uint8Array, orientation: u16, frame: (usize, usize)) -> JsValue {
     let o = js_sys::Object::new();
     session::jset(&o, "kind", "camera");
     session::jset(&o, "orientation", orientation as f64);
-    let arr = js_sys::Uint8Array::from(jpeg);
-    session::jset(&o, "bytes", arr.buffer());
+    let bytes: JsValue = match web::view_to_blob(jpeg, "image/jpeg") {
+        Ok(b) => b.into(),
+        Err(_) => jpeg.buffer().into(),
+    };
+    session::jset(&o, "bytes", bytes);
     session::jset(&o, "full_w", frame.0 as f64);
     session::jset(&o, "full_h", frame.1 as f64);
     o.into()
 }
 
-fn developed_proxy_record(jpeg: &[u8], frame: (usize, usize)) -> JsValue {
+fn developed_proxy_record(blob: &Blob, frame: (usize, usize)) -> JsValue {
     let o = js_sys::Object::new();
     session::jset(&o, "kind", "raw");
     session::jset(&o, "orientation", 1.0);
-    let arr = js_sys::Uint8Array::from(jpeg);
-    session::jset(&o, "bytes", arr.buffer());
+    session::jset(&o, "bytes", blob);
     session::jset(&o, "full_w", frame.0 as f64);
     session::jset(&o, "full_h", frame.1 as f64);
     o.into()
@@ -514,8 +628,12 @@ fn parse_proxy_record(v: &JsValue) -> Option<StoredProxy> {
     let kind = state::jget(v, "kind")?.as_string()?;
     let orientation = state::jnum(v, "orientation").unwrap_or(1.0) as u16;
     let bytes = state::jget(v, "bytes")?;
-    let bytes = js_sys::Uint8Array::new(&bytes).to_vec();
-    if bytes.is_empty() {
+    let empty = if bytes.is_instance_of::<Blob>() {
+        bytes.unchecked_ref::<Blob>().size() == 0.0
+    } else {
+        js_sys::Uint8Array::new(&bytes).length() == 0
+    };
+    if empty {
         return None;
     }
     let frame = (
@@ -565,27 +683,27 @@ async fn await_worker<T: 'static>(
     result
 }
 
-async fn camera_proxy_async(jpeg: &[u8], orientation: u16) -> Option<pworker::ProxyResult> {
-    let jpeg = jpeg.to_vec();
+async fn camera_proxy_async(jpeg: &JsValue, orientation: u16) -> Option<pworker::ProxyResult> {
+    let jpeg = jpeg.clone();
     let t0 = perf::now();
     let r = await_worker(move |cb| pworker::camera_proxy(&jpeg, orientation, PROXY_EDGE, cb)).await;
     perf::record("proxy.camera_decode", perf::now() - t0);
     r
 }
 
-async fn raw_proxy_async(id: usize, bytes: &[u8]) -> Option<pworker::ProxyResult> {
-    let bytes = bytes.to_vec();
+async fn raw_proxy_async(id: usize, src: &JsValue) -> Option<pworker::ProxyResult> {
+    let src = src.clone();
     let t0 = perf::now();
-    let r = await_worker(move |cb| pworker::raw_proxy(id, &bytes, PROXY_EDGE, cb)).await;
+    let r = await_worker(move |cb| pworker::raw_proxy(id, &src, PROXY_EDGE, cb)).await;
     perf::record("proxy.raw_develop", perf::now() - t0);
     r
 }
 
 /// RAW header metadata + preview from the raw worker.
-async fn raw_meta_async(bytes: &[u8], preview_edge: u32) -> Option<pworker::RawMeta> {
-    let bytes = bytes.to_vec();
+async fn raw_meta_async(src: &JsValue, preview_edge: u32) -> Option<pworker::RawMeta> {
+    let src = src.clone();
     let t0 = perf::now();
-    let r = await_worker(move |cb| pworker::raw_meta(&bytes, preview_edge, cb)).await;
+    let r = await_worker(move |cb| pworker::raw_meta(&src, preview_edge, cb)).await;
     perf::record("proxy.raw_meta", perf::now() - t0);
     if let Some(m) = &r {
         if m.get_decoder_first {
@@ -595,55 +713,62 @@ async fn raw_meta_async(bytes: &[u8], preview_edge: u32) -> Option<pworker::RawM
     r
 }
 
-/// Full sensor develop in the raw worker.
-async fn raw_develop_async(id: usize, bytes: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
-    let bytes = bytes.to_vec();
+/// Full sensor develop in the raw worker. The pixels come back as a view over
+/// the transferred buffer — no Rust copy on the app thread.
+async fn raw_develop_async(id: usize, src: &JsValue) -> Option<(Pixels, usize, usize)> {
+    let src = src.clone();
     let t0 = perf::now();
-    let r = await_worker(move |cb| pworker::raw_develop(id, &bytes, cb)).await;
+    let r = await_worker(move |cb| pworker::raw_develop(id, &src, cb)).await;
     perf::record("proxy.raw_develop_full", perf::now() - t0);
-    r.map(|f| (f.pixels, f.w, f.h))
+    r.map(|f| (Pixels::view(f.pixels), f.w, f.h))
 }
 
 /// Embedded preview (no demosaic) at display resolution.
-async fn raw_preview_async(bytes: &[u8]) -> Option<pworker::ProxyResult> {
-    let bytes = bytes.to_vec();
+async fn raw_preview_async(src: &JsValue) -> Option<pworker::ProxyResult> {
+    let src = src.clone();
     let t0 = perf::now();
-    let r = await_worker(move |cb| pworker::raw_preview(&bytes, PROXY_EDGE, cb)).await;
+    let r = await_worker(move |cb| pworker::raw_preview(&src, PROXY_EDGE, cb)).await;
     perf::record("proxy.raw_preview", perf::now() - t0);
     r
 }
 
-async fn raw_source_bytes(id: usize) -> Option<Rc<Vec<u8>>> {
+/// A worker-callable source for an item's original: the IndexedDB Blob
+/// (structured-cloned by reference), or the in-memory fallback when the bytes
+/// never reached storage.
+async fn raw_source_src(id: usize) -> Option<JsValue> {
     if let Some(b) = CACHE.with(|c| c.borrow().raw_fallback.get(&id).cloned()) {
-        return Some(b);
+        return Some(Uint8Array::from(&b[..]).into());
     }
-    session::load_raw_bytes(id).await.map(Rc::new)
+    session::load_raw_blob(id).await.map(JsValue::from)
 }
 
 /// Decode a stored proxy record. A "raw" record is already sensor pixels —
 /// only a JPEG decode remains; a "camera" record still needs the WASM decode.
 async fn decode_stored_proxy(rec: StoredProxy) -> Option<DecodedProxy> {
     if rec.kind == "raw" {
-        let blob = web::bytes_to_blob(&rec.bytes, "image/jpeg").ok()?;
+        let blob = match rec.bytes.dyn_into::<Blob>() {
+            Ok(b) => b,
+            Err(v) => web::view_to_blob(&js_sys::Uint8Array::new(&v), "image/jpeg").ok()?,
+        };
         let (img, url) = web::load_image(&blob).await.ok()?;
         let _ = Url::revoke_object_url(&url);
         let (px, w, h) = web::rgba_from_image(&img);
-        Some(DecodedProxy { pixels: px, w, h, frame: rec.frame, developed: true })
+        Some(DecodedProxy { pixels: Pixels::owned(px), w, h, frame: rec.frame, developed: true })
     } else {
         let r = camera_proxy_async(&rec.bytes, rec.orientation).await?;
         let frame = if rec.frame.0 > 0 { rec.frame } else { (r.full_w, r.full_h) };
-        Some(DecodedProxy { pixels: r.pixels, w: r.w, h: r.h, frame, developed: false })
+        Some(DecodedProxy { pixels: Pixels::view(r.pixels), w: r.w, h: r.h, frame, developed: false })
     }
 }
 
 /// First decode for an item with no proxy record: prefer the camera JPEG (and
 /// persist a record for next time), else develop fully in the worker.
-async fn decode_camera_from_raw(id: usize, bytes: &[u8]) -> Option<DecodedProxy> {
-    if let Some(meta) = raw_meta_async(bytes, 0).await {
+async fn decode_camera_from_raw(id: usize, src: &JsValue) -> Option<DecodedProxy> {
+    if let Some(meta) = raw_meta_async(src, 0).await {
         if let Some(jpeg) = meta.camera_jpeg {
             let orientation = meta.orientation;
             let frame = oriented_dims(meta.camera_w, meta.camera_h, orientation);
-            if let Some(r) = camera_proxy_async(&jpeg, orientation).await {
+            if let Some(r) = camera_proxy_async(&jpeg.clone().into(), orientation).await {
                 let frame = if frame.0 > 0 { frame } else { (r.full_w, r.full_h) };
                 if let Ok(db) = session::open_db().await {
                     let _ = session::put_proxy(
@@ -654,7 +779,7 @@ async fn decode_camera_from_raw(id: usize, bytes: &[u8]) -> Option<DecodedProxy>
                     .await;
                 }
                 return Some(DecodedProxy {
-                    pixels: r.pixels,
+                    pixels: Pixels::view(r.pixels),
                     w: r.w,
                     h: r.h,
                     frame,
@@ -663,9 +788,9 @@ async fn decode_camera_from_raw(id: usize, bytes: &[u8]) -> Option<DecodedProxy>
             }
         }
     }
-    let r = raw_proxy_async(id, bytes).await?;
+    let r = raw_proxy_async(id, src).await?;
     Some(DecodedProxy {
-        pixels: r.pixels,
+        pixels: Pixels::view(r.pixels),
         w: r.w,
         h: r.h,
         frame: (r.full_w, r.full_h),
@@ -683,8 +808,8 @@ async fn decode_proxy_source(id: usize, priority: bool) -> Option<DecodedProxy> 
     if !priority && PROXY_DECODE_WANT.with(|w| w.get()) != Some(id) {
         return None;
     }
-    let bytes = raw_source_bytes(id).await?;
-    decode_camera_from_raw(id, &bytes).await
+    let src = raw_source_src(id).await?;
+    decode_camera_from_raw(id, &src).await
 }
 
 /// Ask for sensor pixels for `id`, debounced so a develop only starts after
@@ -741,8 +866,8 @@ fn pump_upgrade(state: AppState) {
     }
     PROXY_UPGRADE_BUSY.with(|b| b.set(true));
     spawn_local(async move {
-        let decoded = match raw_source_bytes(id).await {
-            Some(bytes) => raw_proxy_async(id, &bytes).await,
+        let decoded = match raw_source_src(id).await {
+            Some(src) => raw_proxy_async(id, &src).await,
             None => None,
         };
         PROXY_UPGRADE_BUSY.with(|b| b.set(false));
@@ -755,7 +880,7 @@ fn pump_upgrade(state: AppState) {
             let landed = land_proxy(
                 state,
                 id,
-                DecodedProxy { pixels: r.pixels, w: r.w, h: r.h, frame, developed: true },
+                DecodedProxy { pixels: Pixels::view(r.pixels), w: r.w, h: r.h, frame, developed: true },
             );
             if landed {
                 if let Some(p) = proxy_data(id) {
@@ -770,10 +895,10 @@ fn pump_upgrade(state: AppState) {
 /// Persist a sensor-developed proxy as a q0.9 JPEG, so a reload skips both the
 /// RAW read and the demosaic. Skipped if the item stopped being lazy while the
 /// encode ran (heal/cut bake new pixels and purge proxy records).
-fn persist_developed_proxy(id: usize, px: Rc<Vec<u8>>, w: usize, h: usize, frame: (usize, usize)) {
+fn persist_developed_proxy(id: usize, px: Pixels, w: usize, h: usize, frame: (usize, usize)) {
     spawn_local(async move {
         let canvas = web::create_canvas(w as u32, h as u32);
-        web::put_pixels(&canvas, &px, w as u32, h as u32);
+        px.put_on_canvas(&canvas, w as u32, h as u32);
         let Ok(blob) = web::canvas_to_jpeg_blob(&canvas, 0.9).await else { return };
         let still_lazy = CACHE.with(|c| {
             c.borrow()
@@ -785,9 +910,8 @@ fn persist_developed_proxy(id: usize, px: Rc<Vec<u8>>, w: usize, h: usize, frame
         if !still_lazy {
             return;
         }
-        let Ok(bytes) = web::blob_to_bytes(&blob).await else { return };
         let Ok(db) = session::open_db().await else { return };
-        let _ = session::put_proxy(&db, id, &developed_proxy_record(&bytes, frame)).await;
+        let _ = session::put_proxy(&db, id, &developed_proxy_record(&blob, frame)).await;
     });
 }
 
@@ -912,7 +1036,7 @@ fn is_heic(file: &File) -> bool {
 }
 
 struct RawIngest {
-    full: Option<(Vec<u8>, usize, usize)>,
+    full: Option<(Pixels, usize, usize)>,
     preview: (Vec<u8>, usize, usize),
     dims: (usize, usize),
     object_url: String,
@@ -920,14 +1044,27 @@ struct RawIngest {
     exif: Option<Rc<Vec<u8>>>,
     taken: Option<f64>,
     stored: bool,
+    /// Only populated when `stored` is false: the file bytes kept on the app
+    /// thread because the worker can no longer reach them through IndexedDB.
+    fallback: Option<Vec<u8>>,
+}
+
+/// Materialise a RAW source on the app thread. Used only on the fallback path
+/// (the original could not be persisted), so a copy here is acceptable.
+async fn raw_bytes_from_src(src: &JsValue) -> Option<Vec<u8>> {
+    if src.is_instance_of::<Blob>() {
+        web::blob_to_bytes(src.unchecked_ref()).await.ok()
+    } else {
+        Some(js_sys::Uint8Array::new(src).to_vec())
+    }
 }
 
 /// Preview-first RAW ingest. Decode the embedded camera JPEG (no demosaic),
-/// persist the original bytes and preview PNG to IndexedDB, and leave the
+/// persist the original source and preview PNG to IndexedDB, and leave the
 /// full develop for first open/export. Falls back to an eager develop when
-/// the file has no usable preview or the bytes could not be stored.
-async fn prepare_raw(id: usize, bytes: &[u8], mtime: Option<f64>) -> Option<RawIngest> {
-    let meta = raw_meta_async(bytes, 1024).await?;
+/// the file has no usable preview or the source could not be stored.
+async fn prepare_raw(id: usize, src: &JsValue, mtime: Option<f64>) -> Option<RawIngest> {
+    let meta = raw_meta_async(src, 1024).await?;
     let taken = meta.taken.or(mtime);
     let exif = meta.exif_tiff.map(Rc::new);
 
@@ -945,8 +1082,7 @@ async fn prepare_raw(id: usize, bytes: &[u8], mtime: Option<f64>) -> Option<RawI
 
     let stored = {
         let db = session::open_db().await.ok()?;
-        let raw_blob = web::bytes_to_blob(bytes, "application/octet-stream").ok()?;
-        let a = session::put_raw_src(&db, id, raw_blob.as_ref()).await;
+        let a = session::put_raw_src(&db, id, src).await;
         let b = session::put_preview(&db, id, png.as_ref()).await;
         let ok = a.is_ok() && b.is_ok();
         if ok {
@@ -962,13 +1098,11 @@ async fn prepare_raw(id: usize, bytes: &[u8], mtime: Option<f64>) -> Option<RawI
         None
     } else {
         web::log("RAW bytes not persisted; developing eagerly");
-        raw_develop_async(id, bytes).await
+        raw_develop_async(id, src).await
     };
+    let fallback = if stored { None } else { raw_bytes_from_src(src).await };
     let (dims, preview) = match &full {
-        Some((fpx, fw, fh)) => {
-            let d = (*fw, *fh);
-            (d, downscale_pixels(fpx, *fw, *fh, 1024))
-        }
+        Some((fpx, fw, fh)) => ((*fw, *fh), fpx.downscale(*fw, *fh, 1024)),
         // Camera frame dims keep the hi-res target sized to the sensor, not
         // the small embedded preview rawler exposes.
         None => (
@@ -987,6 +1121,7 @@ async fn prepare_raw(id: usize, bytes: &[u8], mtime: Option<f64>) -> Option<RawI
         exif,
         taken,
         stored,
+        fallback,
     })
 }
 
@@ -1045,28 +1180,21 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                 }
             } else if raw::is_raw_name(&name) {
                 state.busy.set(Some(format!("Loading RAW {name}…")));
-                let read = perf::Span::new("ingest.read").detail(name.clone());
-                let read_res = web::read_file_array_buffer(&file).await;
-                drop(read);
-                let Ok(buf) = read_res else {
-                    state.busy.set(None);
-                    continue;
-                };
-                let bytes = js_sys::Uint8Array::new(&buf).to_vec();
+                let raw_len = file.size() as u64;
+                let src: JsValue = file.clone().into();
                 let decode = perf::Span::new("ingest.decode").detail(name.clone());
-                let prepared = prepare_raw(id, &bytes, mtime).await;
+                let prepared = prepare_raw(id, &src, mtime).await;
                 drop(decode);
-                let Some(ing) = prepared else {
+                let Some(mut ing) = prepared else {
                     web::log(&format!("RAW decode failed for {name}"));
                     state.busy.set(None);
                     continue;
                 };
-                let raw_len = bytes.len() as u64;
-                if !ing.stored {
-                    CACHE.with(|c| c.borrow_mut().raw_fallback.insert(id, Rc::new(bytes)));
+                if let Some(b) = ing.fallback.take() {
+                    CACHE.with(|c| c.borrow_mut().raw_fallback.insert(id, Rc::new(b)));
                 }
                 if let Some((full_rgba, fw, fh)) = &ing.full {
-                    pworker::load(id, full_rgba, *fw, *fh);
+                    full_rgba.load_into_worker(id, *fw, *fh);
                     touch_full(id);
                 }
                 CACHE.with(|c| {
@@ -1258,16 +1386,21 @@ async fn ingest_drive_bytes(
         };
 
         if raw::is_raw_name(&name) {
-            let Some(ing) = prepare_raw(id, &bytes, None).await else {
+            let raw_len = bytes.len() as u64;
+            let Ok(blob) = web::bytes_to_blob(&bytes, "application/octet-stream") else {
+                return;
+            };
+            drop(bytes);
+            let src: JsValue = blob.into();
+            let Some(mut ing) = prepare_raw(id, &src, None).await else {
                 web::log(&format!("RAW decode failed for {name}"));
                 return;
             };
-            let raw_len = bytes.len() as u64;
-            if !ing.stored {
-                CACHE.with(|c| c.borrow_mut().raw_fallback.insert(id, Rc::new(bytes)));
+            if let Some(b) = ing.fallback.take() {
+                CACHE.with(|c| c.borrow_mut().raw_fallback.insert(id, Rc::new(b)));
             }
             if let Some((full_rgba, fw, fh)) = &ing.full {
-                pworker::load(id, full_rgba, *fw, *fh);
+                full_rgba.load_into_worker(id, *fw, *fh);
                 touch_full(id);
             }
             CACHE.with(|c| {
@@ -1797,7 +1930,7 @@ fn render_hi(item: &MediaItem, req_w: f64, req_h: f64) -> Option<HiCache> {
     let photo = get_photo(item.id)?;
     let fingerprint = content_fingerprint(item, photo.gen, proxy_gen(item.id));
     let (fpix, fw, fh) = photo.full.as_ref()?;
-    let (p, ww, wh) = geometry(fpix, *fw, *fh, &item.edit);
+    let (p, ww, wh) = fpix.with_slice(|s| geometry(s, *fw, *fh, &item.edit));
     let (tw, th) = hi_target(req_w, req_h, ww, wh, HI_MAX_EDGE as u32);
     let mut buf = if (tw, th) != (ww, wh) {
         resample_pixels(&p, ww, wh, tw, th)
@@ -1922,65 +2055,88 @@ async fn render_photo_export(
     }
     let photo = get_photo(item.id)?;
     let (pix, fw, fh) = photo.full.as_ref()?;
-    // A full-res export must fit a ~4 GB box: borrow the cached pixels when
-    // geometry is a no-op and only copy for color edits, so the pipeline holds
-    // one full buffer plus the canvas, not three.
+    // A full-res export must fit a ~4 GB box. An untouched unrotated frame is
+    // put on the canvas straight from the cached buffer (a JS view for RAW
+    // develops); a Rust copy only exists when geometry or colour edits need a
+    // mutable frame, and it is dropped before crop/encode.
     let mut geometry_span = perf::Span::new("export.geometry");
     let plain_geometry = item.edit.rot90 % 4 == 0 && item.edit.fine_angle.abs() <= 0.01;
-    let (mut p, w, h): (Cow<[u8]>, usize, usize) = if plain_geometry {
-        (Cow::Borrowed(pix.as_slice()), *fw, *fh)
+    let untouched = item.edit.raw.is_identity() && !item.edit.is_color_touched();
+    let geometry = if plain_geometry {
+        None
     } else {
-        let (v, w, h) = geometry(pix, *fw, *fh, &item.edit);
-        (Cow::Owned(v), w, h)
+        Some(pix.with_slice(|s| geometry(s, *fw, *fh, &item.edit)))
+    };
+    let (w, h) = match &geometry {
+        Some((_, w, h)) => (*w, *h),
+        None => (*fw, *fh),
     };
     geometry_span.set_detail(format!("{}x{}", w, h));
     drop(geometry_span);
     let color_span = perf::Span::new("export.color");
-    if !item.edit.raw.is_identity() {
-        rawops::apply(p.to_mut(), w, h, &item.edit.raw);
-    }
-    if item.edit.is_color_touched() {
-        let p = p.to_mut();
-        if let Some(sel) = &item.edit.selection {
-            let mask = ops::selection_mask(sel, w, h);
-            blur::blur_apply_masked(p, &mask, w, h, item.edit.blur);
-            if !item.edit.levels.is_identity() {
-                levels::levels_apply_masked(p, &mask, &item.edit.levels.build_tables());
-            }
-            item.edit.curves.apply_masked(p, &mask);
-            ops::adjust_masked(
-                p,
-                &mask,
-                item.edit.brightness,
-                item.edit.contrast,
-                item.edit.saturation,
-                item.edit.warmth,
-            );
-            noise::noise_add_masked(p, &mask, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
-        } else {
-            blur::blur_apply(p, w, h, item.edit.blur);
-            if !item.edit.levels.is_identity() {
-                levels::levels_apply(p, &item.edit.levels.build_tables());
-            }
-            item.edit.curves.apply(p);
-            ops::adjust(
-                p,
-                item.edit.brightness,
-                item.edit.contrast,
-                item.edit.saturation,
-                item.edit.warmth,
-            );
-            noise::noise_add(p, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
+    let apply_color = |p: &mut [u8], w: usize, h: usize| {
+        if !item.edit.raw.is_identity() {
+            rawops::apply(p, w, h, &item.edit.raw);
         }
-    }
+        if item.edit.is_color_touched() {
+            if let Some(sel) = &item.edit.selection {
+                let mask = ops::selection_mask(sel, w, h);
+                blur::blur_apply_masked(p, &mask, w, h, item.edit.blur);
+                if !item.edit.levels.is_identity() {
+                    levels::levels_apply_masked(p, &mask, &item.edit.levels.build_tables());
+                }
+                item.edit.curves.apply_masked(p, &mask);
+                ops::adjust_masked(
+                    p,
+                    &mask,
+                    item.edit.brightness,
+                    item.edit.contrast,
+                    item.edit.saturation,
+                    item.edit.warmth,
+                );
+                noise::noise_add_masked(p, &mask, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
+            } else {
+                blur::blur_apply(p, w, h, item.edit.blur);
+                if !item.edit.levels.is_identity() {
+                    levels::levels_apply(p, &item.edit.levels.build_tables());
+                }
+                item.edit.curves.apply(p);
+                ops::adjust(
+                    p,
+                    item.edit.brightness,
+                    item.edit.contrast,
+                    item.edit.saturation,
+                    item.edit.warmth,
+                );
+                noise::noise_add(p, w, h, item.edit.grain, item.edit.grain_gaussian, item.edit.grain_mono, item.id as u32);
+            }
+        }
+    };
+    let edited: Option<Vec<u8>> = match geometry {
+        Some((mut v, _, _)) => {
+            if !untouched {
+                apply_color(&mut v, w, h);
+            }
+            Some(v)
+        }
+        None if untouched => None,
+        None => {
+            let mut v = pix.as_cow().into_owned();
+            apply_color(&mut v, w, h);
+            Some(v)
+        }
+    };
     drop(color_span);
 
     // Composite onto the full geometry-corrected canvas, then crop+scale
     // straight into the export canvas (one resample instead of two).
     let mut encode_span = perf::Span::new("export.encode");
     let base = web::create_canvas(w as u32, h as u32);
-    web::put_pixels(&base, &p, w as u32, h as u32);
-    drop(p);
+    match &edited {
+        Some(v) => web::put_pixels(&base, v, w as u32, h as u32),
+        None => pix.put_on_canvas(&base, w as u32, h as u32),
+    }
+    drop(edited);
     composite_layers(&base, &item.layers, w, h);
 
     let (cx, cy, cw, ch) = crop_px(&item.edit, w, h);
@@ -2669,7 +2825,7 @@ fn FocusLoupe(state: AppState) -> impl IntoView {
         let proxy = proxy_data(id);
         // Native-resolution crop copied row-wise out of whichever buffer the
         // item has: sensor pixels when loaded, else the display proxy.
-        let copy_crop = |px: &[u8], w: usize, h: usize| -> bool {
+        let copy_crop = |px: &Pixels, w: usize, h: usize| -> bool {
             if w < bw || h < bh {
                 return false;
             }
@@ -2677,11 +2833,7 @@ fn FocusLoupe(state: AppState) -> impl IntoView {
                 .clamp(0, (w - bw) as isize) as usize;
             let sy = ((ny * h as f64 - bh as f64 / 2.0) as isize)
                 .clamp(0, (h - bh) as isize) as usize;
-            let mut crop = vec![0u8; bw * bh * 4];
-            for row in 0..bh {
-                let src = ((sy + row) * w + sx) * 4;
-                crop[row * bw * 4..(row + 1) * bw * 4].copy_from_slice(&px[src..src + bw * 4]);
-            }
+            let crop = px.crop_rows(w, sy, sx, bw, bh);
             web::put_pixels(&canvas, &crop, bw as u32, bh as u32);
             true
         };
@@ -2705,14 +2857,25 @@ fn FocusLoupe(state: AppState) -> impl IntoView {
             !matches!(&*s.borrow(), Some((sid, sver, ..)) if *sid == id && *sver == ver)
         });
         if rebuild {
-            let (px, w, h) = match (&photo.full, &proxy) {
-                (Some((px, w, h)), _) => (px.clone(), *w, *h),
-                (None, Some(p)) => (p.pixels.as_ref().clone(), p.w, p.h),
-                (None, None) => (photo.preview.0.clone(), photo.preview.1, photo.preview.2),
+            let scratch = match (&photo.full, &proxy) {
+                (Some((px, w, h)), _) => {
+                    let c = web::create_canvas(*w as u32, *h as u32);
+                    px.put_on_canvas(&c, *w as u32, *h as u32);
+                    (c, *w as u32, *h as u32)
+                }
+                (None, Some(p)) => {
+                    let c = web::create_canvas(p.w as u32, p.h as u32);
+                    p.pixels.put_on_canvas(&c, p.w as u32, p.h as u32);
+                    (c, p.w as u32, p.h as u32)
+                }
+                (None, None) => {
+                    let (px, w, h) = &photo.preview;
+                    let c = web::create_canvas(*w as u32, *h as u32);
+                    web::put_pixels(&c, px, *w as u32, *h as u32);
+                    (c, *w as u32, *h as u32)
+                }
             };
-            let scratch = web::create_canvas(w as u32, h as u32);
-            web::put_pixels(&scratch, &px, w as u32, h as u32);
-            LOUPE_SRC.with(|s| *s.borrow_mut() = Some((id, ver, scratch, w as u32, h as u32)));
+            LOUPE_SRC.with(|s| *s.borrow_mut() = Some((id, ver, scratch.0, scratch.1, scratch.2)));
         }
         LOUPE_SRC.with(|s| {
             let b = s.borrow();
@@ -2750,22 +2913,22 @@ fn FocusLoupe(state: AppState) -> impl IntoView {
 
 // --- editor-canvas hover loupe -------------------------------------------------
 
-/// Full-res *edited* render feeding the canvas loupe. Separate from HI_CACHE
-/// (display-sized) — the loupe wants native pixels, so its render targets the
-/// full working resolution (still HI_MAX_EDGE-capped) and runs in the worker.
+// Full-res *edited* render feeding the canvas loupe. Separate from HI_CACHE
+// (display-sized) — the loupe wants native pixels, so its render targets the
+// full working resolution (still HI_MAX_EDGE-capped) and runs in the worker.
 thread_local! {
     static CANVAS_LOUPE_HI: RefCell<Option<HiCache>> = RefCell::new(None);
     static CANVAS_LOUPE_REQ: Cell<u32> = const { Cell::new(0) };
     /// Native-resolution camera JPEG for an item whose sensor pixels were not
     /// developed (lazy RAW). One entry — a 26MP frame is ~100MB of RGBA.
-    static CAMERA_LOUPE: RefCell<Option<(usize, Rc<(Vec<u8>, usize, usize)>)>> = RefCell::new(None);
+    static CAMERA_LOUPE: RefCell<Option<(usize, Rc<(Pixels, usize, usize)>)>> = RefCell::new(None);
     static CAMERA_LOUPE_INFLIGHT: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
     /// Items with no usable camera JPEG (or no stored original) — don't
     /// re-read a 29MB blob on every repaint.
     static CAMERA_LOUPE_FAILED: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
 }
 
-fn camera_loupe_source(id: usize) -> Option<Rc<(Vec<u8>, usize, usize)>> {
+fn camera_loupe_source(id: usize) -> Option<Rc<(Pixels, usize, usize)>> {
     CAMERA_LOUPE.with(|c| {
         c.borrow()
             .as_ref()
@@ -2824,8 +2987,8 @@ fn request_camera_loupe(state: AppState, id: usize) {
     }
     spawn_local(async move {
         let decoded = async {
-            let bytes = session::load_raw_bytes(id).await?;
-            let meta = raw_meta_async(&bytes, 0).await?;
+            let blob = session::load_raw_blob(id).await?;
+            let meta = raw_meta_async(blob.as_ref(), 0).await?;
             let jpeg = meta.camera_jpeg?;
             // Below ~3k wide the largest JPEG is still a preview, not sensor
             // resolution.
@@ -2834,7 +2997,7 @@ fn request_camera_loupe(state: AppState, id: usize) {
             }
             let (px, w, h) = camera_jpeg_rgba(&jpeg).await?;
             let (px, w, h) = raw::apply_orientation_code(px, w, h, meta.orientation);
-            Some(Rc::new((px, w, h)))
+            Some(Rc::new((Pixels::owned(px), w, h)))
         }
         .await;
         CAMERA_LOUPE_INFLIGHT.with(|s| {
@@ -2939,7 +3102,7 @@ fn canvas_loupe_clear(state: AppState) {
 /// adjust → grain), mirroring render_pipeline. Local ops get a margin so the
 /// cropped window's edges do not darken against the border.
 fn source_window(
-    px: &[u8],
+    px: &Pixels,
     fw: usize,
     fh: usize,
     sx: usize,
@@ -2958,11 +3121,7 @@ fn source_window(
     let x1 = (sx + cw + margin).min(fw);
     let y1 = (sy + ch + margin).min(fh);
     let (ew, eh) = (x1 - x0, y1 - y0);
-    let mut win = Vec::with_capacity(ew * eh * 4);
-    for row in 0..eh {
-        let start = ((y0 + row) * fw + x0) * 4;
-        win.extend_from_slice(&px[start..start + ew * 4]);
-    }
+    let mut win = px.crop_rows(fw, y0, x0, ew, eh);
     if !edit.raw.is_identity() {
         rawops::apply(&mut win, ew, eh, &edit.raw);
     }
@@ -3369,12 +3528,7 @@ fn DriveHoverLoupe(state: AppState) -> impl IntoView {
                 .clamp(0, (w - cw) as isize) as usize;
             let sy = ((ny * h as f64 - ch as f64 / 2.0) as isize)
                 .clamp(0, (h - ch) as isize) as usize;
-            let mut crop = vec![0u8; cw * ch * 4];
-            for row in 0..ch {
-                let src = ((sy + row) * w + sx) * 4;
-                crop[row * cw * 4..(row + 1) * cw * 4]
-                    .copy_from_slice(&px[src..src + cw * 4]);
-            }
+            let crop = px.crop_rows(w, sy, sx, cw, ch);
             let scratch = web::create_canvas(cw as u32, ch as u32);
             web::put_pixels(&scratch, &crop, cw as u32, ch as u32);
             let ctx = web::ctx2d(&canvas);
@@ -3395,7 +3549,7 @@ fn DriveHoverLoupe(state: AppState) -> impl IntoView {
             canvas_on.set(true);
             // Image smaller than the loupe: scale-to-fit via a scratch canvas.
             let scratch = web::create_canvas(w as u32, h as u32);
-            web::put_pixels(&scratch, px, w as u32, h as u32);
+            px.put_on_canvas(&scratch, w as u32, h as u32);
             let scale = (bw as f64 / w as f64).min(bh as f64 / h as f64);
             let dw = w as f64 * scale;
             let dh = h as f64 * scale;
@@ -3997,7 +4151,7 @@ async fn persist_session(state: AppState) {
                 // items are eviction-exempt), so the None arm can't fire.
                 BytesSig::Photo(_, _) | BytesSig::Raw(_, _) => match get_photo(item.id) {
                     Some(p) => match &p.full {
-                        Some((px, w, h)) => pixels_to_png_blob(px, *w, *h).await.ok(),
+                        Some((px, w, h)) => px.to_png_blob(*w, *h).await.ok(),
                         None => None,
                     },
                     None => None,
@@ -4218,32 +4372,27 @@ fn restore_session(state: AppState) {
                 // next restore is preview-only.
                 let Some(bytes_v) = state::jget(&v, "bytes") else { continue };
                 let Ok(blob) = bytes_v.dyn_into::<Blob>() else { continue };
-                let Ok(buf) = wasm_bindgen_futures::JsFuture::from(blob.array_buffer()).await
-                else {
+                let raw_len = blob.size() as u64;
+                let Some((full_rgba, fw, fh)) = raw_develop_async(id, blob.as_ref()).await else {
                     continue;
                 };
-                let bytes = js_sys::Uint8Array::new(&buf).to_vec();
-                let Some((full_rgba, fw, fh)) = raw_develop_async(id, &bytes).await else { continue };
-                let (pp, pw, ph) = downscale_pixels(&full_rgba, fw, fh, 1024);
+                let (pp, pw, ph) = full_rgba.downscale(fw, fh, 1024);
                 let canvas = web::create_canvas(pw as u32, ph as u32);
                 web::put_pixels(&canvas, &pp, pw as u32, ph as u32);
                 let Ok(png) = web::canvas_to_blob(&canvas, "image/png").await else {
                     continue;
                 };
-                let raw_ok = if let Ok(raw_blob) = web::bytes_to_blob(&bytes, "application/octet-stream") {
-                    session::put_raw_src(&db, id, raw_blob.as_ref()).await.is_ok()
-                } else {
-                    false
-                };
+                let raw_ok = session::put_raw_src(&db, id, blob.as_ref()).await.is_ok();
                 let prev_ok = session::put_preview(&db, id, png.as_ref()).await.is_ok();
                 let raw_persisted = raw_ok && prev_ok;
                 let url = Url::create_object_url_with_blob(&png).unwrap_or_default();
                 let thumb_url = thumb_object_url(&pp, pw, ph).await;
-                let raw_len = bytes.len() as u64;
                 if !raw_persisted {
-                    CACHE.with(|c| c.borrow_mut().raw_fallback.insert(id, Rc::new(bytes)));
+                    if let Ok(bytes) = web::blob_to_bytes(&blob).await {
+                        CACHE.with(|c| c.borrow_mut().raw_fallback.insert(id, Rc::new(bytes)));
+                    }
                 }
-                pworker::load(id, &full_rgba, fw, fh);
+                full_rgba.load_into_worker(id, fw, fh);
                 CACHE.with(|c| {
                     c.borrow_mut().photos.insert(
                         id,
@@ -4483,13 +4632,13 @@ async fn import_drive_one(
     }
 }
 
-/// Full-res RGBA decoded on Drive hover for the 1:1 loupe; FIFO-capped at 2
-/// files (~192MB for 24MP shots) so flip-flopping between two candidates
-/// stays instant without inviting the OOM the 512MB working set guards
-/// against. Crops are row-copied out of these buffers — never a third
-/// full-res canvas.
+// Full-res RGBA decoded on Drive hover for the 1:1 loupe; FIFO-capped at 2
+// files (~192MB for 24MP shots) so flip-flopping between two candidates
+// stays instant without inviting the OOM the 512MB working set guards
+// against. Crops are row-copied out of these buffers — never a third
+// full-res canvas.
 thread_local! {
-    static DRIVE_HOVER_CACHE: RefCell<(Vec<String>, HashMap<String, Rc<(Vec<u8>, usize, usize)>>)> =
+    static DRIVE_HOVER_CACHE: RefCell<(Vec<String>, HashMap<String, Rc<(Pixels, usize, usize)>>)> =
         RefCell::new((Vec::new(), HashMap::new()));
     static DRIVE_HOVER_INFLIGHT: RefCell<std::collections::HashSet<String>> =
         RefCell::new(std::collections::HashSet::new());
@@ -4499,7 +4648,7 @@ thread_local! {
         RefCell::new(std::collections::HashSet::new());
     /// Sensor-res develop for the currently popped-up RAW, single-slot: a
     /// 24MP demosaic is ~96MB and only the open popup can use it.
-    static DRIVE_FULL_CACHE: RefCell<Option<(String, Rc<(Vec<u8>, usize, usize)>)>> =
+    static DRIVE_FULL_CACHE: RefCell<Option<(String, Rc<(Pixels, usize, usize)>)>> =
         RefCell::new(None);
 }
 
@@ -4550,8 +4699,13 @@ fn drive_develop_full(state: AppState, id: String) {
         if !alive() {
             return;
         }
+        let Ok(blob) = web::bytes_to_blob(&bytes, "application/octet-stream") else {
+            state.drive_full_busy.set(None);
+            return;
+        };
+        drop(bytes);
         // Drive files have no numeric item id; 0 never matches a cached frame.
-        match raw_develop_async(0, &bytes).await {
+        match raw_develop_async(0, blob.as_ref()).await {
             Some((px, w, h)) => {
                 if !alive() {
                     return;
@@ -4622,8 +4776,11 @@ fn drive_hover_prefetch(state: AppState, id: String, name: String) {
             let token = fresh_drive_token(state).await?;
             let bytes = drive::download_file(token.as_str(), &id).await.ok()?;
             if raw {
+                let blob = web::bytes_to_blob(&bytes, "application/octet-stream").ok()?;
+                drop(bytes);
+                let src: JsValue = blob.into();
                 if arw {
-                    if let Some(meta) = raw_meta_async(&bytes, 0).await {
+                    if let Some(meta) = raw_meta_async(&src, 0).await {
                         // Below ~3k wide the largest JPEG is still a preview,
                         // not sensor resolution — keep the preview tag.
                         if meta.camera_w >= 3000 {
@@ -4631,19 +4788,20 @@ fn drive_hover_prefetch(state: AppState, id: String, name: String) {
                                 if let Some((px, w, h)) = camera_jpeg_rgba(&jpeg).await {
                                     let (px, w, h) =
                                         raw::apply_orientation_code(px, w, h, meta.orientation);
-                                    return Some(((px, w, h), false));
+                                    return Some(((Pixels::owned(px), w, h), false));
                                 }
                             }
                         }
                     }
                 }
-                return raw_preview_async(&bytes)
+                return raw_preview_async(&src)
                     .await
-                    .map(|r| ((r.pixels, r.w, r.h), true));
+                    .map(|r| ((Pixels::view(r.pixels), r.w, r.h), true));
             }
             let blob = web::bytes_to_blob(&bytes, still_mime?).ok()?;
             let (img, _) = web::load_image(&blob).await.ok()?;
-            Some((web::rgba_from_image(&img), false))
+            let (px, w, h) = web::rgba_from_image(&img);
+            Some(((Pixels::owned(px), w, h), false))
         }
         .await;
         DRIVE_HOVER_INFLIGHT.with(|s| {
@@ -4676,8 +4834,8 @@ fn drive_hover_prefetch(state: AppState, id: String, name: String) {
 }
 
 /// Decode an embedded camera JPEG through the browser's image pipeline.
-async fn camera_jpeg_rgba(jpeg: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
-    let blob = web::bytes_to_blob(jpeg, "image/jpeg").ok()?;
+async fn camera_jpeg_rgba(jpeg: &Uint8Array) -> Option<(Vec<u8>, usize, usize)> {
+    let blob = web::view_to_blob(jpeg, "image/jpeg").ok()?;
     let (img, url) = web::load_image(&blob).await.ok()?;
     let out = web::rgba_from_image(&img);
     let _ = web_sys::Url::revoke_object_url(&url);
@@ -6884,7 +7042,7 @@ fn selection_to_layer_sync(state: AppState, cut: bool) {
     let Some(sel) = item.edit.selection.clone() else { return; };
     let Some(photo) = get_photo(item.id) else { return; };
     let Some((full, fw, fh)) = photo.full.clone() else { return };
-    let (base, w, h) = geometry(&full, fw, fh, &item.edit);
+    let (base, w, h) = full.with_slice(|s| geometry(s, fw, fh, &item.edit));
     let mask = ops::selection_mask(&sel, w, h);
     let extracted = ops::extract_masked(&base, &mask);
     let next_id = item.next_layer_id;
@@ -6903,7 +7061,7 @@ fn selection_to_layer_sync(state: AppState, cut: bool) {
         CACHE.with(|c| {
             if let Some(pd) = c.borrow_mut().photos.get_mut(&item.id) {
                 let pd = Rc::make_mut(pd);
-                pd.full = Some((cleared, w, h));
+                pd.full = Some((Pixels::owned(cleared), w, h));
                 pd.full_dims = (w, h);
                 pd.preview = preview;
                 pd.dirty = true;
@@ -6956,7 +7114,7 @@ fn delete_selection_sync(state: AppState) {
     let Some(sel) = item.edit.selection.clone() else { return; };
     let Some(photo) = get_photo(item.id) else { return; };
     let Some((full, fw, fh)) = photo.full.clone() else { return };
-    let (mut base, w, h) = geometry(&full, fw, fh, &item.edit);
+    let (mut base, w, h) = full.with_slice(|s| geometry(s, fw, fh, &item.edit));
     let mask = ops::selection_mask(&sel, w, h);
     for (px, m) in base.chunks_exact_mut(4).zip(mask.iter()) {
         let a = *m as f32 / 255.0;
@@ -6967,7 +7125,7 @@ fn delete_selection_sync(state: AppState) {
     CACHE.with(|c| {
         if let Some(pd) = c.borrow_mut().photos.get_mut(&item.id) {
             let pd = Rc::make_mut(pd);
-            pd.full = Some((base, w, h));
+            pd.full = Some((Pixels::owned(base), w, h));
             pd.full_dims = (w, h);
             pd.preview = preview;
             pd.dirty = true;
@@ -7021,7 +7179,7 @@ fn content_fill_selection_sync(state: AppState) {
     let Some(sel) = item.edit.selection.clone() else { return; };
     let Some(photo) = get_photo(item.id) else { return; };
     let Some((full, fw, fh)) = photo.full.clone() else { return };
-    let (mut base, w, h) = geometry(&full, fw, fh, &item.edit);
+    let (mut base, w, h) = full.with_slice(|s| geometry(s, fw, fh, &item.edit));
     let mask = ops::selection_mask(&sel, w, h);
     if !fill::content_fill(&mut base, &mask, w, h) {
         return;
@@ -7031,7 +7189,7 @@ fn content_fill_selection_sync(state: AppState) {
     CACHE.with(|c| {
         if let Some(pd) = c.borrow_mut().photos.get_mut(&item.id) {
             let pd = Rc::make_mut(pd);
-            pd.full = Some((base, w, h));
+            pd.full = Some((Pixels::owned(base), w, h));
             pd.full_dims = (w, h);
             pd.preview = preview;
             pd.dirty = true;
@@ -7053,7 +7211,7 @@ fn destructive_apply(state: AppState, item_id: usize, r: pworker::DestructiveRes
     CACHE.with(|c| {
         if let Some(pd) = c.borrow_mut().photos.get_mut(&item_id) {
             let pd = Rc::make_mut(pd);
-            pd.full = Some((r.pixels, r.w, r.h));
+            pd.full = Some((Pixels::owned(r.pixels), r.w, r.h));
             pd.full_dims = (r.w, r.h);
             pd.preview = (r.preview, r.pw, r.ph);
             pd.dirty = true;
@@ -7128,7 +7286,7 @@ fn apply_heal_sync(state: AppState, pts: &[(f32, f32)]) {
     }
     let Some(photo) = get_photo(item.id) else { return };
     let Some((full, fw, fh)) = photo.full.clone() else { return };
-    let (mut base, w, h) = geometry(&full, fw, fh, &item.edit);
+    let (mut base, w, h) = full.with_slice(|s| geometry(s, fw, fh, &item.edit));
     let diag = ((w * w + h * h) as f32).sqrt();
     let r = (state.heal_radius.get_untracked() * diag).max(1.0);
     let mut coverage = vec![0u8; w * h];
@@ -7142,7 +7300,7 @@ fn apply_heal_sync(state: AppState, pts: &[(f32, f32)]) {
     CACHE.with(|c| {
         if let Some(pd) = c.borrow_mut().photos.get_mut(&item.id) {
             let pd = Rc::make_mut(pd);
-            pd.full = Some((base, w, h));
+            pd.full = Some((Pixels::owned(base), w, h));
             pd.full_dims = (w, h);
             pd.preview = preview;
             pd.dirty = true;
@@ -7228,7 +7386,7 @@ fn apply_clone_sync(state: AppState, pts: &[(f32, f32)]) {
     let Some(src) = state.clone_source.get_untracked() else { return };
     let Some(photo) = get_photo(item.id) else { return };
     let Some((full, fw, fh)) = photo.full.clone() else { return };
-    let (mut base, w, h) = geometry(&full, fw, fh, &item.edit);
+    let (mut base, w, h) = full.with_slice(|s| geometry(s, fw, fh, &item.edit));
     let aligned = state.clone_aligned.get_untracked();
     let offset = if aligned {
         match state.clone_offset.get_untracked() {
@@ -7254,7 +7412,7 @@ fn apply_clone_sync(state: AppState, pts: &[(f32, f32)]) {
     CACHE.with(|c| {
         if let Some(pd) = c.borrow_mut().photos.get_mut(&item.id) {
             let pd = Rc::make_mut(pd);
-            pd.full = Some((base, w, h));
+            pd.full = Some((Pixels::owned(base), w, h));
             pd.full_dims = (w, h);
             pd.preview = preview;
             pd.dirty = true;

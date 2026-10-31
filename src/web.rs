@@ -267,6 +267,16 @@ pub fn bytes_to_blob(bytes: &[u8], mime: &str) -> Result<Blob, JsValue> {
     Blob::new_with_u8_array_sequence_and_options(&parts, &bag)
 }
 
+/// Blob over an existing JS buffer view. The Blob constructor copies once;
+/// the caller's view is untouched.
+pub fn view_to_blob(view: &Uint8Array, mime: &str) -> Result<Blob, JsValue> {
+    let parts = js_sys::Array::new();
+    parts.push(view);
+    let bag = web_sys::BlobPropertyBag::new();
+    bag.set_type(mime);
+    Blob::new_with_u8_array_sequence_and_options(&parts, &bag)
+}
+
 pub async fn load_font(family: &str, url: &str, weight: &str) -> Result<(), JsValue> {
     let window = window();
     let desc = web_sys::FontFaceDescriptors::new();

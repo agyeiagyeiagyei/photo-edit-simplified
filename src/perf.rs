@@ -148,8 +148,27 @@ fn reset() {
     RING_BUF.with(|r| r.borrow_mut().clear());
 }
 
-/// Publish `window.__pes.perf()` / `window.__pes.reset()`. Idempotent; other
-/// helpers may share the `__pes` namespace.
+/// `{main, raw_worker}` wasm linear-memory bytes. wasm never shrinks, so the
+/// main figure is its high-water; the RAW worker's is the max `mem` reported
+/// by develop replies.
+fn mem() -> JsValue {
+    let main = Reflect::get(&wasm_bindgen::memory(), &JsValue::from_str("buffer"))
+        .ok()
+        .and_then(|b| b.dyn_into::<js_sys::ArrayBuffer>().ok())
+        .map(|b| b.byte_length() as f64)
+        .unwrap_or(0.0);
+    let o = Object::new();
+    let _ = Reflect::set(&o, &JsValue::from_str("main"), &JsValue::from(main));
+    let _ = Reflect::set(
+        &o,
+        &JsValue::from_str("raw_worker"),
+        &JsValue::from(crate::pworker::raw_mem_high()),
+    );
+    o.into()
+}
+
+/// Publish `window.__pes.perf()` / `window.__pes.reset()` / `window.__pes.mem()`.
+/// Idempotent; other helpers may share the `__pes` namespace.
 pub fn install() {
     let Some(win) = web_sys::window() else { return };
     let pes = Reflect::get(win.as_ref(), &JsValue::from_str("__pes"))
@@ -166,4 +185,7 @@ pub fn install() {
     let reset_fn = Closure::<dyn Fn()>::new(reset);
     let _ = Reflect::set(&pes, &JsValue::from_str("reset"), reset_fn.as_ref().unchecked_ref());
     reset_fn.forget();
+    let mem_fn = Closure::<dyn Fn() -> JsValue>::new(mem);
+    let _ = Reflect::set(&pes, &JsValue::from_str("mem"), mem_fn.as_ref().unchecked_ref());
+    mem_fn.forget();
 }
