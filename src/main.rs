@@ -1,5 +1,6 @@
 mod drive;
 mod exif;
+mod gpu;
 mod zip;
 mod perf;
 mod pworker;
@@ -2016,6 +2017,10 @@ thread_local! {
     static PREVIEW_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Changes arrived since the leading-edge paint; the trailing pass runs.
     static PREVIEW_DIRTY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Generation guard for the debounced GPU base request; only the latest fires.
+    static GPU_DEBOUNCE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// The base request in flight, so repeated effect passes don't queue more.
+    static GPU_BASE_REQ: RefCell<Option<gpu::BaseKey>> = const { RefCell::new(None) };
 }
 
 /// Geometry applied to the 1024px preview, cached across renders.
@@ -6388,7 +6393,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         // Exact size the render will produce for this request, sized from the
         // source actually loaded (sensor pixels or the display proxy) — the
         // cache is sufficient iff it matches, which keeps rebuilds from looping.
-        let (_, (sw, sh)) = render_source(item.id, &photo);
+        let (src_id, (sw, sh)) = render_source(item.id, &photo);
         let (fw, fh) = working_dims(sw, sh, &item.edit);
         let target = hi_target(req_w, req_h, fw, fh, HI_MAX_EDGE as u32);
 
@@ -6404,6 +6409,47 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         // A sharp frame from an older source stays on screen while the new
         // one renders, so a RAW proxy upgrade never flashes the soft preview.
         let mut stale_source = false;
+        // GPU parametric preview: one shader draw per paint from the worker
+        // base, which is pre-develop and pre-colour, so slider ticks never
+        // touch the worker. With no usable base the 1024px preview stays up
+        // until one lands; the CPU hi-res path below is then not requested.
+        let mut gpu_ok = want_hi && !cropped_view && gpu::eligible(&item.edit) && gpu::active();
+        let mut gkey: Option<gpu::BaseKey> = None;
+        if gpu_ok {
+            let key = gpu::BaseKey {
+                item: item.id as u32,
+                src_id: src_id as u32,
+                src_fp,
+                rot90: item.edit.rot90,
+                fine_bits: item.edit.fine_angle.to_bits(),
+                need_w: target.0 as u32,
+                need_h: target.1 as u32,
+            };
+            gkey = Some(key);
+            if gpu::base_match(&key).is_some() {
+                match gpu::render(&item.edit, item.id as u32) {
+                    Some((gcanvas, gw, gh)) => {
+                        if canvas.width() != gw || canvas.height() != gh {
+                            canvas.set_width(gw);
+                            canvas.set_height(gh);
+                        }
+                        let blit_span = perf::Span::new("gpu.blit");
+                        let blitted = web::ctx2d(&canvas)
+                            .draw_image_with_html_canvas_element(&gcanvas, 0.0, 0.0)
+                            .is_ok();
+                        drop(blit_span);
+                        if blitted {
+                            composite_layers(&canvas, &item.layers, gw as usize, gh as usize);
+                            sharp = Some(Sharp::Whole { w: gw as usize });
+                        } else {
+                            gpu::latch_off();
+                            gpu_ok = false;
+                        }
+                    }
+                    None => gpu_ok = false,
+                }
+            }
+        }
         if want_hi {
             if cropped_view {
                 let (_, _, fcw, fch) = crop_px(&item.edit, fw, fh);
@@ -6497,7 +6543,104 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 composite_layers(&canvas, &item.layers, w, h);
             }
         }
-        if want_hi && (sharp.is_none() || stale_source) {
+        if want_hi
+            && gpu_ok
+            && gkey.as_ref().map_or(false, |k| gpu::base_match(k) != Some(false))
+        {
+            // 60ms debounce so a fine-angle drag issues one base request, not
+            // one per frame; a pending request that already covers this key
+            // is left to land.
+            GPU_DEBOUNCE.with(|d| d.set(d.get() + 1));
+            let gen = GPU_DEBOUNCE.with(|d| d.get());
+            let cb = Closure::once(move || {
+                if GPU_DEBOUNCE.with(|d| d.get()) != gen {
+                    return;
+                }
+                let Some(item) = state.current() else { return };
+                if item.kind != MediaKind::Photo {
+                    return;
+                }
+                if !full_present(item.id) && !proxy_in_mem(item.id) {
+                    ensure_proxy(state, item.id, true);
+                    return;
+                }
+                let Some(photo) = get_photo(item.id) else { return };
+                let (src_id, (sw2, sh2)) = render_source(item.id, &photo);
+                let (fw2, fh2) = working_dims(sw2, sh2, &item.edit);
+                let t2 = hi_target(need_w, need_h, fw2, fh2, HI_MAX_EDGE as u32);
+                let key = gpu::BaseKey {
+                    item: item.id as u32,
+                    src_id: src_id as u32,
+                    src_fp: source_fingerprint(photo.gen, proxy_gen(item.id)),
+                    rot90: item.edit.rot90,
+                    fine_bits: item.edit.fine_angle.to_bits(),
+                    need_w: t2.0 as u32,
+                    need_h: t2.1 as u32,
+                };
+                if gpu::base_match(&key) == Some(false) {
+                    return;
+                }
+                let covered = GPU_BASE_REQ.with(|r| {
+                    r.borrow().as_ref().map_or(false, |p| {
+                        p.item == key.item
+                            && p.rot90 == key.rot90
+                            && p.fine_bits == key.fine_bits
+                            && p.src_id == key.src_id
+                            && p.src_fp == key.src_fp
+                            && p.need_w >= key.need_w
+                            && p.need_h >= key.need_h
+                    })
+                });
+                if covered {
+                    return;
+                }
+                GPU_BASE_REQ.with(|r| *r.borrow_mut() = Some(key));
+                let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
+                let accepted = pworker::render_base(
+                    src_id,
+                    &recipe,
+                    need_w,
+                    need_h,
+                    HI_MAX_EDGE as u32,
+                    move |reply| {
+                        let superseded = GPU_BASE_REQ.with(|r| {
+                            let mut r = r.borrow_mut();
+                            if r.as_ref() == Some(&key) {
+                                *r = None;
+                                false
+                            } else {
+                                r.is_some()
+                            }
+                        });
+                        if superseded {
+                            return;
+                        }
+                        match reply {
+                            Ok(r) => {
+                                if gpu::upload_base(key, &r.pixels.to_vec(), r.w, r.h) {
+                                    state.hi_built.update(|g| *g += 1);
+                                }
+                            }
+                            Err(_) => {
+                                gpu::latch_off();
+                                state.hi_built.update(|g| *g += 1);
+                            }
+                        }
+                    },
+                );
+                if !accepted {
+                    GPU_BASE_REQ.with(|r| *r.borrow_mut() = None);
+                    gpu::latch_off();
+                    state.hi_built.update(|g| *g += 1);
+                }
+            });
+            let _ = web::window().set_timeout_with_callback_and_timeout_and_arguments_0(
+                cb.as_ref().unchecked_ref(),
+                60,
+            );
+            cb.forget();
+        }
+        if want_hi && !gpu_ok && (sharp.is_none() || stale_source) {
             // Sharp frame lands 60ms after edits settle; until then the
             // cheap preview render keeps drags responsive. The worker's
             // base cache makes the follow-up render cheap, so a short

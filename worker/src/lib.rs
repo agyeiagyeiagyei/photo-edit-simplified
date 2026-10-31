@@ -135,21 +135,18 @@ fn parse_edit(recipe: &str) -> EditParams {
     edit_params_from_recipe(recipe).unwrap_or_default()
 }
 
-/// Parametric pipeline (geometry → resample → color ops), mirroring the app's
-/// render_hi. Selection comes as JSON + optional mask buffer.
-fn render_pipeline(
+/// Geometry + resample front half of the render pipeline, with the base
+/// cache. Returns pre-develop, pre-colour pixels.
+fn base_pipeline(
     id: u32,
     full: &[u8],
     fw: usize,
     fh: usize,
     edit: &EditParams,
-    seed: u32,
     req_w: f64,
     req_h: f64,
     max_edge: u32,
-    sel_json: Option<String>,
-    sel_mask: Option<Uint8Array>,
-) -> (Vec<u8>, usize, usize, [f64; 5]) {
+) -> (Vec<u8>, usize, usize, f64, f64, f64) {
     let t0 = js_sys::Date::now();
     // Target dims are pure arithmetic, so the cache key is computable without
     // rotating anything.
@@ -165,7 +162,7 @@ fn render_pipeline(
                 && b.th == th
         })
     });
-    let (mut buf, t1, t2) = if cached {
+    let (buf, t1, t2) = if cached {
         // A tonal edit only needs a fresh copy of the base; the ~27 MB
         // memcpy is far cheaper than geometry over the sensor frame.
         let v = BASE_CACHE.with(|c| {
@@ -195,15 +192,36 @@ fn render_pipeline(
         });
         (buf, t, js_sys::Date::now())
     };
+    let hit = if cached { 1.0 } else { 0.0 };
+    (buf, tw, th, t1 - t0, t2 - t1, hit)
+}
+
+/// Parametric pipeline (geometry → resample → color ops), mirroring the app's
+/// render_hi. Selection comes as JSON + optional mask buffer.
+fn render_pipeline(
+    id: u32,
+    full: &[u8],
+    fw: usize,
+    fh: usize,
+    edit: &EditParams,
+    seed: u32,
+    req_w: f64,
+    req_h: f64,
+    max_edge: u32,
+    sel_json: Option<String>,
+    sel_mask: Option<Uint8Array>,
+) -> (Vec<u8>, usize, usize, [f64; 5]) {
+    let (mut buf, tw, th, geometry_ms, resample_ms, hit) =
+        base_pipeline(id, full, fw, fh, edit, req_w, req_h, max_edge);
     // Develop stage first: white balance, exposure and the lighting controls
     // run in linear light, before any gamma-space colour adjustment.
+    let t0 = js_sys::Date::now();
     if !edit.raw.is_identity() {
         rawops::apply(&mut buf, tw, th, &edit.raw);
     }
-    let t3 = js_sys::Date::now();
-    let hit = if cached { 1.0 } else { 0.0 };
+    let t1 = js_sys::Date::now();
     if !edit.is_color_touched() {
-        return (buf, tw, th, [t1 - t0, t2 - t1, t3 - t2, 0.0, hit]);
+        return (buf, tw, th, [geometry_ms, resample_ms, t1 - t0, 0.0, hit]);
     }
     let selection = sel_json.and_then(|j| selection_from_json(&j, sel_mask.map(|m| m.to_vec())));
     if let Some(sel) = selection {
@@ -212,8 +230,8 @@ fn render_pipeline(
     } else {
         color::apply_color_effects(&mut buf, tw, th, edit, seed);
     }
-    let t4 = js_sys::Date::now();
-    (buf, tw, th, [t1 - t0, t2 - t1, t3 - t2, t4 - t3, hit])
+    let t2 = js_sys::Date::now();
+    (buf, tw, th, [geometry_ms, resample_ms, t1 - t0, t2 - t1, hit])
 }
 
 /// Render the hi-res frame. Returns {pixels, w, h}.
@@ -238,6 +256,36 @@ pub fn render(
             ("develop", t[2].into()),
             ("color", t[3].into()),
             ("cache", t[4].into()),
+        ]);
+        result_obj(&[
+            ("pixels", js_buf(buf)),
+            ("w", (tw as u32).into()),
+            ("h", (th as u32).into()),
+            ("timings", timings),
+        ])
+    })
+}
+
+/// Base for the GPU preview: geometry + resample only, before develop and
+/// colour. Shares `BASE_CACHE` with `render`, so CPU and GPU renders of the
+/// same (item, geometry, target) never rebuild the base. Returns
+/// {pixels, w, h, timings:{geometry, resample, cache}}.
+#[wasm_bindgen]
+pub fn render_base(
+    id: u32,
+    recipe: &str,
+    req_w: f64,
+    req_h: f64,
+    max_edge: u32,
+) -> Result<JsValue, JsValue> {
+    with_buffer(id, |(full, fw, fh)| {
+        let edit = parse_edit(recipe);
+        let (buf, tw, th, geometry_ms, resample_ms, hit) =
+            base_pipeline(id, full, *fw, *fh, &edit, req_w, req_h, max_edge);
+        let timings = result_obj(&[
+            ("geometry", geometry_ms.into()),
+            ("resample", resample_ms.into()),
+            ("cache", hit.into()),
         ]);
         result_obj(&[
             ("pixels", js_buf(buf)),

@@ -39,6 +39,8 @@ cleared right after the measure so the timeline never accumulates marks.
 | `hi.request` | debounce fired → hi-res render posted to the worker | requested `WxH` |
 | `hi.worker_reply` | request posted → worker reply received | — |
 | `hi.blit` | worker pixels → canvas → layer composite | — |
+| `gpu.render` | uniform setup + draw command submission for one GPU preview frame (not GPU execution; see below) | — |
+| `gpu.blit` | WebGL canvas → visible 2D canvas `drawImage` (a GPU copy on hardware, a CPU readback on software rasterisers) | — |
 | `proxy.camera_decode` | camera-JPEG proxy decode in the raw worker | — |
 | `proxy.raw_develop` | sensor develop to a 3200px display proxy | — |
 | `proxy.raw_develop_full` | full-size sensor develop in the raw worker | — |
@@ -147,7 +149,7 @@ returns `ms` with the reply; the app records it as:
 
 | Name | Measures |
 |---|---|
-| `worker.<op>` | worker execution of `op` (`load`, `unload`, `render`, `render_window`, `raw_proxy`, `raw_meta`, `raw_develop`, `raw_preview`, `camera_proxy`, `heal_stroke`, `clone_stamp`, `cut`, `fill_selection`, `extract`) |
+| `worker.<op>` | worker execution of `op` (`load`, `unload`, `render`, `render_window`, `render_base`, `raw_proxy`, `raw_meta`, `raw_develop`, `raw_preview`, `camera_proxy`, `heal_stroke`, `clone_stamp`, `cut`, `fill_selection`, `extract`) |
 
 `render` additionally returns a `timings` object, recorded as:
 
@@ -207,6 +209,27 @@ fingerprint keeps the old sharp canvas on screen instead of flashing back to
 the 1024px tier, then schedules a fresh render that blits when it lands. The
 RAW e2e samples the canvas backing width every frame and asserts it never drops
 below the sharp threshold across the swap.
+
+### GPU parametric preview
+
+`?gpu=1`, or Auto on a hardware WebGL2 renderer, replaces the whole-frame
+preview render with one WebGL2 draw from a worker base (see `docs/GPU.md`):
+
+- `worker.render_base` is the one-shot worker op that produces the base: the
+  stored frame after geometry and resample, before develop and colour. Its
+  `worker.render_base.{geometry, resample, cache}` stages behave like
+  `worker.render`'s (a cache hit copies the base and reports `resample` 0),
+  minus develop/colour. It is requested once per (source, geometry, display
+  target), then reused for every slider tick.
+- `gpu.render` measures uniform setup and draw submission on the main thread,
+  not GPU execution — WebGL commands are asynchronous. After a warm-up draw it
+  is ~0.2 ms even on SwiftShader. `gpu.blit` is the webgl canvas → visible 2D
+  canvas copy: a GPU copy on hardware, but a CPU readback on software
+  rasterisers (273 ms at 2888×1925 in the CI container), which is why Auto
+  refuses software.
+- A slider tick on the GPU path shows `preview.render` plus one
+  `gpu.render`/`gpu.blit`, and no `hi.request`, `worker.render` or
+  `worker.render_base`.
 
 ## Reading them
 

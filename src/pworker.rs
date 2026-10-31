@@ -167,7 +167,7 @@ fn record_worker_reply(op: &str, data: &JsValue, result: &JsValue) {
     {
         perf::record(&format!("worker.{op}"), ms);
     }
-    if op != "render" && op != "render_window" {
+    if op != "render" && op != "render_window" && op != "render_base" {
         return;
     }
     let Ok(timings) = Reflect::get(result, &JsValue::from_str("timings")) else { return };
@@ -1024,6 +1024,39 @@ pub fn render_window(
         "render_window",
         &args,
         &transfer,
+        Box::new(move |reply| {
+            cb(match reply {
+                Ok(v) => match (get_buf(&v, "pixels"), get_u32(&v, "w"), get_u32(&v, "h")) {
+                    (Some(pixels), Some(w), Some(h)) => Ok(RenderResult { pixels, w, h }),
+                    _ => Err(()),
+                },
+                Err(_) => Err(()),
+            });
+        }),
+    )
+}
+
+/// Base frame for the GPU preview: geometry + resample before develop and
+/// colour. Shares the worker's base cache with `render`.
+pub fn render_base(
+    id: usize,
+    recipe: &str,
+    req_w: f64,
+    req_h: f64,
+    max_edge: u32,
+    cb: impl FnOnce(Result<RenderResult, ()>) + 'static,
+) -> bool {
+    let args = vec![
+        JsValue::from(id as u32),
+        JsValue::from_str(recipe),
+        JsValue::from(req_w),
+        JsValue::from(req_h),
+        JsValue::from(max_edge),
+    ];
+    call(
+        "render_base",
+        &args,
+        &[],
         Box::new(move |reply| {
             cb(match reply {
                 Ok(v) => match (get_buf(&v, "pixels"), get_u32(&v, "w"), get_u32(&v, "h")) {

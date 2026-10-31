@@ -18,7 +18,7 @@ use crate::types::EditParams;
 
 type Tables = [[u8; 256]; 3];
 
-fn compose_tables(levels: &LevelsSettings, curves: &CurvesSettings) -> Tables {
+pub fn compose_tables(levels: &LevelsSettings, curves: &CurvesSettings) -> Tables {
     let lev = levels.build_tables();
     let cur = curves.build_tables();
     let mut out = [[0u8; 256]; 3];

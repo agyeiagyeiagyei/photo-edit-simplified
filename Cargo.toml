@@ -27,7 +27,10 @@ web-sys = { version = "0.3", features = [
   "FontFace", "FontFaceDescriptors", "FontFaceSet",
   "Headers", "Request", "RequestInit", "Response",
   "Worker", "WorkerOptions", "WorkerType", "ErrorEvent", "MessageEvent",
-  "Performance",
+  "Performance", "Location",
+  "WebGl2RenderingContext", "WebGlProgram", "WebGlShader", "WebGlBuffer",
+  "WebGlTexture", "WebGlUniformLocation", "WebGlFramebuffer",
+  "WebGlVertexArrayObject",
 ] }
 
 console_error_panic_hook = "0.1"
