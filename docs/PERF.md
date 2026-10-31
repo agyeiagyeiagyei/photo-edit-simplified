@@ -147,7 +147,7 @@ returns `ms` with the reply; the app records it as:
 
 | Name | Measures |
 |---|---|
-| `worker.<op>` | worker execution of `op` (`load`, `unload`, `render`, `raw_proxy`, `raw_meta`, `raw_develop`, `raw_preview`, `camera_proxy`, `heal_stroke`, `clone_stamp`, `cut`, `fill_selection`, `extract`) |
+| `worker.<op>` | worker execution of `op` (`load`, `unload`, `render`, `render_window`, `raw_proxy`, `raw_meta`, `raw_develop`, `raw_preview`, `camera_proxy`, `heal_stroke`, `clone_stamp`, `cut`, `fill_selection`, `extract`) |
 
 `render` additionally returns a `timings` object, recorded as:
 
@@ -167,6 +167,46 @@ downscaling the full frame again, so `geometry` measures the base copy (about
 `rawops` and colour run, so exposure edits never compound into it, and it is
 dropped whenever the stored full frame changes (`load`, `unload`, and
 destructive ops, which `commit`).
+
+### Crop-window renders
+
+When a crop is active, the preview asks for the visible crop window instead of
+the whole frame: `render_window` takes the crop rectangle and the display
+target, runs geometry + resample + develop + colour, and returns only that
+window (long edge capped at `WINDOW_MAX_EDGE`, 4096 px). The view can therefore
+be denser than the screen without rendering pixels nobody sees. The reply
+carries the same `timings` object as `render`, recorded as
+`worker.render_window` and `worker.render_window.{geometry, resample, develop,
+color, cache}` (`cache`: 1 = window cache hit, 0 = rebuilt). App-side marks are
+the shared `hi.request` / `hi.worker_reply` / `hi.blit`.
+
+The worker keeps one window slot keyed by `(id, rot90, fine_angle, crop,
+target w, target h)`:
+
+- Identity rotation borrows the full frame and copies only the crop rows; a
+  rotated frame is built full-size first. A colour-only edit (no geometry or
+  crop change) reuses the cached window, so only `color` runs.
+- The selection mask is built at full working size and cropped with nearest
+  sampling, matching the export mask.
+- The window is cached before `rawops`/colour, so exposure edits never compound
+  into it, and the slot is dropped on `load`, `unload` and `commit` — the same
+  lifecycle as the whole-frame base.
+
+The app blits the window with the export's framing (`scale(w/fcw, h/fch)` then
+translate by the crop origin) and layers composite in full-frame coordinates.
+While a crop drag is live the cheap whole-frame proxy still paints; the window
+render is debounced like the hi-res frame.
+
+### Stale-while-revalidate on source swaps
+
+A sharp frame is cached against `(item, edit, source)` fingerprints, where the
+source fingerprint covers the full-res generation and the display proxy
+generation. When only the source changes — chiefly a RAW's camera-JPEG proxy
+being replaced by the developed proxy — the cache hit with a different source
+fingerprint keeps the old sharp canvas on screen instead of flashing back to
+the 1024px tier, then schedules a fresh render that blits when it lands. The
+RAW e2e samples the canvas backing width every frame and asserts it never drops
+below the sharp threshold across the swap.
 
 ## Reading them
 

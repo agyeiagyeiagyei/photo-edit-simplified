@@ -167,7 +167,7 @@ fn record_worker_reply(op: &str, data: &JsValue, result: &JsValue) {
     {
         perf::record(&format!("worker.{op}"), ms);
     }
-    if op != "render" {
+    if op != "render" && op != "render_window" {
         return;
     }
     let Ok(timings) = Reflect::get(result, &JsValue::from_str("timings")) else { return };
@@ -179,7 +179,7 @@ fn record_worker_reply(op: &str, data: &JsValue, result: &JsValue) {
             .ok()
             .and_then(|v| v.as_f64())
         {
-            perf::record(&format!("worker.render.{stage}"), ms);
+            perf::record(&format!("worker.{op}.{stage}"), ms);
         }
     }
 }
@@ -986,6 +986,42 @@ pub fn render(
     args.extend(sargs);
     call(
         "render",
+        &args,
+        &transfer,
+        Box::new(move |reply| {
+            cb(match reply {
+                Ok(v) => match (get_buf(&v, "pixels"), get_u32(&v, "w"), get_u32(&v, "h")) {
+                    (Some(pixels), Some(w), Some(h)) => Ok(RenderResult { pixels, w, h }),
+                    _ => Err(()),
+                },
+                Err(_) => Err(()),
+            });
+        }),
+    )
+}
+
+/// Crop-window render: the same recipe, but the worker returns only the crop
+/// rectangle (geometry + colour applied there) at up to native pixels.
+pub fn render_window(
+    id: usize,
+    recipe: &str,
+    req_w: f64,
+    req_h: f64,
+    max_edge: u32,
+    sel: Option<&Selection>,
+    cb: impl FnOnce(Result<RenderResult, ()>) + 'static,
+) -> bool {
+    let (sargs, transfer) = sel_args(sel);
+    let mut args = vec![
+        JsValue::from(id as u32),
+        JsValue::from_str(recipe),
+        JsValue::from(req_w),
+        JsValue::from(req_h),
+        JsValue::from(max_edge),
+    ];
+    args.extend(sargs);
+    call(
+        "render_window",
         &args,
         &transfer,
         Box::new(move |reply| {

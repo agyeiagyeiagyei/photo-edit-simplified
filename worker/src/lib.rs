@@ -9,7 +9,7 @@ use js_sys::{Array, Object, Reflect, Uint8Array, Uint8ClampedArray};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
-use pes_pixel::geo::{geometry, hi_target, stamp_stroke, working_dims};
+use pes_pixel::geo::{crop_px, geometry, hi_target, stamp_stroke, working_dims};
 use pes_pixel::recipe::{edit_params_from_recipe, selection_from_json};
 use pes_pixel::types::EditParams;
 use pes_pixel::{clone, color, fill, heal, ops, rawops};
@@ -33,6 +33,10 @@ thread_local! {
     /// (load, unload, destructive commit), so an entry can never outlive the
     /// pixels it was derived from.
     static BASE_CACHE: RefCell<Option<BaseCache>> = const { RefCell::new(None) };
+    /// Post-crop, post-resample pixels for the last crop-window render. The
+    /// cropped view shows only this region, so a colour-only edit copies the
+    /// window rather than the whole frame. Cleared with the base cache.
+    static WINDOW_CACHE: RefCell<Option<WindowCache>> = const { RefCell::new(None) };
 }
 
 struct BaseCache {
@@ -46,8 +50,20 @@ struct BaseCache {
     pixels: Vec<u8>,
 }
 
-fn clear_base_cache() {
+struct WindowCache {
+    id: u32,
+    rot90: u8,
+    fine_bits: u32,
+    /// Crop rect in working pixels.
+    crop: (usize, usize, usize, usize),
+    tw: usize,
+    th: usize,
+    pixels: Vec<u8>,
+}
+
+fn clear_render_caches() {
     BASE_CACHE.with(|c| *c.borrow_mut() = None);
+    WINDOW_CACHE.with(|c| *c.borrow_mut() = None);
 }
 
 fn with_buffer<R>(id: u32, f: impl FnOnce(&mut (Vec<u8>, usize, usize)) -> R) -> Result<R, JsValue> {
@@ -88,7 +104,7 @@ fn wasm_mem_bytes() -> f64 {
 /// Store (or replace) an item's full-res RGBA buffer.
 #[wasm_bindgen]
 pub fn load(id: u32, pixels: Uint8Array, w: u32, h: u32) {
-    clear_base_cache();
+    clear_render_caches();
     BUFFERS.with(|b| {
         b.borrow_mut()
             .insert(id, (pixels.to_vec(), w as usize, h as usize));
@@ -97,7 +113,7 @@ pub fn load(id: u32, pixels: Uint8Array, w: u32, h: u32) {
 
 #[wasm_bindgen]
 pub fn unload(id: u32) {
-    clear_base_cache();
+    clear_render_caches();
     BUFFERS.with(|b| {
         b.borrow_mut().remove(&id);
     });
@@ -232,6 +248,155 @@ pub fn render(
     })
 }
 
+/// Copy a sub-rect out of a `bpp`-bytes-per-pixel buffer, row by row.
+fn crop_rows(p: &[u8], w: usize, cx: usize, cy: usize, cw: usize, ch: usize, bpp: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(cw * ch * bpp);
+    for y in cy..cy + ch {
+        let s = (y * w + cx) * bpp;
+        out.extend_from_slice(&p[s..s + cw * bpp]);
+    }
+    out
+}
+
+fn nearest_resample_mask(p: &[u8], w: usize, h: usize, tw: usize, th: usize) -> Vec<u8> {
+    let mut out = vec![0u8; tw * th];
+    for y in 0..th {
+        let sy = y * h / th;
+        for x in 0..tw {
+            out[y * tw + x] = p[sy * w + x * w / tw];
+        }
+    }
+    out
+}
+
+/// Render only the crop window the cropped view shows. The whole-frame
+/// hi-res cache is capped at the display proxy's long edge, so a tight crop
+/// would blit only a fraction of the device pixels; this renders the window
+/// itself, at native resolution up to `max_edge`. `req_w`/`req_h` are the
+/// device pixels the window must cover. Everything before `rawops`/colour is
+/// cached per crop rect, so a slider tick copies the window instead of
+/// rotating and cropping the frame again.
+fn render_window_pipeline(
+    id: u32,
+    full: &[u8],
+    fw: usize,
+    fh: usize,
+    edit: &EditParams,
+    seed: u32,
+    req_w: f64,
+    req_h: f64,
+    max_edge: u32,
+    sel_json: Option<String>,
+    sel_mask: Option<Uint8Array>,
+) -> (Vec<u8>, usize, usize, [f64; 5]) {
+    let t0 = js_sys::Date::now();
+    let (ww, wh) = working_dims(fw, fh, edit);
+    let (cx, cy, cw, ch) = crop_px(edit, ww, wh);
+    let (tw, th) = hi_target(req_w, req_h, cw, ch, max_edge);
+    let fine_bits = edit.fine_angle.to_bits();
+    let cached = WINDOW_CACHE.with(|c| {
+        c.borrow().as_ref().is_some_and(|w| {
+            w.id == id
+                && w.rot90 == edit.rot90
+                && w.fine_bits == fine_bits
+                && w.crop == (cx, cy, cw, ch)
+                && w.tw == tw
+                && w.th == th
+        })
+    });
+    let (mut buf, t1, t2) = if cached {
+        let v = WINDOW_CACHE.with(|c| {
+            c.borrow().as_ref().map(|w| w.pixels.clone()).unwrap_or_default()
+        });
+        let t = js_sys::Date::now();
+        (v, t, t)
+    } else {
+        let (p, gw, gh) = geometry(full, fw, fh, edit);
+        let t = js_sys::Date::now();
+        // Identity geometry borrows the stored frame: copy only the window's
+        // rows. A rotation has already produced a full working frame.
+        let win = if (cx, cy, cw, ch) == (0, 0, gw, gh) {
+            p.into_owned()
+        } else {
+            crop_rows(&p, gw, cx, cy, cw, ch, 4)
+        };
+        let buf = if (tw, th) != (cw, ch) {
+            resample(&win, cw, ch, tw, th)
+        } else {
+            win
+        };
+        WINDOW_CACHE.with(|c| {
+            *c.borrow_mut() = Some(WindowCache {
+                id,
+                rot90: edit.rot90,
+                fine_bits,
+                crop: (cx, cy, cw, ch),
+                tw,
+                th,
+                pixels: buf.clone(),
+            })
+        });
+        (buf, t, js_sys::Date::now())
+    };
+    if !edit.raw.is_identity() {
+        rawops::apply(&mut buf, tw, th, &edit.raw);
+    }
+    let t3 = js_sys::Date::now();
+    let hit = if cached { 1.0 } else { 0.0 };
+    if !edit.is_color_touched() {
+        return (buf, tw, th, [t1 - t0, t2 - t1, t3 - t2, 0.0, hit]);
+    }
+    let selection = sel_json.and_then(|j| selection_from_json(&j, sel_mask.map(|m| m.to_vec())));
+    if let Some(sel) = selection {
+        // Build the mask over the full working frame (selection coordinates
+        // are normalized to it), then take the window and scale it.
+        let mask = ops::selection_mask(&sel, ww, wh);
+        let win = crop_rows(&mask, ww, cx, cy, cw, ch, 1);
+        let mask = if (tw, th) != (cw, ch) {
+            nearest_resample_mask(&win, cw, ch, tw, th)
+        } else {
+            win
+        };
+        color::apply_color_effects_masked(&mut buf, &mask, tw, th, edit, seed);
+    } else {
+        color::apply_color_effects(&mut buf, tw, th, edit, seed);
+    }
+    let t4 = js_sys::Date::now();
+    (buf, tw, th, [t1 - t0, t2 - t1, t3 - t2, t4 - t3, hit])
+}
+
+/// Render the crop window the cropped view displays. Returns {pixels, w, h}.
+#[wasm_bindgen]
+pub fn render_window(
+    id: u32,
+    recipe: &str,
+    req_w: f64,
+    req_h: f64,
+    max_edge: u32,
+    sel_json: Option<String>,
+    sel_mask: Option<Uint8Array>,
+) -> Result<JsValue, JsValue> {
+    with_buffer(id, |(full, fw, fh)| {
+        let edit = parse_edit(recipe);
+        let (buf, tw, th, t) = render_window_pipeline(
+            id, full, *fw, *fh, &edit, id, req_w, req_h, max_edge, sel_json, sel_mask,
+        );
+        let timings = result_obj(&[
+            ("geometry", t[0].into()),
+            ("resample", t[1].into()),
+            ("develop", t[2].into()),
+            ("color", t[3].into()),
+            ("cache", t[4].into()),
+        ]);
+        result_obj(&[
+            ("pixels", js_buf(buf)),
+            ("w", (tw as u32).into()),
+            ("h", (th as u32).into()),
+            ("timings", timings),
+        ])
+    })
+}
+
 /// Resample via OffscreenCanvas 2D (same bilinear path as the app's canvas).
 fn resample(pixels: &[u8], w: usize, h: usize, tw: usize, th: usize) -> Vec<u8> {
     let fallback = || nearest_resample(pixels, w, h, tw, th);
@@ -299,7 +464,7 @@ fn downscale(pixels: &[u8], w: usize, h: usize, long_edge: u32) -> (Vec<u8>, usi
 /// bakes rotation into the result and keeps the crop, which is applied at
 /// render time over the working frame.
 fn commit(full: &mut Vec<u8>, fw: &mut usize, fh: &mut usize, base: &[u8], w: usize, h: usize) {
-    clear_base_cache();
+    clear_render_caches();
     full.clear();
     full.extend_from_slice(base);
     *fw = w;

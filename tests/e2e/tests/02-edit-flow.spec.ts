@@ -181,6 +181,80 @@ test.describe('24MP JPEG: import → edit → export', () => {
     recordMetrics(testInfo, { export_1x1_ms: exportMs, export_w: dims.w, export_h: dims.h, export_bytes: bytes.length, export_chroma_sampling: ySampling, export_progressive: sof.marker === 0xc2 });
   });
 
+  test('crop view renders at display density and matches the export', async ({ page }, testInfo) => {
+    await openApp(page);
+    await importFiles(page, [JPEG_A]);
+    await waitCanvasWidthAbove(page, 1200, 20_000);
+    await clickTab(page, 'Crop');
+    await page.locator('.chip', { hasText: /^1:1$/ }).click();
+    await clickTab(page, 'Color');
+    // The cropped view renders only the 4000x4000 crop window: a 1600px window
+    // over a 1280px device raster is denser than the screen.
+    const minSide = () => canvasSize(page).then((s) => Math.min(s.w, s.h));
+    await expect.poll(minSide, { timeout: 20_000 }).toBeGreaterThanOrEqual(1500);
+    await page.waitForTimeout(150); // let the cropped --ar CSS size settle
+    const backing = await canvasSize(page);
+    const dpr = await page.evaluate(() => devicePixelRatio);
+    const ratio = backing.w / (backing.cw * dpr);
+    expect(ratio, 'crop backing must be at least device density').toBeGreaterThanOrEqual(1.0);
+    // A colour-only edit keeps geometry/crop/target, so the worker reuses the
+    // window rows it copied out of the full frame.
+    await setRange(page, /^Brightness/, 0.25);
+    await expect.poll(minSide, { timeout: 20_000 }).toBeGreaterThanOrEqual(1500);
+    await setRange(page, /^Contrast/, 0.2);
+    await expect.poll(minSide, { timeout: 20_000 }).toBeGreaterThanOrEqual(1500);
+    const windowMarks = await page.evaluate(() => {
+      const p = ((window as any).__pes?.perf() as any[] | undefined) ?? [];
+      return {
+        renders: p.filter((e) => e.name === 'worker.render_window').map((e) => Math.round(e.dur_ms * 10) / 10),
+        cache: p.filter((e) => e.name === 'worker.render_window.cache').map((e) => Math.round(e.dur_ms)),
+      };
+    });
+    expect(windowMarks.renders.length, 'window renders must go through the worker').toBeGreaterThan(0);
+    expect(windowMarks.cache, 'a colour-only edit should hit the window cache').toContain(1);
+    // The on-screen crop and the exported crop share one tone pipeline and one
+    // framing; compare both downscaled (grain is off, so only resample/JPEG
+    // noise remains).
+    await page.evaluate(() => {
+      const c = document.querySelector('.canvas-wrap canvas') as HTMLCanvasElement;
+      const n = 512;
+      const t = document.createElement('canvas'); t.width = n; t.height = n;
+      const x = t.getContext('2d')!;
+      x.drawImage(c, 0, 0, c.width, c.height, 0, 0, n, n);
+      (window as any).__qaCropPrev = x.getImageData(0, 0, n, n).data;
+    });
+    await clickTab(page, 'Export');
+    const [dl] = await Promise.all([
+      page.waitForEvent('download', { timeout: 60_000 }),
+      page.locator('button.btn.primary', { hasText: 'Download this' }).click(),
+    ]);
+    const bytes = fs.readFileSync((await dl.path())!);
+    expect(bytes.subarray(0, 2)).toEqual(Buffer.from([0xff, 0xd8]));
+    const mae = await page.evaluate(async ({ b64, n }) => {
+      const bin = atob(b64); const u8 = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+      const bmp = await createImageBitmap(new Blob([u8], { type: 'image/jpeg' }));
+      const t = document.createElement('canvas'); t.width = n; t.height = n;
+      const x = t.getContext('2d')!;
+      x.drawImage(bmp, 0, 0, bmp.width, bmp.height, 0, 0, n, n);
+      const b = x.getImageData(0, 0, n, n).data;
+      const a = (window as any).__qaCropPrev as Uint8ClampedArray;
+      let sum = 0;
+      for (let i = 0; i < a.length; i += 4) {
+        sum += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
+      }
+      return sum / (n * n * 3);
+    }, { b64: bytes.toString('base64'), n: 512 });
+    expect(mae, `preview vs export MAE (255ths) was ${mae.toFixed(2)}`).toBeLessThanOrEqual(2);
+    recordMetrics(testInfo, {
+      crop_backing_ratio: Math.round(ratio * 100) / 100, crop_backing_w: backing.w, crop_backing_h: backing.h,
+      crop_window_render_ms: Math.max(...windowMarks.renders),
+      crop_window_cache_hits: windowMarks.cache.filter((v) => v === 1).length,
+      crop_window_cache_misses: windowMarks.cache.filter((v) => v === 0).length,
+      crop_preview_mae: Math.round(mae * 100) / 100,
+    });
+  });
+
   test('"Download N edited" produces ONE zip containing every edited item (issue #1)', async ({ page }, testInfo) => {
     await openApp(page);
     await importFiles(page, [JPEG_A, JPEG_B]);

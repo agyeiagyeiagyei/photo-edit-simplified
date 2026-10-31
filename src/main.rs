@@ -1945,12 +1945,45 @@ async fn render_text_overlay(t: &state::TextLayer, w: usize, h: usize) -> Result
 /// the sharpness is worth.
 const HI_MAX_EDGE: usize = 3200;
 
+/// The cropped view renders only its crop window, so that window can afford
+/// native density far past the whole-frame cap.
+const WINDOW_MAX_EDGE: usize = 4096;
+
 struct HiCache {
     item_id: usize,
-    fingerprint: u64,
+    edit_fp: u64,
+    source_fp: u64,
     canvas: web_sys::HtmlCanvasElement,
     w: usize,
     h: usize,
+}
+
+/// Crop-window render for the cropped view: the canvas holds only the crop
+/// region at display (up to native) density.
+struct HiWindow {
+    item_id: usize,
+    edit_fp: u64,
+    source_fp: u64,
+    /// Crop rect bits (normalized x, y, w, h). The same normalized region is
+    /// the same framing even when the source's pixel density changes, so a
+    /// proxy→full swap keeps the old window on screen while it re-renders.
+    crop: [u32; 4],
+    canvas: web_sys::HtmlCanvasElement,
+    w: usize,
+    h: usize,
+}
+
+/// Which sharp frame currently backs the canvas, for mapping overlays from
+/// preview working coordinates onto it.
+enum Sharp {
+    /// Whole working image from [`HiCache`].
+    Whole { w: usize },
+    /// Crop window from [`HiWindow`]; `cw` is the crop width in preview px.
+    Window { w: usize, cw: usize },
+}
+
+fn crop_key(c: &state::CropRect) -> [u32; 4] {
+    [c.x.to_bits(), c.y.to_bits(), c.w.to_bits(), c.h.to_bits()]
 }
 
 struct PreviewGeo {
@@ -1965,6 +1998,9 @@ struct PreviewGeo {
 
 thread_local! {
     static HI_CACHE: RefCell<Option<HiCache>> = const { RefCell::new(None) };
+    /// Crop-window render for the cropped view (separate from the whole-frame
+    /// cache: it holds a different region at a different density).
+    static HI_WINDOW: RefCell<Option<HiWindow>> = const { RefCell::new(None) };
     /// Rotated/fine-angle preview, reused across colour-only renders. The
     /// identity transform is not cached — callers borrow the source directly.
     static PREVIEW_GEO: RefCell<Option<PreviewGeo>> = const { RefCell::new(None) };
@@ -2019,13 +2055,13 @@ fn preview_geometry_cached(
     })
 }
 
-/// Content identity for the hi cache: everything that changes the rendered
-/// pixels EXCEPT the crop rect (crop only reframes the blit).
-fn content_fingerprint(item: &MediaItem, photo_gen: u64, proxy_gen: u64) -> u64 {
+/// Edit identity for the hi caches: everything in the recipe and layer set
+/// that changes rendered pixels EXCEPT the crop rect (crop only reframes the
+/// blit) and the source generation (kept separate so a source swap can show
+/// the stale frame while the new one renders).
+fn edit_fingerprint(item: &MediaItem) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    h.write_u64(photo_gen);
-    h.write_u64(proxy_gen);
     let e = &item.edit;
     h.write_u8(e.rot90);
     for v in [e.fine_angle, e.brightness, e.contrast, e.saturation, e.warmth, e.blur, e.grain] {
@@ -2152,6 +2188,16 @@ fn content_fingerprint(item: &MediaItem, photo_gen: u64, proxy_gen: u64) -> u64 
     h.finish()
 }
 
+/// Identity of the pixels a render was produced from: the preview generation
+/// and the RAW proxy generation.
+fn source_fingerprint(photo_gen: u64, proxy_gen: u64) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    h.write_u64(photo_gen);
+    h.write_u64(proxy_gen);
+    h.finish()
+}
+
 /// Resize a pixel buffer to exact dims via a canvas round-trip.
 fn resample_pixels(pixels: &[u8], w: usize, h: usize, tw: usize, th: usize) -> Vec<u8> {
     let src = web::create_canvas(w as u32, h as u32);
@@ -2167,7 +2213,8 @@ fn resample_pixels(pixels: &[u8], w: usize, h: usize, tw: usize, th: usize) -> V
 /// resolution. Mirrors the preview pipeline and export.
 fn render_hi(item: &MediaItem, req_w: f64, req_h: f64) -> Option<HiCache> {
     let photo = get_photo(item.id)?;
-    let fingerprint = content_fingerprint(item, photo.gen, proxy_gen(item.id));
+    let edit_fp = edit_fingerprint(item);
+    let source_fp = source_fingerprint(photo.gen, proxy_gen(item.id));
     let (fpix, fw, fh) = photo.full.as_ref()?;
     let src = fpix.as_cow();
     let (p, ww, wh) = geometry(&src, *fw, *fh, &item.edit);
@@ -2191,7 +2238,7 @@ fn render_hi(item: &MediaItem, req_w: f64, req_h: f64) -> Option<HiCache> {
     let canvas = web::create_canvas(tw as u32, th as u32);
     web::put_pixels(&canvas, &buf, tw as u32, th as u32);
     composite_layers(&canvas, &item.layers, tw, th);
-    Some(HiCache { item_id: item.id, fingerprint, canvas, w: tw, h: th })
+    Some(HiCache { item_id: item.id, edit_fp, source_fp, canvas, w: tw, h: th })
 }
 
 fn video_export_dims(edit: &EditParams, w: usize, h: usize) -> (usize, usize, usize, usize, usize, usize) {
@@ -3502,11 +3549,13 @@ fn CanvasLoupe(
             }
         }
 
-        let fp = content_fingerprint(&item, photo.gen, proxy_gen(id));
+        let edit_fp = edit_fingerprint(&item);
+        let source_fp = source_fingerprint(photo.gen, proxy_gen(id));
         let hit = CANVAS_LOUPE_HI.with(|c| {
             let b = c.borrow();
             let hi = b.as_ref()?;
-            (hi.item_id == id && hi.fingerprint == fp).then(|| (hi.canvas.clone(), hi.w, hi.h))
+            (hi.item_id == id && hi.edit_fp == edit_fp && hi.source_fp == source_fp)
+                .then(|| (hi.canvas.clone(), hi.w, hi.h))
         });
         if let Some((hi_canvas, hw, hh)) = hit {
             // The cached render covers the whole working frame; map the
@@ -3597,7 +3646,8 @@ fn CanvasLoupe(
                         composite_layers(&c, &item_cb.layers, r.w as usize, r.h as usize);
                         Some(HiCache {
                             item_id: id,
-                            fingerprint: fp,
+                            edit_fp,
+                            source_fp,
                             canvas: c,
                             w: r.w as usize,
                             h: r.h as usize,
@@ -6342,40 +6392,75 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         let (fw, fh) = working_dims(sw, sh, &item.edit);
         let target = hi_target(req_w, req_h, fw, fh, HI_MAX_EDGE as u32);
 
-        let mut hi_dims: Option<(usize, usize)> = None;
+        // Sharp backing for the canvas. The cropped view prefers a crop-window
+        // render (native density up to WINDOW_MAX_EDGE); the whole-frame hi
+        // cache still serves the full view and backs the cropped one when a
+        // window is not available (worker down → sync fallback).
+        let edit_fp = edit_fingerprint(&item);
+        let src_fp = source_fingerprint(photo.gen, proxy_gen(item.id));
+        let (cx_px, cy_px, cw_p, _) = crop_px(&item.edit, w, h);
+        let (cx_p, cy_p) = (cx_px as f64, cy_px as f64);
+        let mut sharp: Option<Sharp> = None;
+        // A sharp frame from an older source stays on screen while the new
+        // one renders, so a RAW proxy upgrade never flashes the soft preview.
+        let mut stale_source = false;
         if want_hi {
-            let fp = content_fingerprint(&item, photo.gen, proxy_gen(item.id));
-            hi_dims = HI_CACHE.with(|c| {
-                let b = c.borrow();
-                let hi = b.as_ref()?;
-                if hi.item_id != item.id || hi.fingerprint != fp {
-                    return None;
-                }
-                if hi.w < target.0 || hi.h < target.1 {
-                    return None;
-                }
-                if cropped_view {
-                    let (cx2, cy2, cw2, ch2) = crop_px(&item.edit, hi.w, hi.h);
-                    canvas.set_width(cw2 as u32);
-                    canvas.set_height(ch2 as u32);
+            if cropped_view {
+                let (_, _, fcw, fch) = crop_px(&item.edit, fw, fh);
+                let win_target = hi_target(need_w, need_h, fcw, fch, WINDOW_MAX_EDGE as u32);
+                let key = crop_key(&crop);
+                sharp = HI_WINDOW.with(|c| {
+                    let b = c.borrow();
+                    let win = b.as_ref()?;
+                    if win.item_id != item.id || win.edit_fp != edit_fp || win.crop != key {
+                        return None;
+                    }
+                    if win.w < win_target.0 || win.h < win_target.1 {
+                        return None;
+                    }
+                    canvas.set_width(win.w as u32);
+                    canvas.set_height(win.h as u32);
                     web::ctx2d(&canvas)
-                        .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
-                            &hi.canvas, cx2 as f64, cy2 as f64, cw2 as f64, ch2 as f64,
-                            0.0, 0.0, cw2 as f64, ch2 as f64,
-                        )
+                        .draw_image_with_html_canvas_element(&win.canvas, 0.0, 0.0)
                         .unwrap();
-                } else {
-                    canvas.set_width(hi.w as u32);
-                    canvas.set_height(hi.h as u32);
-                    web::ctx2d(&canvas)
-                        .draw_image_with_html_canvas_element(&hi.canvas, 0.0, 0.0)
-                        .unwrap();
-                }
-                Some((hi.w, hi.h))
-            });
+                    stale_source = win.source_fp != src_fp;
+                    Some(Sharp::Window { w: win.w, cw: cw_p })
+                });
+            }
+            if sharp.is_none() {
+                sharp = HI_CACHE.with(|c| {
+                    let b = c.borrow();
+                    let hi = b.as_ref()?;
+                    if hi.item_id != item.id || hi.edit_fp != edit_fp {
+                        return None;
+                    }
+                    if hi.w < target.0 || hi.h < target.1 {
+                        return None;
+                    }
+                    if cropped_view {
+                        let (cx2, cy2, cw2, ch2) = crop_px(&item.edit, hi.w, hi.h);
+                        canvas.set_width(cw2 as u32);
+                        canvas.set_height(ch2 as u32);
+                        web::ctx2d(&canvas)
+                            .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+                                &hi.canvas, cx2 as f64, cy2 as f64, cw2 as f64, ch2 as f64,
+                                0.0, 0.0, cw2 as f64, ch2 as f64,
+                            )
+                            .unwrap();
+                    } else {
+                        canvas.set_width(hi.w as u32);
+                        canvas.set_height(hi.h as u32);
+                        web::ctx2d(&canvas)
+                            .draw_image_with_html_canvas_element(&hi.canvas, 0.0, 0.0)
+                            .unwrap();
+                    }
+                    stale_source = hi.source_fp != src_fp;
+                    Some(Sharp::Whole { w: hi.w })
+                });
+            }
         }
 
-        if hi_dims.is_none() {
+        if sharp.is_none() {
             if item.edit.is_color_touched() {
                 if let Some(sel) = &item.edit.selection {
                     let mask = ops::selection_mask(sel, w, h);
@@ -6411,67 +6496,80 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 web::put_pixels(&canvas, &p, w as u32, h as u32);
                 composite_layers(&canvas, &item.layers, w, h);
             }
-            if want_hi {
-                // Sharp frame lands 60ms after edits settle; until then the
-                // cheap preview render keeps drags responsive. The worker's
-                // base cache makes the follow-up render cheap, so a short
-                // debounce no longer buys a costly re-decode of the frame.
-                HI_DEBOUNCE.with(|d| d.set(d.get() + 1));
-                let gen = HI_DEBOUNCE.with(|d| d.get());
-                let cb = Closure::once(move || {
-                    if HI_DEBOUNCE.with(|d| d.get()) != gen {
-                        return;
-                    }
-                    let Some(item) = state.current() else { return };
-                    if item.kind != MediaKind::Photo {
-                        return;
-                    }
-                    if !full_present(item.id) && !proxy_in_mem(item.id) {
-                        // Pixels not decoded yet — kick the loader; its
-                        // completion nudge retriggers this effect and
-                        // reschedules the hi-res render.
-                        ensure_proxy(state, item.id, true);
-                        return;
-                    }
-                    let Some(photo) = get_photo(item.id) else { return };
-                    let (src_id, _) = render_source(item.id, &photo);
-                    HI_REQ_GEN.with(|d| d.set(d.get() + 1));
-                    let rgen = HI_REQ_GEN.with(|d| d.get());
-                    let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
-                    let sel = item.edit.selection.clone();
-                    let fp = Some(content_fingerprint(&item, photo.gen, proxy_gen(item.id)));
-                    let item_id = item.id;
-                    let item_cb = item.clone();
-                    let request =
-                        perf::Span::new("hi.request").detail(format!("{}x{}", req_w, req_h));
+        }
+        if want_hi && (sharp.is_none() || stale_source) {
+            // Sharp frame lands 60ms after edits settle; until then the
+            // cheap preview render keeps drags responsive. The worker's
+            // base cache makes the follow-up render cheap, so a short
+            // debounce no longer buys a costly re-decode of the frame.
+            HI_DEBOUNCE.with(|d| d.set(d.get() + 1));
+            let gen = HI_DEBOUNCE.with(|d| d.get());
+            let cb = Closure::once(move || {
+                if HI_DEBOUNCE.with(|d| d.get()) != gen {
+                    return;
+                }
+                let Some(item) = state.current() else { return };
+                if item.kind != MediaKind::Photo {
+                    return;
+                }
+                if !full_present(item.id) && !proxy_in_mem(item.id) {
+                    // Pixels not decoded yet — kick the loader; its
+                    // completion nudge retriggers this effect and
+                    // reschedules the hi-res render.
+                    ensure_proxy(state, item.id, true);
+                    return;
+                }
+                let Some(photo) = get_photo(item.id) else { return };
+                let (src_id, (sw2, sh2)) = render_source(item.id, &photo);
+                let (fw2, fh2) = working_dims(sw2, sh2, &item.edit);
+                HI_REQ_GEN.with(|d| d.set(d.get() + 1));
+                let rgen = HI_REQ_GEN.with(|d| d.get());
+                let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
+                let sel = item.edit.selection.clone();
+                let edit_fp = edit_fingerprint(&item);
+                let source_fp = source_fingerprint(photo.gen, proxy_gen(item.id));
+                let item_id = item.id;
+                let item_cb = item.clone();
+                if cropped_view {
+                    let (fcx, fcy, fcw, fch) = crop_px(&item.edit, fw2, fh2);
+                    let win_target =
+                        hi_target(need_w, need_h, fcw, fch, WINDOW_MAX_EDGE as u32);
+                    let request = perf::Span::new("hi.request")
+                        .detail(format!("{}x{}", win_target.0, win_target.1));
                     let hi_t0 = perf::now();
-                    let accepted = pworker::render(
+                    let accepted = pworker::render_window(
                         src_id,
                         &recipe,
-                        req_w,
-                        req_h,
-                        HI_MAX_EDGE as u32,
+                        need_w,
+                        need_h,
+                        WINDOW_MAX_EDGE as u32,
                         sel.as_ref(),
                         move |reply| {
                             if HI_REQ_GEN.with(|d| d.get()) != rgen {
                                 return;
                             }
-                            match (reply, fp) {
-                                (Ok(r), Some(fp)) => {
+                            match reply {
+                                Ok(r) => {
                                     perf::record("hi.worker_reply", perf::now() - hi_t0);
                                     let blit = perf::Span::new("hi.blit");
                                     let canvas = web::create_canvas(r.w, r.h);
                                     web::put_pixels_view(&canvas, &r.pixels, r.w, r.h);
-                                    composite_layers(
-                                        &canvas,
-                                        &item_cb.layers,
-                                        r.w as usize,
-                                        r.h as usize,
-                                    );
-                                    HI_CACHE.with(|c| {
-                                        *c.borrow_mut() = Some(HiCache {
+                                    // Layers live in working-image coords;
+                                    // scale/translate them onto the window.
+                                    let ctx = web::ctx2d(&canvas);
+                                    let sx = r.w as f64 / fcw as f64;
+                                    let sy = r.h as f64 / fch as f64;
+                                    let _ = ctx.scale(sx, sy);
+                                    let _ = ctx.translate(-(fcx as f64), -(fcy as f64));
+                                    composite_layers(&canvas, &item_cb.layers, fw2, fh2);
+                                    let _ =
+                                        ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+                                    HI_WINDOW.with(|c| {
+                                        *c.borrow_mut() = Some(HiWindow {
                                             item_id,
-                                            fingerprint: fp,
+                                            edit_fp,
+                                            source_fp,
+                                            crop: crop_key(&item_cb.edit.crop),
                                             canvas,
                                             w: r.w as usize,
                                             h: r.h as usize,
@@ -6497,35 +6595,94 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                             state.hi_built.update(|g| *g += 1);
                         }
                     }
-                });
-                let _ = web::window().set_timeout_with_callback_and_timeout_and_arguments_0(
-                    cb.as_ref().unchecked_ref(),
-                    60,
-                );
-                cb.forget();
-            }
+                } else {
+                    let request =
+                        perf::Span::new("hi.request").detail(format!("{}x{}", req_w, req_h));
+                    let hi_t0 = perf::now();
+                    let accepted = pworker::render(
+                        src_id,
+                        &recipe,
+                        req_w,
+                        req_h,
+                        HI_MAX_EDGE as u32,
+                        sel.as_ref(),
+                        move |reply| {
+                            if HI_REQ_GEN.with(|d| d.get()) != rgen {
+                                return;
+                            }
+                            match reply {
+                                Ok(r) => {
+                                    perf::record("hi.worker_reply", perf::now() - hi_t0);
+                                    let blit = perf::Span::new("hi.blit");
+                                    let canvas = web::create_canvas(r.w, r.h);
+                                    web::put_pixels_view(&canvas, &r.pixels, r.w, r.h);
+                                    composite_layers(
+                                        &canvas,
+                                        &item_cb.layers,
+                                        r.w as usize,
+                                        r.h as usize,
+                                    );
+                                    HI_CACHE.with(|c| {
+                                        *c.borrow_mut() = Some(HiCache {
+                                            item_id,
+                                            edit_fp,
+                                            source_fp,
+                                            canvas,
+                                            w: r.w as usize,
+                                            h: r.h as usize,
+                                        })
+                                    });
+                                    state.hi_built.update(|g| *g += 1);
+                                    drop(blit);
+                                }
+                                _ => {
+                                    perf::record("hi.worker_reply", perf::now() - hi_t0);
+                                    if let Some(hi) = render_hi(&item_cb, req_w, req_h) {
+                                        HI_CACHE.with(|c| *c.borrow_mut() = Some(hi));
+                                        state.hi_built.update(|g| *g += 1);
+                                    }
+                                }
+                            }
+                        },
+                    );
+                    drop(request);
+                    if !accepted {
+                        if let Some(hi) = render_hi(&item, req_w, req_h) {
+                            HI_CACHE.with(|c| *c.borrow_mut() = Some(hi));
+                            state.hi_built.update(|g| *g += 1);
+                        }
+                    }
+                }
+            });
+            let _ = web::window().set_timeout_with_callback_and_timeout_and_arguments_0(
+                cb.as_ref().unchecked_ref(),
+                60,
+            );
+            cb.forget();
         }
 
         // Overlay draws below use full-image preview pixel coords; map them
-        // onto the canvas backing (hi-res scale and/or the crop offset).
-        let (cx_p, cy_p) = if cropped_view {
-            let (cx, cy, _, _) = crop_px(&item.edit, w, h);
-            (cx as f64, cy as f64)
-        } else {
-            (0.0, 0.0)
-        };
+        // onto the canvas backing (sharp-frame scale and/or the crop offset).
         let ctx = web::ctx2d(&canvas);
-        let overlay_open = match (hi_dims, cropped_view) {
-            (Some((hw, _)), true) => {
+        let overlay_open = match (&sharp, cropped_view) {
+            (Some(Sharp::Window { w: win_w, cw }), _) => {
                 ctx.save();
-                let s = hw as f64 / w as f64;
+                let s = *win_w as f64 / *cw as f64;
                 let _ = ctx.scale(s, s);
                 let _ = ctx.translate(-cx_p, -cy_p);
                 true
             }
-            (Some((hw, _)), false) => {
+            (Some(Sharp::Whole { w: hw }), true) => {
                 ctx.save();
-                let _ = ctx.scale(hw as f64 / w as f64, hw as f64 / w as f64);
+                let s = *hw as f64 / w as f64;
+                let _ = ctx.scale(s, s);
+                let _ = ctx.translate(-cx_p, -cy_p);
+                true
+            }
+            (Some(Sharp::Whole { w: hw }), false) => {
+                ctx.save();
+                let s = *hw as f64 / w as f64;
+                let _ = ctx.scale(s, s);
                 true
             }
             (None, true) => {
