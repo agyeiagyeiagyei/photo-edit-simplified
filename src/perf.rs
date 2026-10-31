@@ -148,9 +148,10 @@ fn reset() {
     RING_BUF.with(|r| r.borrow_mut().clear());
 }
 
-/// `{main, raw_worker}` wasm linear-memory bytes. wasm never shrinks, so the
-/// main figure is its high-water; the RAW worker's is the max `mem` reported
-/// by develop replies.
+/// `{main, raw_worker, raw_pool}` wasm linear-memory bytes. wasm never shrinks,
+/// so the main figure is its high-water; `raw_worker` is the max `mem` reported
+/// by develop replies, and `raw_pool` the peak sum across batch pool workers
+/// (0 when no batch import has run).
 fn mem() -> JsValue {
     let main = Reflect::get(&wasm_bindgen::memory(), &JsValue::from_str("buffer"))
         .ok()
@@ -163,6 +164,11 @@ fn mem() -> JsValue {
         &o,
         &JsValue::from_str("raw_worker"),
         &JsValue::from(crate::pworker::raw_mem_high()),
+    );
+    let _ = Reflect::set(
+        &o,
+        &JsValue::from_str("raw_pool"),
+        &JsValue::from(crate::pworker::raw_pool_mem_high()),
     );
     o.into()
 }

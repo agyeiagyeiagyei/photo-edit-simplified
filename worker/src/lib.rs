@@ -446,13 +446,23 @@ pub fn extract(
     })
 }
 
-fn proxy_result(px: Vec<u8>, w: usize, h: usize, full_w: usize, full_h: usize) -> JsValue {
+fn proxy_result(
+    px: Vec<u8>,
+    w: usize,
+    h: usize,
+    full_w: usize,
+    full_h: usize,
+    tone: Option<[u8; 256]>,
+) -> JsValue {
     result_obj(&[
         ("pixels", js_buf(px)),
         ("w", (w as u32).into()),
         ("h", (h as u32).into()),
         ("full_w", (full_w as u32).into()),
         ("full_h", (full_h as u32).into()),
+        // The tone curve used for these pixels; the export develop reuses it
+        // so display and export share one response. Null for camera JPEGs.
+        ("tone", tone.map(|t| js_buf(t.to_vec())).unwrap_or(JsValue::NULL)),
         ("mem", wasm_mem_bytes().into()),
     ])
 }
@@ -461,20 +471,29 @@ fn proxy_result(px: Vec<u8>, w: usize, h: usize, full_w: usize, full_h: usize) -
 /// import previews never block the main thread or need the full buffer. Large
 /// Bayer sensors develop at half size (2×2 binning); a full-size frame stays
 /// here for `raw_develop` to reuse, and either way the tone curve does.
+/// `retain` keeps those caches — false on the batch pool, whose frame the
+/// interactive worker's export can never reuse.
 #[wasm_bindgen]
-pub fn raw_proxy(id: u32, bytes: Uint8Array, max_edge: u32) -> Result<JsValue, JsValue> {
+pub fn raw_proxy(
+    id: u32,
+    bytes: Uint8Array,
+    max_edge: u32,
+    retain: bool,
+) -> Result<JsValue, JsValue> {
     let p = rawcore::decode_raw_proxy(&bytes.to_vec(), max_edge)
         .map_err(|e| JsValue::from_str(&e))?;
     let (px, pw, ph) = downscale(&p.rgba, p.w, p.h, max_edge);
-    RAW_FULL.with(|c| {
-        *c.borrow_mut() = if p.half {
-            None
-        } else {
-            Some((id, p.rgba, p.w, p.h))
-        }
-    });
-    RAW_TONE.with(|c| *c.borrow_mut() = p.tone.map(|t| (id, t)));
-    Ok(proxy_result(px, pw, ph, p.full_w, p.full_h))
+    if retain {
+        RAW_FULL.with(|c| {
+            *c.borrow_mut() = if p.half {
+                None
+            } else {
+                Some((id, p.rgba, p.w, p.h))
+            }
+        });
+        RAW_TONE.with(|c| *c.borrow_mut() = p.tone.map(|t| (id, t)));
+    }
+    Ok(proxy_result(px, pw, ph, p.full_w, p.full_h, p.tone))
 }
 
 /// Decode the camera's embedded full-size JPEG (no EXIF of its own) into a
@@ -484,7 +503,7 @@ pub fn camera_proxy(jpeg: Uint8Array, orientation: u16, max_edge: u32) -> Result
     let (rgba, w, h) = rawcore::camera_jpeg_rgba(&jpeg.to_vec(), orientation)
         .ok_or_else(|| JsValue::from_str("camera JPEG decode failed"))?;
     let (px, pw, ph) = downscale(&rgba, w, h, max_edge);
-    Ok(proxy_result(px, pw, ph, w, h))
+    Ok(proxy_result(px, pw, ph, w, h, None))
 }
 
 /// RAW metadata in one round-trip: EXIF payload, orientation, capture time,
@@ -524,9 +543,18 @@ pub fn raw_meta(bytes: Uint8Array, preview_edge: u32) -> Result<JsValue, JsValue
 /// Full sensor develop — the multi-second demosaic. Runs here so the app
 /// thread never blocks on RAW decoding. Reuses the last proxy develop's frame
 /// when it is the same item, or its tone curve when the proxy was half-size; a
-/// stale frame is dropped before developing.
+/// stale frame is dropped before developing. `tone` is the proxy's LUT when the
+/// app has one from another worker (the batch pool) — an empty array means the
+/// app has no curve for this item.
 #[wasm_bindgen]
-pub fn raw_develop(id: u32, bytes: Uint8Array) -> Result<JsValue, JsValue> {
+pub fn raw_develop(id: u32, bytes: Uint8Array, tone: Uint8Array) -> Result<JsValue, JsValue> {
+    let explicit: Option<[u8; 256]> = if tone.length() == 256 {
+        let mut lut = [0u8; 256];
+        tone.copy_to(&mut lut);
+        Some(lut)
+    } else {
+        None
+    };
     let cached = RAW_FULL.with(|c| {
         let mut slot = c.borrow_mut();
         let hit = slot.as_ref().map(|(cid, _, _, _)| *cid == id).unwrap_or(false);
@@ -540,15 +568,17 @@ pub fn raw_develop(id: u32, bytes: Uint8Array) -> Result<JsValue, JsValue> {
     let (rgba, w, h) = match cached {
         Some((_, rgba, w, h)) => (rgba, w, h),
         None => {
-            let tone = RAW_TONE.with(|c| {
-                let mut slot = c.borrow_mut();
-                let hit = slot.as_ref().is_some_and(|(cid, _)| *cid == id);
-                let taken = slot.take();
-                if hit {
-                    taken.map(|(_, t)| t)
-                } else {
-                    None
-                }
+            let tone = explicit.or_else(|| {
+                RAW_TONE.with(|c| {
+                    let mut slot = c.borrow_mut();
+                    let hit = slot.as_ref().is_some_and(|(cid, _)| *cid == id);
+                    let taken = slot.take();
+                    if hit {
+                        taken.map(|(_, t)| t)
+                    } else {
+                        None
+                    }
+                })
             });
             rawcore::decode_raw_with_tone(&bytes.to_vec(), tone.as_ref())
                 .map_err(|e| JsValue::from_str(&e))?
@@ -568,7 +598,7 @@ pub fn raw_preview(bytes: Uint8Array, max_edge: u32) -> Result<JsValue, JsValue>
     let (rgba, w, h) = rawcore::preview_rgba(&bytes.to_vec())
         .ok_or_else(|| JsValue::from_str("no embedded preview"))?;
     let (px, pw, ph) = downscale(&rgba, w, h, max_edge);
-    Ok(proxy_result(px, pw, ph, w, h))
+    Ok(proxy_result(px, pw, ph, w, h, None))
 }
 
 fn parse_pts(v: &JsValue) -> Vec<(f32, f32)> {

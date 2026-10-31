@@ -419,6 +419,19 @@ thread_local! {
     /// Newest hover decode. A request superseded while another decode runs is
     /// dropped; selected-item requests are never gated.
     static PROXY_DECODE_WANT: Cell<Option<usize>> = const { Cell::new(None) };
+    /// Tone curve fitted when an item's display proxy developed, keyed by item.
+    /// The export develop passes it explicitly so pixels match the screen even
+    /// when the develop runs in a fresh worker (pool develop, reload).
+    static RAW_TONES: RefCell<HashMap<usize, [u8; 256]>> = RefCell::new(HashMap::new());
+    /// Items whose display proxy a batch pool worker is developing. The
+    /// interactive pump must not start a duplicate develop for these.
+    static POOL_INFLIGHT: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+    /// Queued + in-flight pool develops for the current import batch.
+    static POOL_JOBS: Cell<usize> = const { Cell::new(0) };
+    /// Open ingest scopes (overlapping drops share one batch mark).
+    static POOL_SCOPES: Cell<usize> = const { Cell::new(0) };
+    static POOL_BATCH_START: Cell<f64> = const { Cell::new(0.0) };
+    static POOL_BATCH_FILES: Cell<usize> = const { Cell::new(0) };
 }
 
 fn proxy_wid(id: usize) -> usize {
@@ -476,6 +489,7 @@ fn drop_proxy(id: usize) {
 /// Full cleanup when an item leaves the session.
 fn purge_proxy(id: usize) {
     drop_proxy(id);
+    RAW_TONES.with(|t| t.borrow_mut().remove(&id));
     PROXY_GEN.with(|g| g.borrow_mut().remove(&id));
     PROXY_UPGRADE_WANT.with(|w| {
         if w.get() == Some(id) {
@@ -598,6 +612,9 @@ struct StoredProxy {
     /// records persisted before it. Both are handed to the worker as-is.
     bytes: JsValue,
     frame: (usize, usize),
+    /// Tone curve the pixels were developed with; absent for camera JPEGs and
+    /// records written before the curve was persisted.
+    tone: Option<[u8; 256]>,
 }
 
 fn camera_proxy_record(jpeg: &Uint8Array, orientation: u16, frame: (usize, usize)) -> JsValue {
@@ -614,13 +631,20 @@ fn camera_proxy_record(jpeg: &Uint8Array, orientation: u16, frame: (usize, usize
     o.into()
 }
 
-fn developed_proxy_record(blob: &Blob, frame: (usize, usize)) -> JsValue {
+fn developed_proxy_record(
+    blob: &Blob,
+    frame: (usize, usize),
+    tone: Option<[u8; 256]>,
+) -> JsValue {
     let o = js_sys::Object::new();
     session::jset(&o, "kind", "raw");
     session::jset(&o, "orientation", 1.0);
     session::jset(&o, "bytes", blob);
     session::jset(&o, "full_w", frame.0 as f64);
     session::jset(&o, "full_h", frame.1 as f64);
+    if let Some(t) = tone {
+        session::jset(&o, "tone", Uint8Array::from(&t[..]));
+    }
     o.into()
 }
 
@@ -640,7 +664,17 @@ fn parse_proxy_record(v: &JsValue) -> Option<StoredProxy> {
         state::jnum(v, "full_w").unwrap_or(0.0) as usize,
         state::jnum(v, "full_h").unwrap_or(0.0) as usize,
     );
-    Some(StoredProxy { kind, orientation, bytes, frame })
+    let tone = state::jget(v, "tone").and_then(|t| {
+        let b = Uint8Array::new(&t);
+        if b.length() == 256 {
+            let mut lut = [0u8; 256];
+            b.copy_to(&mut lut);
+            Some(lut)
+        } else {
+            None
+        }
+    });
+    Some(StoredProxy { kind, orientation, bytes, frame, tone })
 }
 
 async fn read_proxy_record(id: usize) -> Option<StoredProxy> {
@@ -696,7 +730,20 @@ async fn raw_proxy_async(id: usize, src: &JsValue) -> Option<pworker::ProxyResul
     let t0 = perf::now();
     let r = await_worker(move |cb| pworker::raw_proxy(id, &src, PROXY_EDGE, cb)).await;
     perf::record("proxy.raw_develop", perf::now() - t0);
+    store_tone(id, r.as_ref().and_then(|p| p.tone));
     r
+}
+
+fn store_tone(id: usize, tone: Option<[u8; 256]>) {
+    if let Some(t) = tone {
+        RAW_TONES.with(|m| {
+            m.borrow_mut().insert(id, t);
+        });
+    }
+}
+
+fn tone_of(id: usize) -> Option<[u8; 256]> {
+    RAW_TONES.with(|m| m.borrow().get(&id).copied())
 }
 
 /// RAW header metadata + preview from the raw worker.
@@ -717,8 +764,9 @@ async fn raw_meta_async(src: &JsValue, preview_edge: u32) -> Option<pworker::Raw
 /// the transferred buffer — no Rust copy on the app thread.
 async fn raw_develop_async(id: usize, src: &JsValue) -> Option<(Pixels, usize, usize)> {
     let src = src.clone();
+    let tone = tone_of(id);
     let t0 = perf::now();
-    let r = await_worker(move |cb| pworker::raw_develop(id, &src, cb)).await;
+    let r = await_worker(move |cb| pworker::raw_develop(id, &src, tone.as_ref(), cb)).await;
     perf::record("proxy.raw_develop_full", perf::now() - t0);
     r.map(|f| (Pixels::view(f.pixels), f.w, f.h))
 }
@@ -744,7 +792,7 @@ async fn raw_source_src(id: usize) -> Option<JsValue> {
 
 /// Decode a stored proxy record. A "raw" record is already sensor pixels —
 /// only a JPEG decode remains; a "camera" record still needs the WASM decode.
-async fn decode_stored_proxy(rec: StoredProxy) -> Option<DecodedProxy> {
+async fn decode_stored_proxy(id: usize, rec: StoredProxy) -> Option<DecodedProxy> {
     if rec.kind == "raw" {
         let blob = match rec.bytes.dyn_into::<Blob>() {
             Ok(b) => b,
@@ -753,6 +801,7 @@ async fn decode_stored_proxy(rec: StoredProxy) -> Option<DecodedProxy> {
         let (img, url) = web::load_image(&blob).await.ok()?;
         let _ = Url::revoke_object_url(&url);
         let (px, w, h) = web::rgba_from_image(&img);
+        store_tone(id, rec.tone);
         Some(DecodedProxy { pixels: Pixels::owned(px), w, h, frame: rec.frame, developed: true })
     } else {
         let r = camera_proxy_async(&rec.bytes, rec.orientation).await?;
@@ -803,7 +852,7 @@ async fn decode_proxy_source(id: usize, priority: bool) -> Option<DecodedProxy> 
         return None;
     }
     if let Some(rec) = read_proxy_record(id).await {
-        return decode_stored_proxy(rec).await;
+        return decode_stored_proxy(id, rec).await;
     }
     if !priority && PROXY_DECODE_WANT.with(|w| w.get()) != Some(id) {
         return None;
@@ -860,6 +909,13 @@ fn pump_upgrade(state: AppState) {
     if proxy_developed(id) {
         return;
     }
+    if POOL_INFLIGHT.with(|s| s.borrow().contains(&id)) {
+        // A batch worker is already developing this proxy: let its queued job
+        // jump ahead and land for the selection instead of developing twice.
+        pworker::raw_pool_prioritize(id);
+        schedule_pump(state, 600);
+        return;
+    }
     if pworker::raw_busy() {
         schedule_pump(state, 700);
         return;
@@ -884,7 +940,7 @@ fn pump_upgrade(state: AppState) {
             );
             if landed {
                 if let Some(p) = proxy_data(id) {
-                    persist_developed_proxy(id, p.pixels.clone(), p.w, p.h, p.frame);
+                    persist_developed_proxy(id, p.pixels.clone(), p.w, p.h, p.frame, tone_of(id));
                 }
             }
         }
@@ -895,7 +951,14 @@ fn pump_upgrade(state: AppState) {
 /// Persist a sensor-developed proxy as a q0.9 JPEG, so a reload skips both the
 /// RAW read and the demosaic. Skipped if the item stopped being lazy while the
 /// encode ran (heal/cut bake new pixels and purge proxy records).
-fn persist_developed_proxy(id: usize, px: Pixels, w: usize, h: usize, frame: (usize, usize)) {
+fn persist_developed_proxy(
+    id: usize,
+    px: Pixels,
+    w: usize,
+    h: usize,
+    frame: (usize, usize),
+    tone: Option<[u8; 256]>,
+) {
     spawn_local(async move {
         let canvas = web::create_canvas(w as u32, h as u32);
         px.put_on_canvas(&canvas, w as u32, h as u32);
@@ -911,8 +974,116 @@ fn persist_developed_proxy(id: usize, px: Pixels, w: usize, h: usize, frame: (us
             return;
         }
         let Ok(db) = session::open_db().await else { return };
-        let _ = session::put_proxy(&db, id, &developed_proxy_record(&blob, frame)).await;
+        let _ = session::put_proxy(&db, id, &developed_proxy_record(&blob, frame, tone)).await;
     });
+}
+
+/// Eagerly develop an imported RAW's display proxy on the batch pool, so a
+/// batch of files renders without each selection paying the demosaic and the
+/// interactive worker stays free for the selected item. Failures are silent:
+/// the item still upgrades on selection through the normal pump.
+fn develop_proxy_pool(state: AppState, id: usize, name: String) {
+    let eligible = CACHE.with(|c| {
+        c.borrow()
+            .photos
+            .get(&id)
+            .map(|p| p.raw && p.full.is_none())
+            .unwrap_or(false)
+    });
+    if !eligible || proxy_developed(id) {
+        return;
+    }
+    // The selected item keeps developing on the interactive worker: that worker
+    // retains a full-size proxy frame (non-superpixel sensors), which the export
+    // develop reuses. Batch files have no such reuse to lose.
+    if state.selected.get_untracked() == Some(id) {
+        return;
+    }
+    if !POOL_INFLIGHT.with(|s| s.borrow_mut().insert(id)) {
+        return;
+    }
+    pool_batch_add();
+    spawn_local(async move {
+        let t0 = perf::now();
+        let r = match raw_source_src(id).await {
+            Some(src) => {
+                await_worker(move |cb| pworker::raw_proxy_pool(id, &src, PROXY_EDGE, cb)).await
+            }
+            None => None,
+        };
+        if let Some(p) = r {
+            store_tone(id, p.tone);
+            let frame = if p.full_w > 0 && p.full_h > 0 {
+                (p.full_w, p.full_h)
+            } else {
+                (p.w, p.h)
+            };
+            let landed = land_proxy(
+                state,
+                id,
+                DecodedProxy {
+                    pixels: Pixels::view(p.pixels.clone()),
+                    w: p.w,
+                    h: p.h,
+                    frame,
+                    developed: true,
+                },
+            );
+            if landed {
+                persist_developed_proxy(id, Pixels::view(p.pixels), p.w, p.h, frame, p.tone);
+            }
+        }
+        perf::record_detail("pool.develop", perf::now() - t0, Some(name));
+        POOL_INFLIGHT.with(|s| s.borrow_mut().remove(&id));
+        pool_batch_done();
+    });
+}
+
+fn pool_batch_begin() {
+    if POOL_SCOPES.with(|s| s.get()) == 0 {
+        POOL_BATCH_START.with(|s| s.set(perf::now()));
+        POOL_BATCH_FILES.with(|f| f.set(0));
+    }
+    POOL_SCOPES.with(|s| s.set(s.get() + 1));
+}
+
+fn pool_batch_add() {
+    POOL_BATCH_FILES.with(|f| f.set(f.get() + 1));
+    POOL_JOBS.with(|j| j.set(j.get() + 1));
+}
+
+fn pool_batch_done() {
+    let left = POOL_JOBS.with(|j| j.get().saturating_sub(1));
+    POOL_JOBS.with(|j| j.set(left));
+    pool_batch_finish_if_idle();
+}
+
+fn pool_batch_end() {
+    let n = POOL_SCOPES.with(|s| s.get()).saturating_sub(1);
+    POOL_SCOPES.with(|s| s.set(n));
+    pool_batch_finish_if_idle();
+}
+
+/// Once the import has enqueued every RAW and the pool has drained, record the
+/// batch mark and terminate the pool workers — their wasm memory never shrinks
+/// and a batch develop measures ~450 MB per worker.
+fn pool_batch_finish_if_idle() {
+    if POOL_SCOPES.with(|s| s.get()) != 0 || POOL_JOBS.with(|j| j.get()) != 0 {
+        return;
+    }
+    let files = POOL_BATCH_FILES.with(|f| f.replace(0));
+    if files == 0 {
+        return;
+    }
+    let start = POOL_BATCH_START.with(|s| s.replace(0.0));
+    if start > 0.0 {
+        perf::record_detail(
+            "ingest.raw_batch",
+            perf::now() - start,
+            Some(format!("{files} files, pool {}", pworker::raw_pool_size())),
+        );
+    }
+    pworker::raw_pool_shutdown();
 }
 
 /// Make a display proxy available. Non-RAW items use the ordinary full decode.
@@ -1137,6 +1308,7 @@ fn main() {
 
 fn ingest_files(state: AppState, files: Vec<File>) {
     spawn_local(async move {
+        pool_batch_begin();
         for file in files {
             let name = file.name();
             let mtime = Some(file.last_modified() / 1000.0);
@@ -1213,6 +1385,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                     )
                 });
                 evict_full_lru();
+                let pool_name = name.clone();
                 let push = perf::Span::new("ingest.push").detail(name.clone());
                 push_item(state, MediaItem {
                     id,
@@ -1232,6 +1405,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                     drive_baked: false,
                 });
                 drop(push);
+                develop_proxy_pool(state, id, pool_name);
             } else {
                 state.busy.set(Some(format!("Loading {name}…")));
                 let mut blob: Blob = file.clone().into();
@@ -1324,6 +1498,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
             }
             state.busy.set(None);
         }
+        pool_batch_end();
     });
 }
 
@@ -1419,6 +1594,7 @@ async fn ingest_drive_bytes(
                 )
             });
             evict_full_lru();
+            let pool_name = name.clone();
             push_item(state, MediaItem {
                 id,
                 kind: MediaKind::Photo,
@@ -1436,6 +1612,7 @@ async fn ingest_drive_bytes(
                 drive_parent_id: Some(drive_parent_id),
                 drive_baked,
             });
+            develop_proxy_pool(state, id, pool_name);
         } else {
             let lname = name.to_lowercase();
             let mime = if lname.ends_with(".png") { "image/png" } else { "image/jpeg" };
@@ -4582,6 +4759,7 @@ fn import_drive_files(state: AppState, files: Vec<drive::DriveFile>, missing: Ve
             DRIVE_IMPORT_ACTIVE.with(|a| a.set(false));
             return;
         };
+        pool_batch_begin();
         let total = files.len() + missing.len();
         let mut done = 0;
         for f in files {
@@ -4608,6 +4786,7 @@ fn import_drive_files(state: AppState, files: Vec<drive::DriveFile>, missing: Ve
             }
         }
         state.busy.set(None);
+        pool_batch_end();
         DRIVE_IMPORT_ACTIVE.with(|a| a.set(false));
     });
 }

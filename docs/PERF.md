@@ -8,12 +8,15 @@ in-memory ring buffer.
 ```js
 window.__pes.perf()   // → [{ name, dur_ms, at, detail }, …], oldest first
 window.__pes.reset()  // clears the ring (the DevTools timeline is untouched)
-window.__pes.mem()    // → { main, raw_worker } wasm linear-memory bytes
+window.__pes.mem()    // → { main, raw_worker, raw_pool } wasm linear-memory bytes
 ```
 
 `__pes.mem()` is the memory high-water probe: wasm memory never shrinks, so
-`main` is the app worker's peak, and `raw_worker` is the max `mem` reported by
-RAW develop replies (0 until the first one).
+`main` is the app worker's peak, `raw_worker` is the max `mem` reported by
+RAW develop replies (0 until the first one), and `raw_pool` is the peak sum
+reported by the batch pool workers at their replies (0 until a batch import
+runs). Pool workers are terminated when the batch drains, so `raw_pool` is a
+peak, not current usage.
 
 `at` is `performance.now()` when the measure closed. `detail` is a free-form
 string (dimensions, item names) or `null`. Names are stable; the e2e suite and
@@ -42,6 +45,8 @@ cleared right after the measure so the timeline never accumulates marks.
 | `proxy.raw_meta` | one raw-worker round-trip: EXIF, capture time, preview, camera JPEG | — |
 | `raw.get_decoder` | first `rawler::get_decoder` in this worker (includes the camera-DB build) | — |
 | `proxy.raw_preview` | embedded RAW preview (no demosaic) at display size | — |
+| `pool.develop` | one batch-pool proxy develop: enqueue through landed | file name |
+| `ingest.raw_batch` | first pool enqueue of an import → last batch develop landed | `N files, pool K` |
 | `proxy.land` | installing a decoded proxy (cache, worker load, LRU) | item id |
 | `export.ensure_full` | waiting for full-res pixels to materialise | — |
 | `export.geometry` | geometry stage of the export pipeline | working `WxH` |
@@ -62,9 +67,32 @@ cleared right after the measure so the timeline never accumulates marks.
   sensors, X-Trans and 4-colour CFAs keep the normal demosaic.
 - The proxy's tone curve is fitted once against the camera preview and stored
   with it; the export develop (`decode_raw_with_tone`) reuses the same 256-byte
-  LUT, so display and export share one tone response.
+  LUT, so display and export share one tone response. The LUT also crosses
+  workers: every `raw_proxy` reply carries it, the app keeps it per item, and
+  `raw_develop` takes it as an explicit argument — so an export matches the
+  screen even when a different (fresh) worker develops. It is persisted inside
+  the developed proxy record, so a reload keeps display/export parity.
 - `PROXY_DEVELOP_DELAY_MS` (750 ms) debounces selection changes before the
   sensor develop starts; a changed selection drops any in-flight result.
+
+### Batch RAW pool
+
+A drop of many RAWs develops display proxies in a small pool of workers instead
+of serially behind the selected item:
+
+- Size: `clamp(hardwareConcurrency - 2, 1, 3)` capped at one worker per 2 GB of
+  `navigator.deviceMemory` (4 when absent). A 26 MP superpixel develop peaks
+  near 450 MB of pool-worker wasm memory on the reference VM, so `raw_pool`
+  in `__pes.mem()` is the number to watch.
+- Each pool worker runs exactly one op at a time: the worker bootstrap resolves
+  a Blob to bytes on message receipt, so queueing several would materialise
+  every file's bytes before the prior develop finishes.
+- The selected item is not pooled — it keeps developing on the interactive RAW
+  worker, which retains a full-size proxy frame for the export develop to
+  reuse. Selecting a pooled item mid-batch promotes its queued job to the front
+  and the pump waits for it instead of developing twice.
+- Pool develops do not retain frames (`retain: false`); the pool is terminated
+  when the import's jobs drain, releasing its wasm high-water.
 
 ### Zero-copy RAW sources
 
