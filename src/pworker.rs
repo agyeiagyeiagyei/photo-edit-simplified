@@ -1,6 +1,7 @@
-//! Client for the pixel worker (public/pixel-worker/run.js): hi-res renders
-//! and destructive pixel ops run off the main thread. Callers provide a sync
-//! fallback for when the worker is unavailable or errors.
+//! Client for the pixel worker (the fingerprinted
+//! public/pixel-worker/run.<hash>.js): hi-res renders and destructive pixel
+//! ops run off the main thread. Callers provide a sync fallback for when the
+//! worker is unavailable or errors.
 
 use js_sys::{Array, Object, Reflect, Uint8Array};
 use std::cell::{Cell, RefCell};
@@ -36,20 +37,46 @@ thread_local! {
     static RAW_DEAD: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Worker instance index.html created at parse time so its bundle downloads
+/// in parallel with the app wasm. Taken once; the RAW worker makes its own.
+fn adopt_precreated() -> Option<Worker> {
+    let win = web_sys::window()?;
+    let v = Reflect::get(win.as_ref(), &JsValue::from_str("__pesWorker")).ok()?;
+    if v.is_undefined() || v.is_null() {
+        return None;
+    }
+    let _ = Reflect::set(win.as_ref(), &JsValue::from_str("__pesWorker"), &JsValue::NULL);
+    v.dyn_into::<Worker>().ok()
+}
+
+/// Fingerprinted bootstrap path from `<meta name="pes-worker">` (written by
+/// the trunk post-build hook), resolved against the app directory.
+fn worker_url() -> Option<String> {
+    let win = web_sys::window()?;
+    let doc = win.document()?;
+    let el = doc.query_selector("meta[name=\"pes-worker\"]").ok().flatten()?;
+    let src = el.get_attribute("content")?;
+    if src.is_empty() {
+        return None;
+    }
+    let href = win.location().href().ok()?;
+    let i = href.rfind('/')?;
+    Some(format!("{}{}", &href[..=i], src))
+}
+
 pub fn init() {
     let started = WORKER.with(|w| w.borrow().is_some()) || DEAD.with(|d| d.get());
     if started {
         return;
     }
-    let Some(win) = web_sys::window() else { return };
-    let Ok(href) = win.location().href() else { return };
-    let Some(i) = href.rfind('/') else { return };
-    let url = format!("{}pixel-worker/run.js", &href[..=i]);
-    let opts = WorkerOptions::new();
-    opts.set_type(WorkerType::Module);
-    let worker = match Worker::new_with_options(&url, &opts) {
-        Ok(w) => w,
-        Err(_) => {
+    let worker = match adopt_precreated().or_else(|| {
+        let url = worker_url()?;
+        let opts = WorkerOptions::new();
+        opts.set_type(WorkerType::Module);
+        Worker::new_with_options(&url, &opts).ok()
+    }) {
+        Some(w) => w,
+        None => {
             DEAD.with(|d| d.set(true));
             return;
         }
@@ -154,10 +181,10 @@ fn raw_init() -> bool {
     if started {
         return RAW_WORKER.with(|w| w.borrow().is_some());
     }
-    let Some(win) = web_sys::window() else { return false };
-    let Ok(href) = win.location().href() else { return false };
-    let Some(i) = href.rfind('/') else { return false };
-    let url = format!("{}pixel-worker/run.js", &href[..=i]);
+    let Some(url) = worker_url() else {
+        RAW_DEAD.with(|d| d.set(true));
+        return false;
+    };
     let opts = WorkerOptions::new();
     opts.set_type(WorkerType::Module);
     let worker = match Worker::new_with_options(&url, &opts) {

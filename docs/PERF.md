@@ -49,8 +49,9 @@ cleared right after the measure so the timeline never accumulates marks.
 
 ## Worker marks
 
-`public/pixel-worker/run.js` times each op around the wasm call and returns
-`ms` with the reply; the app records it as:
+The worker bootstrap (built from `scripts/pixel-worker-run.js` into
+`public/pixel-worker/run.<hash>.js`) times each op around the wasm call and
+returns `ms` with the reply; the app records it as:
 
 | Name | Measures |
 |---|---|

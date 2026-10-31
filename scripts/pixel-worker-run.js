@@ -1,6 +1,7 @@
 // Pixel worker bootstrap: loads the wasm-bindgen bundle beside this file and
 // dispatches {id, op, args} messages. ArrayBuffers in results are transferred
 // back (zero-copy). Errors come back as {id, ok: false, error}.
+// build.sh rewrites the glue import below to the content-hashed filename.
 import init, * as api from './pixel_worker.js';
 
 const ready = init();

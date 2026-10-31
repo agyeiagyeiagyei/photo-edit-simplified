@@ -5,9 +5,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 main=$(ls dist/photo-edit-simplified-*_bg.wasm 2>/dev/null | head -1 || true)
-worker=dist/pixel-worker/pixel_worker_bg.wasm
+worker=$(ls dist/pixel-worker/pixel_worker_bg.*.wasm 2>/dev/null | head -1 || true)
 [ -n "$main" ] && [ -f "$main" ] || { echo "missing main wasm in dist — run trunk build"; exit 1; }
-[ -f "$worker" ] || { echo "missing worker wasm in dist"; exit 1; }
+[ -n "$worker" ] && [ -f "$worker" ] || { echo "missing worker wasm in dist"; exit 1; }
 
 main_gz=$(gzip -9c "$main" | wc -c)
 worker_gz=$(gzip -9c "$worker" | wc -c)

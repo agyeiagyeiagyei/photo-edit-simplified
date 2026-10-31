@@ -4,6 +4,23 @@
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
   <meta name="theme-color" content="#111111"/>
+  <!-- Filled in by the trunk post-build hook with the fingerprinted
+       pixel-worker/run.<hash>.js name; pworker::init reads it too. -->
+  <meta name="pes-worker" content=""/>
+  <script>
+    // Start the pixel worker before the app wasm so its bundle downloads in
+    // parallel; pworker::init adopts this instance instead of creating one.
+    (function () {
+      var meta = document.querySelector('meta[name="pes-worker"]');
+      var src = meta && meta.content;
+      if (!src) return;
+      try {
+        window.__pesWorker = new Worker(new URL(src, document.baseURI), { type: 'module' });
+      } catch (e) {
+        window.__pesWorker = null;
+      }
+    })();
+  </script>
   <title>photo-edit-simplified</title>
   <link rel="manifest" href="manifest.webmanifest"/>
   <link rel="icon" href="icon-192.png"/>
