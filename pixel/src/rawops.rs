@@ -324,6 +324,71 @@ pub fn tone_table(tone: &[u8; 256]) -> Vec<u16> {
     crate::wide::widen_table(&knots)
 }
 
+/// How far the highlight repair pulls the clip point down, as a fraction of
+/// the camera curve's top code.
+const TONE_TAIL_DROP: f32 = 0.12;
+
+/// The tone table for a render with `highlights` active. At zero this is
+/// [`tone_table`] exactly. Above zero the camera curve's clipped tail is
+/// replaced by a chord from an adaptive knee to the same top code: the camera
+/// tone saturates the top of the develop range (DSC05659: every code ≥190
+/// maps to 252), so a highlight edit applied before it would be invisible.
+/// The chord darkens the clipped region by [`TONE_TAIL_DROP`] of the top,
+/// spreads its formerly-identical inputs over the freed range, and stays
+/// monotone and darken-only — below the knee nothing moves.
+pub fn tone_table_for(tone: &[u8; 256], highlights: f32) -> Vec<u16> {
+    let hl = (highlights / 100.0).clamp(0.0, 1.0);
+    let mut knots = [0f32; 256];
+    for (k, &v) in knots.iter_mut().zip(tone.iter()) {
+        *k = v as f32;
+    }
+    if hl > 0.0 {
+        if let Some(repaired) = unclip_tail(&knots) {
+            for (k, r) in knots.iter_mut().zip(repaired) {
+                *k += hl * (r - *k);
+            }
+        }
+    }
+    crate::wide::widen_table(&knots)
+}
+
+/// The camera curve with its clipped tail replaced by the chord from the
+/// nearest knee that frees [`TONE_TAIL_DROP`] of the top at the clip point.
+/// None when the curve never reaches a plateau.
+fn unclip_tail(tone: &[f32; 256]) -> Option<[f32; 256]> {
+    let max = tone[255];
+    if max <= 0.0 {
+        return None;
+    }
+    let mut p0 = 256;
+    for i in (0..256).rev() {
+        if tone[i] < max {
+            p0 = i + 1;
+            break;
+        }
+    }
+    if p0 == 0 || p0 >= 256 {
+        return None;
+    }
+    let target = max * (1.0 - TONE_TAIL_DROP);
+    let mut knee = p0 - 1;
+    while knee > 0 {
+        let a = tone[knee];
+        let chord = a + (p0 - knee) as f32 * (max - a) / (255 - knee) as f32;
+        if chord <= target {
+            break;
+        }
+        knee -= 1;
+    }
+    let a = tone[knee];
+    let slope = (max - a) / (255 - knee) as f32;
+    let mut out = *tone;
+    for (p, slot) in out.iter_mut().enumerate().skip(knee) {
+        *slot = (a + (p - knee) as f32 * slope).min(tone[p]);
+    }
+    Some(out)
+}
+
 /// Apply the camera tone curve to a developed 16-bit sRGB frame. Alpha is
 /// untouched.
 pub fn apply_tone_wide(buf: &mut [u16], table: &[u16]) {
@@ -461,5 +526,63 @@ mod tests {
         develop_wide(&mut buf, 2, 1, &RawAdjust { exposure: 2.0, ..Default::default() });
         assert_ne!(buf[0], buf[4]);
         assert!(buf[4] > buf[0]);
+    }
+
+    fn clipped_curve() -> [u8; 256] {
+        let mut t = [0u8; 256];
+        for (i, v) in t.iter_mut().enumerate() {
+            *v = ((i as f32 * 1.2).min(240.0)) as u8;
+        }
+        t
+    }
+
+    fn at(table: &[u16], code: usize) -> u16 {
+        table[code * 257]
+    }
+
+    #[test]
+    fn tone_table_for_is_identity_at_zero() {
+        let tone = clipped_curve();
+        assert_eq!(tone_table_for(&tone, 0.0), tone_table(&tone));
+    }
+
+    #[test]
+    fn tone_table_for_keeps_an_unclipped_curve() {
+        let mut tone = [0u8; 256];
+        for (i, v) in tone.iter_mut().enumerate() {
+            *v = i as u8;
+        }
+        assert_eq!(tone_table_for(&tone, 100.0), tone_table(&tone));
+    }
+
+    #[test]
+    fn tone_table_for_unclips_the_flat_tail() {
+        let tone = clipped_curve();
+        let flat = tone_table(&tone);
+        let hl = tone_table_for(&tone, 100.0);
+        for p in 0..256 {
+            assert!(at(&hl, p) <= at(&flat, p), "code {p} brightened");
+        }
+        assert_eq!(at(&hl, 255), at(&flat, 255), "white moved");
+        assert_eq!(at(&hl, 20), at(&flat, 20), "below the knee moved");
+        let drop = (at(&flat, 201) as i32 - at(&hl, 201) as i32) / 257;
+        assert!((25..=35).contains(&drop), "clip-point drop {drop}");
+        // The former plateau resolves distinct, increasing inputs.
+        assert!(at(&hl, 210) > at(&hl, 201));
+        assert!(at(&hl, 240) > at(&hl, 210));
+        assert!(at(&hl, 255) > at(&hl, 240));
+        for pair in hl.windows(2) {
+            assert!(pair[0] <= pair[1], "not monotone: {pair:?}");
+        }
+    }
+
+    #[test]
+    fn tone_table_for_scales_with_highlights() {
+        let tone = clipped_curve();
+        let flat = tone_table(&tone);
+        let full = tone_table_for(&tone, 100.0);
+        let half = tone_table_for(&tone, 50.0);
+        assert!(at(&full, 201) < at(&half, 201));
+        assert!(at(&half, 201) < at(&flat, 201));
     }
 }

@@ -2355,7 +2355,7 @@ fn render_hi(item: &MediaItem, req_w: f64, req_h: f64) -> Option<HiCache> {
     let buf = match neutral {
         Some(n) => {
             let src = n.pixels.to_vec();
-            let tone = n.tone.as_ref().map(|t| rawops::tone_table(t));
+            let tone = n.tone.as_ref().map(|t| rawops::tone_table_for(t, item.edit.raw.highlights));
             let frame = pipeline::render_neutral(
                 &src,
                 *fw,
@@ -2504,7 +2504,7 @@ async fn render_photo_export(
         let src = n.pixels.to_vec();
         let (p, gw, gh) = geometry_wide(&src, *fw, *fh, &item.edit);
         let (mut p, w, h) = (p.into_owned(), gw, gh);
-        let tone = n.tone.as_ref().map(|t| rawops::tone_table(t));
+        let tone = n.tone.as_ref().map(|t| rawops::tone_table_for(t, item.edit.raw.highlights));
         let mask = pipeline::mask_for_dims(w, h, &item.edit);
         pipeline::finish_neutral_wide(
             &mut p,

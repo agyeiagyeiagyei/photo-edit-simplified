@@ -55,9 +55,11 @@ struct Neutral {
     w: usize,
     h: usize,
     white: f32,
-    /// Expanded camera-tone table; None when the develop had no usable
-    /// preview curve, in which case the neutral frame is already the output.
-    tone: Option<Vec<u16>>,
+    /// Camera-tone curve; None when the develop had no usable preview curve,
+    /// in which case the neutral frame is already the output. Kept as the
+    /// curve itself so each render can repair its clipped tail to the
+    /// current highlights value.
+    tone: Option<[u8; 256]>,
 }
 
 struct RawFull {
@@ -186,7 +188,7 @@ pub fn load_neutral(id: u32, pixels: Uint16Array, w: u32, h: u32, white: f32, to
     let tone = if tone.length() == 256 {
         let mut lut = [0u8; 256];
         tone.copy_to(&mut lut);
-        Some(rawops::tone_table(&lut))
+        Some(lut)
     } else {
         None
     };
@@ -464,13 +466,14 @@ fn neutral_finish(
     edit: &EditParams,
     seed: u32,
     white: f32,
-    tone: Option<&[u16]>,
+    tone: Option<&[u8; 256]>,
     mask: Option<&[u8]>,
 ) -> (Vec<u8>, f64, f64) {
     let t0 = js_sys::Date::now();
     rawops::develop_neutral_wide(buf, w, h, &edit.raw, white);
-    if let Some(table) = tone {
-        rawops::apply_tone_wide(buf, table);
+    if let Some(lut) = tone {
+        let table = rawops::tone_table_for(lut, edit.raw.highlights);
+        rawops::apply_tone_wide(buf, &table);
     }
     let t1 = js_sys::Date::now();
     if edit.is_color_touched() {
@@ -530,7 +533,7 @@ fn neutral_render(
     let (out, dev_ms, col_ms) = NEUTRAL.with(|n| {
         let n = n.borrow();
         let src = n.get(&id).expect("neutral frame missing");
-        neutral_finish(&mut buf, tw, th, edit, seed, src.white, src.tone.as_deref(), mask.as_deref())
+        neutral_finish(&mut buf, tw, th, edit, seed, src.white, src.tone.as_ref(), mask.as_deref())
     });
     (out, tw, th, [t[0], t[1], dev_ms, col_ms, t[2]])
 }
@@ -568,7 +571,7 @@ fn neutral_window_render(
     let (out, dev_ms, col_ms) = NEUTRAL.with(|n| {
         let n = n.borrow();
         let src = n.get(&id).expect("neutral frame missing");
-        neutral_finish(&mut buf, tw, th, edit, seed, src.white, src.tone.as_deref(), mask.as_deref())
+        neutral_finish(&mut buf, tw, th, edit, seed, src.white, src.tone.as_ref(), mask.as_deref())
     });
     (out, tw, th, [t[0], t[1], dev_ms, col_ms, t[2]])
 }
