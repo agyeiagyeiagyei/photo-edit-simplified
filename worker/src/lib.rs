@@ -5,14 +5,15 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
-use js_sys::{Array, Object, Reflect, Uint8Array, Uint8ClampedArray};
+use js_sys::{Array, Object, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 use pes_pixel::geo::{crop_px, geometry, hi_target, stamp_stroke, working_dims};
+use pes_pixel::pipeline::{self, Frame, Target};
 use pes_pixel::recipe::{edit_params_from_recipe, selection_from_json};
 use pes_pixel::types::EditParams;
-use pes_pixel::{clone, color, fill, heal, ops, rawops};
+use pes_pixel::{clone, fill, heal, ops, resample};
 
 thread_local! {
     static BUFFERS: RefCell<HashMap<u32, (Vec<u8>, usize, usize)>> = RefCell::new(HashMap::new());
@@ -173,11 +174,7 @@ fn base_pipeline(
     } else {
         let (p, gw, gh) = geometry(full, fw, fh, edit);
         let t = js_sys::Date::now();
-        let buf = if (tw, th) != (gw, gh) {
-            resample(&p, gw, gh, tw, th)
-        } else {
-            p.into_owned()
-        };
+        let buf = pipeline::resize(&p, gw, gh, Target::new(tw, th)).pixels;
         // Store the pre-develop base: later renders re-run rawops on the
         // copy, so exposure edits never compound into the cached pixels.
         BASE_CACHE.with(|c| {
@@ -211,27 +208,20 @@ fn render_pipeline(
     sel_json: Option<String>,
     sel_mask: Option<Uint8Array>,
 ) -> (Vec<u8>, usize, usize, [f64; 5]) {
-    let (mut buf, tw, th, geometry_ms, resample_ms, hit) =
+    let (buf, tw, th, geometry_ms, resample_ms, hit) =
         base_pipeline(id, full, fw, fh, edit, req_w, req_h, max_edge);
-    // Develop stage first: white balance, exposure and the lighting controls
-    // run in linear light, before any gamma-space colour adjustment.
+    let mut frame = Frame::new(buf, tw, th);
     let t0 = js_sys::Date::now();
-    if !edit.raw.is_identity() {
-        rawops::apply(&mut buf, tw, th, &edit.raw);
-    }
+    pipeline::develop(&mut frame, edit);
     let t1 = js_sys::Date::now();
     if !edit.is_color_touched() {
-        return (buf, tw, th, [geometry_ms, resample_ms, t1 - t0, 0.0, hit]);
+        return (frame.pixels, tw, th, [geometry_ms, resample_ms, t1 - t0, 0.0, hit]);
     }
     let selection = sel_json.and_then(|j| selection_from_json(&j, sel_mask.map(|m| m.to_vec())));
-    if let Some(sel) = selection {
-        let mask = ops::selection_mask(&sel, tw, th);
-        color::apply_color_effects_masked(&mut buf, &mask, tw, th, edit, seed);
-    } else {
-        color::apply_color_effects(&mut buf, tw, th, edit, seed);
-    }
+    let mask = selection.as_ref().map(|sel| ops::selection_mask(sel, tw, th));
+    pipeline::colour(&mut frame, edit, seed, mask.as_deref());
     let t2 = js_sys::Date::now();
-    (buf, tw, th, [geometry_ms, resample_ms, t1 - t0, t2 - t1, hit])
+    (frame.pixels, tw, th, [geometry_ms, resample_ms, t1 - t0, t2 - t1, hit])
 }
 
 /// Render the hi-res frame. Returns {pixels, w, h}.
@@ -352,7 +342,7 @@ fn render_window_pipeline(
                 && w.th == th
         })
     });
-    let (mut buf, t1, t2) = if cached {
+    let (buf, t1, t2) = if cached {
         let v = WINDOW_CACHE.with(|c| {
             c.borrow().as_ref().map(|w| w.pixels.clone()).unwrap_or_default()
         });
@@ -368,11 +358,7 @@ fn render_window_pipeline(
         } else {
             crop_rows(&p, gw, cx, cy, cw, ch, 4)
         };
-        let buf = if (tw, th) != (cw, ch) {
-            resample(&win, cw, ch, tw, th)
-        } else {
-            win
-        };
+        let buf = pipeline::resize(&win, cw, ch, Target::new(tw, th)).pixels;
         WINDOW_CACHE.with(|c| {
             *c.borrow_mut() = Some(WindowCache {
                 id,
@@ -386,31 +372,28 @@ fn render_window_pipeline(
         });
         (buf, t, js_sys::Date::now())
     };
-    if !edit.raw.is_identity() {
-        rawops::apply(&mut buf, tw, th, &edit.raw);
-    }
+    let mut frame = Frame::new(buf, tw, th);
+    pipeline::develop(&mut frame, edit);
     let t3 = js_sys::Date::now();
     let hit = if cached { 1.0 } else { 0.0 };
     if !edit.is_color_touched() {
-        return (buf, tw, th, [t1 - t0, t2 - t1, t3 - t2, 0.0, hit]);
+        return (frame.pixels, tw, th, [t1 - t0, t2 - t1, t3 - t2, 0.0, hit]);
     }
     let selection = sel_json.and_then(|j| selection_from_json(&j, sel_mask.map(|m| m.to_vec())));
-    if let Some(sel) = selection {
+    let mask = selection.map(|sel| {
         // Build the mask over the full working frame (selection coordinates
         // are normalized to it), then take the window and scale it.
         let mask = ops::selection_mask(&sel, ww, wh);
         let win = crop_rows(&mask, ww, cx, cy, cw, ch, 1);
-        let mask = if (tw, th) != (cw, ch) {
+        if (tw, th) != (cw, ch) {
             nearest_resample_mask(&win, cw, ch, tw, th)
         } else {
             win
-        };
-        color::apply_color_effects_masked(&mut buf, &mask, tw, th, edit, seed);
-    } else {
-        color::apply_color_effects(&mut buf, tw, th, edit, seed);
-    }
+        }
+    });
+    pipeline::colour(&mut frame, edit, seed, mask.as_deref());
     let t4 = js_sys::Date::now();
-    (buf, tw, th, [t1 - t0, t2 - t1, t3 - t2, t4 - t3, hit])
+    (frame.pixels, tw, th, [t1 - t0, t2 - t1, t3 - t2, t4 - t3, hit])
 }
 
 /// Render the crop window the cropped view displays. Returns {pixels, w, h}.
@@ -445,67 +428,8 @@ pub fn render_window(
     })
 }
 
-/// Resample via OffscreenCanvas 2D (same bilinear path as the app's canvas).
-fn resample(pixels: &[u8], w: usize, h: usize, tw: usize, th: usize) -> Vec<u8> {
-    let fallback = || nearest_resample(pixels, w, h, tw, th);
-    let Ok(src) = OffscreenCanvas::new(w as u32, h as u32) else {
-        return fallback();
-    };
-    put_pixels(&src, pixels, w as u32, h as u32);
-    let Ok(dst) = OffscreenCanvas::new(tw as u32, th as u32) else {
-        return fallback();
-    };
-    let Some(ctx) = ctx2d(&dst) else {
-        return fallback();
-    };
-    if ctx
-        .draw_image_with_offscreen_canvas_and_dw_and_dh(&src, 0.0, 0.0, tw as f64, th as f64)
-        .is_err()
-    {
-        return fallback();
-    }
-    match ctx.get_image_data(0.0, 0.0, tw as f64, th as f64) {
-        Ok(data) => data.data().to_vec(),
-        Err(_) => fallback(),
-    }
-}
-
-fn ctx2d(c: &OffscreenCanvas) -> Option<OffscreenCanvasRenderingContext2d> {
-    c.get_context("2d").ok()??.dyn_into().ok()
-}
-
-fn put_pixels(c: &OffscreenCanvas, pixels: &[u8], w: u32, h: u32) {
-    let Some(ctx) = ctx2d(c) else { return };
-    let arr = Uint8ClampedArray::from(pixels);
-    let Ok(data) = web_sys::ImageData::new_with_js_u8_clamped_array_and_sh(&arr, w, h) else {
-        return;
-    };
-    let _ = ctx.put_image_data(&data, 0.0, 0.0);
-}
-
-/// Pure-Rust fallback resampler (nearest) if OffscreenCanvas is unavailable.
-fn nearest_resample(pixels: &[u8], w: usize, h: usize, tw: usize, th: usize) -> Vec<u8> {
-    let mut out = vec![0u8; tw * th * 4];
-    for y in 0..th {
-        let sy = y * h / th;
-        for x in 0..tw {
-            let sx = x * w / tw;
-            out[(y * tw + x) * 4..(y * tw + x) * 4 + 4]
-                .copy_from_slice(&pixels[(sy * w + sx) * 4..(sy * w + sx) * 4 + 4]);
-        }
-    }
-    out
-}
-
 fn downscale(pixels: &[u8], w: usize, h: usize, long_edge: u32) -> (Vec<u8>, usize, usize) {
-    let le = w.max(h) as u32;
-    if le <= long_edge {
-        return (pixels.to_vec(), w, h);
-    }
-    let scale = long_edge as f64 / le as f64;
-    let tw = ((w as f64 * scale).round() as usize).max(1);
-    let th = ((h as f64 * scale).round() as usize).max(1);
-    (resample(pixels, w, h, tw, th), tw, th)
+    resample::fit_long_edge(pixels, w, h, long_edge)
 }
 
 /// Destructive ops make their result the item's new stored buffer. The app
@@ -857,5 +781,3 @@ fn parse_pts(v: &JsValue) -> Vec<(f32, f32)> {
     }
     out
 }
-
-use web_sys::{OffscreenCanvas, OffscreenCanvasRenderingContext2d};

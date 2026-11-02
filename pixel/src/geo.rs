@@ -1,6 +1,6 @@
 //! Geometry pipeline shared by app and worker: rotate/crop math, target
-//! sizing, stroke rasterization. Pure Rust — canvas resampling lives in the
-//! caller (DOM canvas in the app, OffscreenCanvas in the worker).
+//! sizing, stroke rasterization. Resampling after geometry lives in
+//! [`crate::resample`], driven by [`crate::pipeline`].
 
 use std::borrow::Cow;
 

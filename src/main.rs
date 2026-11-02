@@ -9,8 +9,9 @@ mod session;
 mod state;
 mod web;
 
-use pes_pixel::{blur, clone, color, curves, fill, heal, levels, ops, rawops, stroke, wand};
+use pes_pixel::{blur, clone, color, curves, fill, heal, levels, ops, rawops, resample, stroke, wand};
 use pes_pixel::geo::{crop_px, geometry, hi_target, stamp_stroke, working_dims};
+use pes_pixel::pipeline::{self, Frame as PipeFrame, Target as PipeTarget};
 use pes_pixel::types::RawAdjust;
 
 use std::borrow::Cow;
@@ -108,16 +109,7 @@ impl Pixels {
     }
 
     fn downscale(&self, w: usize, h: usize, long_edge: u32) -> (Vec<u8>, usize, usize) {
-        let scale = (long_edge as f32 / w.max(h) as f32).min(1.0);
-        let tw = (w as f32 * scale).max(1.0) as u32;
-        let th = (h as f32 * scale).max(1.0) as u32;
-        let src = web::create_canvas(w as u32, h as u32);
-        self.put_on_canvas(&src, w as u32, h as u32);
-        let dst = web::create_canvas(tw, th);
-        let ctx = web::ctx2d(&dst);
-        ctx.draw_image_with_html_canvas_element_and_dw_and_dh(&src, 0.0, 0.0, tw as f64, th as f64)
-            .unwrap();
-        web::image_data_from_ctx(&ctx, tw, th)
+        resample::fit_long_edge(&self.as_cow(), w, h, long_edge)
     }
 }
 
@@ -1701,12 +1693,24 @@ async fn probe_video(url: &str) -> Option<(f64, u32, u32)> {
     }
 }
 
+/// `imageSmoothingQuality = "high"` — this web-sys version has no binding.
+fn high_quality(ctx: &web_sys::CanvasRenderingContext2d) {
+    let _ = js_sys::Reflect::set(
+        ctx.as_ref(),
+        &JsValue::from_str("imageSmoothingQuality"),
+        &JsValue::from_str("high"),
+    );
+}
+
 fn downscale(img: &web_sys::HtmlImageElement, long_edge: u32) -> (Vec<u8>, usize, usize) {
     let (w, h) = (img.natural_width(), img.natural_height());
     let scale = (long_edge as f32 / w.max(h) as f32).min(1.0);
     let (pw, ph) = ((w as f32 * scale) as u32, (h as f32 * scale) as u32);
     let canvas = web::create_canvas(pw, ph);
     let ctx = web::ctx2d(&canvas);
+    // The source pixels are not in memory here, so this decode still uses the
+    // browser scaler; ask it for its best filter until the pixels are staged.
+    high_quality(&ctx);
     ctx.draw_image_with_html_image_element_and_dw_and_dh(img, 0.0, 0.0, pw as f64, ph as f64)
         .unwrap();
     web::image_data_from_ctx(&ctx, pw, ph)
@@ -2203,17 +2207,6 @@ fn source_fingerprint(photo_gen: u64, proxy_gen: u64) -> u64 {
     h.finish()
 }
 
-/// Resize a pixel buffer to exact dims via a canvas round-trip.
-fn resample_pixels(pixels: &[u8], w: usize, h: usize, tw: usize, th: usize) -> Vec<u8> {
-    let src = web::create_canvas(w as u32, h as u32);
-    web::put_pixels(&src, pixels, w as u32, h as u32);
-    let dst = web::create_canvas(tw as u32, th as u32);
-    web::ctx2d(&dst)
-        .draw_image_with_html_canvas_element_and_dw_and_dh(&src, 0.0, 0.0, tw as f64, th as f64)
-        .unwrap();
-    web::image_data_from_ctx(&web::ctx2d(&dst), tw as u32, th as u32).0
-}
-
 /// Render the photo from its full-res original at (roughly) display
 /// resolution. Mirrors the preview pipeline and export.
 fn render_hi(item: &MediaItem, req_w: f64, req_h: f64) -> Option<HiCache> {
@@ -2222,24 +2215,17 @@ fn render_hi(item: &MediaItem, req_w: f64, req_h: f64) -> Option<HiCache> {
     let source_fp = source_fingerprint(photo.gen, proxy_gen(item.id));
     let (fpix, fw, fh) = photo.full.as_ref()?;
     let src = fpix.as_cow();
-    let (p, ww, wh) = geometry(&src, *fw, *fh, &item.edit);
+    let (ww, wh) = working_dims(*fw, *fh, &item.edit);
     let (tw, th) = hi_target(req_w, req_h, ww, wh, HI_MAX_EDGE as u32);
-    let mut buf = if (tw, th) != (ww, wh) {
-        resample_pixels(&p, ww, wh, tw, th)
-    } else {
-        p.into_owned()
-    };
-    if !item.edit.raw.is_identity() {
-        rawops::apply(&mut buf, tw, th, &item.edit.raw);
-    }
-    if item.edit.is_color_touched() {
-        if let Some(sel) = &item.edit.selection {
-            let mask = ops::selection_mask(sel, tw, th);
-            color::apply_color_effects_masked(&mut buf, &mask, tw, th, &item.edit, item.id as u32);
-        } else {
-            color::apply_color_effects(&mut buf, tw, th, &item.edit, item.id as u32);
-        }
-    }
+    let buf = pipeline::render(
+        &src,
+        *fw,
+        *fh,
+        &item.edit,
+        PipeTarget::new(tw, th),
+        item.id as u32,
+    )
+    .pixels;
     let canvas = web::create_canvas(tw as u32, th as u32);
     web::put_pixels(&canvas, &buf, tw as u32, th as u32);
     composite_layers(&canvas, &item.layers, tw, th);
@@ -2344,32 +2330,16 @@ async fn render_photo_export(
     geometry_span.set_detail(format!("{}x{}", w, h));
     drop(geometry_span);
     let color_span = perf::Span::new("export.color");
-    let apply_color = |p: &mut [u8], w: usize, h: usize| {
-        if !item.edit.raw.is_identity() {
-            rawops::apply(p, w, h, &item.edit.raw);
-        }
-        if item.edit.is_color_touched() {
-            if let Some(sel) = &item.edit.selection {
-                let mask = ops::selection_mask(sel, w, h);
-                color::apply_color_effects_masked(p, &mask, w, h, &item.edit, item.id as u32);
-            } else {
-                color::apply_color_effects(p, w, h, &item.edit, item.id as u32);
-            }
-        }
+    let apply_color = |v: Vec<u8>| {
+        let mut frame = PipeFrame::new(v, w, h);
+        pipeline::finish_edit(&mut frame, &item.edit, item.id as u32);
+        frame.pixels
     };
     let edited: Option<Vec<u8>> = match geometry {
-        Some((mut v, _, _)) => {
-            if !untouched {
-                apply_color(&mut v, w, h);
-            }
-            Some(v)
-        }
+        Some((v, _, _)) if untouched => Some(v),
+        Some((v, _, _)) => Some(apply_color(v)),
         None if untouched => None,
-        None => {
-            let mut v = pix.as_cow().into_owned();
-            apply_color(&mut v, w, h);
-            Some(v)
-        }
+        None => Some(apply_color(pix.as_cow().into_owned())),
     };
     drop(color_span);
 
@@ -3367,11 +3337,11 @@ fn source_window(
     let x1 = (sx + cw + margin).min(fw);
     let y1 = (sy + ch + margin).min(fh);
     let (ew, eh) = (x1 - x0, y1 - y0);
-    let mut win = px.crop_rows(fw, y0, x0, ew, eh);
-    if !edit.raw.is_identity() {
-        rawops::apply(&mut win, ew, eh, &edit.raw);
-    }
-    color::apply_color_effects(&mut win, ew, eh, edit, seed);
+    let win = px.crop_rows(fw, y0, x0, ew, eh);
+    let mut frame = PipeFrame::new(win, ew, eh);
+    // The loupe shows the whole window, not the selection.
+    pipeline::finish(&mut frame, edit, seed, None);
+    let win = frame.pixels;
     let (ix, iy) = (sx - x0, sy - y0);
     let mut out = Vec::with_capacity(cw * ch * 4);
     for row in 0..ch {
@@ -3387,6 +3357,7 @@ fn blit_window(canvas: &web_sys::HtmlCanvasElement, px: &[u8], w: u32, h: u32, b
     web::put_pixels(&scratch, px, w, h);
     let ctx = web::ctx2d(canvas);
     ctx.set_image_smoothing_enabled(true);
+    high_quality(&ctx);
     let _ = ctx.draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
         &scratch,
         0.0,
@@ -6353,13 +6324,10 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
 
         let (pix, w, h) = &photo.preview;
         let geo = preview_geometry_cached(item.id, photo.gen, &photo.preview, &item.edit);
-        let (mut p, w, h) = match &geo {
+        let (p, w, h) = match &geo {
             Some((px, gw, gh)) => (Cow::Borrowed(px.as_slice()), *gw, *gh),
             None => geometry(pix, *w, *h, &item.edit),
         };
-        if !item.edit.raw.is_identity() {
-            rawops::apply(p.to_mut(), w, h, &item.edit.raw);
-        }
         working.set((w, h));
         let crop = item.edit.crop;
         let cropped_view = tab.get() != Tab::Crop && !crop_is_full(&crop);
@@ -6507,21 +6475,9 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         }
 
         if sharp.is_none() {
-            if item.edit.is_color_touched() {
-                if let Some(sel) = &item.edit.selection {
-                    let mask = ops::selection_mask(sel, w, h);
-                    color::apply_color_effects_masked(
-                        p.to_mut(),
-                        &mask,
-                        w,
-                        h,
-                        &item.edit,
-                        item.id as u32,
-                    );
-                } else {
-                    color::apply_color_effects(p.to_mut(), w, h, &item.edit, item.id as u32);
-                }
-            }
+            let mut frame = PipeFrame::new(p.into_owned(), w, h);
+            pipeline::finish_edit(&mut frame, &item.edit, item.id as u32);
+            let p = frame.pixels;
             if cropped_view {
                 // Composite at full size offscreen, then blit the crop region —
                 // the same pipeline as export, so the preview matches the output.
@@ -7481,16 +7437,7 @@ async fn thumb_object_url(pixels: &[u8], w: usize, h: usize) -> String {
 }
 
 fn downscale_pixels(pixels: &[u8], w: usize, h: usize, long_edge: u32) -> (Vec<u8>, usize, usize) {
-    let scale = (long_edge as f32 / w.max(h) as f32).min(1.0);
-    let pw = (w as f32 * scale).max(1.0) as u32;
-    let ph = (h as f32 * scale).max(1.0) as u32;
-    let src = web::create_canvas(w as u32, h as u32);
-    web::put_pixels(&src, pixels, w as u32, h as u32);
-    let dst = web::create_canvas(pw, ph);
-    let ctx = web::ctx2d(&dst);
-    ctx.draw_image_with_html_canvas_element_and_dw_and_dh(&src, 0.0, 0.0, pw as f64, ph as f64)
-        .unwrap();
-    web::image_data_from_ctx(&ctx, pw, ph)
+    resample::fit_long_edge(pixels, w, h, long_edge)
 }
 
 fn selection_to_layer(state: AppState, cut: bool) {

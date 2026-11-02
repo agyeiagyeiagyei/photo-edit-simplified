@@ -2,7 +2,7 @@ import { test, expect } from '@playwright/test';
 import * as fs from 'fs';
 import {
   openApp, trackErrors, recordMetrics, importFiles, thumbs, canvas, canvasSize, canvasMean,
-  clickTab, setRange, imageDims, zipEntryCount, jpegSegments, waitCanvasWidthAbove, perfMarks, JPEG_A, JPEG_B,
+  clickTab, setRange, imageDims, zipEntryCount, jpegSegments, waitCanvasWidthAbove, perfMarks, JPEG_A, JPEG_B, PNG_SMALL,
 } from './helpers';
 
 test.describe('24MP JPEG: import → edit → export', () => {
@@ -253,6 +253,77 @@ test.describe('24MP JPEG: import → edit → export', () => {
       crop_window_cache_misses: windowMarks.cache.filter((v) => v === 0).length,
       crop_preview_mae: Math.round(mae * 100) / 100,
     });
+  });
+
+  test('worker preview and PNG export go through one pipeline (issue #9 parity)', async ({ page }, testInfo) => {
+    // The small fixture renders natively: hi_target is capped at the source
+    // size, so the on-screen frame and the exported PNG are the same pixels
+    // through the same pes_pixel::pipeline. ?gpu=0 keeps the preview on the
+    // CPU path the export uses.
+    await page.goto('./?gpu=0');
+    await expect(page.locator('header h1')).toHaveText('photo-edit-simplified');
+    await importFiles(page, [PNG_SMALL]);
+    await expect.poll(
+      () => canvasSize(page).then((s) => ({ w: s.w, h: s.h })),
+      { timeout: 20_000 },
+    ).toEqual({ w: 800, h: 600 });
+    const perfLen = () => page.evaluate(() => ((window as any).__pes?.perf() as any[] | undefined)?.length ?? 0);
+    // Settle the import render first so its reply can't be mistaken for an edited one.
+    const blits = () => page.evaluate(() =>
+      (((window as any).__pes?.perf() as any[]) ?? []).filter((e) => e.name === 'hi.blit').length);
+    await expect.poll(blits, { timeout: 20_000 }).toBeGreaterThan(0);
+    const blits0 = await blits();
+    const from = await perfLen();
+    await clickTab(page, 'Color');
+    await setRange(page, /^Brightness/, 0.25);
+    await setRange(page, /^Contrast/, 0.2);
+    // hi.blit is recorded only for an accepted worker reply; stale generations
+    // return before recording, so this is the edited frame.
+    await expect.poll(blits, { timeout: 20_000 }).toBeGreaterThan(blits0);
+    await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(null)))));
+    await page.evaluate(() => {
+      const c = document.querySelector('.canvas-wrap canvas') as HTMLCanvasElement;
+      (window as any).__qaParityPrev = { w: c.width, h: c.height, d: c.getContext('2d')!.getImageData(0, 0, c.width, c.height).data };
+    });
+    await clickTab(page, 'Export');
+    await page.locator('label', { hasText: 'Format' }).locator('select').selectOption('png');
+    const [dl] = await Promise.all([
+      page.waitForEvent('download', { timeout: 60_000 }),
+      page.locator('button.btn.primary', { hasText: 'Download this' }).click(),
+    ]);
+    expect(dl.suggestedFilename()).toMatch(/^edited-.*-small\.png$/);
+    const bytes = fs.readFileSync((await dl.path())!);
+    expect(bytes.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    const cmp = await page.evaluate(async (b64) => {
+      const prev = (window as any).__qaParityPrev as { w: number; h: number; d: Uint8ClampedArray };
+      const bin = atob(b64); const u8 = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+      const bmp = await createImageBitmap(new Blob([u8], { type: 'image/png' }));
+      const t = document.createElement('canvas'); t.width = bmp.width; t.height = bmp.height;
+      const x = t.getContext('2d')!;
+      x.drawImage(bmp, 0, 0);
+      const b = x.getImageData(0, 0, bmp.width, bmp.height).data;
+      const a = prev.d;
+      const pw = a.length / 4 / bmp.height;
+      if (pw !== bmp.width || prev.w !== bmp.width || prev.h !== bmp.height) {
+        return { w: bmp.width, h: bmp.height, pw: Math.round(pw), mse: -1 };
+      }
+      let sum = 0; let n = 0;
+      for (let i = 0; i < a.length; i += 4) {
+        for (let k = 0; k < 3; k++) { const d = a[i + k] - b[i + k]; sum += d * d; }
+        n += 3;
+      }
+      return { w: bmp.width, h: bmp.height, pw, mse: sum / n };
+    }, bytes.toString('base64'));
+    expect(cmp.pw, 'preview and export must have matching dimensions').toBe(cmp.w);
+    expect(cmp.mse, 'comparison failed').toBeGreaterThanOrEqual(0);
+    const psnr = cmp.mse === 0 ? 99 : 10 * Math.log10(65025 / cmp.mse);
+    recordMetrics(testInfo, {
+      pipeline_parity_w: cmp.w, pipeline_parity_h: cmp.h,
+      pipeline_parity_mse: Math.round(cmp.mse * 1000) / 1000,
+      pipeline_parity_psnr_db: Math.round(psnr * 100) / 100,
+    });
+    expect(psnr, `worker preview vs PNG export PSNR ${psnr.toFixed(2)} dB`).toBeGreaterThanOrEqual(50);
   });
 
   test('"Download N edited" produces ONE zip containing every edited item (issue #1)', async ({ page }, testInfo) => {

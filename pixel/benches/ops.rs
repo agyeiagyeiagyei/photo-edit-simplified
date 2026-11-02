@@ -14,7 +14,7 @@ use std::time::Instant;
 use pes_pixel::curves::{CurvePoint, CurvesSettings};
 use pes_pixel::levels::{LevelRange, LevelsSettings};
 use pes_pixel::types::{EditParams, RawAdjust, Selection, SelectionKind};
-use pes_pixel::{blur, denoise, geo, levels, ops, rawops};
+use pes_pixel::{blur, denoise, geo, levels, ops, rawops, resample};
 
 const W: usize = 6000;
 const H: usize = 4000;
@@ -111,6 +111,13 @@ fn main() {
     });
     bench_read("geo::geometry fine 3°", &base, 3, |b| {
         let _ = geo::geometry(b, W, H, &fine);
+    });
+    // Display proxy (2×+ → exact-area box) vs the Lanczos path a 1.5× downscale takes.
+    bench_read("resample 6000×4000→1024 area", &base, 3, |b| {
+        let _ = resample::resample(b, W, H, 1024, 683);
+    });
+    bench_read("resample 6000×4000→4000 lanczos", &base, 3, |b| {
+        let _ = resample::resample(b, W, H, 4000, 2667);
     });
 
     let stages: [(&str, RawAdjust); 8] = [
