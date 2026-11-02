@@ -147,8 +147,9 @@ test.describe('WebGL2 parametric preview (docs/GPU.md)', () => {
   // qa-regression #13: RAW items on the GPU path were 29-32 dB against the
   // CPU/export pipeline because the shader always ran its linear-light tone
   // round trip, even when the develop stage was identity. Untouched RAW must
-  // now pass through bit-exactly; develop and colour sliders stay above the
-  // 45 dB gate.
+  // now pass through bit-exactly; a develop slider hands the frame to the
+  // neutral CPU pipeline (WS5), which this test pins structurally and by
+  // parity.
   test('RAW preview matches the CPU pipeline within 45 dB', async ({ browser }, testInfo) => {
     test.skip(RAWS.length === 0, 'no RAW fixture in dl-raw; run gen_dng.py to create one');
     const raw = RAWS[0];
@@ -161,7 +162,8 @@ test.describe('WebGL2 parametric preview (docs/GPU.md)', () => {
       deviceScaleFactor: 2,
       baseURL: process.env.PES_BASE_URL || 'http://127.0.0.1:8787/',
     };
-    const renderMark = (mode: '0' | '1') => (mode === '1' ? 'gpu.render' : 'hi.blit');
+    const gpuRenders = async (page: Page) =>
+      (await markNames(page)).filter((n) => n === 'gpu.render').length;
     const capture = async (mode: '0' | '1') => {
       const ctx = await browser.newContext(contextOpts);
       try {
@@ -172,6 +174,10 @@ test.describe('WebGL2 parametric preview (docs/GPU.md)', () => {
         await waitCanvasWidthAbove(page, 1200);
         await waitMark(page, 'proxy.raw_develop');
         await waitStableSharpCanvas(page);
+        if (mode === '1') {
+          // The untouched RAW is the GPU path's own case and must stay there.
+          await expect.poll(() => gpuRenders(page), { timeout: 30_000 }).toBeGreaterThan(0);
+        }
         const out = { errors, frames: {} as Record<string, { w: number; h: number; b64: string }> };
         out.frames.untouched = await downscaled(page, 512);
 
@@ -180,15 +186,22 @@ test.describe('WebGL2 parametric preview (docs/GPU.md)', () => {
         await clickTab(page, 'Color');
         await page.waitForTimeout(250);
         await waitStableSharpCanvas(page);
-        let before = (await markNames(page)).filter((n) => n === renderMark(mode)).length;
+        // A non-identity RAW develop belongs to the neutral CPU pipeline even
+        // in GPU mode (docs/GPU.md): the shader would hide recovered highlight
+        // detail, so every develop tick takes the CPU hi-res path.
+        const gpuBefore = mode === '1' ? await gpuRenders(page) : 0;
+        let before = (await markNames(page)).filter((n) => n === 'hi.blit').length;
         await applyRawDevelop(page);
-        await waitRenderTick(page, renderMark(mode), before);
+        await waitRenderTick(page, 'hi.blit', before);
         out.frames.develop = await downscaled(page, 512);
 
-        before = (await markNames(page)).filter((n) => n === renderMark(mode)).length;
+        before = (await markNames(page)).filter((n) => n === 'hi.blit').length;
         await setRange(page, /^Saturation/, 0.4);
-        await waitRenderTick(page, renderMark(mode), before);
+        await waitRenderTick(page, 'hi.blit', before);
         out.frames.develop_saturation = await downscaled(page, 512);
+        if (mode === '1') {
+          expect(await gpuRenders(page), 'GPU drew a develop the neutral path owns').toBe(gpuBefore);
+        }
         return out;
       } finally {
         await ctx.close();
