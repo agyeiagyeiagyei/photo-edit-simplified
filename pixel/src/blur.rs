@@ -56,6 +56,61 @@ pub fn blur_apply(rgba: &mut [u8], width: usize, height: usize, amount: f32) {
     blur_pass(&tmp, rgba, width, height, &k, false);
 }
 
+fn blur_pass_wide(src: &[u16], dst: &mut [u16], w: usize, h: usize, k: &[f32], horizontal: bool) {
+    let radius = (k.len() / 2) as i32;
+    for y in 0..h {
+        for x in 0..w {
+            let mut acc = [0.0f32; 4];
+            for (ki, &kv) in k.iter().enumerate() {
+                let off = ki as i32 - radius;
+                let (sx, sy) = if horizontal {
+                    ((x as i32 + off).clamp(0, w as i32 - 1), y as i32)
+                } else {
+                    (x as i32, (y as i32 + off).clamp(0, h as i32 - 1))
+                };
+                let p = &src[(sy as usize * w + sx as usize) * 4..];
+                for c in 0..4 {
+                    acc[c] += p[c] as f32 * kv;
+                }
+            }
+            let p = &mut dst[(y * w + x) * 4..];
+            for c in 0..4 {
+                p[c] = acc[c].round().clamp(0.0, 65535.0) as u16;
+            }
+        }
+    }
+}
+
+/// 16-bit variant used by the wide (develop-active) colour stage.
+pub fn blur_apply_wide(rgba: &mut [u16], width: usize, height: usize, amount: f32) {
+    if amount <= 0.0 {
+        return;
+    }
+    let sigma = amount / 100.0 * 8.0;
+    let k = kernel(sigma);
+    let mut tmp = rgba.to_vec();
+    blur_pass_wide(rgba, &mut tmp, width, height, &k, true);
+    blur_pass_wide(&tmp, rgba, width, height, &k, false);
+}
+
+/// 16-bit masked blur: blends the blurred value by mask/255.
+pub fn blur_apply_wide_masked(rgba: &mut [u16], mask: &[u8], width: usize, height: usize, amount: f32) {
+    if amount <= 0.0 {
+        return;
+    }
+    let mut blurred = rgba.to_vec();
+    blur_apply_wide(&mut blurred, width, height, amount);
+    for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+        let m = mask[i] as u32;
+        if m == 0 {
+            continue;
+        }
+        for c in 0..4 {
+            px[c] = ((px[c] as u32 * (255 - m) + blurred[i * 4 + c] as u32 * m + 127) / 255) as u16;
+        }
+    }
+}
+
 /// Masked variant: blends the blurred value by mask/255.
 pub fn blur_apply_masked(rgba: &mut [u8], mask: &[u8], width: usize, height: usize, amount: f32) {
     if amount <= 0.0 {
@@ -151,6 +206,27 @@ mod tests {
                 assert_eq!(got, &full[i * 4..i * 4 + 3], "pixel {i} fully masked");
             }
         }
+    }
+
+    #[test]
+    fn wide_flat_image_unchanged() {
+        let v = 77u16 * 257;
+        let mut img = vec![v; 16 * 16 * 4];
+        blur_apply_wide(&mut img, 16, 16, 50.0);
+        assert!(img.chunks_exact(4).all(|p| (p[0] as i32 - v as i32).abs() <= 257));
+    }
+
+    #[test]
+    fn wide_impulse_spreads_to_neighbors() {
+        let mut img = vec![0u16; 21 * 21 * 4];
+        let c = (10 * 21 + 10) * 4;
+        img[c..c + 3].fill(65535);
+        img[c + 3] = 65535;
+        blur_apply_wide(&mut img, 21, 21, 40.0);
+        let at = |x: usize, y: usize| img[(y * 21 + x) * 4];
+        assert!(at(10, 10) < 65535 && at(10, 10) > at(8, 10));
+        assert!(at(8, 10) > at(5, 10));
+        assert!(at(5, 10) > 0, "blur reaches 5px out");
     }
 
     #[test]

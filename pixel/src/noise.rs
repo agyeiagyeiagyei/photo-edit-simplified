@@ -68,6 +68,67 @@ pub fn noise_add_masked(rgba: &mut [u8], mask: &[u8], width: usize, height: usiz
     }
 }
 
+/// 16-bit variant used by the wide (develop-active) colour stage. The amount
+/// is still in 8-bit levels; one level is 257 wide units.
+pub fn noise_add_wide(
+    rgba: &mut [u16],
+    width: usize,
+    height: usize,
+    amount: f32,
+    gaussian: bool,
+    monochromatic: bool,
+    seed: u32,
+) {
+    if amount <= 0.0 {
+        return;
+    }
+    let spread = amount / 100.0 * 127.5 * 257.0;
+    for y in 0..height {
+        for x in 0..width {
+            let p = &mut rgba[(y * width + x) * 4..];
+            let base = noise_hash(seed ^ noise_hash((y * width + x) as u32));
+            for c in 0..3 {
+                let key = if monochromatic { base } else { base.wrapping_add((c as u32).wrapping_mul(0x9e3779b9)) };
+                let n = if gaussian {
+                    let u1 = noise_unit(key);
+                    let u2 = noise_unit(key ^ 0x68e31da4);
+                    (-2.0 * (1.0 - u1).ln()).sqrt() * (std::f32::consts::TAU * u2).cos() * spread * (2.0 / 3.0)
+                } else {
+                    (noise_unit(key) * 2.0 - 1.0) * spread
+                };
+                p[c] = (p[c] as f32 + n).clamp(0.0, 65535.0).round() as u16;
+            }
+        }
+    }
+}
+
+/// Masked 16-bit noise: blends the noisy value by mask/255.
+pub fn noise_add_wide_masked(
+    rgba: &mut [u16],
+    mask: &[u8],
+    width: usize,
+    height: usize,
+    amount: f32,
+    gaussian: bool,
+    monochromatic: bool,
+    seed: u32,
+) {
+    if amount <= 0.0 {
+        return;
+    }
+    let mut noisy = rgba.to_vec();
+    noise_add_wide(&mut noisy, width, height, amount, gaussian, monochromatic, seed);
+    for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+        let m = mask[i] as u32;
+        if m == 0 {
+            continue;
+        }
+        for c in 0..3 {
+            px[c] = ((px[c] as u32 * (255 - m) + noisy[i * 4 + c] as u32 * m + 127) / 255) as u16;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +213,18 @@ mod tests {
         let mut img = solid(8, 8, 5);
         noise_add(&mut img, 8, 8, 100.0, false, false, 0);
         assert!(img.chunks_exact(4).all(|p| p[0] <= 255));
+    }
+
+    #[test]
+    fn wide_noise_is_deterministic_and_scales_with_levels() {
+        let base = 128u16 * 257;
+        let mut a = vec![base; 16 * 16 * 4];
+        let mut b = a.clone();
+        noise_add_wide(&mut a, 16, 16, 30.0, true, false, 7);
+        noise_add_wide(&mut b, 16, 16, 30.0, true, false, 7);
+        assert_eq!(a, b);
+        let mean = a.iter().step_by(4).map(|&v| v as f32 / 257.0 - 128.0).sum::<f32>() / 256.0;
+        assert!(mean.abs() < 2.0, "mean drift {mean}");
     }
 
     #[test]

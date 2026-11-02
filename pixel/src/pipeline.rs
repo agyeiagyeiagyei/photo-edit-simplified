@@ -12,6 +12,7 @@ use crate::ops;
 use crate::rawops;
 use crate::resample;
 use crate::types::EditParams;
+use crate::wide;
 
 /// RGBA8 pixels at a known size.
 pub struct Frame {
@@ -70,15 +71,37 @@ pub fn mask_for(frame: &Frame, edit: &EditParams) -> Option<Vec<u8>> {
 
 /// Develop stage: white balance, exposure and the lighting controls in linear
 /// light, before any gamma-space colour adjustment.
-pub fn develop(frame: &mut Frame, edit: &EditParams) {
-    if !edit.raw.is_identity() {
-        rawops::apply(&mut frame.pixels, frame.w, frame.h, &edit.raw);
+///
+/// A RAW edit returns the developed frame as a 16-bit sRGB buffer so colour can
+/// run at that precision and the pipeline quantises to u8 once, with a dither;
+/// an identity develop returns `None` and colour stays on the u8 buffer.
+pub fn develop(frame: &mut Frame, edit: &EditParams) -> Option<Vec<u16>> {
+    if edit.raw.is_identity() {
+        return None;
     }
+    let mut buf = wide::widen(&frame.pixels);
+    rawops::develop_wide(&mut buf, frame.w, frame.h, &edit.raw);
+    Some(buf)
 }
 
 /// Colour stage: blurred levels/curves/adjust, then grain. `mask` is a
 /// selection mask at the frame's size, or `None` for a whole-frame edit.
-pub fn colour(frame: &mut Frame, edit: &EditParams, seed: u32, mask: Option<&[u8]>) {
+/// `wide_buf` is a developed 16-bit frame from [`develop`]; when present the
+/// result is narrowed to the frame's u8 pixels with the final dither.
+pub fn colour(
+    frame: &mut Frame,
+    edit: &EditParams,
+    seed: u32,
+    mask: Option<&[u8]>,
+    wide_buf: Option<Vec<u16>>,
+) {
+    if let Some(mut buf) = wide_buf {
+        if edit.is_color_touched() {
+            color::apply_color_effects_wide(&mut buf, frame.w, frame.h, edit, seed, mask);
+        }
+        wide::narrow_dithered(&buf, &mut frame.pixels, frame.w, frame.h);
+        return;
+    }
     if !edit.is_color_touched() {
         return;
     }
@@ -97,18 +120,36 @@ pub fn colour(frame: &mut Frame, edit: &EditParams, seed: u32, mask: Option<&[u8
 
 /// Develop + colour on a prepared frame.
 pub fn finish(frame: &mut Frame, edit: &EditParams, seed: u32, mask: Option<&[u8]>) {
-    develop(frame, edit);
-    colour(frame, edit, seed, mask);
+    let wide_buf = develop(frame, edit);
+    colour(frame, edit, seed, mask, wide_buf);
 }
 
 /// `finish` with the mask taken from `edit.selection`.
 pub fn finish_edit(frame: &mut Frame, edit: &EditParams, seed: u32) {
-    develop(frame, edit);
-    if !edit.is_color_touched() {
-        return;
+    let wide_buf = develop(frame, edit);
+    let mask = if edit.is_color_touched() {
+        mask_for(frame, edit)
+    } else {
+        None
+    };
+    colour(frame, edit, seed, mask.as_deref(), wide_buf);
+}
+
+/// The whole stage set on a 16-bit sRGB RGBA frame, for callers that own the
+/// final quantisation (the worker and the export narrow with
+/// [`wide::narrow_dithered`] once).
+pub fn finish_wide(
+    buf: &mut [u16],
+    w: usize,
+    h: usize,
+    edit: &EditParams,
+    seed: u32,
+    mask: Option<&[u8]>,
+) {
+    rawops::develop_wide(buf, w, h, &edit.raw);
+    if edit.is_color_touched() {
+        color::apply_color_effects_wide(buf, w, h, edit, seed, mask);
     }
-    let mask = mask_for(frame, edit);
-    colour(frame, edit, seed, mask.as_deref());
 }
 
 /// The whole pipeline for a source frame rendered to `target`.
@@ -181,6 +222,83 @@ mod tests {
         let mut direct = Frame::new(px.clone(), 20, 10);
         finish_edit(&mut direct, &edit, 1);
         assert_eq!(out.pixels, direct.pixels);
+    }
+
+    /// 16-bit sRGB ramp over the first quarter of the range, so +2 EV and a
+    /// full shadow lift produce a very slow 8-bit gradient after encoding.
+    fn ramp16(w: usize, h: usize) -> Vec<u16> {
+        let mut buf = Vec::with_capacity(w * h * 4);
+        for _ in 0..h {
+            for x in 0..w {
+                let v = (x as u32 * 16383 / (w as u32 - 1)) as u16;
+                buf.extend_from_slice(&[v, v, v, 65535]);
+            }
+        }
+        buf
+    }
+
+    fn longest_run(row: &[u8]) -> usize {
+        let (mut best, mut run) = (1usize, 1usize);
+        for i in 1..row.len() {
+            if row[i] == row[i - 1] {
+                run += 1;
+                best = best.max(run);
+            } else {
+                run = 1;
+            }
+        }
+        best
+    }
+
+    fn banding_edit() -> EditParams {
+        EditParams {
+            raw: RawAdjust { exposure: 2.0, shadows: 100.0, ..RawAdjust::default() },
+            ..EditParams::default()
+        }
+    }
+
+    fn assert_dithered_ramp(w: usize, h: usize) {
+        let mut buf = ramp16(w, h);
+        finish_wide(&mut buf, w, h, &banding_edit(), 1, None);
+        let mut out = vec![0u8; w * h * 4];
+        wide::narrow_dithered(&buf, &mut out, w, h);
+        let row: Vec<u8> = out[..w * 4].chunks_exact(4).map(|p| p[0]).collect();
+        let step = row
+            .windows(2)
+            .map(|p| (p[0] as i32 - p[1] as i32).abs())
+            .max()
+            .unwrap();
+        assert!(step <= 1, "adjacent-band step {step} at w={w}");
+        let mut plain = vec![0u8; w * h * 4];
+        wide::narrow_plain(&buf, &mut plain);
+        let plain: Vec<u8> = plain[..w * 4].chunks_exact(4).map(|p| p[0]).collect();
+        let transitions = |r: &[u8]| r.windows(2).filter(|p| p[0] != p[1]).count();
+        // The dither is what turns each code plateau into texture: the plain
+        // quantisation is flat for over a hundred pixels, the dithered row is
+        // not, and it flips values far more often inside every band.
+        assert!(
+            longest_run(&row) * 2 <= longest_run(&plain),
+            "no dither texture: {} vs {}",
+            longest_run(&row),
+            longest_run(&plain)
+        );
+        assert!(
+            transitions(&row) > 10 * transitions(&plain),
+            "dither too weak: {} vs {}",
+            transitions(&row),
+            transitions(&plain)
+        );
+    }
+
+    #[test]
+    fn banding_ramp_is_dithered() {
+        assert_dithered_ramp(4096, 8);
+    }
+
+    #[test]
+    #[ignore = "24 MP fixture; run with --release"]
+    fn banding_ramp_24mp_is_dithered() {
+        assert_dithered_ramp(6000, 4000);
     }
 
     #[test]

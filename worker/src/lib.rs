@@ -212,14 +212,16 @@ fn render_pipeline(
         base_pipeline(id, full, fw, fh, edit, req_w, req_h, max_edge);
     let mut frame = Frame::new(buf, tw, th);
     let t0 = js_sys::Date::now();
-    pipeline::develop(&mut frame, edit);
+    let wide_buf = pipeline::develop(&mut frame, edit);
     let t1 = js_sys::Date::now();
-    if !edit.is_color_touched() {
-        return (frame.pixels, tw, th, [geometry_ms, resample_ms, t1 - t0, 0.0, hit]);
-    }
-    let selection = sel_json.and_then(|j| selection_from_json(&j, sel_mask.map(|m| m.to_vec())));
-    let mask = selection.as_ref().map(|sel| ops::selection_mask(sel, tw, th));
-    pipeline::colour(&mut frame, edit, seed, mask.as_deref());
+    let mask = if edit.is_color_touched() {
+        sel_json
+            .and_then(|j| selection_from_json(&j, sel_mask.map(|m| m.to_vec())))
+            .map(|sel| ops::selection_mask(&sel, tw, th))
+    } else {
+        None
+    };
+    pipeline::colour(&mut frame, edit, seed, mask.as_deref(), wide_buf);
     let t2 = js_sys::Date::now();
     (frame.pixels, tw, th, [geometry_ms, resample_ms, t1 - t0, t2 - t1, hit])
 }
@@ -373,25 +375,28 @@ fn render_window_pipeline(
         (buf, t, js_sys::Date::now())
     };
     let mut frame = Frame::new(buf, tw, th);
-    pipeline::develop(&mut frame, edit);
+    let wide_buf = pipeline::develop(&mut frame, edit);
     let t3 = js_sys::Date::now();
     let hit = if cached { 1.0 } else { 0.0 };
-    if !edit.is_color_touched() {
-        return (frame.pixels, tw, th, [t1 - t0, t2 - t1, t3 - t2, 0.0, hit]);
-    }
-    let selection = sel_json.and_then(|j| selection_from_json(&j, sel_mask.map(|m| m.to_vec())));
-    let mask = selection.map(|sel| {
-        // Build the mask over the full working frame (selection coordinates
-        // are normalized to it), then take the window and scale it.
-        let mask = ops::selection_mask(&sel, ww, wh);
-        let win = crop_rows(&mask, ww, cx, cy, cw, ch, 1);
-        if (tw, th) != (cw, ch) {
-            nearest_resample_mask(&win, cw, ch, tw, th)
-        } else {
-            win
-        }
-    });
-    pipeline::colour(&mut frame, edit, seed, mask.as_deref());
+    let mask = if edit.is_color_touched() {
+        sel_json
+            .and_then(|j| selection_from_json(&j, sel_mask.map(|m| m.to_vec())))
+            .map(|sel| {
+                // Build the mask over the full working frame (selection
+                // coordinates are normalized to it), then take the window and
+                // scale it.
+                let mask = ops::selection_mask(&sel, ww, wh);
+                let win = crop_rows(&mask, ww, cx, cy, cw, ch, 1);
+                if (tw, th) != (cw, ch) {
+                    nearest_resample_mask(&win, cw, ch, tw, th)
+                } else {
+                    win
+                }
+            })
+    } else {
+        None
+    };
+    pipeline::colour(&mut frame, edit, seed, mask.as_deref(), wide_buf);
     let t4 = js_sys::Date::now();
     (frame.pixels, tw, th, [t1 - t0, t2 - t1, t3 - t2, t4 - t3, hit])
 }

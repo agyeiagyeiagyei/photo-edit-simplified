@@ -19,3 +19,4 @@ pub mod resample;
 pub mod stroke;
 pub mod types;
 pub mod wand;
+pub mod wide;

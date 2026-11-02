@@ -43,10 +43,12 @@ CPU:
 4. highlight shoulder (knee 0.6, exponential), skipped when 0;
 5. shadow toe (`0.04·sh·(1−min(y/0.18,1))²`);
 6. shadow chroma NR (luma-preserving, `t = nr·(1−min(y/0.12,1))·0.8`);
-7. linear → sRGB and quantise exactly as `rawops::apply` (`floor(v·1024)`,
-   1025-step encode, round to u8);
-8. levels+curves: composed 256-byte per-channel LUTs (`compose_tables`) in one
-   256×3 R8 texture, nearest, u8 in/out;
+7. linear → sRGB and quantise to u8 (the CPU carries 16-bit sRGB from develop
+   through colour and dithers once; the shader stays the 8-bit preview
+   approximation, gated at 45 dB in the parity tests);
+8. levels+curves: composed 256-byte per-channel LUTs (`compose_tables`, the
+   same tables the CPU feeds its wide path) in one 256×3 R8 texture, nearest,
+   u8 in/out;
 9. adjust: brightness/contrast/saturation/warmth on 0..255 values, same math
    and truncation as `color::adjust_rgb`;
 10. grain: the CPU hash (`noise_hash`), Box–Muller, per-channel decorrelation,
@@ -80,8 +82,11 @@ texture is a follow-up).
 - e2e forces the GPU, renders the same deterministic edit (brightness,
   contrast, saturation, warmth, levels gamma and black point) on both paths and
   compares the canvases downscaled to 512 px: PSNR ≥ 45 dB. Measured 53 dB.
-  Grain, blur, selections, denoise and sharpen are excluded from the parity
-  edit (resolution-dependent or CPU-only).
+  The CPU colour-only path is still byte-identical to the u8 sequence; RAW
+  develops carry 16 bits through colour, which the dither and the 512 px
+  downsample put comfortably inside the gate. Grain, blur, selections, denoise
+  and sharpen are excluded from the parity edit (resolution-dependent or
+  CPU-only).
 - Per tick on hardware: `preview.render` ≤ 16 ms (the 5 ms submission target is
   reported as `gpu.render`, but that span is command submission, not GPU
   execution). Headless CI is SwiftShader, so the timing marks are recorded and

@@ -9,7 +9,10 @@
 //! white balance, and moving away from it applies a blackbody-derived von
 //! Kries gain.
 
+use std::sync::OnceLock;
+
 use crate::types::{RawAdjust, NEUTRAL_K};
+use crate::wide;
 
 /// Linear value where highlight compression starts.
 const HL_KNEE: f32 = 0.6;
@@ -86,10 +89,36 @@ fn scale_rgb(rgb: &mut [f32; 3], s: f32) {
     rgb[2] *= s;
 }
 
-/// 3x3 box blur of the sRGB luma, used as the unsharp reference. One byte
+/// 16-bit sRGB decode table, built once per process.
+fn dec16() -> &'static [f32] {
+    static T: OnceLock<Vec<f32>> = OnceLock::new();
+    T.get_or_init(|| {
+        (0..65536)
+            .map(|i| srgb_to_linear(i as f32 / 65535.0))
+            .collect()
+    })
+}
+
+/// Linear -> 16-bit sRGB, sampled at 1/65536 linear steps. Finer than the
+/// 8-bit output needs, so the only rounding that reaches the frame is the
+/// final dither.
+fn enc16() -> &'static [u16] {
+    static T: OnceLock<Vec<u16>> = OnceLock::new();
+    T.get_or_init(|| {
+        (0..=65536)
+            .map(|i| {
+                (linear_to_srgb(i as f32 / 65536.0) * 65535.0)
+                    .round()
+                    .clamp(0.0, 65535.0) as u16
+            })
+            .collect()
+    })
+}
+
+/// 3x3 box blur of the sRGB luma, used as the unsharp reference. One u16
 /// per pixel so a 24MP develop pass adds 48MB, not another RGBA buffer.
-fn blur_luma(buf: &[u8], w: usize, h: usize) -> Vec<u8> {
-    let mut horiz = vec![0u8; w * h];
+fn blur_luma_wide(buf: &[u16], w: usize, h: usize) -> Vec<u16> {
+    let mut horiz = vec![0u16; w * h];
     for y in 0..h {
         let row = y * w;
         for x in 0..w {
@@ -100,10 +129,10 @@ fn blur_luma(buf: &[u8], w: usize, h: usize) -> Vec<u8> {
                 let i = (row + xx) * 4;
                 s += 54 * buf[i] as u32 + 183 * buf[i + 1] as u32 + 19 * buf[i + 2] as u32;
             }
-            horiz[row + x] = ((s >> 8) / (x1 - x0 + 1) as u32) as u8;
+            horiz[row + x] = ((s >> 8) / (x1 - x0 + 1) as u32) as u16;
         }
     }
-    let mut out = vec![0u8; w * h];
+    let mut out = vec![0u16; w * h];
     for y in 0..h {
         let y0 = y.saturating_sub(1);
         let y1 = (y + 1).min(h - 1);
@@ -113,21 +142,28 @@ fn blur_luma(buf: &[u8], w: usize, h: usize) -> Vec<u8> {
             for yy in y0..=y1 {
                 s += horiz[yy * w + x] as u32;
             }
-            out[y * w + x] = (s / rows) as u8;
+            out[y * w + x] = (s / rows) as u16;
         }
     }
     out
 }
 
-/// Apply the develop stage in place. Identity leaves the buffer untouched.
-pub fn apply(buf: &mut [u8], w: usize, h: usize, adj: &RawAdjust) {
+/// Apply the develop stage to a 16-bit sRGB RGBA frame in place. Identity
+/// leaves the buffer untouched.
+pub fn develop_wide(buf: &mut [u16], w: usize, h: usize, adj: &RawAdjust) {
     if adj.is_identity() || w == 0 || h == 0 {
         return;
     }
     // Spatial denoise first, so sharpening and the tone curves act on the
-    // cleaned image rather than amplifying sensor noise.
+    // cleaned image rather than amplifying sensor noise. The denoiser is
+    // still an 8-bit luma/chroma filter; it is the one stage that narrows
+    // here, and #9's denoise task moves it to linear luma.
     if adj.denoise > 0.0 {
-        crate::denoise::smart_denoise(buf, w, h, (adj.denoise / 100.0).clamp(0.0, 1.0));
+        let mut px8: Vec<u8> = buf.iter().map(|&v| ((v as u32 + 128) / 257) as u8).collect();
+        crate::denoise::smart_denoise(&mut px8, w, h, (adj.denoise / 100.0).clamp(0.0, 1.0));
+        for (dst, &v) in buf.iter_mut().zip(px8.iter()) {
+            *dst = v as u16 * 257;
+        }
     }
     let sharp = (adj.sharpen / 100.0).clamp(0.0, 1.0);
     let hl = (adj.highlights / 100.0).clamp(0.0, 1.0);
@@ -136,20 +172,11 @@ pub fn apply(buf: &mut [u8], w: usize, h: usize, adj: &RawAdjust) {
     let gains = wb_gains(adj.temp, adj.tint);
     let exp_gain = 2f32.powf(adj.exposure.clamp(-5.0, 5.0));
 
-    let mut dec = [0f32; 256];
-    for (i, v) in dec.iter_mut().enumerate() {
-        *v = srgb_to_linear(i as f32 / 255.0);
-    }
-    let mut enc = [0f32; 1025];
-    for (i, v) in enc.iter_mut().enumerate() {
-        *v = linear_to_srgb(i as f32 / 1024.0);
-    }
-    let encode = |v: f32| -> u8 {
-        let x = (v.clamp(0.0, 1.0) * 1024.0) as usize;
-        (enc[x] * 255.0).round() as u8
-    };
+    let dec = dec16();
+    let enc = enc16();
+    let encode = |v: f32| -> u16 { enc[(v.clamp(0.0, 1.0) * 65536.0) as usize] };
 
-    let blur = if sharp > 0.0 { Some(blur_luma(buf, w, h)) } else { None };
+    let blur = if sharp > 0.0 { Some(blur_luma_wide(buf, w, h)) } else { None };
 
     for (i, px) in buf.chunks_exact_mut(4).enumerate() {
         let mut rgb = [
@@ -162,7 +189,7 @@ pub fn apply(buf: &mut [u8], w: usize, h: usize, adj: &RawAdjust) {
         // signal, applied multiplicatively so hue is preserved in linear.
         if let Some(bp) = &blur {
             let yb = (54 * px[0] as u32 + 183 * px[1] as u32 + 19 * px[2] as u32) >> 8;
-            let d = (yb as f32 - bp[i] as f32) / 255.0;
+            let d = (yb as f32 - bp[i] as f32) / 65535.0;
             let g = (1.0 + sharp * 3.0 * d).clamp(0.2, 4.0);
             scale_rgb(&mut rgb, g);
         }
@@ -181,12 +208,18 @@ pub fn apply(buf: &mut [u8], w: usize, h: usize, adj: &RawAdjust) {
             y = y2;
         }
 
-        // Shadow lift: soft toe that fades out by mid-grey.
+        // Shadow lift: soft toe that fades out by mid-grey. Exactly-black has
+        // no colour to scale, so it takes the neutral lifted black point —
+        // scaling it would leave it at 0 next to a lifted neighbour.
         if sh > 0.0 {
             let w8 = (1.0 - (y / 0.18).min(1.0)).powi(2);
             let y2 = y + sh * 0.04 * w8;
             if y2 > y {
-                scale_rgb(&mut rgb, y2 / y.max(1e-6));
+                if y <= 1e-6 {
+                    rgb = [y2, y2, y2];
+                } else {
+                    scale_rgb(&mut rgb, y2 / y);
+                }
                 y = y2;
             }
         }
@@ -207,6 +240,18 @@ pub fn apply(buf: &mut [u8], w: usize, h: usize, adj: &RawAdjust) {
         px[1] = encode(rgb[1]);
         px[2] = encode(rgb[2]);
     }
+}
+
+/// Apply the develop stage to an 8-bit sRGB buffer. Legacy entry point (the
+/// wand sampler and the ops bench); the render pipeline widens first, develops
+/// wide, and dithers once at the end of the colour stage.
+pub fn apply(buf: &mut [u8], w: usize, h: usize, adj: &RawAdjust) {
+    if adj.is_identity() || w == 0 || h == 0 {
+        return;
+    }
+    let mut wide_buf = wide::widen(buf);
+    develop_wide(&mut wide_buf, w, h, adj);
+    wide::narrow_plain(&wide_buf, buf);
 }
 
 #[cfg(test)]
@@ -313,5 +358,15 @@ mod tests {
         assert!(v[1 * 4] < before[1 * 4], "dark side {v:?}");
         assert!(v[2 * 4] > before[2 * 4], "bright side {v:?}");
         assert_eq!(v[0], before[0], "far pixels are not touched");
+    }
+
+    #[test]
+    fn develop_wide_keeps_sub_8_bit_input() {
+        // Two source levels that narrow to the same u8 code must survive an
+        // exposure lift in the 16-bit path.
+        let mut buf = vec![0u16, 0, 0, 65535, 128, 128, 128, 65535];
+        develop_wide(&mut buf, 2, 1, &RawAdjust { exposure: 2.0, ..Default::default() });
+        assert_ne!(buf[0], buf[4]);
+        assert!(buf[4] > buf[0]);
     }
 }
