@@ -137,6 +137,97 @@ pub fn crop(src: &[u8], w: usize, x: usize, y: usize, cw: usize, ch: usize) -> V
     out
 }
 
+/// 16-bit counterpart of [`rotate_90`], for the neutral RAW frame.
+pub fn rotate_90_wide(src: &[u16], w: usize, h: usize, turns: u8) -> (Vec<u16>, usize, usize) {
+    match turns % 4 {
+        0 => (src.to_vec(), w, h),
+        1 => {
+            let (ow, oh) = (h, w);
+            let mut out = vec![0u16; src.len()];
+            for y in 0..h {
+                for x in 0..w {
+                    let (nx, ny) = (h - 1 - y, x);
+                    out[(ny * ow + nx) * 4..(ny * ow + nx) * 4 + 4]
+                        .copy_from_slice(&src[(y * w + x) * 4..(y * w + x) * 4 + 4]);
+                }
+            }
+            (out, ow, oh)
+        }
+        2 => {
+            let mut out = vec![0u16; src.len()];
+            for y in 0..h {
+                for x in 0..w {
+                    let (nx, ny) = (w - 1 - x, h - 1 - y);
+                    out[(ny * w + nx) * 4..(ny * w + nx) * 4 + 4]
+                        .copy_from_slice(&src[(y * w + x) * 4..(y * w + x) * 4 + 4]);
+                }
+            }
+            (out, w, h)
+        }
+        _ => {
+            let (ow, oh) = (h, w);
+            let mut out = vec![0u16; src.len()];
+            for y in 0..h {
+                for x in 0..w {
+                    let (nx, ny) = (y, w - 1 - x);
+                    out[(ny * ow + nx) * 4..(ny * ow + nx) * 4 + 4]
+                        .copy_from_slice(&src[(y * w + x) * 4..(y * w + x) * 4 + 4]);
+                }
+            }
+            (out, ow, oh)
+        }
+    }
+}
+
+/// 16-bit counterpart of [`rotate_auto_crop`], sampling with rounding.
+pub fn rotate_auto_crop_wide(
+    src: &[u16],
+    w: usize,
+    h: usize,
+    angle_deg: f32,
+) -> (Vec<u16>, usize, usize) {
+    let a = angle_deg.to_radians();
+    let (sin, cos) = (a.sin().abs(), a.cos().abs());
+    let bw = w as f32 * cos + h as f32 * sin;
+    let bh = w as f32 * sin + h as f32 * cos;
+    let x1 = (w * w) as f32 / (2.0 * bw);
+    let x2 = (w * h) as f32 / (2.0 * bh);
+    let half_w = x1.min(x2);
+    let half_h = half_w * h as f32 / w as f32;
+    let out_w = (half_w * 2.0).floor().max(1.0) as usize;
+    let out_h = (half_h * 2.0).floor().max(1.0) as usize;
+
+    let a = -angle_deg.to_radians();
+    let (sn, cs) = a.sin_cos();
+    let cx = w as f32 / 2.0;
+    let cy = h as f32 / 2.0;
+
+    let mut out = vec![0u16; out_w * out_h * 4];
+    for oy in 0..out_h {
+        for ox in 0..out_w {
+            let dx = ox as f32 + 0.5 - out_w as f32 / 2.0;
+            let dy = oy as f32 + 0.5 - out_h as f32 / 2.0;
+            let sx = cx + dx * cs - dy * sn;
+            let sy = cy + dx * sn + dy * cs;
+            let di = (oy * out_w + ox) * 4;
+            if sx >= 0.0 && sy >= 0.0 && sx < (w - 1) as f32 && sy < (h - 1) as f32 {
+                let (x0, y0) = (sx.floor() as usize, sy.floor() as usize);
+                let (fx, fy) = (sx - x0 as f32, sy - y0 as f32);
+                for ch in 0..4 {
+                    let i00 = src[(y0 * w + x0) * 4 + ch] as f32;
+                    let i10 = src[(y0 * w + x0 + 1) * 4 + ch] as f32;
+                    let i01 = src[((y0 + 1) * w + x0) * 4 + ch] as f32;
+                    let i11 = src[((y0 + 1) * w + x0 + 1) * 4 + ch] as f32;
+                    let top = i00 + (i10 - i00) * fx;
+                    let bot = i01 + (i11 - i01) * fx;
+                    out[di + ch] = (top + (bot - top) * fy + 0.5).clamp(0.0, 65535.0) as u16;
+                }
+            }
+        }
+    }
+    (out, out_w, out_h)
+}
+
 // --- selection / mask ops -----------------------------------------------------
 
 /// Generate an 8-bit alpha mask from a normalized selection.
@@ -473,5 +564,32 @@ mod tests {
         src[(1 * 4 + 2) * 4] = 99; // pixel at (x=2, y=1)
         let out = crop(&src, 4, 2, 1, 1, 1);
         assert_eq!(out[0], 99);
+    }
+
+    #[test]
+    fn rotate_90_wide_matches_the_u8_rotation() {
+        let src: Vec<u8> = (0..4 * 3 * 4).map(|i| (i * 7 % 256) as u8).collect();
+        let wide: Vec<u16> = src.iter().map(|&v| v as u16 * 257).collect();
+        for turns in 0..4 {
+            let (a, aw, ah) = rotate_90(&src, 4, 3, turns);
+            let (b, bw, bh) = rotate_90_wide(&wide, 4, 3, turns);
+            assert_eq!((aw, ah), (bw, bh));
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert_eq!(*y, *x as u16 * 257);
+            }
+        }
+    }
+
+    #[test]
+    fn rotate_auto_crop_wide_tracks_the_u8_output() {
+        let (w, h) = (40usize, 30usize);
+        let src: Vec<u8> = (0..w * h * 4).map(|i| ((i * 3) % 200) as u8 + 20).collect();
+        let wide: Vec<u16> = src.iter().map(|&v| v as u16 * 257).collect();
+        let (a, aw, ah) = rotate_auto_crop(&src, w, h, 12.0);
+        let (b, bw, bh) = rotate_auto_crop_wide(&wide, w, h, 12.0);
+        assert_eq!((aw, ah), (bw, bh));
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert!((*y as i32 - *x as i32 * 257).abs() <= 257, "{y} vs {x}");
+        }
     }
 }

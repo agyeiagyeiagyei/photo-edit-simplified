@@ -3,7 +3,7 @@
 //! ops run off the main thread. Callers provide a sync fallback for when the
 //! worker is unavailable or errors.
 
-use js_sys::{Array, Object, Reflect, Uint8Array};
+use js_sys::{Array, Object, Reflect, Uint16Array, Uint8Array};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use wasm_bindgen::prelude::*;
@@ -627,6 +627,10 @@ pub fn raw_pool_shutdown() {
 pub struct ProxyResult {
     /// Transferred from the worker — a JS view, never copied into Rust.
     pub pixels: Uint8Array,
+    /// Un-toned 16-bit develop at the same dims; empty when the source has no
+    /// demosaic to redevelop (camera JPEG, embedded preview).
+    pub neutral: Uint16Array,
+    pub white: f32,
     pub w: usize,
     pub h: usize,
     pub full_w: usize,
@@ -647,6 +651,8 @@ fn parse_proxy(v: &JsValue) -> Option<ProxyResult> {
     });
     Some(ProxyResult {
         pixels: get_buf(v, "pixels")?,
+        neutral: get_u16_buf(v, "neutral").unwrap_or_else(|| Uint16Array::new_with_length(0)),
+        white: get_f64(v, "white").unwrap_or(1.0) as f32,
         w: get_u32(v, "w")? as usize,
         h: get_u32(v, "h")? as usize,
         full_w: get_u32(v, "full_w")? as usize,
@@ -783,6 +789,12 @@ pub fn raw_meta(
 pub struct FullResult {
     /// Transferred from the worker — a JS view, never copied into Rust.
     pub pixels: Uint8Array,
+    /// Un-toned 16-bit develop at `pixels`' dims.
+    pub neutral: Uint16Array,
+    pub white: f32,
+    /// The camera-tone curve used for `pixels`; the render worker applies the
+    /// same curve after the neutral develop stage.
+    pub tone: Option<[u8; 256]>,
     pub w: usize,
     pub h: usize,
 }
@@ -808,8 +820,21 @@ pub fn raw_develop(
         &[],
         Box::new(move |reply| {
             cb(reply.ok().and_then(|v| {
+                let tone = get_buf(&v, "tone").and_then(|b| {
+                    if b.length() == 256 {
+                        let mut lut = [0u8; 256];
+                        b.copy_to(&mut lut);
+                        Some(lut)
+                    } else {
+                        None
+                    }
+                });
                 Some(FullResult {
                     pixels: get_buf(&v, "pixels")?,
+                    neutral: get_u16_buf(&v, "neutral")
+                        .unwrap_or_else(|| Uint16Array::new_with_length(0)),
+                    white: get_f64(&v, "white").unwrap_or(1.0) as f32,
+                    tone,
                     w: get_u32(&v, "w")? as usize,
                     h: get_u32(&v, "h")? as usize,
                 })
@@ -841,6 +866,14 @@ fn get_buf(v: &JsValue, key: &str) -> Option<Uint8Array> {
         return None;
     }
     Some(Uint8Array::new(&b))
+}
+
+fn get_u16_buf(v: &JsValue, key: &str) -> Option<Uint16Array> {
+    let b = Reflect::get(v, &JsValue::from_str(key)).ok()?;
+    if b.is_undefined() || b.is_null() {
+        return None;
+    }
+    Some(Uint16Array::new(&b))
 }
 
 fn get_u32(v: &JsValue, key: &str) -> Option<u32> {
@@ -888,6 +921,37 @@ pub fn load_view(id: usize, pixels: &Uint8Array, w: usize, h: usize) {
             JsValue::from(h as u32),
         ],
         &[],
+        Box::new(|_| {}),
+    );
+}
+
+/// Ship an item's un-toned 16-bit develop to the worker. The pixels are
+/// structured-cloned, not transferred: the app keeps its copy for the export
+/// render, which runs outside the worker's per-item caches.
+pub fn load_neutral_view(
+    id: usize,
+    pixels: &Uint16Array,
+    w: usize,
+    h: usize,
+    white: f32,
+    tone: Option<&[u8; 256]>,
+) {
+    let tone_arr = match tone {
+        Some(lut) => Uint8Array::from(&lut[..]),
+        None => Uint8Array::new_with_length(0),
+    };
+    let tone_buf = tone_arr.buffer();
+    call(
+        "load_neutral",
+        &[
+            JsValue::from(id as u32),
+            pixels.clone().into(),
+            JsValue::from(w as u32),
+            JsValue::from(h as u32),
+            JsValue::from(white),
+            tone_arr.into(),
+        ],
+        &[tone_buf.into()],
         Box::new(|_| {}),
     );
 }

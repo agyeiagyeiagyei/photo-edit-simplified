@@ -74,6 +74,10 @@ texture is a follow-up).
   blit alone measured 273 ms at 2888×1925 in the CI container (a GPU copy on
   hardware).
 - `?gpu=1` forces the GPU path, `?gpu=0` forces CPU — used by the e2e suite.
+- A RAW source with a non-identity develop stays on the CPU path: the shader
+  approximates develop from the camera-toned u8 base, while the worker renders
+  the 16-bit neutral frame with the camera tone last (WS5 highlight recovery).
+  Letting the shader win would hide the recovered highlight detail.
 - Any context/shader/link/upload failure latches the GPU off for the session;
   the existing CPU path runs untouched.
 

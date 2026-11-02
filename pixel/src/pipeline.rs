@@ -28,6 +28,21 @@ impl Frame {
     }
 }
 
+/// A 16-bit sRGB RGBA frame: the un-toned neutral RAW develop, carried
+/// through geometry and resample before the develop and camera-tone stages.
+pub struct Frame16 {
+    pub pixels: Vec<u16>,
+    pub w: usize,
+    pub h: usize,
+}
+
+impl Frame16 {
+    pub fn new(pixels: Vec<u16>, w: usize, h: usize) -> Self {
+        debug_assert_eq!(pixels.len(), w * h * 4, "pipeline: frame16 size mismatch");
+        Frame16 { pixels, w, h }
+    }
+}
+
 /// Size a render produces, as `geo::hi_target` computes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -62,11 +77,49 @@ pub fn resize(src: &[u8], w: usize, h: usize, target: Target) -> Frame {
     }
 }
 
-/// Selection mask for `edit` at `frame`'s size, when the edit is masked.
-pub fn mask_for(frame: &Frame, edit: &EditParams) -> Option<Vec<u8>> {
+/// Geometry + resample on a neutral 16-bit frame, before develop and tone.
+pub fn prepare_neutral(
+    src: &[u16],
+    w: usize,
+    h: usize,
+    edit: &EditParams,
+    target: Target,
+) -> Frame16 {
+    let (p, gw, gh) = crate::geo::geometry_wide(src, w, h, edit);
+    resize_wide(&p, gw, gh, target)
+}
+
+/// Resample a neutral geometry result to the render target.
+pub fn resize_wide(src: &[u16], w: usize, h: usize, target: Target) -> Frame16 {
+    if (w, h) == (target.w, target.h) {
+        Frame16 { pixels: src.to_vec(), w, h }
+    } else {
+        Frame16 {
+            pixels: resample::resample_wide(src, w, h, target.w, target.h),
+            w: target.w,
+            h: target.h,
+        }
+    }
+}
+
+/// Whether a RAW edit can render from the un-toned 16-bit develop: the
+/// develop is actually non-identity, and neither stage the neutral path
+/// lacks (denoise, capture sharpen) is in use. Callers fall back to the
+/// legacy u8 pipeline otherwise, so an edit never silently loses a stage.
+pub fn neutral_eligible(edit: &EditParams) -> bool {
+    !edit.raw.is_identity() && edit.raw.denoise <= 0.0 && edit.raw.sharpen <= 0.0
+}
+
+/// Selection mask for an edit at `w`×`h`, when the edit is masked.
+pub fn mask_for_dims(w: usize, h: usize, edit: &EditParams) -> Option<Vec<u8>> {
     edit.selection
         .as_ref()
-        .map(|sel| ops::selection_mask(sel, frame.w, frame.h))
+        .map(|sel| ops::selection_mask(sel, w, h))
+}
+
+/// Selection mask for `edit` at `frame`'s size, when the edit is masked.
+pub fn mask_for(frame: &Frame, edit: &EditParams) -> Option<Vec<u8>> {
+    mask_for_dims(frame.w, frame.h, edit)
 }
 
 /// Develop stage: white balance, exposure and the lighting controls in linear
@@ -150,6 +203,68 @@ pub fn finish_wide(
     if edit.is_color_touched() {
         color::apply_color_effects_wide(buf, w, h, edit, seed, mask);
     }
+}
+
+/// Neutral develop (white-relative, on unclipped data), then the camera tone
+/// curve, then colour. `tone` is the table from [`rawops::tone_table`].
+pub fn finish_neutral_wide(
+    buf: &mut [u16],
+    w: usize,
+    h: usize,
+    edit: &EditParams,
+    seed: u32,
+    mask: Option<&[u8]>,
+    white: f32,
+    tone: Option<&[u16]>,
+) {
+    rawops::develop_neutral_wide(buf, w, h, &edit.raw, white);
+    if let Some(table) = tone {
+        rawops::apply_tone_wide(buf, table);
+    }
+    if edit.is_color_touched() {
+        color::apply_color_effects_wide(buf, w, h, edit, seed, mask);
+    }
+}
+
+/// `finish_neutral_wide` with the mask taken from `edit.selection`.
+pub fn finish_neutral(
+    frame: &mut Frame16,
+    edit: &EditParams,
+    seed: u32,
+    white: f32,
+    tone: Option<&[u16]>,
+) {
+    let mask = if edit.is_color_touched() {
+        mask_for_dims(frame.w, frame.h, edit)
+    } else {
+        None
+    };
+    finish_neutral_wide(
+        &mut frame.pixels,
+        frame.w,
+        frame.h,
+        edit,
+        seed,
+        mask.as_deref(),
+        white,
+        tone,
+    );
+}
+
+/// The neutral pipeline for a source frame rendered to `target`.
+pub fn render_neutral(
+    src: &[u16],
+    w: usize,
+    h: usize,
+    edit: &EditParams,
+    target: Target,
+    seed: u32,
+    white: f32,
+    tone: Option<&[u16]>,
+) -> Frame16 {
+    let mut frame = prepare_neutral(src, w, h, edit, target);
+    finish_neutral(&mut frame, edit, seed, white, tone);
+    frame
 }
 
 /// The whole pipeline for a source frame rendered to `target`.
@@ -299,6 +414,78 @@ mod tests {
     #[ignore = "24 MP fixture; run with --release"]
     fn banding_ramp_24mp_is_dithered() {
         assert_dithered_ramp(6000, 4000);
+    }
+
+    fn tone_curve() -> [u8; 256] {
+        // Monotone lift: the camera curve a dark neutral develop needs.
+        let mut lut = [0u8; 256];
+        for (i, v) in lut.iter_mut().enumerate() {
+            *v = (10 + i * 235 / 255) as u8;
+        }
+        lut
+    }
+
+    #[test]
+    fn identity_neutral_with_tone_matches_the_toned_frame() {
+        let (w, h) = (64usize, 8usize);
+        let untoned: Vec<u8> = (0..w * h * 4)
+            .map(|i| match i % 4 {
+                0 => (i / 4 % w * 255 / (w - 1)) as u8,
+                1 => ((i / 4 * 7) % 256) as u8,
+                2 => 40,
+                _ => 255,
+            })
+            .collect();
+        let lut = tone_curve();
+        let toned: Vec<u8> = untoned
+            .chunks_exact(4)
+            .flat_map(|p| [lut[p[0] as usize], lut[p[1] as usize], lut[p[2] as usize], p[3]])
+            .collect();
+        let mut buf: Vec<u16> = untoned.iter().map(|&v| v as u16 * 257).collect();
+        let table = rawops::tone_table(&lut);
+        finish_neutral_wide(
+            &mut buf,
+            w,
+            h,
+            &EditParams::default(),
+            1,
+            None,
+            1.0,
+            Some(&table),
+        );
+        let mut out = vec![0u8; w * h * 4];
+        wide::narrow_dithered(&buf, &mut out, w, h);
+        let max = out.iter().zip(&toned).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+        assert!(max <= 1, "tone stage moved a pixel by {max} codes");
+    }
+
+    #[test]
+    fn neutral_develop_scales_thresholds_by_white() {
+        let (w, h) = (8usize, 8usize);
+        let v = (0.9 * 65535.0) as u16;
+        let frame = vec![v; w * h * 4];
+        let adj = RawAdjust { highlights: 100.0, ..RawAdjust::default() };
+        let mut less = frame.clone();
+        rawops::develop_neutral_wide(&mut less, w, h, &adj, 0.8);
+        let mut more = frame.clone();
+        rawops::develop_neutral_wide(&mut more, w, h, &adj, 0.3);
+        assert!(less[0] < v, "highlight recovery did not act at all");
+        assert!(
+            less[0] > more[0],
+            "smaller white must compress more: {} vs {}",
+            less[0],
+            more[0]
+        );
+    }
+
+    #[test]
+    fn tone_table_is_monotone_and_anchored() {
+        let lut = tone_curve();
+        let table = rawops::tone_table(&lut);
+        assert_eq!(table.len(), 65536);
+        assert_eq!(table[0], lut[0] as u16 * 257);
+        assert_eq!(table[65535], lut[255] as u16 * 257);
+        assert!(table.windows(2).all(|p| p[0] <= p[1]));
     }
 
     #[test]

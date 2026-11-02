@@ -30,6 +30,28 @@ pub fn geometry<'a>(
     }
 }
 
+/// 16-bit counterpart of [`geometry`] for the neutral RAW frame. Same math;
+/// the identity case borrows the source.
+pub fn geometry_wide<'a>(
+    pixels: &'a [u16],
+    w: usize,
+    h: usize,
+    edit: &EditParams,
+) -> (Cow<'a, [u16]>, usize, usize) {
+    let (p, w, h): (Cow<'a, [u16]>, usize, usize) = if edit.rot90 % 4 != 0 {
+        let (v, w, h) = ops::rotate_90_wide(pixels, w, h, edit.rot90);
+        (Cow::Owned(v), w, h)
+    } else {
+        (Cow::Borrowed(pixels), w, h)
+    };
+    if edit.fine_angle.abs() > 0.01 {
+        let (v, w, h) = ops::rotate_auto_crop_wide(&p, w, h, edit.fine_angle);
+        (Cow::Owned(v), w, h)
+    } else {
+        (p, w, h)
+    }
+}
+
 /// Dimensions after geometry() without running it.
 pub fn working_dims(w: usize, h: usize, edit: &EditParams) -> (usize, usize) {
     let (w, h) = if edit.rot90 % 2 == 1 { (h, w) } else { (w, h) };

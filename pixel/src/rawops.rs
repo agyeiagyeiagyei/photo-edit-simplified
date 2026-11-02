@@ -242,6 +242,99 @@ pub fn develop_wide(buf: &mut [u16], w: usize, h: usize, adj: &RawAdjust) {
     }
 }
 
+/// Develop the un-toned 16-bit sRGB RAW frame, white-relative.
+///
+/// The neutral develop spans only the camera's raw range (a dark frame might
+/// top out near 5% linear), so every threshold here is evaluated in units of
+/// `white` — the linear level the camera-tone curve maps to preview white.
+/// The stages themselves match [`develop_wide`]; denoise and capture
+/// sharpening stay on the legacy path and callers gate this one off when
+/// either is active.
+pub fn develop_neutral_wide(buf: &mut [u16], w: usize, h: usize, adj: &RawAdjust, white: f32) {
+    if adj.is_identity() || w == 0 || h == 0 {
+        return;
+    }
+    let white = if white.is_finite() && white > 1e-6 { white } else { 1.0 };
+    let hl = (adj.highlights / 100.0).clamp(0.0, 1.0);
+    let sh = (adj.shadows / 100.0).clamp(0.0, 1.0);
+    let nr = (adj.noise / 100.0).clamp(0.0, 1.0);
+    let gains = wb_gains(adj.temp, adj.tint);
+    let exp_gain = 2f32.powf(adj.exposure.clamp(-5.0, 5.0));
+
+    let dec = dec16();
+    let enc = enc16();
+    let encode = |v: f32| -> u16 { enc[(v.clamp(0.0, 1.0) * 65536.0) as usize] };
+    let inv = 1.0 / white;
+
+    for px in buf.chunks_exact_mut(4) {
+        let mut rgb = [
+            dec[px[0] as usize] * inv * gains[0] * exp_gain,
+            dec[px[1] as usize] * inv * gains[1] * exp_gain,
+            dec[px[2] as usize] * inv * gains[2] * exp_gain,
+        ];
+
+        let mut y = luma(rgb[0], rgb[1], rgb[2]);
+
+        // Highlight recovery on unclipped data, before the camera tone curve.
+        if hl > 0.0 && y > HL_KNEE {
+            let head = 1.0 - HL_KNEE;
+            let over = y - HL_KNEE;
+            let compressed = HL_KNEE + head * (1.0 - (-over / head).exp());
+            let y2 = y + (compressed - y) * hl;
+            scale_rgb(&mut rgb, y2 / y);
+            y = y2;
+        }
+
+        if sh > 0.0 {
+            let w8 = (1.0 - (y / 0.18).min(1.0)).powi(2);
+            let y2 = y + sh * 0.04 * w8;
+            if y2 > y {
+                if y <= 1e-6 {
+                    rgb = [y2, y2, y2];
+                } else {
+                    scale_rgb(&mut rgb, y2 / y);
+                }
+                y = y2;
+            }
+        }
+
+        if nr > 0.0 {
+            let dark = 1.0 - (y / 0.12).min(1.0);
+            let t = nr * dark * 0.8;
+            if t > 0.0 {
+                rgb[0] = y + (rgb[0] - y) * (1.0 - t);
+                rgb[1] = y + (rgb[1] - y) * (1.0 - t);
+                rgb[2] = y + (rgb[2] - y) * (1.0 - t);
+            }
+        }
+
+        px[0] = encode(rgb[0] * white);
+        px[1] = encode(rgb[1] * white);
+        px[2] = encode(rgb[2] * white);
+    }
+}
+
+/// Expand a camera-tone curve into the 16-bit input table the tone stage
+/// indexes. Built once per developed item.
+pub fn tone_table(tone: &[u8; 256]) -> Vec<u16> {
+    let mut knots = [0f32; 256];
+    for (k, &v) in knots.iter_mut().zip(tone.iter()) {
+        *k = v as f32;
+    }
+    crate::wide::widen_table(&knots)
+}
+
+/// Apply the camera tone curve to a developed 16-bit sRGB frame. Alpha is
+/// untouched.
+pub fn apply_tone_wide(buf: &mut [u16], table: &[u16]) {
+    debug_assert_eq!(table.len(), 65536, "tone: table size mismatch");
+    for px in buf.chunks_exact_mut(4) {
+        px[0] = table[px[0] as usize];
+        px[1] = table[px[1] as usize];
+        px[2] = table[px[2] as usize];
+    }
+}
+
 /// Apply the develop stage to an 8-bit sRGB buffer. Legacy entry point (the
 /// wand sampler and the ops bench); the render pipeline widens first, develops
 /// wide, and dithers once at the end of the colour stage.

@@ -105,8 +105,51 @@ fn lanczos3(x: f64) -> f64 {
     s
 }
 
+/// A channel sample the resampler can read and write.
+trait Sample: Copy {
+    fn to_f32(self) -> f32;
+    fn from_f32(v: f32) -> Self;
+}
+
+impl Sample for u8 {
+    #[inline]
+    fn to_f32(self) -> f32 {
+        self as f32
+    }
+    #[inline]
+    fn from_f32(v: f32) -> Self {
+        (v + 0.5).clamp(0.0, 255.0) as u8
+    }
+}
+
+impl Sample for u16 {
+    #[inline]
+    fn to_f32(self) -> f32 {
+        self as f32
+    }
+    #[inline]
+    fn from_f32(v: f32) -> Self {
+        (v + 0.5).clamp(0.0, 65535.0) as u16
+    }
+}
+
 /// Resample RGBA8 pixels from `sw`×`sh` to `dw`×`dh`.
 pub fn resample(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
+    resample_impl(src, sw, sh, dw, dh)
+}
+
+/// Resample a 16-bit RGBA frame (the neutral RAW develop) between sizes.
+pub fn resample_wide(src: &[u16], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u16> {
+    resample_impl(src, sw, sh, dw, dh)
+}
+
+fn resample_impl<T: Sample>(
+    src: &[T],
+    sw: usize,
+    sh: usize,
+    dw: usize,
+    dh: usize,
+) -> Vec<T> {
     assert_eq!(src.len(), sw * sh * 4, "resample: source size mismatch");
     assert!(dw > 0 && dh > 0, "resample: zero-sized target");
     if (sw, sh) == (dw, dh) {
@@ -114,7 +157,7 @@ pub fn resample(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u
     }
     let ax = Axis::new(sw, dw);
     let ay = Axis::new(sh, dh);
-    let mut out = vec![0u8; dw * dh * 4];
+    let mut out = vec![T::from_f32(0.0); dw * dh * 4];
     let strip = STRIP_ROWS.min(dh);
     let mut tmp: Vec<f32> = Vec::new();
     let mut y0 = 0;
@@ -135,10 +178,10 @@ pub fn resample(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u
                 let (mut r, mut g, mut b, mut a) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
                 for (k, &w) in wgt.iter().enumerate() {
                     let p = (start + k) * 4;
-                    r += src_row[p] as f32 * w;
-                    g += src_row[p + 1] as f32 * w;
-                    b += src_row[p + 2] as f32 * w;
-                    a += src_row[p + 3] as f32 * w;
+                    r += src_row[p].to_f32() * w;
+                    g += src_row[p + 1].to_f32() * w;
+                    b += src_row[p + 2].to_f32() * w;
+                    a += src_row[p + 3].to_f32() * w;
                 }
                 let o = dx * 4;
                 dst_row[o] = r;
@@ -162,10 +205,10 @@ pub fn resample(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u
                     a += tmp[p + 3] * w;
                 }
                 let o = dx * 4;
-                dst_row[o] = (r + 0.5).clamp(0.0, 255.0) as u8;
-                dst_row[o + 1] = (g + 0.5).clamp(0.0, 255.0) as u8;
-                dst_row[o + 2] = (b + 0.5).clamp(0.0, 255.0) as u8;
-                dst_row[o + 3] = (a + 0.5).clamp(0.0, 255.0) as u8;
+                dst_row[o] = T::from_f32(r);
+                dst_row[o + 1] = T::from_f32(g);
+                dst_row[o + 2] = T::from_f32(b);
+                dst_row[o + 3] = T::from_f32(a);
             }
         }
         y0 = y1;
@@ -262,6 +305,31 @@ mod tests {
         // levels in from the source extremes.
         assert!(out[0] <= 8);
         assert!(out[15 * 4] >= 247);
+    }
+
+    #[test]
+    fn wide_resample_narrows_to_the_u8_result() {
+        let (w, h) = (64usize, 32usize);
+        let mut px = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                let v = ((x * 7 + y * 3) % 256) as u8;
+                px[i] = v;
+                px[i + 1] = v / 2;
+                px[i + 2] = 255 - v;
+                px[i + 3] = 255;
+            }
+        }
+        let wide: Vec<u16> = px.iter().map(|&v| v as u16 * 257).collect();
+        let narrow = resample(&px, w, h, 23, 11);
+        let sixteen = resample_wide(&wide, w, h, 23, 11);
+        for (a, b) in narrow.iter().zip(sixteen.iter()) {
+            assert!(
+                (*b as i32 - *a as i32 * 257).abs() <= 258,
+                "wide {b} vs u8 {a} scaled"
+            );
+        }
     }
 
     #[test]

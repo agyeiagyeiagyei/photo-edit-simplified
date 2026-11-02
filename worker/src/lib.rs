@@ -5,18 +5,25 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
-use js_sys::{Array, Object, Reflect, Uint8Array};
+use js_sys::{Array, Object, Reflect, Uint16Array, Uint8Array};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
-use pes_pixel::geo::{crop_px, geometry, hi_target, stamp_stroke, working_dims};
+use pes_pixel::geo::{crop_px, geometry, geometry_wide, hi_target, stamp_stroke, working_dims};
 use pes_pixel::pipeline::{self, Frame, Target};
+use pes_pixel::rawops;
 use pes_pixel::recipe::{edit_params_from_recipe, selection_from_json};
 use pes_pixel::types::EditParams;
-use pes_pixel::{clone, fill, heal, ops, resample};
+use pes_pixel::{clone, color, fill, heal, ops, resample, wide};
 
 thread_local! {
     static BUFFERS: RefCell<HashMap<u32, (Vec<u8>, usize, usize)>> = RefCell::new(HashMap::new());
+    /// Un-toned 16-bit develop for RAW items, at the stored frame's dims. The
+    /// neutral pipeline renders from this and applies the camera tone curve
+    /// per tick, so a highlight edit acts on unclipped data. Dropped whenever
+    /// the item's stored pixels are replaced (load, destructive commit,
+    /// unload).
+    static NEUTRAL: RefCell<HashMap<u32, Neutral>> = RefCell::new(HashMap::new());
     /// `get_decoder_ms` of the first RAW opened in this worker. The first call
     /// pays rawler's camera-database build; later calls are the steady state.
     static DECODER_FIRST_MS: Cell<Option<f64>> = const { Cell::new(None) };
@@ -24,7 +31,7 @@ thread_local! {
     /// the export otherwise demosaic the same file twice; the export takes
     /// this instead. One slot: the app exports what it just selected. Empty
     /// when the proxy was a half-size superpixel develop.
-    static RAW_FULL: RefCell<Option<(u32, Vec<u8>, usize, usize)>> = RefCell::new(None);
+    static RAW_FULL: RefCell<Option<RawFull>> = RefCell::new(None);
     /// Tone curve from the last proxy develop. A half-size proxy cannot serve
     /// the export, but the full develop reuses this curve so both match.
     static RAW_TONE: RefCell<Option<(u32, [u8; 256])>> = RefCell::new(None);
@@ -38,6 +45,29 @@ thread_local! {
     /// cropped view shows only this region, so a colour-only edit copies the
     /// window rather than the whole frame. Cleared with the base cache.
     static WINDOW_CACHE: RefCell<Option<WindowCache>> = const { RefCell::new(None) };
+    /// 16-bit counterparts of the two caches above, for the neutral path.
+    static WIDE_BASE_CACHE: RefCell<Option<WideBaseCache>> = const { RefCell::new(None) };
+    static WIDE_WINDOW_CACHE: RefCell<Option<WideWindowCache>> = const { RefCell::new(None) };
+}
+
+struct Neutral {
+    pixels: Vec<u16>,
+    w: usize,
+    h: usize,
+    white: f32,
+    /// Expanded camera-tone table; None when the develop had no usable
+    /// preview curve, in which case the neutral frame is already the output.
+    tone: Option<Vec<u16>>,
+}
+
+struct RawFull {
+    id: u32,
+    rgba: Vec<u8>,
+    neutral: Vec<u16>,
+    white: f32,
+    tone: Option<[u8; 256]>,
+    w: usize,
+    h: usize,
 }
 
 struct BaseCache {
@@ -62,9 +92,37 @@ struct WindowCache {
     pixels: Vec<u8>,
 }
 
+/// 16-bit counterparts of the two caches above, for the neutral pipeline.
+struct WideBaseCache {
+    id: u32,
+    rot90: u8,
+    fine_bits: u32,
+    tw: usize,
+    th: usize,
+    pixels: Vec<u16>,
+}
+
+struct WideWindowCache {
+    id: u32,
+    rot90: u8,
+    fine_bits: u32,
+    crop: (usize, usize, usize, usize),
+    tw: usize,
+    th: usize,
+    pixels: Vec<u16>,
+}
+
 fn clear_render_caches() {
     BASE_CACHE.with(|c| *c.borrow_mut() = None);
     WINDOW_CACHE.with(|c| *c.borrow_mut() = None);
+    WIDE_BASE_CACHE.with(|c| *c.borrow_mut() = None);
+    WIDE_WINDOW_CACHE.with(|c| *c.borrow_mut() = None);
+}
+
+fn drop_neutral(id: u32) {
+    NEUTRAL.with(|n| {
+        n.borrow_mut().remove(&id);
+    });
 }
 
 fn with_buffer<R>(id: u32, f: impl FnOnce(&mut (Vec<u8>, usize, usize)) -> R) -> Result<R, JsValue> {
@@ -77,6 +135,12 @@ fn with_buffer<R>(id: u32, f: impl FnOnce(&mut (Vec<u8>, usize, usize)) -> R) ->
 
 fn js_buf(v: Vec<u8>) -> JsValue {
     let arr = Uint8Array::new_with_length(v.len() as u32);
+    arr.copy_from(&v);
+    arr.buffer().into()
+}
+
+fn js_u16_buf(v: Vec<u16>) -> JsValue {
+    let arr = Uint16Array::new_with_length(v.len() as u32);
     arr.copy_from(&v);
     arr.buffer().into()
 }
@@ -106,21 +170,52 @@ fn wasm_mem_bytes() -> f64 {
 #[wasm_bindgen]
 pub fn load(id: u32, pixels: Uint8Array, w: u32, h: u32) {
     clear_render_caches();
+    drop_neutral(id);
     BUFFERS.with(|b| {
         b.borrow_mut()
             .insert(id, (pixels.to_vec(), w as usize, h as usize));
     });
 }
 
+/// Store (or replace) an item's un-toned 16-bit develop. Its dims must match
+/// the stored RGBA buffer's: it replaces that buffer's develop stage, not its
+/// geometry. `tone` is the camera-tone LUT (256 entries), or empty when the
+/// develop had no usable preview curve.
+#[wasm_bindgen]
+pub fn load_neutral(id: u32, pixels: Uint16Array, w: u32, h: u32, white: f32, tone: Uint8Array) {
+    let tone = if tone.length() == 256 {
+        let mut lut = [0u8; 256];
+        tone.copy_to(&mut lut);
+        Some(rawops::tone_table(&lut))
+    } else {
+        None
+    };
+    WIDE_BASE_CACHE.with(|c| *c.borrow_mut() = None);
+    WIDE_WINDOW_CACHE.with(|c| *c.borrow_mut() = None);
+    NEUTRAL.with(|n| {
+        n.borrow_mut().insert(
+            id,
+            Neutral {
+                pixels: pixels.to_vec(),
+                w: w as usize,
+                h: h as usize,
+                white,
+                tone,
+            },
+        );
+    });
+}
+
 #[wasm_bindgen]
 pub fn unload(id: u32) {
     clear_render_caches();
+    drop_neutral(id);
     BUFFERS.with(|b| {
         b.borrow_mut().remove(&id);
     });
     RAW_FULL.with(|c| {
         let mut slot = c.borrow_mut();
-        if slot.as_ref().is_some_and(|(cid, _, _, _)| *cid == id) {
+        if slot.as_ref().is_some_and(|f| f.id == id) {
             *slot = None;
         }
     });
@@ -226,6 +321,258 @@ fn render_pipeline(
     (frame.pixels, tw, th, [geometry_ms, resample_ms, t1 - t0, t2 - t1, hit])
 }
 
+/// The neutral frame's dims when this item renders from it: a neutral develop
+/// is loaded at exactly the stored buffer's size and the edit has no stage
+/// the neutral pipeline lacks.
+fn neutral_dims(id: u32, edit: &EditParams) -> Option<(usize, usize)> {
+    if !pipeline::neutral_eligible(edit) {
+        return None;
+    }
+    let (bw, bh) = BUFFERS.with(|b| b.borrow().get(&id).map(|(_, w, h)| (*w, *h)))?;
+    NEUTRAL.with(|n| {
+        let n = n.borrow();
+        let f = n.get(&id)?;
+        (f.w == bw && f.h == bh).then_some((f.w, f.h))
+    })
+}
+
+/// Geometry + resample on the neutral frame, with a 16-bit base cache keyed
+/// like the u8 one. Neutral pixel edits (exposure, highlights, shadows, WB)
+/// rerun develop on a copy of this base, so they never compound.
+fn wide_base_pipeline(
+    id: u32,
+    fw: usize,
+    fh: usize,
+    edit: &EditParams,
+    req_w: f64,
+    req_h: f64,
+    max_edge: u32,
+) -> (Vec<u16>, usize, usize, [f64; 3]) {
+    let t0 = js_sys::Date::now();
+    let (ww, wh) = working_dims(fw, fh, edit);
+    let (tw, th) = hi_target(req_w, req_h, ww, wh, max_edge);
+    let fine_bits = edit.fine_angle.to_bits();
+    let cached = WIDE_BASE_CACHE.with(|c| {
+        c.borrow().as_ref().is_some_and(|b| {
+            b.id == id
+                && b.rot90 == edit.rot90
+                && b.fine_bits == fine_bits
+                && b.tw == tw
+                && b.th == th
+        })
+    });
+    let (buf, t1, t2) = if cached {
+        let v = WIDE_BASE_CACHE.with(|c| {
+            c.borrow().as_ref().map(|b| b.pixels.clone()).unwrap_or_default()
+        });
+        let t = js_sys::Date::now();
+        (v, t, t)
+    } else {
+        let (v, t1, t2) = NEUTRAL.with(|n| {
+            let n = n.borrow();
+            let src = n.get(&id).expect("neutral frame missing");
+            let (p, gw, gh) = geometry_wide(&src.pixels, fw, fh, edit);
+            let t1 = js_sys::Date::now();
+            let frame = pipeline::resize_wide(&p, gw, gh, Target::new(tw, th));
+            let t2 = js_sys::Date::now();
+            (frame.pixels, t1, t2)
+        });
+        WIDE_BASE_CACHE.with(|c| {
+            *c.borrow_mut() = Some(WideBaseCache {
+                id,
+                rot90: edit.rot90,
+                fine_bits,
+                tw,
+                th,
+                pixels: v.clone(),
+            })
+        });
+        (v, t1, t2)
+    };
+    let hit = if cached { 1.0 } else { 0.0 };
+    (buf, tw, th, [t1 - t0, t2 - t1, hit])
+}
+
+fn wide_window_pipeline(
+    id: u32,
+    fw: usize,
+    fh: usize,
+    edit: &EditParams,
+    req_w: f64,
+    req_h: f64,
+    max_edge: u32,
+) -> (Vec<u16>, usize, usize, [f64; 3]) {
+    let t0 = js_sys::Date::now();
+    let (ww, wh) = working_dims(fw, fh, edit);
+    let (cx, cy, cw, ch) = crop_px(edit, ww, wh);
+    let (tw, th) = hi_target(req_w, req_h, cw, ch, max_edge);
+    let fine_bits = edit.fine_angle.to_bits();
+    let cached = WIDE_WINDOW_CACHE.with(|c| {
+        c.borrow().as_ref().is_some_and(|w| {
+            w.id == id
+                && w.rot90 == edit.rot90
+                && w.fine_bits == fine_bits
+                && w.crop == (cx, cy, cw, ch)
+                && w.tw == tw
+                && w.th == th
+        })
+    });
+    let (buf, t1, t2) = if cached {
+        let v = WIDE_WINDOW_CACHE.with(|c| {
+            c.borrow().as_ref().map(|w| w.pixels.clone()).unwrap_or_default()
+        });
+        let t = js_sys::Date::now();
+        (v, t, t)
+    } else {
+        let (v, t1, t2) = NEUTRAL.with(|n| {
+            let n = n.borrow();
+            let src = n.get(&id).expect("neutral frame missing");
+            let (p, gw, gh) = geometry_wide(&src.pixels, fw, fh, edit);
+            let t1 = js_sys::Date::now();
+            let win: Vec<u16> = if (cx, cy, cw, ch) == (0, 0, gw, gh) {
+                p.into_owned()
+            } else {
+                crop_rows(&p, gw, cx, cy, cw, ch, 4)
+            };
+            let frame = pipeline::resize_wide(&win, cw, ch, Target::new(tw, th));
+            let t2 = js_sys::Date::now();
+            (frame.pixels, t1, t2)
+        });
+        WIDE_WINDOW_CACHE.with(|c| {
+            *c.borrow_mut() = Some(WideWindowCache {
+                id,
+                rot90: edit.rot90,
+                fine_bits,
+                crop: (cx, cy, cw, ch),
+                tw,
+                th,
+                pixels: v.clone(),
+            })
+        });
+        (v, t1, t2)
+    };
+    let hit = if cached { 1.0 } else { 0.0 };
+    (buf, tw, th, [t1 - t0, t2 - t1, hit])
+}
+
+/// Develop, camera tone and colour on a neutral frame, then the single 8-bit
+/// quantisation. Returns the u8 pixels and (develop+tone, colour) timings.
+fn neutral_finish(
+    buf: &mut [u16],
+    w: usize,
+    h: usize,
+    edit: &EditParams,
+    seed: u32,
+    white: f32,
+    tone: Option<&[u16]>,
+    mask: Option<&[u8]>,
+) -> (Vec<u8>, f64, f64) {
+    let t0 = js_sys::Date::now();
+    rawops::develop_neutral_wide(buf, w, h, &edit.raw, white);
+    if let Some(table) = tone {
+        rawops::apply_tone_wide(buf, table);
+    }
+    let t1 = js_sys::Date::now();
+    if edit.is_color_touched() {
+        color::apply_color_effects_wide(buf, w, h, edit, seed, mask);
+    }
+    let t2 = js_sys::Date::now();
+    let mut out = vec![0u8; w * h * 4];
+    wide::narrow_dithered(buf, &mut out, w, h);
+    (out, t1 - t0, t2 - t1)
+}
+
+fn selection_mask_for(
+    edit: &EditParams,
+    w: usize,
+    h: usize,
+    sel_json: Option<String>,
+    sel_mask: Option<Uint8Array>,
+) -> Option<Vec<u8>> {
+    if !edit.is_color_touched() {
+        return None;
+    }
+    sel_json
+        .and_then(|j| selection_from_json(&j, sel_mask.map(|m| m.to_vec())))
+        .map(|sel| ops::selection_mask(&sel, w, h))
+}
+
+fn render_reply(pixels: Vec<u8>, tw: usize, th: usize, t: [f64; 5]) -> JsValue {
+    let timings = result_obj(&[
+        ("geometry", t[0].into()),
+        ("resample", t[1].into()),
+        ("develop", t[2].into()),
+        ("color", t[3].into()),
+        ("cache", t[4].into()),
+    ]);
+    result_obj(&[
+        ("pixels", js_buf(pixels)),
+        ("w", (tw as u32).into()),
+        ("h", (th as u32).into()),
+        ("timings", timings),
+    ])
+}
+
+fn neutral_render(
+    id: u32,
+    fw: usize,
+    fh: usize,
+    edit: &EditParams,
+    seed: u32,
+    req_w: f64,
+    req_h: f64,
+    max_edge: u32,
+    sel_json: Option<String>,
+    sel_mask: Option<Uint8Array>,
+) -> (Vec<u8>, usize, usize, [f64; 5]) {
+    let (mut buf, tw, th, t) = wide_base_pipeline(id, fw, fh, edit, req_w, req_h, max_edge);
+    let mask = selection_mask_for(edit, tw, th, sel_json, sel_mask);
+    let (out, dev_ms, col_ms) = NEUTRAL.with(|n| {
+        let n = n.borrow();
+        let src = n.get(&id).expect("neutral frame missing");
+        neutral_finish(&mut buf, tw, th, edit, seed, src.white, src.tone.as_deref(), mask.as_deref())
+    });
+    (out, tw, th, [t[0], t[1], dev_ms, col_ms, t[2]])
+}
+
+fn neutral_window_render(
+    id: u32,
+    fw: usize,
+    fh: usize,
+    edit: &EditParams,
+    seed: u32,
+    req_w: f64,
+    req_h: f64,
+    max_edge: u32,
+    sel_json: Option<String>,
+    sel_mask: Option<Uint8Array>,
+) -> (Vec<u8>, usize, usize, [f64; 5]) {
+    let (mut buf, tw, th, t) = wide_window_pipeline(id, fw, fh, edit, req_w, req_h, max_edge);
+    let mask = if edit.is_color_touched() {
+        let (ww, wh) = working_dims(fw, fh, edit);
+        let (cx, cy, cw, ch) = crop_px(edit, ww, wh);
+        sel_json
+            .and_then(|j| selection_from_json(&j, sel_mask.map(|m| m.to_vec())))
+            .map(|sel| {
+                let full = ops::selection_mask(&sel, ww, wh);
+                let win = crop_rows(&full, ww, cx, cy, cw, ch, 1);
+                if (tw, th) != (cw, ch) {
+                    nearest_resample_mask(&win, cw, ch, tw, th)
+                } else {
+                    win
+                }
+            })
+    } else {
+        None
+    };
+    let (out, dev_ms, col_ms) = NEUTRAL.with(|n| {
+        let n = n.borrow();
+        let src = n.get(&id).expect("neutral frame missing");
+        neutral_finish(&mut buf, tw, th, edit, seed, src.white, src.tone.as_deref(), mask.as_deref())
+    });
+    (out, tw, th, [t[0], t[1], dev_ms, col_ms, t[2]])
+}
+
 /// Render the hi-res frame. Returns {pixels, w, h}.
 #[wasm_bindgen]
 pub fn render(
@@ -237,24 +584,18 @@ pub fn render(
     sel_json: Option<String>,
     sel_mask: Option<Uint8Array>,
 ) -> Result<JsValue, JsValue> {
+    let edit = parse_edit(recipe);
+    if let Some((fw, fh)) = neutral_dims(id, &edit) {
+        let (buf, tw, th, t) = neutral_render(
+            id, fw, fh, &edit, id, req_w, req_h, max_edge, sel_json, sel_mask,
+        );
+        return Ok(render_reply(buf, tw, th, t));
+    }
     with_buffer(id, |(full, fw, fh)| {
-        let edit = parse_edit(recipe);
         let (buf, tw, th, t) = render_pipeline(
             id, full, *fw, *fh, &edit, id, req_w, req_h, max_edge, sel_json, sel_mask,
         );
-        let timings = result_obj(&[
-            ("geometry", t[0].into()),
-            ("resample", t[1].into()),
-            ("develop", t[2].into()),
-            ("color", t[3].into()),
-            ("cache", t[4].into()),
-        ]);
-        result_obj(&[
-            ("pixels", js_buf(buf)),
-            ("w", (tw as u32).into()),
-            ("h", (th as u32).into()),
-            ("timings", timings),
-        ])
+        render_reply(buf, tw, th, t)
     })
 }
 
@@ -288,8 +629,16 @@ pub fn render_base(
     })
 }
 
-/// Copy a sub-rect out of a `bpp`-bytes-per-pixel buffer, row by row.
-fn crop_rows(p: &[u8], w: usize, cx: usize, cy: usize, cw: usize, ch: usize, bpp: usize) -> Vec<u8> {
+/// Copy a sub-rect out of a `bpp`-element-per-pixel buffer, row by row.
+fn crop_rows<T: Copy>(
+    p: &[T],
+    w: usize,
+    cx: usize,
+    cy: usize,
+    cw: usize,
+    ch: usize,
+    bpp: usize,
+) -> Vec<T> {
     let mut out = Vec::with_capacity(cw * ch * bpp);
     for y in cy..cy + ch {
         let s = (y * w + cx) * bpp;
@@ -412,24 +761,18 @@ pub fn render_window(
     sel_json: Option<String>,
     sel_mask: Option<Uint8Array>,
 ) -> Result<JsValue, JsValue> {
+    let edit = parse_edit(recipe);
+    if let Some((fw, fh)) = neutral_dims(id, &edit) {
+        let (buf, tw, th, t) = neutral_window_render(
+            id, fw, fh, &edit, id, req_w, req_h, max_edge, sel_json, sel_mask,
+        );
+        return Ok(render_reply(buf, tw, th, t));
+    }
     with_buffer(id, |(full, fw, fh)| {
-        let edit = parse_edit(recipe);
         let (buf, tw, th, t) = render_window_pipeline(
             id, full, *fw, *fh, &edit, id, req_w, req_h, max_edge, sel_json, sel_mask,
         );
-        let timings = result_obj(&[
-            ("geometry", t[0].into()),
-            ("resample", t[1].into()),
-            ("develop", t[2].into()),
-            ("color", t[3].into()),
-            ("cache", t[4].into()),
-        ]);
-        result_obj(&[
-            ("pixels", js_buf(buf)),
-            ("w", (tw as u32).into()),
-            ("h", (th as u32).into()),
-            ("timings", timings),
-        ])
+        render_reply(buf, tw, th, t)
     })
 }
 
@@ -440,8 +783,19 @@ fn downscale(pixels: &[u8], w: usize, h: usize, long_edge: u32) -> (Vec<u8>, usi
 /// Destructive ops make their result the item's new stored buffer. The app
 /// bakes rotation into the result and keeps the crop, which is applied at
 /// render time over the working frame.
-fn commit(full: &mut Vec<u8>, fw: &mut usize, fh: &mut usize, base: &[u8], w: usize, h: usize) {
+fn commit(
+    id: u32,
+    full: &mut Vec<u8>,
+    fw: &mut usize,
+    fh: &mut usize,
+    base: &[u8],
+    w: usize,
+    h: usize,
+) {
     clear_render_caches();
+    // The neutral develop describes the pre-op pixels; after a destructive
+    // op it no longer matches the stored frame.
+    drop_neutral(id);
     full.clear();
     full.extend_from_slice(base);
     *fw = w;
@@ -490,7 +844,7 @@ pub fn heal_stroke(
         if !heal::spot_heal(&mut base, &coverage, w, h, 1.0, heal_mode_wire(mode), id) {
             return JsValue::NULL;
         }
-        commit(full, fw, fh, &base, w, h);
+        commit(id, full, fw, fh, &base, w, h);
         destructive_result(base, w, h)
     })
 }
@@ -516,7 +870,7 @@ pub fn clone_stamp(
         let mut coverage = vec![0u8; w * h];
         stamp_stroke(&mut coverage, w, h, &pts, r);
         clone::clone_stamp(&mut base, w, h, &coverage, dx, dy);
-        commit(full, fw, fh, &base, w, h);
+        commit(id, full, fw, fh, &base, w, h);
         destructive_result(base, w, h)
     })
 }
@@ -545,7 +899,7 @@ pub fn cut(
         };
         let mask = ops::selection_mask(&sel, w, h);
         delete_by_mask(&mut base, &mask);
-        commit(full, fw, fh, &base, w, h);
+        commit(id, full, fw, fh, &base, w, h);
         destructive_result(base, w, h)
     })
 }
@@ -569,7 +923,7 @@ pub fn fill_selection(
         if !fill::content_fill(&mut base, &mask, w, h) {
             return JsValue::NULL;
         }
-        commit(full, fw, fh, &base, w, h);
+        commit(id, full, fw, fh, &base, w, h);
         destructive_result(base, w, h)
     })
 }
@@ -601,7 +955,7 @@ pub fn extract(
         ];
         if also_cut {
             delete_by_mask(&mut base, &mask);
-            commit(full, fw, fh, &base, w, h);
+            commit(id, full, fw, fh, &base, w, h);
             let (pv, pw, ph) = downscale(&base, w, h, 1024);
             pairs.push(("pixels", js_buf(base)));
             pairs.push(("w", (w as u32).into()));
@@ -618,6 +972,8 @@ fn proxy_result(
     px: Vec<u8>,
     w: usize,
     h: usize,
+    neutral: Vec<u16>,
+    white: f32,
     full_w: usize,
     full_h: usize,
     tone: Option<[u8; 256]>,
@@ -626,6 +982,10 @@ fn proxy_result(
         ("pixels", js_buf(px)),
         ("w", (w as u32).into()),
         ("h", (h as u32).into()),
+        // Un-toned 16-bit develop at the proxy's size; empty for camera
+        // JPEGs and embedded previews, which have no demosaic to redevelop.
+        ("neutral", js_u16_buf(neutral)),
+        ("white", white.into()),
         ("full_w", (full_w as u32).into()),
         ("full_h", (full_h as u32).into()),
         // The tone curve used for these pixels; the export develop reuses it
@@ -651,17 +1011,34 @@ pub fn raw_proxy(
     let p = rawcore::decode_raw_proxy(&bytes.to_vec(), max_edge)
         .map_err(|e| JsValue::from_str(&e))?;
     let (px, pw, ph) = downscale(&p.rgba, p.w, p.h, max_edge);
+    // The proxy's neutral must land at the proxy buffer's dims: the app loads
+    // it into the render worker under the proxy's id, whose geometry runs on
+    // those u8 pixels.
+    let neutral = if (p.w, p.h) == (pw, ph) {
+        p.neutral.clone()
+    } else {
+        resample::resample_wide(&p.neutral, p.w, p.h, pw, ph)
+    };
+    let (full_w, full_h, white, tone, half) = (p.full_w, p.full_h, p.white, p.tone, p.half);
     if retain {
         RAW_FULL.with(|c| {
-            *c.borrow_mut() = if p.half {
+            *c.borrow_mut() = if half {
                 None
             } else {
-                Some((id, p.rgba, p.w, p.h))
+                Some(RawFull {
+                    id,
+                    rgba: p.rgba,
+                    neutral: p.neutral,
+                    white,
+                    tone,
+                    w: p.w,
+                    h: p.h,
+                })
             }
         });
-        RAW_TONE.with(|c| *c.borrow_mut() = p.tone.map(|t| (id, t)));
+        RAW_TONE.with(|c| *c.borrow_mut() = tone.map(|t| (id, t)));
     }
-    Ok(proxy_result(px, pw, ph, p.full_w, p.full_h, p.tone))
+    Ok(proxy_result(px, pw, ph, neutral, white, full_w, full_h, tone))
 }
 
 /// Decode the camera's embedded full-size JPEG (no EXIF of its own) into a
@@ -671,7 +1048,7 @@ pub fn camera_proxy(jpeg: Uint8Array, orientation: u16, max_edge: u32) -> Result
     let (rgba, w, h) = rawcore::camera_jpeg_rgba(&jpeg.to_vec(), orientation)
         .ok_or_else(|| JsValue::from_str("camera JPEG decode failed"))?;
     let (px, pw, ph) = downscale(&rgba, w, h, max_edge);
-    Ok(proxy_result(px, pw, ph, w, h, None))
+    Ok(proxy_result(px, pw, ph, Vec::new(), 1.0, w, h, None))
 }
 
 /// RAW metadata in one round-trip: EXIF payload, orientation, capture time,
@@ -725,7 +1102,7 @@ pub fn raw_develop(id: u32, bytes: Uint8Array, tone: Uint8Array) -> Result<JsVal
     };
     let cached = RAW_FULL.with(|c| {
         let mut slot = c.borrow_mut();
-        let hit = slot.as_ref().map(|(cid, _, _, _)| *cid == id).unwrap_or(false);
+        let hit = slot.as_ref().map(|f| f.id == id).unwrap_or(false);
         let taken = slot.take();
         if hit {
             taken
@@ -733,8 +1110,8 @@ pub fn raw_develop(id: u32, bytes: Uint8Array, tone: Uint8Array) -> Result<JsVal
             None
         }
     });
-    let (rgba, w, h) = match cached {
-        Some((_, rgba, w, h)) => (rgba, w, h),
+    let (rgba, neutral, w, h, white, tone) = match cached {
+        Some(f) => (f.rgba, f.neutral, f.w, f.h, f.white, f.tone),
         None => {
             let tone = explicit.or_else(|| {
                 RAW_TONE.with(|c| {
@@ -748,14 +1125,19 @@ pub fn raw_develop(id: u32, bytes: Uint8Array, tone: Uint8Array) -> Result<JsVal
                     }
                 })
             });
-            rawcore::decode_raw_with_tone(&bytes.to_vec(), tone.as_ref())
-                .map_err(|e| JsValue::from_str(&e))?
+            let d = rawcore::decode_raw_wide(&bytes.to_vec(), tone.as_ref())
+                .map_err(|e| JsValue::from_str(&e))?;
+            (d.rgba, d.neutral, d.w, d.h, d.white, d.tone)
         }
     };
+    let tone_field = tone.map(|t| js_buf(t.to_vec())).unwrap_or(JsValue::NULL);
     Ok(result_obj(&[
         ("pixels", js_buf(rgba)),
+        ("neutral", js_u16_buf(neutral)),
         ("w", (w as u32).into()),
         ("h", (h as u32).into()),
+        ("white", white.into()),
+        ("tone", tone_field),
         ("mem", wasm_mem_bytes().into()),
     ]))
 }
@@ -766,7 +1148,7 @@ pub fn raw_preview(bytes: Uint8Array, max_edge: u32) -> Result<JsValue, JsValue>
     let (rgba, w, h) = rawcore::preview_rgba(&bytes.to_vec())
         .ok_or_else(|| JsValue::from_str("no embedded preview"))?;
     let (px, pw, ph) = downscale(&rgba, w, h, max_edge);
-    Ok(proxy_result(px, pw, ph, w, h, None))
+    Ok(proxy_result(px, pw, ph, Vec::new(), 1.0, w, h, None))
 }
 
 fn parse_pts(v: &JsValue) -> Vec<(f32, f32)> {

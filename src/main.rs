@@ -9,8 +9,8 @@ mod session;
 mod state;
 mod web;
 
-use pes_pixel::{blur, clone, color, curves, fill, heal, levels, ops, rawops, resample, stroke, wand};
-use pes_pixel::geo::{crop_px, geometry, hi_target, stamp_stroke, working_dims};
+use pes_pixel::{blur, clone, color, curves, fill, heal, levels, ops, rawops, resample, stroke, wand, wide};
+use pes_pixel::geo::{crop_px, geometry, geometry_wide, hi_target, stamp_stroke, working_dims};
 use pes_pixel::pipeline::{self, Frame as PipeFrame, Target as PipeTarget};
 use pes_pixel::types::RawAdjust;
 
@@ -22,7 +22,7 @@ use std::rc::Rc;
 use leptos::leptos_dom::helpers::window_event_listener;
 use leptos::*;
 use leptos::batch;
-use js_sys::Uint8Array;
+use js_sys::{Uint16Array, Uint8Array};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{Blob, File, Url};
@@ -127,11 +127,38 @@ fn owned_geometry(
 
 // --- media cache (non-reactive) ---------------------------------------------
 
+/// A RAW item's un-toned 16-bit develop: the source the neutral pipeline
+/// stretches highlights on. Kept beside the camera-toned u8 `full` so a RAW
+/// slider tick and the export both start from unclipped linear data.
+#[derive(Clone)]
+struct NeutralData {
+    /// JS view over the develop transferred back from the RAW worker.
+    pixels: Uint16Array,
+    w: usize,
+    h: usize,
+    /// Un-toned white level, so highlight thresholds scale to the sensor.
+    white: f32,
+    /// Camera-tone curve applied after the develop stages.
+    tone: Option<[u8; 256]>,
+}
+
+/// The result of a full sensel develop: the camera-toned u8 frame plus the
+/// neutral develop the render worker needs for the neutral path.
+struct FullDevelop {
+    pixels: Pixels,
+    w: usize,
+    h: usize,
+    neutral: Option<NeutralData>,
+}
+
 #[derive(Clone)]
 struct PhotoData {
     /// Full-res RGBA. None until materialized (imports decode preview-only);
     /// may be evicted under memory pressure, but never while `dirty`.
     full: Option<(Pixels, usize, usize)>,
+    /// Un-toned 16-bit develop at `full`'s dims (RAW only). Retained for
+    /// export parity; counted in the full-res budget.
+    neutral: Option<NeutralData>,
     /// Source dimensions, known without holding the pixels.
     full_dims: (usize, usize),
     preview: (Vec<u8>, usize, usize),
@@ -214,16 +241,18 @@ fn touch_full(id: usize) {
     LAST_USE.with(|l| l.borrow_mut().insert(id, t));
 }
 
+/// Bytes a decoded item keeps alive (u8 frame + 16-bit neutral develop).
+fn photo_bytes(p: &PhotoData) -> usize {
+    p.full.as_ref().map(|f| f.0.len()).unwrap_or(0)
+        + p.neutral.as_ref().map(|n| n.pixels.length() as usize * 2).unwrap_or(0)
+}
+
 /// Drop least-recently-used clean full-res buffers until the decoded total
-/// fits the budget; the worker's copy goes with each eviction.
+/// fits the budget; the worker's copies go with each eviction.
 fn evict_full_lru() {
     let evicted: Vec<usize> = CACHE.with(|c| {
         let mut c = c.borrow_mut();
-        let mut total: usize = c
-            .photos
-            .values()
-            .filter_map(|p| p.full.as_ref().map(|f| f.0.len()))
-            .sum();
+        let mut total: usize = c.photos.values().map(|p| photo_bytes(p)).sum();
         if total <= FULL_BUDGET {
             return Vec::new();
         }
@@ -235,7 +264,7 @@ fn evict_full_lru() {
                 (
                     LAST_USE.with(|l| l.borrow().get(id).copied()).unwrap_or(0),
                     *id,
-                    p.full.as_ref().map(|f| f.0.len()).unwrap_or(0),
+                    photo_bytes(p),
                 )
             })
             .collect();
@@ -246,7 +275,9 @@ fn evict_full_lru() {
                 break;
             }
             if let Some(p) = c.photos.get_mut(&id) {
-                Rc::make_mut(p).full = None;
+                let p = Rc::make_mut(p);
+                p.full = None;
+                p.neutral = None;
                 total -= len;
                 evicted.push(id);
             }
@@ -260,8 +291,11 @@ fn evict_full_lru() {
 
 /// Install a freshly decoded full-res buffer: cache + worker + LRU, then run
 /// waiters and nudge items so pending hi-res renders reschedule.
-fn materialize_full(state: AppState, id: usize, pixels: Pixels, w: usize, h: usize) {
-    pixels.load_into_worker(id, w, h);
+fn materialize_full(state: AppState, id: usize, full: FullDevelop) {
+    full.pixels.load_into_worker(id, full.w, full.h);
+    if let Some(n) = &full.neutral {
+        pworker::load_neutral_view(id, &n.pixels, n.w, n.h, n.white, n.tone.as_ref());
+    }
     // Sensor pixels supersede the display proxy (and any render it fed).
     if proxy_in_mem(id) {
         drop_proxy(id);
@@ -269,8 +303,9 @@ fn materialize_full(state: AppState, id: usize, pixels: Pixels, w: usize, h: usi
     CACHE.with(|c| {
         if let Some(p) = c.borrow_mut().photos.get_mut(&id) {
             let p = Rc::make_mut(p);
-            p.full_dims = (w, h);
-            p.full = Some((pixels, w, h));
+            p.full_dims = (full.w, full.h);
+            p.full = Some((full.pixels, full.w, full.h));
+            p.neutral = full.neutral;
         }
     });
     touch_full(id);
@@ -312,7 +347,7 @@ fn ensure_full(state: AppState, id: usize, waiter: Option<Box<dyn FnOnce()>>) {
                 Ok((img, url)) => {
                     let _ = Url::revoke_object_url(&url);
                     let (px, w, h) = web::rgba_from_image(&img);
-                    Some((Pixels::owned(px), w, h))
+                    Some(FullDevelop { pixels: Pixels::owned(px), w, h, neutral: None })
                 }
                 Err(_) => None,
             }
@@ -336,7 +371,7 @@ fn ensure_full(state: AppState, id: usize, waiter: Option<Box<dyn FnOnce()>>) {
         FULL_INFLIGHT.with(|f| f.borrow_mut().remove(&id));
         let still_tracked = CACHE.with(|c| c.borrow().photos.contains_key(&id));
         match (decoded, still_tracked) {
-            (Some((px, w, h)), true) => materialize_full(state, id, px, w, h),
+            (Some(full), true) => materialize_full(state, id, full),
             _ => {
                 // Gone or undecodable — drop waiters; their fns re-check and bail.
                 let waiters =
@@ -400,6 +435,9 @@ struct ProxyData {
     frame: (usize, usize),
     /// False while this is the camera JPEG, true once sensor pixels landed.
     developed: bool,
+    /// Whether the render worker holds this proxy's un-toned 16-bit develop.
+    /// A stored (reloaded) JPEG proxy has none until it re-develops.
+    neutral: bool,
 }
 
 thread_local! {
@@ -456,6 +494,23 @@ fn proxy_data(id: usize) -> Option<Rc<ProxyData>> {
 
 fn proxy_developed(id: usize) -> bool {
     PROXY_CACHE.with(|c| c.borrow().get(&id).map(|p| p.developed).unwrap_or(false))
+}
+
+fn proxy_neutral(id: usize) -> bool {
+    PROXY_CACHE.with(|c| c.borrow().get(&id).map(|p| p.neutral).unwrap_or(false))
+}
+
+/// A restored RAW item can carry a develop its stored proxy never saw: only a
+/// sensor re-develop can feed the 16-bit neutral pipeline, so the proxy is
+/// upgraded again before the edit renders.
+fn proxy_wants_neutral(state: AppState, id: usize) -> bool {
+    !proxy_neutral(id)
+        && state.items.with(|v| {
+            v.iter()
+                .find(|m| m.id == id)
+                .map(|m| pipeline::neutral_eligible(&m.edit))
+                .unwrap_or(false)
+        })
 }
 
 fn touch_proxy(id: usize) {
@@ -554,6 +609,9 @@ struct DecodedProxy {
     h: usize,
     frame: (usize, usize),
     developed: bool,
+    /// Un-toned 16-bit develop at the proxy's dims, when the decode
+    /// demosaiced (not for camera JPEGs and stored proxies).
+    neutral: Option<NeutralData>,
 }
 
 /// Install a decoded proxy: cache, worker, dims, version bump. False when the
@@ -575,6 +633,16 @@ fn land_proxy(state: AppState, id: usize, decoded: DecodedProxy) -> bool {
         return false;
     }
     decoded.pixels.load_into_worker(proxy_wid(id), decoded.w, decoded.h);
+    if let Some(n) = &decoded.neutral {
+        pworker::load_neutral_view(
+            proxy_wid(id),
+            &n.pixels,
+            n.w,
+            n.h,
+            n.white,
+            n.tone.as_ref(),
+        );
+    }
     CACHE.with(|c| {
         if let Some(p) = c.borrow_mut().photos.get_mut(&id) {
             let p = Rc::make_mut(p);
@@ -592,6 +660,7 @@ fn land_proxy(state: AppState, id: usize, decoded: DecodedProxy) -> bool {
                 h: decoded.h,
                 frame: decoded.frame,
                 developed: decoded.developed,
+                neutral: decoded.neutral.is_some(),
             }),
         );
     });
@@ -731,6 +800,17 @@ async fn raw_proxy_async(id: usize, src: &JsValue) -> Option<pworker::ProxyResul
     r
 }
 
+/// The neutral develop a sensor proxy decode carried, at the proxy's dims.
+fn proxy_neutral_data(r: &pworker::ProxyResult) -> Option<NeutralData> {
+    (r.neutral.length() > 0).then(|| NeutralData {
+        pixels: r.neutral.clone(),
+        w: r.w,
+        h: r.h,
+        white: r.white,
+        tone: r.tone,
+    })
+}
+
 fn store_tone(id: usize, tone: Option<[u8; 256]>) {
     if let Some(t) = tone {
         RAW_TONES.with(|m| {
@@ -757,15 +837,27 @@ async fn raw_meta_async(src: &JsValue, preview_edge: u32) -> Option<pworker::Raw
     r
 }
 
-/// Full sensor develop in the raw worker. The pixels come back as a view over
-/// the transferred buffer — no Rust copy on the app thread.
-async fn raw_develop_async(id: usize, src: &JsValue) -> Option<(Pixels, usize, usize)> {
+/// Full sensor develop in the raw worker. The pixels and the neutral develop
+/// come back as views over transferred buffers — no Rust copy on the app
+/// thread.
+async fn raw_develop_async(id: usize, src: &JsValue) -> Option<FullDevelop> {
     let src = src.clone();
     let tone = tone_of(id);
     let t0 = perf::now();
     let r = await_worker(move |cb| pworker::raw_develop(id, &src, tone.as_ref(), cb)).await;
     perf::record("proxy.raw_develop_full", perf::now() - t0);
-    r.map(|f| (Pixels::view(f.pixels), f.w, f.h))
+    r.map(|f| FullDevelop {
+        neutral: (f.neutral.length() > 0).then(|| NeutralData {
+            pixels: f.neutral,
+            w: f.w,
+            h: f.h,
+            white: f.white,
+            tone: f.tone,
+        }),
+        pixels: Pixels::view(f.pixels),
+        w: f.w,
+        h: f.h,
+    })
 }
 
 /// Embedded preview (no demosaic) at display resolution.
@@ -799,11 +891,25 @@ async fn decode_stored_proxy(id: usize, rec: StoredProxy) -> Option<DecodedProxy
         let _ = Url::revoke_object_url(&url);
         let (px, w, h) = web::rgba_from_image(&img);
         store_tone(id, rec.tone);
-        Some(DecodedProxy { pixels: Pixels::owned(px), w, h, frame: rec.frame, developed: true })
+        Some(DecodedProxy {
+            pixels: Pixels::owned(px),
+            w,
+            h,
+            frame: rec.frame,
+            developed: true,
+            neutral: None,
+        })
     } else {
         let r = camera_proxy_async(&rec.bytes, rec.orientation).await?;
         let frame = if rec.frame.0 > 0 { rec.frame } else { (r.full_w, r.full_h) };
-        Some(DecodedProxy { pixels: Pixels::view(r.pixels), w: r.w, h: r.h, frame, developed: false })
+        Some(DecodedProxy {
+            pixels: Pixels::view(r.pixels),
+            w: r.w,
+            h: r.h,
+            frame,
+            developed: false,
+            neutral: None,
+        })
     }
 }
 
@@ -830,12 +936,14 @@ async fn decode_camera_from_raw(id: usize, src: &JsValue) -> Option<DecodedProxy
                     h: r.h,
                     frame,
                     developed: false,
+                    neutral: None,
                 });
             }
         }
     }
     let r = raw_proxy_async(id, src).await?;
     Some(DecodedProxy {
+        neutral: proxy_neutral_data(&r),
         pixels: Pixels::view(r.pixels),
         w: r.w,
         h: r.h,
@@ -903,7 +1011,7 @@ fn pump_upgrade(state: AppState) {
         }
         return;
     }
-    if proxy_developed(id) {
+    if proxy_developed(id) && !proxy_wants_neutral(state, id) {
         return;
     }
     if POOL_INFLIGHT.with(|s| s.borrow().contains(&id)) {
@@ -933,7 +1041,14 @@ fn pump_upgrade(state: AppState) {
             let landed = land_proxy(
                 state,
                 id,
-                DecodedProxy { pixels: Pixels::view(r.pixels), w: r.w, h: r.h, frame, developed: true },
+                DecodedProxy {
+                    neutral: proxy_neutral_data(&r),
+                    pixels: Pixels::view(r.pixels),
+                    w: r.w,
+                    h: r.h,
+                    frame,
+                    developed: true,
+                },
             );
             if landed {
                 if let Some(p) = proxy_data(id) {
@@ -1019,6 +1134,7 @@ fn develop_proxy_pool(state: AppState, id: usize, name: String) {
                 state,
                 id,
                 DecodedProxy {
+                    neutral: proxy_neutral_data(&p),
                     pixels: Pixels::view(p.pixels.clone()),
                     w: p.w,
                     h: p.h,
@@ -1097,7 +1213,7 @@ fn ensure_proxy(state: AppState, id: usize, develop: bool) {
     }
     touch_proxy(id);
     if proxy_in_mem(id) {
-        if develop && !proxy_developed(id) {
+        if develop && (!proxy_developed(id) || proxy_wants_neutral(state, id)) {
             request_upgrade(state, id);
         }
         return;
@@ -1207,7 +1323,7 @@ fn is_heic(file: &File) -> bool {
 }
 
 struct RawIngest {
-    full: Option<(Pixels, usize, usize)>,
+    full: Option<FullDevelop>,
     preview: (Vec<u8>, usize, usize),
     dims: (usize, usize),
     object_url: String,
@@ -1273,7 +1389,7 @@ async fn prepare_raw(id: usize, src: &JsValue, mtime: Option<f64>) -> Option<Raw
     };
     let fallback = if stored { None } else { raw_bytes_from_src(src).await };
     let (dims, preview) = match &full {
-        Some((fpx, fw, fh)) => ((*fw, *fh), fpx.downscale(*fw, *fh, 1024)),
+        Some(f) => ((f.w, f.h), f.pixels.downscale(f.w, f.h, 1024)),
         // Camera frame dims keep the hi-res target sized to the sensor, not
         // the small embedded preview rawler exposes.
         None => (
@@ -1365,15 +1481,22 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                 if let Some(b) = ing.fallback.take() {
                     CACHE.with(|c| c.borrow_mut().raw_fallback.insert(id, Rc::new(b)));
                 }
-                if let Some((full_rgba, fw, fh)) = &ing.full {
-                    full_rgba.load_into_worker(id, *fw, *fh);
+                let mut full = ing.full.take();
+                if let Some(f) = &full {
+                    f.pixels.load_into_worker(id, f.w, f.h);
+                    if let Some(n) = &f.neutral {
+                        pworker::load_neutral_view(id, &n.pixels, n.w, n.h, n.white, n.tone.as_ref());
+                    }
                     touch_full(id);
                 }
+                let neutral = full.as_mut().and_then(|f| f.neutral.take());
+                let full = full.map(|f| (f.pixels, f.w, f.h));
                 CACHE.with(|c| {
                     c.borrow_mut().photos.insert(
                         id,
                         Rc::new(PhotoData {
-                            full: ing.full,
+                            full,
+                            neutral,
                             full_dims: ing.dims,
                             preview: ing.preview,
                             dirty: false,
@@ -1466,6 +1589,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                         id,
                         Rc::new(PhotoData {
                             full: None,
+                            neutral: None,
                             full_dims: (fw, fh),
                             preview,
                             dirty: false,
@@ -1575,15 +1699,22 @@ async fn ingest_drive_bytes(
             if let Some(b) = ing.fallback.take() {
                 CACHE.with(|c| c.borrow_mut().raw_fallback.insert(id, Rc::new(b)));
             }
-            if let Some((full_rgba, fw, fh)) = &ing.full {
-                full_rgba.load_into_worker(id, *fw, *fh);
+            let mut full = ing.full.take();
+            if let Some(f) = &full {
+                f.pixels.load_into_worker(id, f.w, f.h);
+                if let Some(n) = &f.neutral {
+                    pworker::load_neutral_view(id, &n.pixels, n.w, n.h, n.white, n.tone.as_ref());
+                }
                 touch_full(id);
             }
+            let neutral = full.as_mut().and_then(|f| f.neutral.take());
+            let full = full.map(|f| (f.pixels, f.w, f.h));
             CACHE.with(|c| {
                 c.borrow_mut().photos.insert(
                     id,
                     Rc::new(PhotoData {
-                        full: ing.full,
+                        full,
+                        neutral,
                         full_dims: ing.dims,
                         preview: ing.preview,
                         dirty: false,
@@ -1642,6 +1773,7 @@ async fn ingest_drive_bytes(
                     id,
                     Rc::new(PhotoData {
                         full: None,
+                        neutral: None,
                         full_dims: (fw, fh),
                         preview,
                         dirty: false,
@@ -2214,18 +2346,43 @@ fn render_hi(item: &MediaItem, req_w: f64, req_h: f64) -> Option<HiCache> {
     let edit_fp = edit_fingerprint(item);
     let source_fp = source_fingerprint(photo.gen, proxy_gen(item.id));
     let (fpix, fw, fh) = photo.full.as_ref()?;
-    let src = fpix.as_cow();
     let (ww, wh) = working_dims(*fw, *fh, &item.edit);
     let (tw, th) = hi_target(req_w, req_h, ww, wh, HI_MAX_EDGE as u32);
-    let buf = pipeline::render(
-        &src,
-        *fw,
-        *fh,
-        &item.edit,
-        PipeTarget::new(tw, th),
-        item.id as u32,
-    )
-    .pixels;
+    let neutral = photo
+        .neutral
+        .as_ref()
+        .filter(|n| n.w == *fw && n.h == *fh && pipeline::neutral_eligible(&item.edit));
+    let buf = match neutral {
+        Some(n) => {
+            let src = n.pixels.to_vec();
+            let tone = n.tone.as_ref().map(|t| rawops::tone_table(t));
+            let frame = pipeline::render_neutral(
+                &src,
+                *fw,
+                *fh,
+                &item.edit,
+                PipeTarget::new(tw, th),
+                item.id as u32,
+                n.white,
+                tone.as_deref(),
+            );
+            let mut out = vec![0u8; tw * th * 4];
+            wide::narrow_dithered(&frame.pixels, &mut out, tw, th);
+            out
+        }
+        None => {
+            let src = fpix.as_cow();
+            pipeline::render(
+                &src,
+                *fw,
+                *fh,
+                &item.edit,
+                PipeTarget::new(tw, th),
+                item.id as u32,
+            )
+            .pixels
+        }
+    };
     let canvas = web::create_canvas(tw as u32, th as u32);
     web::put_pixels(&canvas, &buf, tw as u32, th as u32);
     composite_layers(&canvas, &item.layers, tw, th);
@@ -2315,7 +2472,14 @@ async fn render_photo_export(
     let mut geometry_span = perf::Span::new("export.geometry");
     let plain_geometry = item.edit.rot90 % 4 == 0 && item.edit.fine_angle.abs() <= 0.01;
     let untouched = item.edit.raw.is_identity() && !item.edit.is_color_touched();
-    let geometry = if plain_geometry {
+    // A neutral develop re-runs geometry and the develop at 16-bit from the
+    // un-toned sensor frame, with the camera tone as the final stage, so the
+    // highlights slider acts on unclipped data exactly as in the worker.
+    let neutral = photo
+        .neutral
+        .as_ref()
+        .filter(|n| n.w == *fw && n.h == *fh && pipeline::neutral_eligible(&item.edit));
+    let geometry = if neutral.is_some() || plain_geometry {
         None
     } else {
         Some(pix.with_slice(|s| {
@@ -2323,9 +2487,10 @@ async fn render_photo_export(
             (p.into_owned(), w, h)
         }))
     };
-    let (w, h) = match &geometry {
-        Some((_, w, h)) => (*w, *h),
-        None => (*fw, *fh),
+    let (w, h) = match (&neutral, &geometry) {
+        (Some(_), _) => working_dims(*fw, *fh, &item.edit),
+        (None, Some((_, w, h))) => (*w, *h),
+        (None, None) => (*fw, *fh),
     };
     geometry_span.set_detail(format!("{}x{}", w, h));
     drop(geometry_span);
@@ -2335,11 +2500,35 @@ async fn render_photo_export(
         pipeline::finish_edit(&mut frame, &item.edit, item.id as u32);
         frame.pixels
     };
-    let edited: Option<Vec<u8>> = match geometry {
-        Some((v, _, _)) if untouched => Some(v),
-        Some((v, _, _)) => Some(apply_color(v)),
-        None if untouched => None,
-        None => Some(apply_color(pix.as_cow().into_owned())),
+    let neutral_edited: Option<Vec<u8>> = neutral.map(|n| {
+        let src = n.pixels.to_vec();
+        let (p, gw, gh) = geometry_wide(&src, *fw, *fh, &item.edit);
+        let (mut p, w, h) = (p.into_owned(), gw, gh);
+        let tone = n.tone.as_ref().map(|t| rawops::tone_table(t));
+        let mask = pipeline::mask_for_dims(w, h, &item.edit);
+        pipeline::finish_neutral_wide(
+            &mut p,
+            w,
+            h,
+            &item.edit,
+            item.id as u32,
+            mask.as_deref(),
+            n.white,
+            tone.as_deref(),
+        );
+        let mut out = vec![0u8; w * h * 4];
+        wide::narrow_dithered(&p, &mut out, w, h);
+        out
+    });
+    let edited: Option<Vec<u8>> = if let Some(v) = neutral_edited {
+        Some(v)
+    } else {
+        match geometry {
+            Some((v, _, _)) if untouched => Some(v),
+            Some((v, _, _)) => Some(apply_color(v)),
+            None if untouched => None,
+            None => Some(apply_color(pix.as_cow().into_owned())),
+        }
     };
     drop(color_span);
 
@@ -4559,6 +4748,7 @@ fn restore_session(state: AppState) {
                         id,
                         Rc::new(PhotoData {
                             full: None,
+                            neutral: None,
                             full_dims: (w, h),
                             preview,
                             dirty: false,
@@ -4593,10 +4783,11 @@ fn restore_session(state: AppState) {
                 let Some(bytes_v) = state::jget(&v, "bytes") else { continue };
                 let Ok(blob) = bytes_v.dyn_into::<Blob>() else { continue };
                 let raw_len = blob.size() as u64;
-                let Some((full_rgba, fw, fh)) = raw_develop_async(id, blob.as_ref()).await else {
+                let Some(mut full) = raw_develop_async(id, blob.as_ref()).await else {
                     continue;
                 };
-                let (pp, pw, ph) = full_rgba.downscale(fw, fh, 1024);
+                let (fw, fh) = (full.w, full.h);
+                let (pp, pw, ph) = full.pixels.downscale(fw, fh, 1024);
                 let canvas = web::create_canvas(pw as u32, ph as u32);
                 web::put_pixels(&canvas, &pp, pw as u32, ph as u32);
                 let Ok(png) = web::canvas_to_blob(&canvas, "image/png").await else {
@@ -4612,12 +4803,17 @@ fn restore_session(state: AppState) {
                         CACHE.with(|c| c.borrow_mut().raw_fallback.insert(id, Rc::new(bytes)));
                     }
                 }
-                full_rgba.load_into_worker(id, fw, fh);
+                full.pixels.load_into_worker(id, fw, fh);
+                if let Some(n) = &full.neutral {
+                    pworker::load_neutral_view(id, &n.pixels, n.w, n.h, n.white, n.tone.as_ref());
+                }
+                let neutral = full.neutral.take();
                 CACHE.with(|c| {
                     c.borrow_mut().photos.insert(
                         id,
                         Rc::new(PhotoData {
-                            full: Some((full_rgba, fw, fh)),
+                            full: Some((full.pixels, fw, fh)),
+                            neutral,
                             full_dims: (fw, fh),
                             preview: (pp, pw, ph),
                             dirty: false,
@@ -4661,6 +4857,7 @@ fn restore_session(state: AppState) {
                         id,
                         Rc::new(PhotoData {
                             full: None,
+                            neutral: None,
                             full_dims: (fw, fh),
                             preview,
                             dirty: false,
@@ -4928,12 +5125,12 @@ fn drive_develop_full(state: AppState, id: String) {
         drop(bytes);
         // Drive files have no numeric item id; 0 never matches a cached frame.
         match raw_develop_async(0, blob.as_ref()).await {
-            Some((px, w, h)) => {
+            Some(f) => {
                 if !alive() {
                     return;
                 }
                 DRIVE_FULL_CACHE.with(|c| {
-                    *c.borrow_mut() = Some((id.clone(), Rc::new((px, w, h))));
+                    *c.borrow_mut() = Some((id.clone(), Rc::new((f.pixels, f.w, f.h))));
                 });
                 DRIVE_HOVER_CACHE.with(|c| {
                     let mut c = c.borrow_mut();
@@ -6347,6 +6544,12 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         };
         let want_hi = need_w > w as f64 * 1.05 || need_h > h as f64 * 1.05;
 
+        // A restored edit can carry a RAW develop its stored proxy never saw;
+        // ask for the sensor re-develop so the neutral pipeline can run.
+        if want_hi && photo.raw && !full_present(item.id) && !item.edit.raw.is_identity() {
+            ensure_proxy(state, item.id, true);
+        }
+
         // Total-image render size needed for the cache: when the view is
         // cropped, the crop region alone must cover the display, so the
         // whole image must be proportionally larger.
@@ -6381,7 +6584,13 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         // base, which is pre-develop and pre-colour, so slider ticks never
         // touch the worker. With no usable base the 1024px preview stays up
         // until one lands; the CPU hi-res path below is then not requested.
-        let mut gpu_ok = want_hi && !cropped_view && gpu::eligible(&item.edit) && gpu::active();
+        // A RAW develop the neutral pipeline owns must not be shadowed by the
+        // shader's u8 approximation; the CPU neutral path is authoritative.
+        let mut gpu_ok = want_hi
+            && !cropped_view
+            && gpu::eligible(&item.edit)
+            && gpu::active()
+            && !(photo.raw && !item.edit.raw.is_identity());
         let mut gkey: Option<gpu::BaseKey> = None;
         if gpu_ok {
             let key = gpu::BaseKey {
@@ -7512,6 +7721,7 @@ fn selection_to_layer_sync(state: AppState, cut: bool) {
                 pd.full_dims = (w, h);
                 pd.preview = preview;
                 pd.dirty = true;
+                pd.neutral = None;
                 pd.gen += 1;
             }
         });
@@ -7576,6 +7786,7 @@ fn delete_selection_sync(state: AppState) {
             pd.full_dims = (w, h);
             pd.preview = preview;
             pd.dirty = true;
+            pd.neutral = None;
             pd.gen += 1;
         }
     });
@@ -7640,6 +7851,7 @@ fn content_fill_selection_sync(state: AppState) {
             pd.full_dims = (w, h);
             pd.preview = preview;
             pd.dirty = true;
+            pd.neutral = None;
             pd.gen += 1;
         }
     });
@@ -7662,6 +7874,7 @@ fn destructive_apply(state: AppState, item_id: usize, r: pworker::DestructiveRes
             pd.full_dims = (r.w, r.h);
             pd.preview = (r.preview, r.pw, r.ph);
             pd.dirty = true;
+            pd.neutral = None;
             pd.gen += 1;
         }
     });
@@ -7751,6 +7964,7 @@ fn apply_heal_sync(state: AppState, pts: &[(f32, f32)]) {
             pd.full_dims = (w, h);
             pd.preview = preview;
             pd.dirty = true;
+            pd.neutral = None;
             pd.gen += 1;
         }
     });
@@ -7863,6 +8077,7 @@ fn apply_clone_sync(state: AppState, pts: &[(f32, f32)]) {
             pd.full_dims = (w, h);
             pd.preview = preview;
             pd.dirty = true;
+            pd.neutral = None;
             pd.gen += 1;
         }
     });

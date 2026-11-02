@@ -71,10 +71,78 @@ fn develop_rgba(
     Ok((rgba, w, h))
 }
 
+/// A develop that keeps the pre-tone image for the neutral pipeline.
+///
+/// `rgba` is exactly what [`decode_raw`] returns (the camera tone is applied,
+/// byte for byte), `neutral` is the same develop before the tone curve in
+/// 16-bit sRGB, and `white` is the linear value the tone curve maps to preview
+/// white — the scale the develop stage's exposure/highlight thresholds assume.
+pub struct RawDeveloped {
+    pub rgba: Vec<u8>,
+    pub neutral: Vec<u16>,
+    pub w: usize,
+    pub h: usize,
+    pub tone: Option<[u8; 256]>,
+    pub white: f32,
+}
+
+/// Develop a RAW file and return both the camera-toned RGBA8 and the un-toned
+/// 16-bit sRGB frame, from a single demosaic. `tone` reuses a curve computed
+/// by an earlier proxy develop, as [`decode_raw_with_tone`] does.
+pub fn decode_raw_wide(
+    bytes: &[u8],
+    tone: Option<&[u8; 256]>,
+) -> Result<RawDeveloped, String> {
+    let rawfile = RawSource::new_from_slice(bytes);
+    let decoder = rawler::get_decoder(&rawfile).map_err(|e| format!("unsupported RAW: {e}"))?;
+    let params = RawDecodeParams { image_index: 0 };
+    let rawimage = decoder
+        .raw_image(&rawfile, &params, false)
+        .map_err(|e| format!("RAW decode failed: {e}"))?;
+    let orientation = rawimage.orientation.to_u16();
+    let intermediate = RawDevelop::default()
+        .develop_intermediate(&rawimage)
+        .map_err(|e| format!("RAW develop failed: {e}"))?;
+    let (mut px, w, h) = intermediate_rgba_dual(intermediate, orientation);
+    let lut = match tone {
+        Some(lut) => Some(*lut),
+        None => camera_preview_rgb(decoder.as_ref(), &rawfile, &params)
+            .and_then(|preview| camera_tone_lut(&px.rgba, &preview)),
+    };
+    if let Some(lut) = &lut {
+        apply_tone_lut(&mut px.rgba, lut);
+    }
+    let white = white_level(px.max_luma);
+    Ok(RawDeveloped { rgba: px.rgba, neutral: px.neutral, w, h, tone: lut, white })
+}
+
+fn srgb_to_linear(v: f32) -> f32 {
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// The linear level the tone curve's top code represents; the develop stage
+/// normalises neutral linear values by it so its thresholds behave as if the
+/// frame were exposed to the camera's white.
+fn white_level(max_luma: u8) -> f32 {
+    if max_luma == 0 {
+        1.0
+    } else {
+        srgb_to_linear(max_luma as f32 / 255.0)
+    }
+}
+
 /// A display proxy develop: pixels plus the tone curve used, the true sensor
 /// dims, and whether the 2×2 superpixel binning produced half-size output.
+/// `neutral`/`white` are the pre-tone image for the same reasons as
+/// [`RawDeveloped`].
 pub struct RawProxy {
     pub rgba: Vec<u8>,
+    pub neutral: Vec<u16>,
+    pub white: f32,
     pub w: usize,
     pub h: usize,
     pub full_w: usize,
@@ -105,14 +173,15 @@ pub fn decode_raw_proxy(bytes: &[u8], max_edge: u32) -> Result<RawProxy, String>
     let intermediate = develop
         .develop_intermediate(&rawimage)
         .map_err(|e| format!("RAW develop failed: {e}"))?;
-    let (mut rgba, w, h) = intermediate_rgba(intermediate, orientation);
+    let (mut px, w, h) = intermediate_rgba_dual(intermediate, orientation);
     let tone = camera_preview_rgb(decoder.as_ref(), &rawfile, &params)
-        .and_then(|preview| camera_tone_lut(&rgba, &preview));
+        .and_then(|preview| camera_tone_lut(&px.rgba, &preview));
     if let Some(lut) = &tone {
-        apply_tone_lut(&mut rgba, lut);
+        apply_tone_lut(&mut px.rgba, lut);
     }
+    let white = white_level(px.max_luma);
     let (full_w, full_h) = if half { (w * 2, h * 2) } else { (w, h) };
-    Ok(RawProxy { rgba, w, h, full_w, full_h, tone, half })
+    Ok(RawProxy { rgba: px.rgba, neutral: px.neutral, white, w, h, full_w, full_h, tone, half })
 }
 
 /// Minimum fraction of the display cap a half-size proxy must cover.
@@ -209,6 +278,124 @@ fn write_pixels<T: Copy>(
         out[d + 3] = 255;
     }
     out
+}
+
+/// One develop written twice: the legacy u8 frame and the full-precision
+/// un-toned sRGB frame. The u8 side tracks its brightest luma code so the
+/// tone curve's white point can be derived without a second pass.
+struct Dual {
+    rgba: Vec<u8>,
+    neutral: Vec<u16>,
+    max_luma: u8,
+}
+
+#[inline]
+fn to_neutral16(v: f32) -> u16 {
+    (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16
+}
+
+#[inline]
+fn write_dual_at(
+    rgba: &mut [u8],
+    neutral: &mut [u16],
+    d: usize,
+    r: f32,
+    g: f32,
+    b: f32,
+) -> u8 {
+    let (r8, g8, b8) = (to_u8(r), to_u8(g), to_u8(b));
+    rgba[d] = r8;
+    rgba[d + 1] = g8;
+    rgba[d + 2] = b8;
+    rgba[d + 3] = 255;
+    neutral[d] = to_neutral16(r);
+    neutral[d + 1] = to_neutral16(g);
+    neutral[d + 2] = to_neutral16(b);
+    neutral[d + 3] = 65535;
+    ((2126 * r8 as u32 + 7152 * g8 as u32 + 722 * b8 as u32) / 10000) as u8
+}
+
+/// `write_pixels` plus the un-toned 16-bit frame, from the same orientation
+/// fold. The u8 output is identical to `write_pixels` for the same values.
+fn write_pixels_dual<T: Copy>(
+    data: &[T],
+    w: usize,
+    h: usize,
+    transpose: bool,
+    flip_x: bool,
+    flip_y: bool,
+    rgb: impl Fn(&T) -> (f32, f32, f32),
+) -> Dual {
+    let mut rgba = vec![0u8; w * h * 4];
+    let mut neutral = vec![0u16; w * h * 4];
+    let mut max_luma = 0u8;
+    let ow = if transpose { h } else { w };
+    if !transpose && !flip_x && !flip_y {
+        for (i, px) in data.iter().enumerate() {
+            let (r, g, b) = rgb(px);
+            max_luma = max_luma.max(write_dual_at(&mut rgba, &mut neutral, i * 4, r, g, b));
+        }
+        return Dual { rgba, neutral, max_luma };
+    }
+    for (i, px) in data.iter().enumerate() {
+        let x = i % w;
+        let y = i / w;
+        let xf = if flip_x { w - 1 - x } else { x };
+        let yf = if flip_y { h - 1 - y } else { y };
+        let (dx, dy) = if transpose { (yf, xf) } else { (xf, yf) };
+        let d = (dy * ow + dx) * 4;
+        let (r, g, b) = rgb(px);
+        max_luma = max_luma.max(write_dual_at(&mut rgba, &mut neutral, d, r, g, b));
+    }
+    Dual { rgba, neutral, max_luma }
+}
+
+fn intermediate_rgba_dual(
+    intermediate: Intermediate,
+    code: u16,
+) -> (Dual, usize, usize) {
+    let (transpose, flip_x, flip_y) = rawmeta::orientation_flips(code);
+    match intermediate {
+        Intermediate::ThreeColor(rgb) => {
+            let out = write_pixels_dual(
+                &rgb.data,
+                rgb.width,
+                rgb.height,
+                transpose,
+                flip_x,
+                flip_y,
+                |px| (px[0], px[1], px[2]),
+            );
+            let (ow, oh) = rawmeta::oriented_dims(rgb.width, rgb.height, code);
+            (out, ow, oh)
+        }
+        Intermediate::Monochrome(p) => {
+            let out = write_pixels_dual(
+                &p.data,
+                p.width,
+                p.height,
+                transpose,
+                flip_x,
+                flip_y,
+                |&v| (v, v, v),
+            );
+            let (ow, oh) = rawmeta::oriented_dims(p.width, p.height, code);
+            (out, ow, oh)
+        }
+        Intermediate::FourColor(p) => {
+            let out = write_pixels_dual(
+                &p.data,
+                p.width,
+                p.height,
+                transpose,
+                flip_x,
+                flip_y,
+                |px| (px[0], px[1], px[2]),
+            );
+            let (ow, oh) = rawmeta::oriented_dims(p.width, p.height, code);
+            (out, ow, oh)
+        }
+    }
 }
 
 fn camera_preview_rgb(
@@ -642,6 +829,76 @@ mod tests {
                 assert!(got.chunks_exact(4).all(|p| p[3] == 255));
             }
         }
+    }
+
+    #[test]
+    fn dual_writer_matches_the_u8_writer() {
+        use rawler::pixarray::{Color2D, PixF32};
+        let (w, h) = (29usize, 17usize);
+        let n = w * h;
+        let rgb: Vec<[f32; 3]> =
+            sample_cells(n * 3).chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+        let mono = sample_cells(n);
+        let four: Vec<[f32; 4]> =
+            sample_cells(n * 4).chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
+
+        for code in 1..=8u16 {
+            let cases = [
+                Intermediate::ThreeColor(Color2D { width: w, height: h, data: rgb.clone() }),
+                Intermediate::Monochrome(PixF32 {
+                    width: w,
+                    height: h,
+                    data: mono.clone(),
+                    initialized: true,
+                }),
+                Intermediate::FourColor(Color2D { width: w, height: h, data: four.clone() }),
+            ];
+            for case in cases {
+                let (dual, dw, dh) = intermediate_rgba_dual(case.clone(), code);
+                let (want, ww, wh) = intermediate_rgba(case, code);
+                assert_eq!((dw, dh), (ww, wh), "dims differ for code {code}");
+                assert_eq!(dual.rgba, want, "u8 side differs for code {code}");
+                assert_eq!(dual.neutral.len(), want.len());
+                for (px, npx) in want.chunks_exact(4).zip(dual.neutral.chunks_exact(4)) {
+                    assert_eq!(npx[3], 65535, "alpha not opaque");
+                    for c in 0..3 {
+                        // Narrowing the 16-bit neutral value must land on the
+                        // same 8-bit plateau as the legacy writer.
+                        let narrowed = ((npx[c] as u32 + 128) / 257) as u8;
+                        assert!(
+                            narrowed.abs_diff(px[c]) <= 1,
+                            "code {code}: {narrowed} vs {}",
+                            px[c]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn white_level_is_the_linear_luma_of_the_top_code() {
+        assert_eq!(white_level(0), 1.0);
+        assert!((white_level(255) - 1.0).abs() < 1e-6);
+        let mid = white_level(128);
+        assert!((mid - 0.2158).abs() < 1e-3, "got {mid}");
+        assert!(white_level(64) < white_level(128));
+    }
+
+    #[test]
+    fn wide_develop_keeps_the_legacy_bytes() {
+        let Ok(path) = std::env::var("RAW_FILE") else {
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read RAW_FILE");
+        let (legacy, lw, lh) = decode_raw(&bytes).expect("legacy develop");
+        let wide = decode_raw_wide(&bytes, None).expect("wide develop");
+        assert_eq!((wide.w, wide.h), (lw, lh));
+        assert_eq!(wide.rgba, legacy, "camera-toned u8 differs from decode_raw");
+        assert_eq!(wide.neutral.len(), wide.w * wide.h * 4);
+        assert!(wide.neutral.chunks_exact(4).all(|p| p[3] == 65535));
+        assert!(wide.neutral.iter().any(|&v| v > 0), "neutral develop is black");
+        assert!(wide.white > 0.0 && wide.white <= 1.0);
     }
 
     #[test]
