@@ -115,42 +115,73 @@ fn enc16() -> &'static [u16] {
     })
 }
 
-/// 3x3 box blur of the sRGB luma, used as the unsharp reference. One u16
-/// per pixel so a 24MP develop pass adds 48MB, not another RGBA buffer.
-fn blur_luma_wide(buf: &[u16], w: usize, h: usize) -> Vec<u16> {
+/// USM radius in sensor pixels. Renders below sensor resolution scale it by
+/// the proxy ratio, so the preview and the export sharpen the same spatial
+/// frequency.
+pub const USM_RADIUS: f32 = 0.8;
+
+/// Unsharp deltas below this (8-bit luma) are left alone, so noise in flat
+/// areas is not amplified along with real detail.
+pub const USM_THRESHOLD: f32 = 2.0 / 255.0;
+
+/// Separable Gaussian blur of the sRGB luma, used as the unsharp reference.
+/// One u16 per pixel so a 24MP develop pass adds 48MB per buffer, not another
+/// RGBA frame. Weights are 12-bit fixed point and `sigma` is in render pixels.
+fn blur_luma_gaussian_wide(buf: &[u16], w: usize, h: usize, sigma: f32) -> Vec<u16> {
+    let radius = (3.0 * sigma).ceil().clamp(1.0, 6.0) as usize;
+    let inv = 1.0 / (2.0 * sigma * sigma);
+    let mut floats = vec![0.0f32; 2 * radius + 1];
+    let mut sum = 0.0f32;
+    for i in 0..=radius {
+        let q = (-((i * i) as f32) * inv).exp();
+        floats[radius + i] = q;
+        if i > 0 {
+            floats[radius - i] = q;
+        }
+        sum += if i == 0 { q } else { 2.0 * q };
+    }
+    let mut weights = vec![0u32; 2 * radius + 1];
+    let mut total = 0u32;
+    for (dst, f) in weights.iter_mut().zip(floats.iter()) {
+        *dst = (f / sum * 4096.0).round() as u32;
+        total += *dst;
+    }
+    // Rounding leaves the sum a few LSB off unity; fold the difference into
+    // the centre tap so a flat field reproduces exactly.
+    weights[radius] = (weights[radius] as i32 + 4096 - total as i32).max(0) as u32;
+    let luma_at = |i: usize| -> u32 {
+        (54 * buf[i] as u32 + 183 * buf[i + 1] as u32 + 19 * buf[i + 2] as u32) >> 8
+    };
     let mut horiz = vec![0u16; w * h];
     for y in 0..h {
         let row = y * w;
         for x in 0..w {
-            let x0 = x.saturating_sub(1);
-            let x1 = (x + 1).min(w - 1);
             let mut s = 0u32;
-            for xx in x0..=x1 {
-                let i = (row + xx) * 4;
-                s += 54 * buf[i] as u32 + 183 * buf[i + 1] as u32 + 19 * buf[i + 2] as u32;
+            for (k, &wt) in weights.iter().enumerate() {
+                let xx = (x + k).saturating_sub(radius).min(w - 1);
+                s += wt * luma_at((row + xx) * 4);
             }
-            horiz[row + x] = ((s >> 8) / (x1 - x0 + 1) as u32) as u16;
+            horiz[row + x] = (s >> 12) as u16;
         }
     }
     let mut out = vec![0u16; w * h];
     for y in 0..h {
-        let y0 = y.saturating_sub(1);
-        let y1 = (y + 1).min(h - 1);
-        let rows = (y1 - y0 + 1) as u32;
         for x in 0..w {
             let mut s = 0u32;
-            for yy in y0..=y1 {
-                s += horiz[yy * w + x] as u32;
+            for (k, &wt) in weights.iter().enumerate() {
+                let yy = (y + k).saturating_sub(radius).min(h - 1);
+                s += wt * horiz[yy * w + x] as u32;
             }
-            out[y * w + x] = (s / rows) as u16;
+            out[y * w + x] = (s >> 12) as u16;
         }
     }
     out
 }
 
 /// Apply the develop stage to a 16-bit sRGB RGBA frame in place. Identity
-/// leaves the buffer untouched.
-pub fn develop_wide(buf: &mut [u16], w: usize, h: usize, adj: &RawAdjust) {
+/// leaves the buffer untouched. `px_scale` is sensor pixels per render pixel,
+/// 1.0 at full resolution; capture sharpening scales its radius by it.
+pub fn develop_wide(buf: &mut [u16], w: usize, h: usize, adj: &RawAdjust, px_scale: f32) {
     if adj.is_identity() || w == 0 || h == 0 {
         return;
     }
@@ -176,7 +207,13 @@ pub fn develop_wide(buf: &mut [u16], w: usize, h: usize, adj: &RawAdjust) {
     let enc = enc16();
     let encode = |v: f32| -> u16 { enc[(v.clamp(0.0, 1.0) * 65536.0) as usize] };
 
-    let blur = if sharp > 0.0 { Some(blur_luma_wide(buf, w, h)) } else { None };
+    let sigma = (USM_RADIUS * px_scale.clamp(0.0, 2.0)).min(2.0);
+    let blur = if sharp > 0.0 && sigma >= 0.15 {
+        Some(blur_luma_gaussian_wide(buf, w, h, sigma))
+    } else {
+        None
+    };
+    let sharp_gain = sharp * 3.0;
 
     for (i, px) in buf.chunks_exact_mut(4).enumerate() {
         let mut rgb = [
@@ -189,9 +226,18 @@ pub fn develop_wide(buf: &mut [u16], w: usize, h: usize, adj: &RawAdjust) {
         // signal, applied multiplicatively so hue is preserved in linear.
         if let Some(bp) = &blur {
             let yb = (54 * px[0] as u32 + 183 * px[1] as u32 + 19 * px[2] as u32) >> 8;
-            let d = (yb as f32 - bp[i] as f32) / 65535.0;
-            let g = (1.0 + sharp * 3.0 * d).clamp(0.2, 4.0);
-            scale_rgb(&mut rgb, g);
+            let mut d = (yb as f32 - bp[i] as f32) / 65535.0;
+            // Dead zone: subtract the threshold from the edge signal instead
+            // of hard-gating, so the gain stays continuous at the boundary.
+            if d.abs() <= USM_THRESHOLD {
+                d = 0.0;
+            } else {
+                d -= USM_THRESHOLD.copysign(d);
+            }
+            if d != 0.0 {
+                let g = (1.0 + sharp_gain * d).clamp(0.2, 4.0);
+                scale_rgb(&mut rgb, g);
+            }
         }
 
         let mut y = luma(rgb[0], rgb[1], rgb[2]);
@@ -408,7 +454,7 @@ pub fn apply(buf: &mut [u8], w: usize, h: usize, adj: &RawAdjust) {
         return;
     }
     let mut wide_buf = wide::widen(buf);
-    develop_wide(&mut wide_buf, w, h, adj);
+    develop_wide(&mut wide_buf, w, h, adj, 1.0);
     wide::narrow_plain(&wide_buf, buf);
 }
 
@@ -504,18 +550,62 @@ mod tests {
 
     #[test]
     fn sharpening_adds_edge_contrast() {
-        // 5x1: dark half, bright half.
+        // 11x1: dark half, bright half; the edge at x=5 is 5 px from x=0,
+        // outside the Gaussian support, so only near-edge pixels may move.
         let mut v = Vec::new();
-        for x in 0..5 {
-            let val = if x < 2 { 96 } else { 160 };
+        for x in 0..11 {
+            let val = if x < 5 { 96 } else { 160 };
             v.extend_from_slice(&[val, val, val, 255]);
         }
         let before = v.clone();
-        apply(&mut v, 5, 1, &RawAdjust { sharpen: 100.0, ..Default::default() });
+        apply(&mut v, 11, 1, &RawAdjust { sharpen: 100.0, ..Default::default() });
         // Pixels adjacent to the edge on each side must separate further.
-        assert!(v[1 * 4] < before[1 * 4], "dark side {v:?}");
-        assert!(v[2 * 4] > before[2 * 4], "bright side {v:?}");
+        assert!(v[4 * 4] < before[4 * 4], "dark side {v:?}");
+        assert!(v[5 * 4] > before[5 * 4], "bright side {v:?}");
         assert_eq!(v[0], before[0], "far pixels are not touched");
+    }
+
+    #[test]
+    fn sharpening_threshold_leaves_low_contrast_texture_alone() {
+        // 1-code checkerboard: below the 2/255 dead zone, so no gain.
+        let mut v = Vec::new();
+        for y in 0..16 {
+            for x in 0..16 {
+                let val = if (x + y) % 2 == 0 { 100 } else { 102 };
+                v.extend_from_slice(&[val, val, val, 255]);
+            }
+        }
+        let before = v.clone();
+        apply(&mut v, 16, 16, &RawAdjust { sharpen: 100.0, ..Default::default() });
+        assert_eq!(v, before);
+    }
+
+    fn dark_side_after_sharpen(scale: f32) -> u8 {
+        // 21x1 step 64 -> 255 at x=10. x=8 is two pixels from the edge.
+        let mut buf: Vec<u16> = (0..21)
+            .flat_map(|x| {
+                let val = if x < 10 { 64u16 } else { 255u16 } * 257;
+                [val, val, val, 65535]
+            })
+            .collect();
+        develop_wide(
+            &mut buf,
+            21,
+            1,
+            &RawAdjust { sharpen: 100.0, ..Default::default() },
+            scale,
+        );
+        ((buf[8 * 4] as u32 + 128) / 257) as u8
+    }
+
+    #[test]
+    fn sharpening_radius_scales_with_proxy_ratio() {
+        assert!(dark_side_after_sharpen(1.0) < 64, "full-res USM must reach x=8");
+        assert_eq!(
+            dark_side_after_sharpen(0.25),
+            64,
+            "a quarter-size proxy shrinks the kernel below x=8"
+        );
     }
 
     #[test]
@@ -523,7 +613,7 @@ mod tests {
         // Two source levels that narrow to the same u8 code must survive an
         // exposure lift in the 16-bit path.
         let mut buf = vec![0u16, 0, 0, 65535, 128, 128, 128, 65535];
-        develop_wide(&mut buf, 2, 1, &RawAdjust { exposure: 2.0, ..Default::default() });
+        develop_wide(&mut buf, 2, 1, &RawAdjust { exposure: 2.0, ..Default::default() }, 1.0);
         assert_ne!(buf[0], buf[4]);
         assert!(buf[4] > buf[0]);
     }

@@ -128,12 +128,12 @@ pub fn mask_for(frame: &Frame, edit: &EditParams) -> Option<Vec<u8>> {
 /// A RAW edit returns the developed frame as a 16-bit sRGB buffer so colour can
 /// run at that precision and the pipeline quantises to u8 once, with a dither;
 /// an identity develop returns `None` and colour stays on the u8 buffer.
-pub fn develop(frame: &mut Frame, edit: &EditParams) -> Option<Vec<u16>> {
+pub fn develop(frame: &mut Frame, edit: &EditParams, px_scale: f32) -> Option<Vec<u16>> {
     if edit.raw.is_identity() {
         return None;
     }
     let mut buf = wide::widen(&frame.pixels);
-    rawops::develop_wide(&mut buf, frame.w, frame.h, &edit.raw);
+    rawops::develop_wide(&mut buf, frame.w, frame.h, &edit.raw, px_scale);
     Some(buf)
 }
 
@@ -172,14 +172,20 @@ pub fn colour(
 }
 
 /// Develop + colour on a prepared frame.
-pub fn finish(frame: &mut Frame, edit: &EditParams, seed: u32, mask: Option<&[u8]>) {
-    let wide_buf = develop(frame, edit);
+pub fn finish(
+    frame: &mut Frame,
+    edit: &EditParams,
+    seed: u32,
+    mask: Option<&[u8]>,
+    px_scale: f32,
+) {
+    let wide_buf = develop(frame, edit, px_scale);
     colour(frame, edit, seed, mask, wide_buf);
 }
 
 /// `finish` with the mask taken from `edit.selection`.
-pub fn finish_edit(frame: &mut Frame, edit: &EditParams, seed: u32) {
-    let wide_buf = develop(frame, edit);
+pub fn finish_edit(frame: &mut Frame, edit: &EditParams, seed: u32, px_scale: f32) {
+    let wide_buf = develop(frame, edit, px_scale);
     let mask = if edit.is_color_touched() {
         mask_for(frame, edit)
     } else {
@@ -198,8 +204,9 @@ pub fn finish_wide(
     edit: &EditParams,
     seed: u32,
     mask: Option<&[u8]>,
+    px_scale: f32,
 ) {
-    rawops::develop_wide(buf, w, h, &edit.raw);
+    rawops::develop_wide(buf, w, h, &edit.raw, px_scale);
     if edit.is_color_touched() {
         color::apply_color_effects_wide(buf, w, h, edit, seed, mask);
     }
@@ -277,8 +284,18 @@ pub fn render(
     seed: u32,
 ) -> Frame {
     let mut frame = prepare(src, w, h, edit, target);
-    finish_edit(&mut frame, edit, seed);
+    let px_scale = px_scale_for(w, h, target);
+    finish_edit(&mut frame, edit, seed, px_scale);
     frame
+}
+
+/// Sensor pixels per rendered pixel, for stages whose radius is in sensor
+/// pixels (capture sharpening).
+pub fn px_scale_for(w: usize, h: usize, target: Target) -> f32 {
+    if w == 0 || h == 0 || target.w == 0 || target.h == 0 {
+        return 1.0;
+    }
+    (((w * h) as f64) / ((target.w * target.h) as f64)).sqrt() as f32
 }
 
 #[cfg(test)]
@@ -310,10 +327,18 @@ mod tests {
     }
 
     #[test]
+    fn px_scale_tracks_source_to_target_area() {
+        let half = px_scale_for(6192, 4128, Target::new(3096, 2064));
+        assert!((half - 2.0).abs() < 1e-4, "half-size scale = {half}");
+        assert!((px_scale_for(40, 30, Target::new(40, 30)) - 1.0).abs() < 1e-6);
+        assert_eq!(px_scale_for(0, 10, Target::new(5, 5)), 1.0);
+    }
+
+    #[test]
     fn identity_finish_leaves_pixels_untouched() {
         let px = fixture(16, 12);
         let mut frame = Frame::new(px.clone(), 16, 12);
-        finish_edit(&mut frame, &EditParams::default(), 7);
+        finish_edit(&mut frame, &EditParams::default(), 7, 1.0);
         assert_eq!(frame.pixels, px);
     }
 
@@ -323,7 +348,7 @@ mod tests {
         let edit = touched_edit();
         let out = render(&px, 32, 24, &edit, Target::new(16, 12), 42);
         let mut staged = prepare(&px, 32, 24, &edit, Target::new(16, 12));
-        finish(&mut staged, &edit, 42, None);
+        finish(&mut staged, &edit, 42, None, 1.0);
         assert_eq!(out.pixels, staged.pixels);
         assert_eq!((out.w, out.h), (16, 12));
     }
@@ -335,7 +360,7 @@ mod tests {
         edit.contrast = 0.2;
         let out = render(&px, 20, 10, &edit, Target::new(20, 10), 1);
         let mut direct = Frame::new(px.clone(), 20, 10);
-        finish_edit(&mut direct, &edit, 1);
+        finish_edit(&mut direct, &edit, 1, 1.0);
         assert_eq!(out.pixels, direct.pixels);
     }
 
@@ -374,7 +399,7 @@ mod tests {
 
     fn assert_dithered_ramp(w: usize, h: usize) {
         let mut buf = ramp16(w, h);
-        finish_wide(&mut buf, w, h, &banding_edit(), 1, None);
+        finish_wide(&mut buf, w, h, &banding_edit(), 1, None, 1.0);
         let mut out = vec![0u8; w * h * 4];
         wide::narrow_dithered(&buf, &mut out, w, h);
         let row: Vec<u8> = out[..w * 4].chunks_exact(4).map(|p| p[0]).collect();

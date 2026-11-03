@@ -311,7 +311,8 @@ fn render_pipeline(
         base_pipeline(id, full, fw, fh, edit, req_w, req_h, max_edge);
     let mut frame = Frame::new(buf, tw, th);
     let t0 = js_sys::Date::now();
-    let wide_buf = pipeline::develop(&mut frame, edit);
+    let px_scale = pipeline::px_scale_for(fw, fh, Target::new(tw, th));
+    let wide_buf = pipeline::develop(&mut frame, edit, px_scale);
     let t1 = js_sys::Date::now();
     let mask = if edit.is_color_touched() {
         sel_json
@@ -729,7 +730,9 @@ fn render_window_pipeline(
         (buf, t, js_sys::Date::now())
     };
     let mut frame = Frame::new(buf, tw, th);
-    let wide_buf = pipeline::develop(&mut frame, edit);
+    let px_scale = pipeline::px_scale_for(fw, fh, Target::new(ww, wh))
+        * pipeline::px_scale_for(cw, ch, Target::new(tw, th));
+    let wide_buf = pipeline::develop(&mut frame, edit, px_scale);
     let t3 = js_sys::Date::now();
     let hit = if cached { 1.0 } else { 0.0 };
     let mask = if edit.is_color_touched() {

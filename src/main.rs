@@ -2497,7 +2497,7 @@ async fn render_photo_export(
     let color_span = perf::Span::new("export.color");
     let apply_color = |v: Vec<u8>| {
         let mut frame = PipeFrame::new(v, w, h);
-        pipeline::finish_edit(&mut frame, &item.edit, item.id as u32);
+        pipeline::finish_edit(&mut frame, &item.edit, item.id as u32, 1.0);
         frame.pixels
     };
     let neutral_edited: Option<Vec<u8>> = neutral.map(|n| {
@@ -3597,7 +3597,7 @@ fn source_window(
     let win = px.crop_rows(fw, y0, x0, ew, eh);
     let mut frame = PipeFrame::new(win, ew, eh);
     // The loupe shows the whole window, not the selection.
-    pipeline::finish(&mut frame, edit, seed, None);
+    pipeline::finish(&mut frame, edit, seed, None, 1.0);
     let win = frame.pixels;
     let (ix, iy) = (sx - x0, sy - y0);
     let mut out = Vec::with_capacity(cw * ch * 4);
@@ -6753,7 +6753,8 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
 
         if sharp.is_none() {
             let mut frame = PipeFrame::new(p.into_owned(), w, h);
-            pipeline::finish_edit(&mut frame, &item.edit, item.id as u32);
+            let px_scale = pipeline::px_scale_for(sw, sh, PipeTarget::new(w, h));
+            pipeline::finish_edit(&mut frame, &item.edit, item.id as u32, px_scale);
             let p = frame.pixels;
             if cropped_view {
                 // Composite at full size offscreen, then blit the crop region —
