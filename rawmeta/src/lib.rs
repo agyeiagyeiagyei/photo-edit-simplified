@@ -173,6 +173,95 @@ pub fn oriented_dims(w: usize, h: usize, code: u16) -> (usize, usize) {
     }
 }
 
+/// EXIF orientation (1–8) stored in a TIFF payload's IFD0, if present.
+pub fn tiff_orientation(t: &[u8]) -> Option<u16> {
+    if t.len() < 8 {
+        return None;
+    }
+    let le = match &t[0..2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return None,
+    };
+    let u16at = |o: usize| -> Option<u16> {
+        let s = t.get(o..o + 2)?;
+        Some(if le {
+            u16::from_le_bytes([s[0], s[1]])
+        } else {
+            u16::from_be_bytes([s[0], s[1]])
+        })
+    };
+    let u32at = |o: usize| -> Option<u32> {
+        let s = t.get(o..o + 4)?;
+        Some(if le {
+            u32::from_le_bytes([s[0], s[1], s[2], s[3]])
+        } else {
+            u32::from_be_bytes([s[0], s[1], s[2], s[3]])
+        })
+    };
+    let ifd0 = u32at(4)? as usize;
+    let n = u16at(ifd0)? as usize;
+    for k in 0..n {
+        let e = ifd0 + 2 + 12 * k;
+        if u16at(e)? == 0x0112 {
+            // SHORT with count 1: the value sits inline in the 4-byte field.
+            return u16at(e + 8).filter(|c| (1..=8).contains(c));
+        }
+    }
+    None
+}
+
+/// Orientation of an encoded photo (JPEG APP1 / PNG eXIf), defaulting to 1
+/// ("leave as-is"). The decoder applies this so worker-decoded pixels match
+/// what `<img>` would have shown.
+pub fn photo_orientation(bytes: &[u8]) -> u16 {
+    let tiff = jpeg_tiff(bytes).or_else(|| png_tiff(bytes));
+    tiff.and_then(tiff_orientation).unwrap_or(1)
+}
+
+fn jpeg_tiff(b: &[u8]) -> Option<&[u8]> {
+    if b.len() < 4 || b[0] != 0xFF || b[1] != 0xD8 {
+        return None;
+    }
+    let mut i = 2;
+    while i + 4 <= b.len() {
+        if b[i] != 0xFF {
+            break;
+        }
+        let marker = b[i + 1];
+        if marker == 0xDA || marker == 0xD9 {
+            break;
+        }
+        let len = u16::from_be_bytes([b[i + 2], b[i + 3]]) as usize;
+        if len < 2 || i + 2 + len > b.len() {
+            break;
+        }
+        if marker == 0xE1 && len >= 8 && &b[i + 4..i + 10] == b"Exif\0\0" {
+            return b.get(i + 10..i + 2 + len);
+        }
+        i += 2 + len;
+    }
+    None
+}
+
+fn png_tiff(b: &[u8]) -> Option<&[u8]> {
+    if b.len() < 8 || &b[1..4] != b"PNG" {
+        return None;
+    }
+    let mut i = 8;
+    while i + 12 <= b.len() {
+        let len = u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]) as usize;
+        if i + 12 + len > b.len() {
+            break;
+        }
+        if &b[i + 4..i + 8] == b"eXIf" {
+            return b.get(i + 8..i + 8 + len);
+        }
+        i += 12 + len;
+    }
+    None
+}
+
 /// Apply an EXIF orientation code to RGBA pixels.
 pub fn apply_orientation_code(
     rgba: Vec<u8>,

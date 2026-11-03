@@ -14,9 +14,12 @@ use crate::state::{
 };
 
 const DB_NAME: &str = "pes-session";
-const DB_VERSION: u32 = 3;
+const DB_VERSION: u32 = 4;
 const ITEMS: &str = "items";
 const META: &str = "meta";
+/// Filmstrip thumbnails (256 px JPEG), keyed by item id. Written at import so
+/// a restore builds the filmstrip without decoding a single original.
+const THUMBS: &str = "thumbs";
 /// Raster layer pixel PNGs, keyed "itemId:layerId" — separate from item
 /// records so an edit-params write doesn't rewrite multi-MB pixel blobs.
 const LAYER_PIXELS: &str = "layer_pixels";
@@ -63,6 +66,10 @@ pub async fn open_db() -> Result<Database, JsValue> {
             db.create_object_store(PROXIES, Default::default())
                 .expect("create proxies store");
         }
+        if !db.store_names().iter().any(|n| n == THUMBS) {
+            db.create_object_store(THUMBS, Default::default())
+                .expect("create thumbs store");
+        }
     });
     req.await.map_err(err)
 }
@@ -108,18 +115,38 @@ pub async fn get_item(db: &Database, id: usize) -> Result<Option<JsValue>, JsVal
         .map_err(err)
 }
 
-/// All item records as (id, value) pairs.
-pub async fn all_items(db: &Database) -> Result<Vec<(usize, JsValue)>, JsValue> {
-    let tx = db.transaction(&[ITEMS], TransactionMode::ReadOnly).map_err(err)?;
-    let store = tx.object_store(ITEMS).map_err(err)?;
-    let values = store.get_all(None, None).map_err(err)?.await.map_err(err)?;
-    let keys = store.get_all_keys(None, None).map_err(err)?.await.map_err(err)?;
-    let mut out = Vec::new();
-    for (k, v) in keys.into_iter().zip(values.into_iter()) {
+/// Everything a restore needs, in one read transaction: item records,
+/// filmstrip thumbs (id, JPEG blob) and the session meta record.
+pub async fn load_all(
+    db: &Database,
+) -> Result<(Vec<(usize, JsValue)>, Vec<(usize, JsValue)>, Option<JsValue>), JsValue> {
+    let tx = db
+        .transaction(&[ITEMS, THUMBS, META], TransactionMode::ReadOnly)
+        .map_err(err)?;
+    let items = tx.object_store(ITEMS).map_err(err)?;
+    let item_values = items.get_all(None, None).map_err(err)?.await.map_err(err)?;
+    let item_keys = items.get_all_keys(None, None).map_err(err)?.await.map_err(err)?;
+    let thumbs = tx.object_store(THUMBS).map_err(err)?;
+    let thumb_values = thumbs.get_all(None, None).map_err(err)?.await.map_err(err)?;
+    let thumb_keys = thumbs.get_all_keys(None, None).map_err(err)?.await.map_err(err)?;
+    let meta = tx
+        .object_store(META)
+        .map_err(err)?
+        .get(JsValue::from_str("session"))
+        .map_err(err)?
+        .await
+        .map_err(err)?;
+    let mut item_out = Vec::new();
+    for (k, v) in item_keys.into_iter().zip(item_values.into_iter()) {
         let Some(id) = k.as_f64() else { continue };
-        out.push((id as usize, v));
+        item_out.push((id as usize, v));
     }
-    Ok(out)
+    let mut thumb_out = Vec::new();
+    for (k, v) in thumb_keys.into_iter().zip(thumb_values.into_iter()) {
+        let Some(id) = k.as_f64() else { continue };
+        thumb_out.push((id as usize, v));
+    }
+    Ok((item_out, thumb_out, meta))
 }
 
 pub async fn put_meta(db: &Database, value: &JsValue) -> Result<(), JsValue> {
@@ -132,16 +159,6 @@ pub async fn put_meta(db: &Database, value: &JsValue) -> Result<(), JsValue> {
         .map_err(err)?;
     tx.commit().map_err(err)?.await.map_err(err)?;
     Ok(())
-}
-
-pub async fn get_meta(db: &Database) -> Result<Option<JsValue>, JsValue> {
-    let tx = db.transaction(&[META], TransactionMode::ReadOnly).map_err(err)?;
-    let store = tx.object_store(META).map_err(err)?;
-    store
-        .get(JsValue::from_str("session"))
-        .map_err(err)?
-        .await
-        .map_err(err)
 }
 
 fn lp_key(item_id: usize, layer_id: usize) -> JsValue {
@@ -264,6 +281,30 @@ pub async fn get_preview(db: &Database, id: usize) -> Result<Option<JsValue>, Js
         .map_err(err)?
         .await
         .map_err(err)
+}
+
+pub async fn put_thumb(db: &Database, id: usize, blob: &JsValue) -> Result<(), JsValue> {
+    let tx = db.transaction(&[THUMBS], TransactionMode::ReadWrite).map_err(err)?;
+    let store = tx.object_store(THUMBS).map_err(err)?;
+    store
+        .put(blob, Some(&JsValue::from_f64(id as f64)))
+        .map_err(err)?
+        .await
+        .map_err(err)?;
+    tx.commit().map_err(err)?.await.map_err(err)?;
+    Ok(())
+}
+
+pub async fn delete_thumb(db: &Database, id: usize) -> Result<(), JsValue> {
+    let tx = db.transaction(&[THUMBS], TransactionMode::ReadWrite).map_err(err)?;
+    let store = tx.object_store(THUMBS).map_err(err)?;
+    store
+        .delete(JsValue::from_f64(id as f64))
+        .map_err(err)?
+        .await
+        .map_err(err)?;
+    tx.commit().map_err(err)?.await.map_err(err)?;
+    Ok(())
 }
 
 /// Proxy record: {kind, orientation, bytes, w, h, full_w, full_h}. `bytes` is

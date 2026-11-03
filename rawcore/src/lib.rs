@@ -560,6 +560,17 @@ pub fn camera_jpeg_rgba(jpeg: &[u8], orientation: u16) -> Option<(Vec<u8>, usize
     Some(rawmeta::apply_orientation_code(rgba.into_raw(), w, h, orientation))
 }
 
+/// Decode an encoded photo (JPEG) to full-res RGBA with its own EXIF
+/// orientation applied — the worker-side replacement for an `<img>` decode
+/// plus a main-thread `getImageData` copy.
+pub fn photo_rgba(bytes: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+    let code = rawmeta::photo_orientation(bytes);
+    Some(rawmeta::apply_orientation_code(rgba.into_raw(), w, h, code))
+}
+
 // ---------- EXIF carry-through ----------
 
 fn rat(tag: u16, r: rawler::formats::tiff::Rational) -> tw::Entry {

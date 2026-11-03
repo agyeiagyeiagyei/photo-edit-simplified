@@ -1,5 +1,7 @@
 import { test, expect } from '@playwright/test';
-import { openApp, trackErrors, recordMetrics, importFiles, thumbs, canvasSize, JPEG_A, JPEG_B, PNG_SMALL } from './helpers';
+import * as fs from 'fs';
+import * as path from 'path';
+import { openApp, trackErrors, recordMetrics, importFiles, thumbs, canvasSize, installRestoreProbe, readRestoreProbe, fileInput, JPEG_A, JPEG_B, PNG_SMALL } from './helpers';
 
 test.describe('session persistence (IndexedDB)', () => {
   test('reload restores items and the editor, and measures restore time', async ({ page }, testInfo) => {
@@ -7,15 +9,78 @@ test.describe('session persistence (IndexedDB)', () => {
     await openApp(page);
     await importFiles(page, [JPEG_A, JPEG_B, PNG_SMALL]);
     await page.waitForTimeout(1500); // debounced persist (800 ms) + blob writes
+    await installRestoreProbe(page, 3);
     const t0 = Date.now();
     await page.reload();
     await expect(page.locator('header h1')).toBeVisible();
     await expect(thumbs(page)).toHaveCount(3, { timeout: 60_000 });
-    const thumbsMs = Date.now() - t0;
+    const wallMs = Date.now() - t0;
+    const probe = await readRestoreProbe(page);
     await expect(page.locator('.overlay')).toHaveCount(0, { timeout: 60_000 });
     await expect.poll(async () => (await canvasSize(page)).w, { timeout: 30_000 }).toBeGreaterThan(0);
     const canvasMs = Date.now() - t0;
-    recordMetrics(testInfo, { restore3_to_thumbs_ms: thumbsMs, restore3_to_canvas_ms: canvasMs });
+    recordMetrics(testInfo, {
+      restore3_to_thumbs_ms: probe.thumbsMs,
+      restore3_to_thumbs_wall_ms: wallMs,
+      restore3_overlay_gone_ms: probe.overlayGoneMs,
+      restore3_to_canvas_ms: canvasMs,
+    });
+    expect(probe.thumbsMs).toBeGreaterThan(0);
+    expect(probe.thumbsMs).toBeLessThanOrEqual(300);
+    expect(probe.overlayGoneMs).toBeLessThanOrEqual(300);
     expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  test('reload restores a 50-item session from thumbnails', async ({ page }, testInfo) => {
+    test.setTimeout(300_000);
+    const errors = trackErrors(page);
+    await openApp(page);
+    // Playwright caps in-memory file payloads at 50 MB; hardlink the two
+    // fixtures under 50 distinct names instead.
+    const dir = fs.mkdtempSync(path.join(__dirname, '..', 'results', 'in-50-'));
+    const pad = (i: number) => String(i + 1).padStart(2, '0');
+    const paths = [
+      ...Array.from({ length: 25 }, (_, i) => {
+        const f = `${dir}/bird-a-${pad(i)}.jpg`;
+        fs.linkSync(JPEG_A, f);
+        return f;
+      }),
+      ...Array.from({ length: 25 }, (_, i) => {
+        const f = `${dir}/bird-b-${pad(i)}.jpg`;
+        fs.linkSync(JPEG_B, f);
+        return f;
+      }),
+    ];
+    await fileInput(page).setInputFiles(paths);
+    await expect(thumbs(page)).toHaveCount(50, { timeout: 240_000 });
+    await expect(page.locator('.overlay')).toHaveCount(0, { timeout: 120_000 });
+    // The debounced persist writes records one at a time; wait for a
+    // completed pass that saw all 50 items rather than a fixed delay.
+    await page.waitForFunction(() => {
+      const p = (window as any).__pes?.perf?.() || [];
+      return p.some((e: any) => e.name === 'session.persist' && e.detail === '50 items');
+    }, undefined, { timeout: 120_000, polling: 250 });
+
+    await installRestoreProbe(page, 50);
+    const t0 = Date.now();
+    await page.reload();
+    await expect(thumbs(page)).toHaveCount(50, { timeout: 60_000 });
+    const wallMs = Date.now() - t0;
+    const probe = await readRestoreProbe(page);
+    await expect(page.locator('.overlay')).toHaveCount(0, { timeout: 30_000 });
+    await expect.poll(async () => (await canvasSize(page)).w, { timeout: 30_000 }).toBeGreaterThan(0);
+    const canvasMs = Date.now() - t0;
+    recordMetrics(testInfo, {
+      restore50_to_thumbs_ms: probe.thumbsMs,
+      restore50_thumbs_wall_ms: wallMs,
+      restore50_overlay_gone_ms: probe.overlayGoneMs,
+      restore50_to_canvas_ms: canvasMs,
+    });
+    expect(probe.thumbsMs).toBeGreaterThan(0);
+    expect(probe.thumbsMs).toBeLessThanOrEqual(1000);
+    expect(probe.overlayGoneMs).toBeLessThanOrEqual(1000);
+    expect(errors, errors.join('\n')).toEqual([]);
+    // File blobs are backed by these paths until the session is done with them.
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 });

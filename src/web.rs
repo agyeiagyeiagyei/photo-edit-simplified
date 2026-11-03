@@ -97,6 +97,55 @@ pub async fn load_image(blob: &Blob) -> Result<(HtmlImageElement, String), JsVal
     Ok((img, url))
 }
 
+/// Decode a JPEG/PNG blob and downscale it to `long_edge` without touching the
+/// main thread for the decode or the scaling: `createImageBitmap` decodes off
+/// the main thread (EXIF orientation applied, same as `<img>`), a second
+/// bitmap-options pass resizes with the browser's high-quality filter, and only
+/// the final 1024px readback happens on the app thread.
+pub async fn downscale_blob(
+    blob: &Blob,
+    long_edge: u32,
+) -> Result<(Vec<u8>, usize, usize), JsValue> {
+    let win = window();
+    let full = JsFuture::from(win.create_image_bitmap_with_blob(blob)?)
+        .await?
+        .dyn_into::<web_sys::ImageBitmap>()?;
+    let (w, h) = (full.width(), full.height());
+    if w == 0 || h == 0 {
+        full.close();
+        return Err(JsValue::from_str("empty image"));
+    }
+    let scale = (long_edge as f32 / w.max(h) as f32).min(1.0);
+    let (pw, ph) = (
+        ((w as f32 * scale).round() as u32).max(1),
+        ((h as f32 * scale).round() as u32).max(1),
+    );
+    let bitmap = if pw < w || ph < h {
+        let opts = web_sys::ImageBitmapOptions::new();
+        opts.set_resize_width(pw);
+        opts.set_resize_height(ph);
+        opts.set_resize_quality(web_sys::ResizeQuality::High);
+        let small = JsFuture::from(
+            win.create_image_bitmap_with_image_bitmap_and_image_bitmap_options(&full, &opts)?,
+        )
+        .await?
+        .dyn_into::<web_sys::ImageBitmap>()?;
+        full.close();
+        small
+    } else {
+        full
+    };
+    let canvas = web_sys::OffscreenCanvas::new(pw, ph)?;
+    let ctx = canvas
+        .get_context("2d")?
+        .ok_or_else(|| JsValue::from_str("no offscreen 2d context"))?
+        .dyn_into::<web_sys::OffscreenCanvasRenderingContext2d>()?;
+    ctx.draw_image_with_image_bitmap(&bitmap, 0.0, 0.0)?;
+    let data = ctx.get_image_data(0.0, 0.0, pw as f64, ph as f64)?;
+    bitmap.close();
+    Ok((data.data().to_vec(), pw as usize, ph as usize))
+}
+
 /// Draw an image element to a canvas at natural size and read back RGBA.
 pub fn rgba_from_image(img: &HtmlImageElement) -> (Vec<u8>, usize, usize) {
     let w = img.natural_width();

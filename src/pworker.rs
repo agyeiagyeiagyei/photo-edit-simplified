@@ -733,6 +733,30 @@ pub fn camera_proxy(
     )
 }
 
+/// Decode a non-RAW photo blob to full-res RGBA inside the main pixel worker.
+/// The Blob crosses the boundary by reference; its bytes only materialize in
+/// the worker. Returns false when the worker is unavailable.
+pub fn decode_photo(
+    blob: &JsValue,
+    cb: impl FnOnce(Option<(Uint8Array, usize, usize)>) + 'static,
+) -> bool {
+    init();
+    call(
+        "decode_photo",
+        &[blob.clone()],
+        &[],
+        Box::new(move |reply| {
+            cb(reply.ok().and_then(|v| {
+                Some((
+                    get_buf(&v, "pixels")?,
+                    get_u32(&v, "w")? as usize,
+                    get_u32(&v, "h")? as usize,
+                ))
+            }))
+        }),
+    )
+}
+
 /// Encode RGBA pixels as a 4:4:4 JPEG carrying the sRGB ICC profile. The
 /// pixel buffer is transferred to the worker (the app view is detached).
 /// Returns None when the worker is unavailable; callers then fall back to

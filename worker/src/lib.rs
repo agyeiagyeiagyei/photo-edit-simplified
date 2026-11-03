@@ -1059,6 +1059,20 @@ pub fn camera_proxy(jpeg: Uint8Array, orientation: u16, max_edge: u32) -> Result
     Ok(proxy_result(px, pw, ph, Vec::new(), 1.0, w, h, None))
 }
 
+/// Decode a non-RAW photo (JPEG) to full-res RGBA, applying its EXIF
+/// orientation. Off the app thread: no `<img>` decode or main-thread
+/// `getImageData` for a full-size frame.
+#[wasm_bindgen]
+pub fn decode_photo(bytes: Uint8Array) -> Result<JsValue, JsValue> {
+    let (px, w, h) = rawcore::photo_rgba(&bytes.to_vec())
+        .ok_or_else(|| JsValue::from_str("photo decode failed"))?;
+    Ok(result_obj(&[
+        ("pixels", js_buf(px)),
+        ("w", (w as u32).into()),
+        ("h", (h as u32).into()),
+    ]))
+}
+
 /// RAW metadata in one round-trip: EXIF payload, orientation, capture time,
 /// the camera JPEG, and (when `preview_edge` > 0) a display-resolution
 /// preview. Keeps rawler out of the app bundle.

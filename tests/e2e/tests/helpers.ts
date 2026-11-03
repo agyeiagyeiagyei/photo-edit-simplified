@@ -73,6 +73,34 @@ export async function importFiles(page: Page, files: string[]) {
   return { thumbsMs, canvasMs };
 }
 
+/**
+ * In-page restore probe: install before `page.reload()`. Records, against the
+ * new document's navigation start, when `count` filmstrip thumbs are in the
+ * DOM and when the busy overlay is gone (measured after the thumbs land).
+ */
+export async function installRestoreProbe(page: Page, count: number) {
+  await page.addInitScript((n: number) => {
+    const R: { thumbs: number; overlayGone: number } = { thumbs: -1, overlayGone: -1 };
+    (window as any).__restoreProbe = R;
+    const tick = () => {
+      if (R.thumbs < 0 && document.querySelectorAll('.filmstrip .thumb').length >= n) {
+        R.thumbs = performance.now();
+      }
+      if (R.thumbs >= 0 && R.overlayGone < 0 && !document.querySelector('.overlay')) {
+        R.overlayGone = performance.now();
+      }
+      if (R.thumbs < 0 || R.overlayGone < 0) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }, count);
+}
+
+/** Read the probe installed by `installRestoreProbe` (ms from nav start, -1 if unseen). */
+export async function readRestoreProbe(page: Page) {
+  const r = await page.evaluate(() => (window as any).__restoreProbe || { thumbs: -1, overlayGone: -1 });
+  return { thumbsMs: Math.round(r.thumbs), overlayGoneMs: Math.round(r.overlayGone) };
+}
+
 export async function canvasSize(page: Page) {
   return canvas(page).evaluate((c: HTMLCanvasElement) => ({ w: c.width, h: c.height, cw: c.clientWidth, ch: c.clientHeight }));
 }

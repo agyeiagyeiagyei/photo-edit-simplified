@@ -16,7 +16,7 @@ use pes_pixel::types::RawAdjust;
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use leptos::leptos_dom::helpers::window_event_listener;
@@ -315,6 +315,10 @@ fn materialize_full(state: AppState, id: usize, full: FullDevelop) {
         w();
     }
     state.items.update(|_| {});
+    // An `items` update raised from this spawned task does not flush the
+    // render effect (the restored selection stayed on its 1024px preview);
+    // `hi_built` is the signal that effect listens to for exactly this.
+    state.hi_built.update(|g| *g += 1);
 }
 
 /// Decode an item's full-res pixels on demand from its source blob (healed
@@ -343,13 +347,9 @@ fn ensure_full(state: AppState, id: usize, waiter: Option<Box<dyn FnOnce()>>) {
     });
     spawn_local(async move {
         let decoded = if let Some(blob) = src {
-            match web::load_image(&blob).await {
-                Ok((img, url)) => {
-                    let _ = Url::revoke_object_url(&url);
-                    let (px, w, h) = web::rgba_from_image(&img);
-                    Some(FullDevelop { pixels: Pixels::owned(px), w, h, neutral: None })
-                }
-                Err(_) => None,
+            match decode_full_source(&blob).await {
+                Some((px, w, h)) => Some(FullDevelop { pixels: px, w, h, neutral: None }),
+                None => None,
             }
         } else if is_raw {
             // Lazy develop: hand the stored Blob to the worker, which reads it
@@ -406,6 +406,31 @@ async fn ensure_full_async(state: AppState, id: usize) -> bool {
         sleep_ms(50).await;
     }
     full_present(id)
+}
+
+/// Full-res RGBA for a non-RAW source blob. The decode runs in the pixel
+/// worker (zune-jpeg), so the app thread never does a full-size `<img>` +
+/// `getImageData` copy; `<img>` remains the fallback when the worker is
+/// unavailable or cannot decode the format.
+async fn decode_full_source(blob: &Blob) -> Option<(Pixels, usize, usize)> {
+    let slot: Rc<RefCell<Option<Option<(Uint8Array, usize, usize)>>>> =
+        Rc::new(RefCell::new(None));
+    let done = slot.clone();
+    if pworker::decode_photo(blob.as_ref(), move |d| *done.borrow_mut() = Some(d)) {
+        for _ in 0..1200 {
+            if slot.borrow().is_some() {
+                break;
+            }
+            sleep_ms(25).await;
+        }
+    }
+    if let Some(Some((px, w, h))) = slot.borrow_mut().take() {
+        return Some((Pixels::view(px), w, h));
+    }
+    let (img, url) = web::load_image(blob).await.ok()?;
+    let _ = Url::revoke_object_url(&url);
+    let (px, w, h) = web::rgba_from_image(&img);
+    Some((Pixels::owned(px), w, h))
 }
 
 // --- display proxies for lazy RAW items ---------------------------------------
@@ -1240,6 +1265,219 @@ fn ensure_proxy(state: AppState, id: usize, develop: bool) {
     });
 }
 
+/// How many preview decodes may run at once. Decoding is off the main thread
+/// (createImageBitmap), so this bounds memory, not jank.
+const PREVIEW_CONCURRENCY: usize = 3;
+
+thread_local! {
+    /// Items with a preview decode queued or in flight (dedupes requests).
+    static PREVIEW_INFLIGHT: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+    static PREVIEW_QUEUE: RefCell<VecDeque<usize>> = RefCell::new(VecDeque::new());
+    static PREVIEW_ACTIVE: Cell<usize> = const { Cell::new(0) };
+    static PREVIEW_STATE: Cell<Option<AppState>> = const { Cell::new(None) };
+    /// Filmstrip visibility observer; tiles ask for their preview when they
+    /// scroll into view.
+    static THUMB_OBSERVER: RefCell<Option<web_sys::IntersectionObserver>> =
+        RefCell::new(None);
+    /// Tiles that registered before the strip root mounted.
+    static THUMB_PENDING: RefCell<Vec<web_sys::Element>> = RefCell::new(Vec::new());
+    static THUMB_STATE: Cell<Option<AppState>> = const { Cell::new(None) };
+}
+
+fn preview_ready(id: usize) -> bool {
+    get_photo(id).map(|p| p.preview.1 > 0 && p.preview.2 > 0).unwrap_or(false)
+}
+
+/// Ask for an item's 1024 px working preview. Selection is urgent (front of
+/// the queue); the filmstrip observer and the post-restore idle pass are not.
+fn ensure_preview(state: AppState, id: usize) {
+    request_preview(state, id, true);
+}
+
+fn request_preview(state: AppState, id: usize, urgent: bool) {
+    if preview_ready(id) {
+        return;
+    }
+    if !PREVIEW_INFLIGHT.with(|f| f.borrow_mut().insert(id)) {
+        if urgent {
+            PREVIEW_QUEUE.with(|q| {
+                let mut q = q.borrow_mut();
+                if let Some(pos) = q.iter().position(|&x| x == id) {
+                    let id = q.remove(pos).unwrap();
+                    q.push_front(id);
+                }
+            });
+        }
+        return;
+    }
+    PREVIEW_STATE.with(|s| s.set(Some(state)));
+    PREVIEW_QUEUE.with(|q| {
+        let mut q = q.borrow_mut();
+        if urgent {
+            q.push_front(id);
+        } else {
+            q.push_back(id);
+        }
+    });
+    pump_previews();
+}
+
+fn pump_previews() {
+    loop {
+        if PREVIEW_ACTIVE.with(|a| a.get()) >= PREVIEW_CONCURRENCY {
+            return;
+        }
+        let Some(id) = PREVIEW_QUEUE.with(|q| q.borrow_mut().pop_front()) else {
+            return;
+        };
+        if preview_ready(id) {
+            PREVIEW_INFLIGHT.with(|f| {
+                f.borrow_mut().remove(&id);
+            });
+            continue;
+        }
+        PREVIEW_ACTIVE.with(|a| a.set(a.get() + 1));
+        let state = PREVIEW_STATE.with(|s| s.get());
+        spawn_local(async move {
+            let preview = decode_preview_source(id).await;
+            PREVIEW_ACTIVE.with(|a| a.set(a.get().saturating_sub(1)));
+            PREVIEW_INFLIGHT.with(|f| {
+                f.borrow_mut().remove(&id);
+            });
+            if let (Some(preview), Some(state)) = (preview, state) {
+                let tracked = CACHE.with(|c| c.borrow().photos.contains_key(&id));
+                if tracked {
+                    CACHE.with(|c| {
+                        if let Some(pd) = c.borrow_mut().photos.get_mut(&id) {
+                            let pd = Rc::make_mut(pd);
+                            pd.preview = preview;
+                            pd.gen += 1;
+                        }
+                    });
+                    state.items.update(|_| {});
+                }
+            }
+            pump_previews();
+        });
+    }
+}
+
+async fn decode_preview_source(id: usize) -> Option<(Vec<u8>, usize, usize)> {
+    let stored = match session::open_db().await {
+        Ok(db) => session::get_preview(&db, id).await.ok().flatten(),
+        Err(_) => None,
+    }
+    .and_then(|v| v.dyn_into::<Blob>().ok())
+    .filter(|b| b.size() > 0.0);
+    let raw = CACHE.with(|c| c.borrow().photos.get(&id).map(|p| p.raw).unwrap_or(false));
+    let blob = match stored {
+        Some(b) => b,
+        None if raw => return None,
+        None => CACHE.with(|c| c.borrow().photo_src.get(&id).cloned())?,
+    };
+    match web::downscale_blob(&blob, 1024).await {
+        Ok(p) => Some(p),
+        Err(_) => {
+            // Browser without ImageBitmap/OffscreenCanvas: decode through an
+            // <img>, which still decodes off the main thread.
+            let (img, url) = web::load_image(&blob).await.ok()?;
+            let _ = Url::revoke_object_url(&url);
+            Some(downscale(&img, 1024))
+        }
+    }
+}
+
+/// Start observing filmstrip tiles against the strip as scroll root.
+fn ensure_thumb_observer(state: AppState, root: &web_sys::Element) {
+    if THUMB_OBSERVER.with(|o| o.borrow().is_some()) {
+        return;
+    }
+    THUMB_STATE.with(|s| s.set(Some(state)));
+    let cb =
+        Closure::<dyn FnMut(js_sys::Array, web_sys::IntersectionObserver)>::new(
+            move |entries: js_sys::Array, _| {
+                let Some(state) = THUMB_STATE.with(|s| s.get()) else {
+                    return;
+                };
+                for e in entries.iter() {
+                    let Ok(entry) =
+                        e.dyn_into::<web_sys::IntersectionObserverEntry>()
+                    else {
+                        continue;
+                    };
+                    if !entry.is_intersecting() {
+                        continue;
+                    }
+                    let Some(id) = entry
+                        .target()
+                        .get_attribute("data-id")
+                        .and_then(|s| s.parse::<usize>().ok())
+                    else {
+                        continue;
+                    };
+                    request_preview(state, id, false);
+                }
+            },
+        );
+    let init = web_sys::IntersectionObserverInit::new();
+    init.set_root(Some(root));
+    init.set_root_margin("96px");
+    match web_sys::IntersectionObserver::new_with_options(
+        cb.as_ref().unchecked_ref(),
+        &init,
+    ) {
+        Ok(obs) => {
+            THUMB_OBSERVER.with(|o| *o.borrow_mut() = Some(obs.clone()));
+            THUMB_PENDING.with(|p| {
+                for el in p.borrow_mut().drain(..) {
+                    obs.observe(&el);
+                }
+            });
+        }
+        Err(_) => {}
+    }
+    cb.forget();
+}
+
+fn observe_thumb(el: &web_sys::Element) {
+    if let Some(obs) = THUMB_OBSERVER.with(|o| o.borrow().clone()) {
+        obs.observe(el);
+    } else {
+        THUMB_PENDING.with(|p| p.borrow_mut().push(el.clone()));
+    }
+}
+
+/// Warm the remaining previews once the strip is interactive, so switching
+/// items after a restore doesn't wait on a decode.
+fn prefetch_previews(state: AppState) {
+    let ids: Vec<usize> = state
+        .items
+        .get_untracked()
+        .iter()
+        .filter(|m| m.kind == MediaKind::Photo)
+        .map(|m| m.id)
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    let cb = Closure::once(move || {
+        for id in ids {
+            request_preview(state, id, false);
+        }
+    });
+    let win = web::window();
+    if win
+        .request_idle_callback(cb.as_ref().unchecked_ref())
+        .is_err()
+    {
+        let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(
+            cb.as_ref().unchecked_ref(),
+            250,
+        );
+    }
+    cb.forget();
+}
+
 /// Worker id + pixel dims to render from: sensor pixels when loaded, else the
 /// display proxy.
 fn render_source(id: usize, photo: &PhotoData) -> (usize, (usize, usize)) {
@@ -1250,6 +1488,21 @@ fn render_source(id: usize, photo: &PhotoData) -> (usize, (usize, usize)) {
     } else {
         (id, photo.full_dims)
     }
+}
+
+/// 1024px JPEG preview for the `previews` store: the lazy preview pipeline
+/// decodes this instead of re-decoding a full-size source on restore.
+fn store_preview(id: usize, pixels: Vec<u8>, w: usize, h: usize) {
+    spawn_local(async move {
+        let canvas = web::create_canvas(w as u32, h as u32);
+        web::put_pixels(&canvas, &pixels, w as u32, h as u32);
+        let Ok(b) = web::canvas_to_jpeg_blob(&canvas, 0.9).await else {
+            return;
+        };
+        if let Ok(db) = session::open_db().await {
+            let _ = session::put_preview(&db, id, b.as_ref()).await;
+        }
+    });
 }
 
 /// Drop an item from the filmstrip: revoke its object URLs and free its
@@ -1287,6 +1540,7 @@ fn remove_item(state: AppState, item_id: usize) {
     spawn_local(async move {
         if let Ok(db) = session::open_db().await {
             let _ = session::delete_raw_assets(&db, &[item_id]).await;
+            let _ = session::delete_thumb(&db, item_id).await;
             let _ = session::delete_layer_pixels(&db, item_id).await;
         }
     });
@@ -1398,7 +1652,7 @@ async fn prepare_raw(id: usize, src: &JsValue, mtime: Option<f64>) -> Option<Raw
         ),
     };
     let object_url = Url::create_object_url_with_blob(&png).ok()?;
-    let thumb_url = thumb_object_url(&preview.0, preview.1, preview.2).await;
+    let thumb_url = make_thumb(id, &preview.0, preview.1, preview.2).await;
     Some(RawIngest {
         full,
         preview,
@@ -1580,8 +1834,9 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                 let preview = downscale(&img, 1024);
                 drop(preview_span);
                 let thumb_span = perf::Span::new("ingest.thumb").detail(name.clone());
-                let thumb_url = thumb_object_url(&preview.0, preview.1, preview.2).await;
+                let thumb_url = make_thumb(id, &preview.0, preview.1, preview.2).await;
                 drop(thumb_span);
+                store_preview(id, preview.0.clone(), preview.1, preview.2);
                 CACHE.with(|c| {
                     let mut c = c.borrow_mut();
                     c.photo_src.insert(id, blob);
@@ -1765,7 +2020,8 @@ async fn ingest_drive_bytes(
             };
             let (fw, fh) = (img.natural_width() as usize, img.natural_height() as usize);
             let preview = downscale(&img, 1024);
-            let thumb_url = thumb_object_url(&preview.0, preview.1, preview.2).await;
+            let thumb_url = make_thumb(id, &preview.0, preview.1, preview.2).await;
+            store_preview(id, preview.0.clone(), preview.1, preview.2);
             CACHE.with(|c| {
                 let mut c = c.borrow_mut();
                 c.photo_src.insert(id, blob);
@@ -3103,6 +3359,7 @@ fn App() -> impl IntoView {
             .items
             .with(|v| v.iter().any(|m| m.id == id && m.kind == MediaKind::Photo));
         if is_photo {
+            ensure_preview(state, id);
             ensure_proxy(state, id, true);
         }
     });
@@ -3344,6 +3601,9 @@ fn FocusLoupe(state: AppState) -> impl IntoView {
                 }
                 (None, None) => {
                     let (px, w, h) = &photo.preview;
+                    if *w == 0 || *h == 0 {
+                        return;
+                    }
                     let c = web::create_canvas(*w as u32, *h as u32);
                     web::put_pixels(&c, px, *w as u32, *h as u32);
                     (c, *w as u32, *h as u32)
@@ -4110,8 +4370,14 @@ fn item_edited(m: &MediaItem) -> bool {
 
 #[component]
 fn FilmStrip(state: AppState) -> impl IntoView {
+    let strip_ref = create_node_ref::<html::Div>();
+    create_effect(move |_| {
+        if let Some(el) = strip_ref.get() {
+            ensure_thumb_observer(state, &el);
+        }
+    });
     view! {
-        <div class="filmstrip">
+        <div class="filmstrip" node_ref=strip_ref>
             <For
                 each=move || {
                     perf::record("filmstrip.each", 0.0);
@@ -4125,9 +4391,17 @@ fn FilmStrip(state: AppState) -> impl IntoView {
                     let id = m.id;
                     let is_photo = m.kind == MediaKind::Photo;
                     let badge = if m.kind == MediaKind::Video { "▶" } else { "" };
+                    let tile_ref = create_node_ref::<html::Div>();
+                    create_effect(move |_| {
+                        if let Some(el) = tile_ref.get() {
+                            observe_thumb(&el);
+                        }
+                    });
                     view! {
                         <div
                             class="thumb"
+                            node_ref=tile_ref
+                            attr:data-id=id.to_string()
                             title=m.name.clone()
                             class:selected=move || state.selected.get() == Some(id)
                             on:click=move |_| state.selected.set(Some(id))
@@ -4524,6 +4798,7 @@ async fn persist_session(state: AppState) {
     });
     for id in &gone {
         let _ = session::delete_layer_pixels(&db, *id).await;
+        let _ = session::delete_thumb(&db, *id).await;
     }
     let _ = session::delete_raw_assets(&db, &gone).await;
     let _ = session::delete_items(&db, &gone).await;
@@ -4715,8 +4990,10 @@ fn restore_session(state: AppState) {
                 return;
             }
         };
-        let mut records = session::all_items(&db).await.unwrap_or_default();
+        let (mut records, thumb_records, meta) =
+            session::load_all(&db).await.unwrap_or_default();
         records.sort_by_key(|(_, v)| state::jnum(v, "ord").unwrap_or(0.0) as usize);
+        let thumbs: HashMap<usize, JsValue> = thumb_records.into_iter().collect();
         if records.is_empty() {
             SESSION_READY.with(|r| r.set(true));
             return;
@@ -4766,10 +5043,16 @@ fn restore_session(state: AppState) {
             let drive_baked = state::jbool(&v, "dbaked").unwrap_or(false);
             let next_layer_id = state::jnum(&v, "nlid").unwrap_or(0.0) as usize;
             let taken = state::jnum(&v, "taken");
+            // A stored thumbnail lets this item restore without decoding
+            // anything; sessions written before the `thumbs` store fall back
+            // to the eager preview decode below and migrate on this pass.
+            let stored_thumb = thumbs.get(&id).and_then(|v| {
+                v.clone().dyn_into::<Blob>().ok().filter(|b| b.size() > 0.0)
+            });
 
             // A RAW added by the preview-first importer restores from its
             // stored preview — no sensor decode, no 25MB read.
-            let lazy_preview = if is_raw && !is_video {
+            let lazy_preview = if is_raw && !is_video && stored_thumb.is_none() {
                 match session::get_preview(&db, id).await {
                     Ok(Some(pv)) => pv.dyn_into::<Blob>().ok(),
                     _ => None,
@@ -4805,10 +5088,52 @@ fn restore_session(state: AppState) {
                     drive_parent_id,
                     drive_baked,
                 });
+            } else if is_raw && stored_thumb.is_some() {
+                // Fast path: build the filmstrip tile from the stored thumb.
+                // The 1024px preview and the display proxy decode lazily once
+                // the item is selected.
+                let thumb_url = Url::create_object_url_with_blob(stored_thumb.as_ref().unwrap())
+                    .unwrap_or_default();
+                let w = state::jnum(&v, "w").unwrap_or(0.0) as usize;
+                let h = state::jnum(&v, "h").unwrap_or(0.0) as usize;
+                let raw_len = state::jnum(&v, "rawlen").unwrap_or(0.0) as u64;
+                CACHE.with(|c| {
+                    c.borrow_mut().photos.insert(
+                        id,
+                        Rc::new(PhotoData {
+                            full: None,
+                            neutral: None,
+                            full_dims: (w, h),
+                            preview: (Vec::new(), 0, 0),
+                            dirty: false,
+                            gen: 0,
+                            raw: true,
+                            raw_len,
+                            raw_persisted: true,
+                        }),
+                    )
+                });
+                push_item(state, MediaItem {
+                    id,
+                    kind: MediaKind::Photo,
+                    name,
+                    object_url: String::new(),
+                    thumb_url,
+                    width: w,
+                    height: h,
+                    edit,
+                    layers,
+                    next_layer_id,
+                    exif,
+                    taken,
+                    drive_file_id,
+                    drive_parent_id,
+                    drive_baked,
+                });
             } else if let Some(pv) = lazy_preview {
                 let Ok((img, url)) = web::load_image(&pv).await else { continue };
                 let preview = downscale(&img, 1024);
-                let thumb_url = thumb_object_url(&preview.0, preview.1, preview.2).await;
+                let thumb_url = make_thumb(id, &preview.0, preview.1, preview.2).await;
                 let w = state::jnum(&v, "w").unwrap_or(preview.1 as f64) as usize;
                 let h = state::jnum(&v, "h").unwrap_or(preview.2 as f64) as usize;
                 let raw_len = state::jnum(&v, "rawlen").unwrap_or(0.0) as u64;
@@ -4866,7 +5191,7 @@ fn restore_session(state: AppState) {
                 let prev_ok = session::put_preview(&db, id, png.as_ref()).await.is_ok();
                 let raw_persisted = raw_ok && prev_ok;
                 let url = Url::create_object_url_with_blob(&png).unwrap_or_default();
-                let thumb_url = thumb_object_url(&pp, pw, ph).await;
+                let thumb_url = make_thumb(id, &pp, pw, ph).await;
                 if !raw_persisted {
                     if let Ok(bytes) = web::blob_to_bytes(&blob).await {
                         CACHE.with(|c| c.borrow_mut().raw_fallback.insert(id, Rc::new(bytes)));
@@ -4912,13 +5237,58 @@ fn restore_session(state: AppState) {
                     drive_parent_id,
                     drive_baked,
                 });
+            } else if let Some(thumb) = stored_thumb {
+                // Fast path: keep the source blob for on-demand full decode
+                // and show the stored thumb. The 1024px preview lands when the
+                // item is selected.
+                let Some(bytes_v) = state::jget(&v, "bytes") else { continue };
+                let Ok(blob) = bytes_v.dyn_into::<Blob>() else { continue };
+                let thumb_url = Url::create_object_url_with_blob(&thumb).unwrap_or_default();
+                let url = Url::create_object_url_with_blob(&blob).unwrap_or_default();
+                let fw = state::jnum(&v, "w").unwrap_or(0.0) as usize;
+                let fh = state::jnum(&v, "h").unwrap_or(0.0) as usize;
+                CACHE.with(|c| {
+                    let mut c = c.borrow_mut();
+                    c.photo_src.insert(id, blob);
+                    c.photos.insert(
+                        id,
+                        Rc::new(PhotoData {
+                            full: None,
+                            neutral: None,
+                            full_dims: (fw, fh),
+                            preview: (Vec::new(), 0, 0),
+                            dirty: false,
+                            gen: 0,
+                            raw: false,
+                            raw_len: 0,
+                            raw_persisted: true,
+                        }),
+                    );
+                });
+                push_item(state, MediaItem {
+                    id,
+                    kind: MediaKind::Photo,
+                    name,
+                    object_url: url,
+                    thumb_url,
+                    width: fw,
+                    height: fh,
+                    edit,
+                    layers,
+                    next_layer_id,
+                    exif,
+                    taken,
+                    drive_file_id,
+                    drive_parent_id,
+                    drive_baked,
+                });
             } else {
                 let Some(bytes_v) = state::jget(&v, "bytes") else { continue };
                 let Ok(blob) = bytes_v.dyn_into::<Blob>() else { continue };
                 let Ok((img, url)) = web::load_image(&blob).await else { continue };
                 let (fw, fh) = (img.natural_width() as usize, img.natural_height() as usize);
                 let preview = downscale(&img, 1024);
-                let thumb_url = thumb_object_url(&preview.0, preview.1, preview.2).await;
+                let thumb_url = make_thumb(id, &preview.0, preview.1, preview.2).await;
                 CACHE.with(|c| {
                     let mut c = c.borrow_mut();
                     c.photo_src.insert(id, blob);
@@ -4965,7 +5335,7 @@ fn restore_session(state: AppState) {
                 });
             }
         }
-        if let Ok(Some(meta)) = session::get_meta(&db).await {
+        if let Some(meta) = meta {
             let selected = state::jnum(&meta, "selected").map(|s| s as usize);
             let next_id = state::jnum(&meta, "next_id").unwrap_or(0.0) as usize;
             if let Some(sel) = selected {
@@ -4981,6 +5351,9 @@ fn restore_session(state: AppState) {
         state.busy.set(None);
         // Record the restored baseline without rewriting bytes.
         schedule_session_save(state);
+        // Filmstrip is interactive: warm the rest of the previews in the
+        // background so switching items doesn't wait on a decode.
+        prefetch_previews(state);
     });
 }
 
@@ -6588,6 +6961,12 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             let Some(canvas) = canvas_ref.get() else { return };
             let mut render_span = perf::Span::new("preview.render");
 
+        // A lazily restored item has no preview until the selection effect's
+        // decode lands; skip this pass rather than render a 0×0 buffer.
+        if photo.preview.1 == 0 || photo.preview.2 == 0 {
+            ensure_preview(state, item.id);
+            return;
+        }
         let (pix, w, h) = &photo.preview;
         let geo = preview_geometry_cached(item.id, photo.gen, &photo.preview, &item.edit);
         let (p, w, h) = match &geo {
@@ -7704,13 +8083,22 @@ fn CropTab(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     }
 }
 
-/// 256px JPEG thumbnail blob URL from a pixel buffer, for filmstrip tiles.
-async fn thumb_object_url(pixels: &[u8], w: usize, h: usize) -> String {
+/// 256px JPEG thumbnail for a filmstrip tile: object URL for this session,
+/// plus a write to the `thumbs` store so a reload needs no decode at all.
+async fn make_thumb(id: usize, pixels: &[u8], w: usize, h: usize) -> String {
     let (tp, tw, th) = downscale_pixels(pixels, w, h, 256);
     let canvas = web::create_canvas(tw as u32, th as u32);
     web::put_pixels(&canvas, &tp, tw as u32, th as u32);
     match web::canvas_to_jpeg_blob(&canvas, 0.85).await {
-        Ok(b) => Url::create_object_url_with_blob(&b).unwrap_or_default(),
+        Ok(b) => {
+            let url = Url::create_object_url_with_blob(&b).unwrap_or_default();
+            spawn_local(async move {
+                if let Ok(db) = session::open_db().await {
+                    let _ = session::put_thumb(&db, id, b.as_ref()).await;
+                }
+            });
+            url
+        }
         Err(_) => String::new(),
     }
 }
@@ -8167,6 +8555,9 @@ fn wand_select(state: AppState, nx: f32, ny: f32) {
     }
     let Some(photo) = get_photo(item.id) else { return };
     let (pix, pw, ph) = &photo.preview;
+    if *pw == 0 || *ph == 0 {
+        return;
+    }
     let (mut p, w, h) = geometry(pix, *pw, *ph, &item.edit);
     if !item.edit.raw.is_identity() {
         rawops::apply(p.to_mut(), w, h, &item.edit.raw);
@@ -8199,6 +8590,9 @@ fn isolate_subject(state: AppState) {
     }
     let Some(photo) = get_photo(item.id) else { return; };
     let (pix, pw, ph) = photo.preview.clone();
+    if pw == 0 || ph == 0 {
+        return;
+    }
     state.busy.set(Some("Segmenting subject…".into()));
     spawn_local(async move {
         let canvas = web::create_canvas(pw as u32, ph as u32);
