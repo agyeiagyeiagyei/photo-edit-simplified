@@ -4,12 +4,51 @@
 //! so colour blotches smooth out while real colour and luminance edges hold.
 //! Chroma is filtered at half resolution — the cheaper, standard split, and
 //! chroma noise is low-frequency anyway — and bilinearly upsampled. Luma uses
-//! a narrower window and a tighter range sigma so texture survives. Radii
-//! scale with the image's long edge, so the 3200px preview proxy and a
-//! full-res export smooth at the same relative scale.
+//! a narrower window and a tighter range sigma so texture survives.
+//!
+//! Luma is filtered in linear light: averaging sRGB-encoded values darkens
+//! bright/dark noise pairs, while averaging the light they represent does not.
+//! The bilateral range gate still measures sRGB code differences, so its
+//! calibration and shadow-detail protection are unchanged.
+//!
+//! Window and range parameters are defined in sensor pixels and sensor-referred
+//! noise, then scaled into the render: a proxy at 1/p the sensor's linear
+//! resolution carries ~1/p the noise, so its sigmas shrink by p and its radius
+//! is the sensor radius divided by p. Without that, the proxy would denoise
+//! relatively harder than the export and the two would not match.
+
+use std::sync::OnceLock;
 
 const MAX_LUMA_R: usize = 6;
 const MAX_CHROMA_R: usize = 8;
+
+/// sRGB code -> linear light scaled to 0..=65535, and back.
+fn gamma_luts() -> &'static ([u16; 256], [u8; 65536]) {
+    static LUTS: OnceLock<([u16; 256], [u8; 65536])> = OnceLock::new();
+    LUTS.get_or_init(|| {
+        let mut lin = [0u16; 256];
+        for (c, out) in lin.iter_mut().enumerate() {
+            let s = c as f64 / 255.0;
+            let l = if s <= 0.04045 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            };
+            *out = (l * 65535.0).round() as u16;
+        }
+        let mut srgb = [0u8; 65536];
+        for (v, out) in srgb.iter_mut().enumerate() {
+            let l = v as f64 / 65535.0;
+            let s = if l <= 0.0031308 {
+                12.92 * l
+            } else {
+                1.055 * l.powf(1.0 / 2.4) - 0.055
+            };
+            *out = (s * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+        (lin, srgb)
+    })
+}
 
 /// Normalised spatial Gaussian over the window offsets -r..=r.
 fn spatial(r: usize) -> Vec<f32> {
@@ -34,8 +73,16 @@ fn range(sigma: f32) -> Vec<f32> {
         .collect()
 }
 
-fn luma_horizontal(y: &[u8], w: usize, h: usize, r: usize, sw: &[f32], lut: &[f32]) -> Vec<u8> {
-    let mut out = vec![0u8; w * h];
+fn luma_horizontal(
+    y: &[u8],
+    lin: &[u16],
+    w: usize,
+    h: usize,
+    r: usize,
+    sw: &[f32],
+    lut: &[f32],
+) -> Vec<u16> {
+    let mut out = vec![0u16; w * h];
     for yy in 0..h {
         let row = yy * w;
         for x in 0..w {
@@ -45,33 +92,43 @@ fn luma_horizontal(y: &[u8], w: usize, h: usize, r: usize, sw: &[f32], lut: &[f3
             let mut acc = 0.0f32;
             let mut wsum = 0.0f32;
             for xx in x0..=x1 {
-                let s = y[row + xx] as i32;
-                let wt = sw[xx + r - x] * lut[(s - c).unsigned_abs() as usize];
-                acc += wt * s as f32;
+                let gd = y[row + xx] as i32;
+                let wt = sw[xx + r - x] * lut[(gd - c).unsigned_abs() as usize];
+                acc += wt * lin[row + xx] as f32;
                 wsum += wt;
             }
-            out[row + x] = (acc / wsum).round().clamp(0.0, 255.0) as u8;
+            out[row + x] = (acc / wsum).round().clamp(0.0, 65535.0) as u16;
         }
     }
     out
 }
 
-fn luma_vertical(tmp: &[u8], w: usize, h: usize, r: usize, sw: &[f32], lut: &[f32]) -> Vec<u8> {
+fn luma_vertical(
+    tmp: &[u16],
+    y: &[u8],
+    w: usize,
+    h: usize,
+    r: usize,
+    sw: &[f32],
+    lut: &[f32],
+    srgb: &[u8; 65536],
+) -> Vec<u8> {
     let mut out = vec![0u8; w * h];
-    for y in 0..h {
-        let y0 = y.saturating_sub(r);
-        let y1 = (y + r).min(h - 1);
+    for yy in 0..h {
+        let y0 = yy.saturating_sub(r);
+        let y1 = (yy + r).min(h - 1);
         for x in 0..w {
-            let c = tmp[y * w + x] as i32;
+            let c = y[yy * w + x] as i32;
             let mut acc = 0.0f32;
             let mut wsum = 0.0f32;
-            for yy in y0..=y1 {
-                let s = tmp[yy * w + x] as i32;
-                let wt = sw[yy + r - y] * lut[(s - c).unsigned_abs() as usize];
-                acc += wt * s as f32;
+            for yyy in y0..=y1 {
+                let gd = y[yyy * w + x] as i32;
+                let wt = sw[yyy + r - yy] * lut[(gd - c).unsigned_abs() as usize];
+                acc += wt * tmp[yyy * w + x] as f32;
                 wsum += wt;
             }
-            out[y * w + x] = (acc / wsum).round().clamp(0.0, 255.0) as u8;
+            let v = (acc / wsum).round().clamp(0.0, 65535.0) as usize;
+            out[yy * w + x] = srgb[v];
         }
     }
     out
@@ -214,7 +271,9 @@ fn half_up(src: &[i16], sw: usize, sh: usize, w: usize, h: usize) -> Vec<i16> {
 }
 
 /// Denoise `buf` (RGBA, `w`×`h`) in place. `strength` 0..=1; 0 is a no-op.
-pub fn smart_denoise(buf: &mut [u8], w: usize, h: usize, strength: f32) {
+/// `px_scale` is sensor pixels per buffer pixel — 1.0 for a full-res export,
+/// larger for a downscaled proxy or preview.
+pub fn smart_denoise(buf: &mut [u8], w: usize, h: usize, strength: f32, px_scale: f32) {
     let t = strength.clamp(0.0, 1.0);
     if t <= 0.0 || w == 0 || h == 0 || buf.len() < w * h * 4 {
         return;
@@ -234,18 +293,43 @@ pub fn smart_denoise(buf: &mut [u8], w: usize, h: usize, strength: f32) {
         cr[i] = ((128 * r - 107 * g - 21 * b) >> 8) as i16;
     }
 
-    let scale = w.max(h) as f32 / 1000.0;
-    let r_y = ((0.9 * t * scale).round() as usize).clamp(1, MAX_LUMA_R);
+    // Sensor-space long edge in kilopixels. Radii are chosen there, clamped
+    // there, then divided back into render pixels, so a high-MP sensor's cap
+    // does not shrink the preview's relative window.
+    let p = px_scale.max(1.0);
+    let sensor_kpx = w.max(h) as f32 / 1000.0 * p;
+    let r_y = (((0.9 * t * sensor_kpx).round().clamp(1.0, MAX_LUMA_R as f32)) / p)
+        .round()
+        .max(1.0) as usize;
     // Chroma runs at half resolution, so its radius is in half-res pixels.
-    let r_c = ((1.0 * t * scale).round() as usize).clamp(1, MAX_CHROMA_R);
-    let sy = 4.0 + 14.0 * t;
-    let sg = 8.0 + 24.0 * t;
-    let sc = 10.0 + 20.0 * t;
+    let r_c = (((1.0 * t * sensor_kpx)
+        .round()
+        .clamp(1.0, MAX_CHROMA_R as f32))
+        / p)
+        .round()
+        .max(1.0) as usize;
+    // Range sigmas are in 8-bit codes of this render, and the noise they must
+    // reject shrinks with the downscale factor.
+    let sy = (4.0 + 14.0 * t) / p;
+    let sg = (8.0 + 24.0 * t) / p;
+    let sc = (10.0 + 20.0 * t) / p;
 
     let sw_y = spatial(r_y);
     let lut_y = range(sy);
-    let tmp_y = luma_horizontal(&y, w, h, r_y, &sw_y, &lut_y);
-    let filt_y = luma_vertical(&tmp_y, w, h, r_y, &sw_y, &lut_y);
+    let (lin_lut, srgb_lut) = gamma_luts();
+    let lin: Vec<u16> = (0..n)
+        .map(|i| {
+            let o = i * 4;
+            (0.2126 * lin_lut[buf[o] as usize] as f32
+                + 0.7152 * lin_lut[buf[o + 1] as usize] as f32
+                + 0.0722 * lin_lut[buf[o + 2] as usize] as f32)
+                .round()
+                .clamp(0.0, 65535.0) as u16
+        })
+        .collect();
+    let tmp_y = luma_horizontal(&y, &lin, w, h, r_y, &sw_y, &lut_y);
+    drop(lin);
+    let filt_y = luma_vertical(&tmp_y, &y, w, h, r_y, &sw_y, &lut_y, srgb_lut);
 
     let sw_c = spatial(r_c);
     let lut_g = range(sg);
@@ -310,7 +394,7 @@ mod tests {
     fn zero_strength_is_a_noop() {
         let orig = gray_noisy(64, 64, 120, 10, 7);
         let mut v = orig.clone();
-        smart_denoise(&mut v, 64, 64, 0.0);
+        smart_denoise(&mut v, 64, 64, 0.0, 1.0);
         assert_eq!(v, orig);
     }
 
@@ -320,7 +404,7 @@ mod tests {
         let mut v = orig.clone();
         // 96px image → tiny radii, so use a strong local check instead of
         // absolute numbers: neighbour differences must shrink a lot.
-        smart_denoise(&mut v, 96, 96, 1.0);
+        smart_denoise(&mut v, 96, 96, 1.0, 1.0);
         let noise_before = luma_std(&orig, 96, 96);
         let noise_after = luma_std(&v, 96, 96);
         assert!(
@@ -344,7 +428,7 @@ mod tests {
             }
         }
         let mut d = v.clone();
-        smart_denoise(&mut d, w, h, 1.0);
+        smart_denoise(&mut d, w, h, 1.0, 1.0);
         let dark = |v: &[u8], x: usize| v[(20 * w + x) * 4] as i32;
         let bright = |v: &[u8], x: usize| v[(20 * w + x) * 4] as i32;
         // Just inside the edge, the step must survive.
@@ -380,7 +464,7 @@ mod tests {
         }
         let luma_before = luma_std(&v, w, h);
         let mut d = v.clone();
-        smart_denoise(&mut d, w, h, 1.0);
+        smart_denoise(&mut d, w, h, 1.0, 1.0);
         let spread = |v: &[u8]| -> f32 {
             let vals: Vec<f32> = (0..w * h)
                 .map(|i| v[i * 4] as f32 - v[i * 4 + 2] as f32)

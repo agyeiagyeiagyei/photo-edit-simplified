@@ -2215,6 +2215,7 @@ fn edit_fingerprint(item: &MediaItem) -> u64 {
         e.raw.highlights,
         e.raw.shadows,
         e.raw.noise,
+        e.raw.denoise,
         e.raw.sharpen,
     ] {
         h.write_u32(v.to_bits());

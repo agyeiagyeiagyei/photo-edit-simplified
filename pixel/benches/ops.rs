@@ -150,7 +150,7 @@ fn main() {
     }
 
     bench_mut("denoise::smart_denoise 0.5", &base, 2, |b| {
-        denoise::smart_denoise(b, W, H, 0.5);
+        denoise::smart_denoise(b, W, H, 0.5, 1.0);
     });
     bench_mut("blur::blur_apply 50", &base, 5, |b| {
         blur::blur_apply(b, W, H, 50.0);

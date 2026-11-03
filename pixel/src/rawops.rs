@@ -186,12 +186,18 @@ pub fn develop_wide(buf: &mut [u16], w: usize, h: usize, adj: &RawAdjust, px_sca
         return;
     }
     // Spatial denoise first, so sharpening and the tone curves act on the
-    // cleaned image rather than amplifying sensor noise. The denoiser is
-    // still an 8-bit luma/chroma filter; it is the one stage that narrows
-    // here, and #9's denoise task moves it to linear luma.
+    // cleaned image rather than amplifying sensor noise. The denoiser works
+    // on an 8-bit narrowing of this buffer, but filters linear light
+    // internally, so the narrowing does not cost it linearity.
     if adj.denoise > 0.0 {
         let mut px8: Vec<u8> = buf.iter().map(|&v| ((v as u32 + 128) / 257) as u8).collect();
-        crate::denoise::smart_denoise(&mut px8, w, h, (adj.denoise / 100.0).clamp(0.0, 1.0));
+        crate::denoise::smart_denoise(
+            &mut px8,
+            w,
+            h,
+            (adj.denoise / 100.0).clamp(0.0, 1.0),
+            px_scale,
+        );
         for (dst, &v) in buf.iter_mut().zip(px8.iter()) {
             *dst = v as u16 * 257;
         }
