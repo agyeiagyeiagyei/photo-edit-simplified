@@ -178,7 +178,58 @@ test.describe('24MP JPEG: import → edit → export', () => {
     expect(exif!.data.includes(Buffer.from('Sony', 'latin1'))).toBe(true);
     const sof = jpegSegments(bytes).find((s) => s.marker === 0xc0 || s.marker === 0xc2)!;
     const ySampling = `${sof.data[7] >> 4}x${sof.data[7] & 15}`; // component 1 H×V: 2x2 = 4:2:0, 1x1 = 4:4:4
-    recordMetrics(testInfo, { export_1x1_ms: exportMs, export_w: dims.w, export_h: dims.h, export_bytes: bytes.length, export_chroma_sampling: ySampling, export_progressive: sof.marker === 0xc2 });
+    // The worker encoder keeps full chroma and tags the file sRGB.
+    expect(ySampling, 'exported JPEG is not 4:4:4').toBe('1x1');
+    const icc = jpegSegments(bytes).find((s) => s.marker === 0xe2 && s.data.subarray(0, 12).toString('latin1') === 'ICC_PROFILE\0');
+    expect(icc, 'exported JPEG has no APP2 ICC profile').toBeTruthy();
+    expect(`${icc!.data[12]}/${icc!.data[13]}`).toBe('1/1');
+    const profile = icc!.data.subarray(14);
+    expect(profile.length).toBe(456);
+    expect(profile.includes(Buffer.from('mntrRGB XYZ', 'latin1'))).toBe(true);
+
+    // Lossless reference of the same crop for encoder quality.
+    await page.locator('label.row', { hasText: 'Format' }).locator('select').selectOption('png');
+    const [pngDl] = await Promise.all([
+      page.waitForEvent('download', { timeout: 120_000 }),
+      page.locator('button.btn.primary', { hasText: 'Download this' }).click(),
+    ]);
+    const pngBytes = fs.readFileSync((await pngDl.path())!);
+    expect(pngDl.suggestedFilename()).toMatch(/\.png$/);
+    const pngChunks: string[] = [];
+    for (let i = 8; i + 12 <= pngBytes.length;) {
+      const len = pngBytes.readUInt32BE(i);
+      pngChunks.push(pngBytes.subarray(i + 4, i + 8).toString('latin1'));
+      i += 12 + len;
+    }
+    expect(pngChunks, 'PNG export is not tagged sRGB').toContain('sRGB');
+    const parity = await page.evaluate(async ({ jpeg, png }) => {
+      const bmp = async (b64: string, type: string) => {
+        const bin = atob(b64); const u8 = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+        return createImageBitmap(new Blob([u8], { type }));
+      };
+      const [a, b] = await Promise.all([bmp(jpeg, 'image/jpeg'), bmp(png, 'image/png')]);
+      const W = Math.min(1024, a.width, b.width);
+      const H = Math.min(1024, a.height, b.height);
+      const sx = ((Math.min(a.width, b.width) - W) / 2) | 0;
+      const sy = ((Math.min(a.height, b.height) - H) / 2) | 0;
+      const read = (img: ImageBitmap) => {
+        const c = new OffscreenCanvas(W, H);
+        const x = c.getContext('2d')! as OffscreenCanvasRenderingContext2D;
+        x.drawImage(img, sx, sy, W, H, 0, 0, W, H);
+        return x.getImageData(0, 0, W, H).data;
+      };
+      const da = read(a), db = read(b);
+      a.close(); b.close();
+      let se = 0, n = 0;
+      for (let i = 0; i < da.length; i += 4) {
+        for (let c = 0; c < 3; c++) { const d = da[i + c] - db[i + c]; se += d * d; n++; }
+      }
+      const mse = se / n;
+      return { psnr: mse === 0 ? 99 : 10 * Math.log10((255 * 255) / mse) };
+    }, { jpeg: bytes.toString('base64'), png: pngBytes.toString('base64') });
+    expect(parity.psnr, `q92 PSNR ${parity.psnr.toFixed(2)} dB < 45 dB`).toBeGreaterThanOrEqual(45);
+    recordMetrics(testInfo, { export_1x1_ms: exportMs, export_w: dims.w, export_h: dims.h, export_bytes: bytes.length, export_chroma_sampling: ySampling, export_progressive: sof.marker === 0xc2, export_1x1_png_bytes: pngBytes.length, export_q92_psnr_db: Math.round(parity.psnr * 100) / 100 });
   });
 
   test('crop view renders at display density and matches the export', async ({ page }, testInfo) => {

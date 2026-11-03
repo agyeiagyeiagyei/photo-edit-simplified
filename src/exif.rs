@@ -56,7 +56,9 @@ pub fn tiff_from_png(b: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// In-place: set Orientation to 1 and detach the thumbnail IFD (IFD1).
+/// In-place: set Orientation to 1, tag the colour space as sRGB, and detach
+/// the thumbnail IFD (IFD1). The canvas pipeline is sRGB end to end, so a
+/// source that says "uncalibrated" would mislead a colour-managed viewer.
 fn normalize_orientation(t: &mut Vec<u8>) {
     if t.len() < 8 {
         return;
@@ -84,16 +86,36 @@ fn normalize_orientation(t: &mut Vec<u8>) {
     }
     let Some(ifd) = u32at(t, le, 4).map(|v| v as usize) else { return };
     let Some(n) = u16at(t, le, ifd).map(|v| v as usize) else { return };
+    // SHORT value sits in the first two bytes of the value field.
+    let set_short = |t: &mut [u8], e: usize, val: u16| {
+        if e + 10 <= t.len() {
+            let b = if le { val.to_le_bytes() } else { val.to_be_bytes() };
+            t[e + 8] = b[0];
+            t[e + 9] = b[1];
+        }
+    };
+    let patch_ifd = |t: &mut [u8], ifd: usize| {
+        let Some(n) = u16at(t, le, ifd).map(|v| v as usize) else { return };
+        for k in 0..n {
+            let e = ifd + 2 + 12 * k;
+            let tag = u16at(t, le, e);
+            if u16at(t, le, e + 2) != Some(3) {
+                continue;
+            }
+            if tag == Some(0x0112) {
+                set_short(t, e, 1);
+            } else if tag == Some(0xA001) {
+                set_short(t, e, 1);
+            }
+        }
+    };
+    patch_ifd(t, ifd);
+    // ColourSpace usually lives in the Exif SubIFD (0x8769).
     for k in 0..n {
         let e = ifd + 2 + 12 * k;
-        if u16at(t, le, e) == Some(0x0112) && u16at(t, le, e + 2) == Some(3) && e + 10 <= t.len() {
-            // SHORT value sits in the first two bytes of the value field.
-            if le {
-                t[e + 8] = 1;
-                t[e + 9] = 0;
-            } else {
-                t[e + 8] = 0;
-                t[e + 9] = 1;
+        if u16at(t, le, e) == Some(0x8769) && u16at(t, le, e + 2) == Some(4) {
+            if let Some(sub) = u32at(t, le, e + 8).map(|v| v as usize) {
+                patch_ifd(t, sub);
             }
         }
     }
@@ -146,6 +168,30 @@ pub fn inject_png(png: &[u8], tiff: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(png.len() + 12 + tiff.len());
     out.extend_from_slice(&png[..insert_at]);
     out.extend_from_slice(&(tiff.len() as u32).to_be_bytes());
+    out.extend_from_slice(&payload);
+    out.extend_from_slice(&crc.to_be_bytes());
+    out.extend_from_slice(&png[insert_at..]);
+    out
+}
+
+/// Insert an sRGB chunk right after IHDR (rendering intent: perceptual).
+/// Canvas PNGs are untagged, so without this a colour-managed consumer treats
+/// the export as unspecified.
+pub fn tag_png_srgb(png: &[u8]) -> Vec<u8> {
+    if png.len() < 8 || &png[1..4] != b"PNG" {
+        return png.to_vec();
+    }
+    let ihdr_len = u32::from_be_bytes([png[8], png[9], png[10], png[11]]) as usize;
+    let insert_at = 8 + 12 + ihdr_len;
+    if insert_at > png.len() {
+        return png.to_vec();
+    }
+    let mut payload = b"sRGB".to_vec();
+    payload.push(0);
+    let crc = crc32(&payload);
+    let mut out = Vec::with_capacity(png.len() + 13);
+    out.extend_from_slice(&png[..insert_at]);
+    out.extend_from_slice(&1u32.to_be_bytes());
     out.extend_from_slice(&payload);
     out.extend_from_slice(&crc.to_be_bytes());
     out.extend_from_slice(&png[insert_at..]);
@@ -294,5 +340,67 @@ mod tests {
         assert_eq!(&out[33 + 4..33 + 8], b"eXIf");
         let back = tiff_from_png(&out).expect("eXIf readable");
         assert_eq!(back, tiff);
+    }
+
+    fn tag_short(t: &[u8], ifd: usize, tag: u16) -> Option<u16> {
+        let n = u16::from_le_bytes([t[ifd], t[ifd + 1]]) as usize;
+        for k in 0..n {
+            let e = ifd + 2 + 12 * k;
+            if u16::from_le_bytes([t[e], t[e + 1]]) == tag {
+                return Some(u16::from_le_bytes([t[e + 8], t[e + 9]]));
+            }
+        }
+        None
+    }
+
+    fn tag_long(t: &[u8], ifd: usize, tag: u16) -> Option<u32> {
+        let n = u16::from_le_bytes([t[ifd], t[ifd + 1]]) as usize;
+        for k in 0..n {
+            let e = ifd + 2 + 12 * k;
+            if u16::from_le_bytes([t[e], t[e + 1]]) == tag {
+                return Some(u32::from_le_bytes([t[e + 8], t[e + 9], t[e + 10], t[e + 11]]));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn normalize_sets_orientation_and_srgb_colorspace() {
+        let tiff = build_tiff(
+            vec![e_short(0x0112, 6), e_short(0xA001, 65535)],
+            vec![e_short(0xA001, 65535)],
+            vec![],
+        );
+        let mut t = tiff;
+        normalize_orientation(&mut t);
+        let ifd = u32::from_le_bytes(t[4..8].try_into().unwrap()) as usize;
+        assert_eq!(tag_short(&t, ifd, 0x0112), Some(1));
+        assert_eq!(tag_short(&t, ifd, 0xA001), Some(1));
+        let sub = tag_long(&t, ifd, 0x8769).expect("Exif SubIFD") as usize;
+        assert_eq!(tag_short(&t, sub, 0xA001), Some(1));
+    }
+
+    #[test]
+    fn png_gets_srgb_chunk_before_idat() {
+        let mut png = vec![0x89, b'P', b'N', b'G', 13, 10, 26, 10];
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&[0; 13]);
+        png.extend_from_slice(&[0; 4]);
+        png.extend_from_slice(&0u32.to_be_bytes());
+        png.extend_from_slice(b"IEND");
+        png.extend_from_slice(&[0; 4]);
+        let out = tag_png_srgb(&png);
+        assert_eq!(&out[..33], &png[..33], "IHDR moved");
+        assert_eq!(&out[33..37], &1u32.to_be_bytes());
+        assert_eq!(&out[37..41], b"sRGB");
+        assert_eq!(out[41], 0);
+        let crc = u32::from_be_bytes(out[42..46].try_into().unwrap());
+        assert_eq!(crc, crc32(&out[37..42]));
+        assert_eq!(&out[46..], &png[33..]);
+
+        let tiff = build_tiff(vec![e_ascii(0x010F, "Sony")], vec![], vec![]);
+        let with_exif = inject_png(&out, &tiff);
+        assert_eq!(tiff_from_png(&with_exif).as_deref(), Some(&tiff[..]));
     }
 }

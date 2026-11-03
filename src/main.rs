@@ -2501,9 +2501,16 @@ async fn render_photo_export(
         frame.pixels
     };
     let neutral_edited: Option<Vec<u8>> = neutral.map(|n| {
-        let src = n.pixels.to_vec();
-        let (p, gw, gh) = geometry_wide(&src, *fw, *fh, &item.edit);
-        let (mut p, w, h) = (p.into_owned(), gw, gh);
+        // Plain geometry borrows the source, so the old unconditionally copy
+        // held two full wide frames (~200 MB each at 26 MP) at once. Take the
+        // single copy we need directly.
+        let (mut p, w, h) = if plain_geometry {
+            (n.pixels.to_vec(), *fw, *fh)
+        } else {
+            let src = n.pixels.to_vec();
+            let (p, gw, gh) = geometry_wide(&src, *fw, *fh, &item.edit);
+            (p.into_owned(), gw, gh)
+        };
         let tone = n.tone.as_ref().map(|t| rawops::tone_table_for(t, item.edit.raw.highlights));
         let mask = pipeline::mask_for_dims(w, h, &item.edit);
         pipeline::finish_neutral_wide(
@@ -2520,7 +2527,7 @@ async fn render_photo_export(
         wide::narrow_dithered(&p, &mut out, w, h);
         out
     });
-    let edited: Option<Vec<u8>> = if let Some(v) = neutral_edited {
+    let mut edited: Option<Vec<u8>> = if let Some(v) = neutral_edited {
         Some(v)
     } else {
         match geometry {
@@ -2532,54 +2539,115 @@ async fn render_photo_export(
     };
     drop(color_span);
 
-    // Composite onto the full geometry-corrected canvas, then crop+scale
-    // straight into the export canvas (one resample instead of two).
-    let mut encode_span = perf::Span::new("export.encode");
-    let base = web::create_canvas(w as u32, h as u32);
-    match &edited {
-        Some(v) => web::put_pixels(&base, v, w as u32, h as u32),
-        None => pix.put_on_canvas(&base, w as u32, h as u32),
-    }
-    drop(edited);
-    composite_layers(&base, &item.layers, w, h);
-
     let (cx, cy, cw, ch) = crop_px(&item.edit, w, h);
     let (cx, cy, cw, ch) = aspect_fit(cx, cy, cw, ch, item.edit.aspect);
     // Photo exports keep the crop's native pixels; export_dims is the video cap.
     let (ew, eh) = (cw, ch);
-    encode_span.set_detail(format!("{}x{}", ew, eh));
-    let out = web::create_canvas(ew as u32, eh as u32);
-    web::ctx2d(&out)
-        .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
-            &base, cx as f64, cy as f64, cw as f64, ch as f64,
-            0.0, 0.0, ew as f64, eh as f64,
-        )
-        .unwrap();
-    drop(base);
     let format = state.photo_format.get_untracked();
-    let encoded = match format {
-        PhotoFormat::Jpeg => web::canvas_to_jpeg_blob(&out, 0.92).await,
-        PhotoFormat::JpegMax => web::canvas_to_jpeg_blob(&out, 1.0).await,
-        PhotoFormat::Png => web::canvas_to_blob(&out, "image/png").await,
+    let mut encode_span = perf::Span::new("export.encode");
+    encode_span.set_detail(format!("{}x{}", ew, eh));
+
+    // A full-frame export with no layers is exactly the pixel buffer we hold,
+    // so JPEG can go straight to the worker. Routing it through two full-size
+    // canvases plus a ~100 MB readback pushed 26 MP exports over the
+    // renderer's memory limit.
+    let direct = cx == 0
+        && cy == 0
+        && cw == w
+        && ch == h
+        && item.layers.is_empty()
+        && matches!(format, PhotoFormat::Jpeg | PhotoFormat::JpegMax);
+    let direct_pixels = if direct {
+        match edited.take() {
+            Some(v) => Some(Uint8Array::from(&v[..])),
+            None => match &pix {
+                Pixels::View(v) => Some(v.slice(0, v.length())),
+                Pixels::Owned(v) => Some(Uint8Array::from(&v[..])),
+            },
+        }
+    } else {
+        None
     };
-    let blob = encoded.ok()?;
+    let encoded = if let Some(view) = direct_pixels {
+        let (quality, _) = if format == PhotoFormat::JpegMax { (97, 1.0) } else { (92, 0.92) };
+        await_worker(move |cb| {
+            pworker::encode_jpeg(&view, ew as u32, eh as u32, quality, cb)
+        })
+        .await
+        .and_then(|bytes| web::bytes_to_blob(&bytes, "image/jpeg").ok())
+    } else {
+        // Composite onto the full geometry-corrected canvas, then crop+scale
+        // straight into the export canvas (one resample instead of two).
+        let base = web::create_canvas(w as u32, h as u32);
+        match &edited {
+            Some(v) => web::put_pixels(&base, v, w as u32, h as u32),
+            None => pix.put_on_canvas(&base, w as u32, h as u32),
+        }
+        drop(edited);
+        composite_layers(&base, &item.layers, w, h);
+
+        let out = web::create_canvas(ew as u32, eh as u32);
+        web::ctx2d(&out)
+            .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+                &base, cx as f64, cy as f64, cw as f64, ch as f64,
+                0.0, 0.0, ew as f64, eh as f64,
+            )
+            .unwrap();
+        drop(base);
+        match format {
+            PhotoFormat::Jpeg | PhotoFormat::JpegMax => {
+                let (quality, fallback) = if format == PhotoFormat::JpegMax {
+                    (97, 1.0)
+                } else {
+                    (92, 0.92)
+                };
+                // The encoder runs in the worker (4:4:4, sRGB ICC); the canvas
+                // readback is transferred, so the main thread never encodes a
+                // full-res frame.
+                let jpeg = match web::image_data_view(&out, ew as u32, eh as u32) {
+                    Some(view) => {
+                        await_worker(move |cb| {
+                            pworker::encode_jpeg(&view, ew as u32, eh as u32, quality, cb)
+                        })
+                        .await
+                    }
+                    None => None,
+                };
+                match jpeg {
+                    Some(bytes) => web::bytes_to_blob(&bytes, "image/jpeg").ok(),
+                    None => web::canvas_to_jpeg_blob(&out, fallback).await.ok(),
+                }
+            }
+            PhotoFormat::Png => web::canvas_to_blob(&out, "image/png").await.ok(),
+        }
+    };
+    let blob = encoded?;
     let (mime, ext) = match format {
         PhotoFormat::Png => ("image/png", "png"),
         _ => ("image/jpeg", "jpg"),
     };
-    // Carry source EXIF into the export when we have it.
-    let blob = match &item.exif {
-        Some(tiff) => match web::blob_to_bytes(&blob).await {
-            Ok(bytes) => {
-                let bytes = match format {
-                    PhotoFormat::Png => exif::inject_png(&bytes, tiff),
-                    _ => exif::inject_jpeg(&bytes, tiff),
-                };
+    // Carry source EXIF into the export when we have it; PNGs always get an
+    // sRGB tag because the canvas encoder writes none (the worker JPEG
+    // already carries its ICC profile).
+    let needs_bytes = format == PhotoFormat::Png || item.exif.is_some();
+    let blob = if needs_bytes {
+        match web::blob_to_bytes(&blob).await {
+            Ok(mut bytes) => {
+                if format == PhotoFormat::Png {
+                    bytes = exif::tag_png_srgb(&bytes);
+                }
+                if let Some(tiff) = &item.exif {
+                    bytes = match format {
+                        PhotoFormat::Png => exif::inject_png(&bytes, tiff),
+                        _ => exif::inject_jpeg(&bytes, tiff),
+                    };
+                }
                 web::bytes_to_blob(&bytes, mime).unwrap_or(blob)
             }
             Err(_) => blob,
-        },
-        None => blob,
+        }
+    } else {
+        blob
     };
     drop(encode_span);
     let base = item.name.rsplitn(2, '.').last().unwrap_or("photo");

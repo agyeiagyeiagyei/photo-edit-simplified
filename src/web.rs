@@ -45,6 +45,16 @@ pub fn image_data_from_ctx(
     (data.data().to_vec(), w as usize, h as usize)
 }
 
+/// A Uint8Array view over a fresh canvas readback, backed by an ArrayBuffer
+/// the caller may transfer to a worker (which detaches this view). Reads the
+/// `data` property through JS because web-sys' accessor copies into a Vec.
+pub fn image_data_view(canvas: &HtmlCanvasElement, w: u32, h: u32) -> Option<Uint8Array> {
+    let data = ctx2d(canvas).get_image_data(0.0, 0.0, w as f64, h as f64).ok()?;
+    let raw = Reflect::get(data.as_ref(), &JsValue::from_str("data")).ok()?;
+    let array: Uint8ClampedArray = raw.unchecked_into();
+    Some(Uint8Array::new(&array.buffer()))
+}
+
 pub fn put_pixels(
     canvas: &HtmlCanvasElement,
     pixels: &[u8],

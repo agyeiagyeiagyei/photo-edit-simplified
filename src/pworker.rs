@@ -733,6 +733,33 @@ pub fn camera_proxy(
     )
 }
 
+/// Encode RGBA pixels as a 4:4:4 JPEG carrying the sRGB ICC profile. The
+/// pixel buffer is transferred to the worker (the app view is detached).
+/// Returns None when the worker is unavailable; callers then fall back to
+/// canvas.toBlob.
+pub fn encode_jpeg(
+    rgba: &Uint8Array,
+    w: u32,
+    h: u32,
+    quality: u8,
+    cb: impl FnOnce(Option<Vec<u8>>) + 'static,
+) -> bool {
+    let buf = rgba.buffer();
+    call(
+        "encode_jpeg",
+        &[
+            rgba.clone().into(),
+            JsValue::from(w),
+            JsValue::from(h),
+            JsValue::from(quality),
+        ],
+        &[buf.into()],
+        Box::new(move |reply| {
+            cb(reply.ok().map(|v| Uint8Array::new(&v).to_vec()))
+        }),
+    )
+}
+
 pub struct RawMeta {
     pub exif_tiff: Option<Vec<u8>>,
     pub orientation: u16,

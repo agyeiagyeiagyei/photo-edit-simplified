@@ -16,6 +16,8 @@ use pes_pixel::recipe::{edit_params_from_recipe, selection_from_json};
 use pes_pixel::types::EditParams;
 use pes_pixel::{clone, color, fill, heal, ops, resample, wide};
 
+mod srgb_icc;
+
 thread_local! {
     static BUFFERS: RefCell<HashMap<u32, (Vec<u8>, usize, usize)>> = RefCell::new(HashMap::new());
     /// Un-toned 16-bit develop for RAW items, at the stored frame's dims. The
@@ -1170,4 +1172,60 @@ fn parse_pts(v: &JsValue) -> Vec<(f32, f32)> {
         }
     }
     out
+}
+
+/// Row-wise RGBA source over the transferred canvas readback. The encoder only
+/// ever asks for one row at a time, so this avoids copying the whole frame into
+/// wasm memory (~100 MB at 26 MP, enough to crash the renderer on big exports).
+struct CanvasRows {
+    rgba: Uint8Array,
+    w: u16,
+    h: u16,
+}
+
+impl jpeg_encoder::ImageBuffer for CanvasRows {
+    fn get_jpeg_color_type(&self) -> jpeg_encoder::JpegColorType {
+        jpeg_encoder::JpegColorType::Ycbcr
+    }
+
+    fn width(&self) -> u16 {
+        self.w
+    }
+
+    fn height(&self) -> u16 {
+        self.h
+    }
+
+    fn fill_buffers(&self, y: u16, buffers: &mut [Vec<u8>; 4]) {
+        let stride = self.w as u32 * 4;
+        let start = y as u32 * stride;
+        let row = self.rgba.subarray(start, start + stride).to_vec();
+        for px in row.chunks_exact(4) {
+            let (luma, cb, cr) = jpeg_encoder::rgb_to_ycbcr(px[0], px[1], px[2]);
+            buffers[0].push(luma);
+            buffers[1].push(cb);
+            buffers[2].push(cr);
+        }
+    }
+}
+
+/// Encode RGBA pixels as a 4:4:4 JPEG carrying the sRGB ICC profile.
+/// `rgba` arrives as a transferred ArrayBuffer from the export canvas, so
+/// the encode runs off the main thread. Returns the JPEG bytes as a
+/// transferable ArrayBuffer.
+#[wasm_bindgen]
+pub fn encode_jpeg(rgba: Uint8Array, w: u32, h: u32, quality: u8) -> Result<JsValue, JsValue> {
+    if w == 0 || h == 0 || w > u16::MAX as u32 || h > u16::MAX as u32 {
+        return Err(JsValue::from_str("bad jpeg dimensions"));
+    }
+    let mut out = Vec::new();
+    let mut enc = jpeg_encoder::Encoder::new(&mut out, quality.clamp(1, 100));
+    // F_1_1 keeps full chroma (4:4:4); the default 4:2:0 smears colour on
+    // high-frequency detail such as foliage and fabric.
+    enc.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1);
+    enc.add_icc_profile(srgb_icc::SRGB_ICC)
+        .map_err(|e| JsValue::from_str(&format!("icc: {e}")))?;
+    enc.encode_image(CanvasRows { rgba, w: w as u16, h: h as u16 })
+        .map_err(|e| JsValue::from_str(&format!("jpeg: {e}")))?;
+    Ok(js_buf(out))
 }
