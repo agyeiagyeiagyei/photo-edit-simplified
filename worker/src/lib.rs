@@ -589,6 +589,7 @@ fn neutral_finish(
     white: f32,
     tone: Option<&[u8; 256]>,
     mask: Option<&[u8]>,
+    px_scale: f32,
 ) -> (Vec<u8>, f64, f64) {
     let t0 = js_sys::Date::now();
     rawops::develop_neutral_wide(buf, w, h, &edit.raw, white);
@@ -596,6 +597,7 @@ fn neutral_finish(
         let table = rawops::tone_table_for(lut, edit.raw.highlights);
         rawops::apply_tone_wide(buf, &table);
     }
+    rawops::detail_toned_wide(buf, w, h, &edit.raw, px_scale);
     let t1 = js_sys::Date::now();
     if edit.is_color_touched() {
         color::apply_color_effects_wide(buf, w, h, edit, seed, mask);
@@ -652,10 +654,11 @@ fn neutral_render(
 ) -> (Vec<u8>, usize, usize, [f64; 5]) {
     let (mut buf, tw, th, t) = wide_base_pipeline(id, fw, fh, edit, req_w, req_h, max_edge);
     let mask = selection_mask_for(edit, tw, th, sel_json, sel_mask);
+    let px_scale = pipeline::px_scale_for(fw, fh, Target::new(tw, th));
     let (out, dev_ms, col_ms) = NEUTRAL.with(|n| {
         let n = n.borrow();
         let src = n.get(&id).expect("neutral frame missing");
-        neutral_finish(&mut buf, tw, th, edit, seed, src.white, src.tone.as_ref(), mask.as_deref())
+        neutral_finish(&mut buf, tw, th, edit, seed, src.white, src.tone.as_ref(), mask.as_deref(), px_scale)
     });
     (out, tw, th, [t[0], t[1], dev_ms, col_ms, t[2]])
 }
@@ -673,9 +676,11 @@ fn neutral_window_render(
     sel_mask: Option<Uint8Array>,
 ) -> (Vec<u8>, usize, usize, [f64; 5]) {
     let (mut buf, tw, th, t) = wide_window_pipeline(id, fw, fh, edit, req_w, req_h, max_edge);
+    let (ww, wh) = working_dims(fw, fh, edit);
+    let (cx, cy, cw, ch) = crop_px(edit, ww, wh);
+    let px_scale = pipeline::px_scale_for(fw, fh, Target::new(ww, wh))
+        * pipeline::px_scale_for(cw, ch, Target::new(tw, th));
     let mask = if edit.is_color_touched() {
-        let (ww, wh) = working_dims(fw, fh, edit);
-        let (cx, cy, cw, ch) = crop_px(edit, ww, wh);
         sel_json
             .and_then(|j| selection_from_json(&j, sel_mask.map(|m| m.to_vec())))
             .map(|sel| {
@@ -693,7 +698,7 @@ fn neutral_window_render(
     let (out, dev_ms, col_ms) = NEUTRAL.with(|n| {
         let n = n.borrow();
         let src = n.get(&id).expect("neutral frame missing");
-        neutral_finish(&mut buf, tw, th, edit, seed, src.white, src.tone.as_ref(), mask.as_deref())
+        neutral_finish(&mut buf, tw, th, edit, seed, src.white, src.tone.as_ref(), mask.as_deref(), px_scale)
     });
     (out, tw, th, [t[0], t[1], dev_ms, col_ms, t[2]])
 }
@@ -1475,6 +1480,10 @@ fn export_pixels(
             Ok::<_, JsValue>((f.pixels, f.w, f.h))
         })?;
         let mask = export_mask(edit, ww, wh, rect, out_w, out_h, sel_json, sel_mask);
+        // Sensor pixels per export pixel (1.0 for a full-size export), the
+        // same formula as the legacy branch below.
+        let px_scale = pipeline::px_scale_for(fw, fh, Target::new(ww, wh))
+            * pipeline::px_scale_for(cw, ch, Target::new(out_w, out_h));
         let (out, _, _) = NEUTRAL.with(|n| {
             let n = n.borrow();
             let src = n
@@ -1489,6 +1498,7 @@ fn export_pixels(
                 src.white,
                 src.tone.as_ref(),
                 mask.as_deref(),
+                px_scale,
             ))
         })?;
         return Ok((out, out_w, out_h));

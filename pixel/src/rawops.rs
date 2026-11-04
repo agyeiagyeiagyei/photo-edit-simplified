@@ -190,17 +190,7 @@ pub fn develop_wide(buf: &mut [u16], w: usize, h: usize, adj: &RawAdjust, px_sca
     // on an 8-bit narrowing of this buffer, but filters linear light
     // internally, so the narrowing does not cost it linearity.
     if adj.denoise > 0.0 {
-        let mut px8: Vec<u8> = buf.iter().map(|&v| ((v as u32 + 128) / 257) as u8).collect();
-        crate::denoise::smart_denoise(
-            &mut px8,
-            w,
-            h,
-            (adj.denoise / 100.0).clamp(0.0, 1.0),
-            px_scale,
-        );
-        for (dst, &v) in buf.iter_mut().zip(px8.iter()) {
-            *dst = v as u16 * 257;
-        }
+        denoise_wide(buf, w, h, adj.denoise, px_scale);
     }
     let sharp = (adj.sharpen / 100.0).clamp(0.0, 1.0);
     let hl = (adj.highlights / 100.0).clamp(0.0, 1.0);
@@ -294,14 +284,70 @@ pub fn develop_wide(buf: &mut [u16], w: usize, h: usize, adj: &RawAdjust, px_sca
     }
 }
 
+/// Denoise a 16-bit sRGB frame. The filter runs on an 8-bit narrowing, and
+/// only the change it made is added back to the 16-bit values, so pixels the
+/// filter leaves alone keep their full precision (no 8-bit banding is
+/// introduced into gradients the 16-bit pipeline carries).
+pub fn denoise_wide(buf: &mut [u16], w: usize, h: usize, denoise: f32, px_scale: f32) {
+    let strength = (denoise / 100.0).clamp(0.0, 1.0);
+    if strength <= 0.0 || w == 0 || h == 0 {
+        return;
+    }
+    let before: Vec<u8> = buf.iter().map(|&v| ((v as u32 + 128) / 257) as u8).collect();
+    let mut after = before.clone();
+    crate::denoise::smart_denoise(&mut after, w, h, strength, px_scale);
+    for ((dst, &a), &b) in buf.iter_mut().zip(after.iter()).zip(before.iter()) {
+        let d = (a as i32 - b as i32) * 257;
+        if d != 0 {
+            *dst = (*dst as i32 + d).clamp(0, 65535) as u16;
+        }
+    }
+}
+
+/// Denoise and capture sharpening on a camera-toned 16-bit frame: the
+/// neutral path's detail stage. It runs after the camera tone curve, so both
+/// see the same display-referred data the legacy path gave them, and a RAW
+/// with denoise or sharpening keeps the camera-tone-last rendering instead of
+/// falling back to the legacy pipeline (#15).
+pub fn detail_toned_wide(buf: &mut [u16], w: usize, h: usize, adj: &RawAdjust, px_scale: f32) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    if adj.denoise > 0.0 {
+        denoise_wide(buf, w, h, adj.denoise, px_scale);
+    }
+    let sharp = (adj.sharpen / 100.0).clamp(0.0, 1.0);
+    let sigma = (USM_RADIUS * px_scale.clamp(0.0, 2.0)).min(2.0);
+    if sharp <= 0.0 || sigma < 0.15 {
+        return;
+    }
+    let blur = blur_luma_gaussian_wide(buf, w, h, sigma);
+    let dec = dec16();
+    let enc = enc16();
+    let encode = |v: f32| -> u16 { enc[(v.clamp(0.0, 1.0) * 65536.0) as usize] };
+    let gain = sharp * 3.0;
+    for (i, px) in buf.chunks_exact_mut(4).enumerate() {
+        let yb = (54 * px[0] as u32 + 183 * px[1] as u32 + 19 * px[2] as u32) >> 8;
+        let mut d = (yb as f32 - blur[i] as f32) / 65535.0;
+        if d.abs() <= USM_THRESHOLD {
+            continue;
+        }
+        d -= USM_THRESHOLD.copysign(d);
+        let g = (1.0 + gain * d).clamp(0.2, 4.0);
+        for c in 0..3 {
+            px[c] = encode(dec[px[c] as usize] * g);
+        }
+    }
+}
+
 /// Develop the un-toned 16-bit sRGB RAW frame, white-relative.
 ///
 /// The neutral develop spans only the camera's raw range (a dark frame might
 /// top out near 5% linear), so every threshold here is evaluated in units of
 /// `white` — the linear level the camera-tone curve maps to preview white.
-/// The stages themselves match [`develop_wide`]; denoise and capture
-/// sharpening stay on the legacy path and callers gate this one off when
-/// either is active.
+/// The stages themselves match [`develop_wide`]. Denoise and capture
+/// sharpening are not part of it: they run after the camera tone curve in
+/// [`detail_toned_wide`].
 pub fn develop_neutral_wide(buf: &mut [u16], w: usize, h: usize, adj: &RawAdjust, white: f32) {
     if adj.is_identity() || w == 0 || h == 0 {
         return;
