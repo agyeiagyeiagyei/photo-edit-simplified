@@ -1,15 +1,20 @@
 //! Edge-aware denoiser: separable bilateral filter over a YCbCr split.
 //!
+//! Chroma first: the lower half of the slider mostly removes colour noise,
+//! the blotchy part of high-ISO noise. Luma is mixed in on a quadratic ramp
+//! that reaches the full filter at strength 0.5, because fine luminance
+//! grain is often real texture (feathers, foliage). Above 0.5 the behaviour
+//! is unchanged.
+//!
 //! Chroma gets a wide window and its own range weight plus a luma-guided one,
 //! so colour blotches smooth out while real colour and luminance edges hold.
 //! Chroma is filtered at half resolution — the cheaper, standard split, and
 //! chroma noise is low-frequency anyway — and bilinearly upsampled. Luma uses
 //! a narrower window and a tighter range sigma so texture survives.
 //!
-//! Luma is filtered in linear light: averaging sRGB-encoded values darkens
-//! bright/dark noise pairs, while averaging the light they represent does not.
-//! The bilateral range gate still measures sRGB code differences, so its
-//! calibration and shadow-detail protection are unchanged.
+//! Luma is the Rec.601 luma of the sRGB codes, the same value the YCbCr split
+//! carries, so filtering it leaves tone alone: an unfiltered pixel is returned
+//! exactly and a flat colour of any saturation does not move (#15).
 //!
 //! Window and range parameters are defined in sensor pixels and sensor-referred
 //! noise, then scaled into the render: a proxy at 1/p the sensor's linear
@@ -22,33 +27,18 @@ use std::sync::OnceLock;
 const MAX_LUMA_R: usize = 6;
 const MAX_CHROMA_R: usize = 8;
 
-/// sRGB code -> linear light scaled to 0..=65535, and back.
-fn gamma_luts() -> &'static ([u16; 256], [u8; 65536]) {
-    static LUTS: OnceLock<([u16; 256], [u8; 65536])> = OnceLock::new();
-    LUTS.get_or_init(|| {
-        let mut lin = [0u16; 256];
-        for (c, out) in lin.iter_mut().enumerate() {
-            let s = c as f64 / 255.0;
-            let l = if s <= 0.04045 {
-                s / 12.92
-            } else {
-                ((s + 0.055) / 1.055).powf(2.4)
-            };
-            *out = (l * 65535.0).round() as u16;
+/// u16 luma (code x 257) back to an 8-bit code, rounded.
+fn luma_lut() -> &'static [u8; 65536] {
+    static LUT: OnceLock<[u8; 65536]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t = [0u8; 65536];
+        for (v, out) in t.iter_mut().enumerate() {
+            *out = ((v as u32 + 128) / 257).min(255) as u8;
         }
-        let mut srgb = [0u8; 65536];
-        for (v, out) in srgb.iter_mut().enumerate() {
-            let l = v as f64 / 65535.0;
-            let s = if l <= 0.0031308 {
-                12.92 * l
-            } else {
-                1.055 * l.powf(1.0 / 2.4) - 0.055
-            };
-            *out = (s * 255.0).round().clamp(0.0, 255.0) as u8;
-        }
-        (lin, srgb)
+        t
     })
 }
+
 
 /// Normalised spatial Gaussian over the window offsets -r..=r.
 fn spatial(r: usize) -> Vec<f32> {
@@ -218,7 +208,9 @@ fn half_down(src: &[i16], w: usize, h: usize) -> (Vec<i16>, usize, usize) {
                 + src[y0 * w + x1] as i32
                 + src[y1 * w + x0] as i32
                 + src[y1 * w + x1] as i32;
-            out[y * hw + x] = ((s + 2) / 4) as i16;
+            // Round half up for both signs: `/` truncates toward zero, which
+            // nudged every negative chroma (all greens) one code toward zero.
+            out[y * hw + x] = ((s + 2) >> 2) as i16;
         }
     }
     (out, hw, hh)
@@ -270,6 +262,14 @@ fn half_up(src: &[i16], sw: usize, sh: usize, w: usize, h: usize) -> Vec<i16> {
     out
 }
 
+/// Share of the luma filter applied at slider strength `t` (0..=1):
+/// `(t / LUMA_FULL_AT)²`, capped at 1. 0.1 → 0.04, 0.25 → 0.25, ≥0.5 → 1.
+const LUMA_FULL_AT: f32 = 0.5;
+fn luma_mix(t: f32) -> f32 {
+    let r = (t / LUMA_FULL_AT).clamp(0.0, 1.0);
+    r * r
+}
+
 /// Denoise `buf` (RGBA, `w`×`h`) in place. `strength` 0..=1; 0 is a no-op.
 /// `px_scale` is sensor pixels per buffer pixel — 1.0 for a full-res export,
 /// larger for a downscaled proxy or preview.
@@ -316,20 +316,18 @@ pub fn smart_denoise(buf: &mut [u8], w: usize, h: usize, strength: f32, px_scale
 
     let sw_y = spatial(r_y);
     let lut_y = range(sy);
-    let (lin_lut, srgb_lut) = gamma_luts();
-    let lin: Vec<u16> = (0..n)
-        .map(|i| {
-            let o = i * 4;
-            (0.2126 * lin_lut[buf[o] as usize] as f32
-                + 0.7152 * lin_lut[buf[o + 1] as usize] as f32
-                + 0.0722 * lin_lut[buf[o + 2] as usize] as f32)
-                .round()
-                .clamp(0.0, 65535.0) as u16
-        })
-        .collect();
-    let tmp_y = luma_horizontal(&y, &lin, w, h, r_y, &sw_y, &lut_y);
-    drop(lin);
-    let filt_y = luma_vertical(&tmp_y, &y, w, h, r_y, &sw_y, &lut_y, srgb_lut);
+    // Luma is filtered as the same Rec.601 luma of sRGB codes that the YCbCr
+    // split below carries. 189d5e5 filtered linear Rec.709 luminance instead
+    // and substituted it for this luma; the two agree only for greys, so every
+    // coloured pixel moved by a fixed amount whenever denoise was on (#15),
+    // and pure-chroma noise leaked into luma. The bilateral range gate keeps
+    // the averaged samples within a few codes of each other, so the sRGB-
+    // averaging bias is far below one code (measured: mean -0.6 codes at
+    // denoise 50 on the owner's ARW before 189d5e5).
+    let y16: Vec<u16> = y.iter().map(|&v| v as u16 * 257).collect();
+    let tmp_y = luma_horizontal(&y, &y16, w, h, r_y, &sw_y, &lut_y);
+    drop(y16);
+    let filt_y = luma_vertical(&tmp_y, &y, w, h, r_y, &sw_y, &lut_y, luma_lut());
 
     let sw_c = spatial(r_c);
     let lut_g = range(sg);
@@ -344,24 +342,137 @@ pub fn smart_denoise(buf: &mut [u8], w: usize, h: usize, strength: f32, px_scale
     let v_cr = chroma_vertical(&tmp_cr, &y_h, hw, hh, r_c, &sw_c, &lut_g, &lut_c);
     let filt_cr = half_up(&v_cr, hw, hh, w, h);
 
-    // Radii and sigmas already carry the strength, so the filtered result is
-    // used whole; blending again would square the slider's effect.
+    // Radii and sigmas already carry the strength. Chroma uses the filtered
+    // result whole. Luma is mixed by `luma_mix`, which deliberately squares
+    // the slider over its lower half (see the module docs), so the low range
+    // leaves luminance texture nearly untouched.
+    let luma_mix = luma_mix(t);
     for i in 0..n {
-        let yd = filt_y[i] as f32;
-        let cbd = filt_cb[i] as f32;
-        let crd = filt_cr[i] as f32;
+        // The integer forward split and this float inverse are not exact
+        // inverses (up to 2 codes on saturated blues), so apply only the
+        // change the filter made: an unfiltered pixel comes back exactly.
+        let to_rgb = |yy: f32, cb: f32, cr: f32| {
+            [yy + 1.402 * cr, yy - 0.344136 * cb - 0.714136 * cr, yy + 1.772 * cb]
+        };
+        let a = to_rgb(y[i] as f32, cb[i] as f32, cr[i] as f32);
+        let fy = y[i] as f32 + luma_mix * (filt_y[i] as f32 - y[i] as f32);
+        let b = to_rgb(fy, filt_cb[i] as f32, filt_cr[i] as f32);
         let p = i * 4;
-        buf[p] = (yd + 1.402 * crd).round().clamp(0.0, 255.0) as u8;
-        buf[p + 1] = (yd - 0.344136 * cbd - 0.714136 * crd)
-            .round()
-            .clamp(0.0, 255.0) as u8;
-        buf[p + 2] = (yd + 1.772 * cbd).round().clamp(0.0, 255.0) as u8;
+        for c in 0..3 {
+            buf[p + c] = (buf[p + c] as f32 + (b[c] - a[c])).round().clamp(0.0, 255.0) as u8;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn colour_noisy(w: usize, h: usize, base: [u8; 3], amp: i32, seed: u32) -> Vec<u8> {
+        let mut v = vec![0u8; w * h * 4];
+        let mut s = seed;
+        for i in 0..w * h {
+            for c in 0..3 {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                let d = if amp == 0 { 0 } else { ((s >> 16) as i32 % (2 * amp + 1)) - amp };
+                v[i * 4 + c] = (base[c] as i32 + d).clamp(0, 255) as u8;
+            }
+            v[i * 4 + 3] = 255;
+        }
+        v
+    }
+
+    fn channel_means(v: &[u8]) -> [f64; 3] {
+        let n = (v.len() / 4) as f64;
+        let mut m = [0f64; 3];
+        for p in v.chunks_exact(4) {
+            for c in 0..3 {
+                m[c] += p[c] as f64;
+            }
+        }
+        m.map(|x| x / n)
+    }
+
+    #[test]
+    fn flat_saturated_colour_is_unchanged() {
+        // #15: a flat foliage green came back ~+9 codes brighter at any
+        // strength because filtered luminance replaced Rec.601 luma.
+        for base in [[60u8, 140, 40], [200, 60, 50], [40, 70, 180], [128, 128, 128]] {
+            for strength in [0.1f32, 0.5, 1.0] {
+                let src = colour_noisy(48, 32, base, 0, 1);
+                let mut out = src.clone();
+                smart_denoise(&mut out, 48, 32, strength, 1.0);
+                let max = out.iter().zip(&src).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+                assert!(max <= 1, "flat {base:?} at {strength} moved by {max}");
+            }
+        }
+    }
+
+    #[test]
+    fn noisy_saturated_colour_keeps_its_mean() {
+        for base in [[60u8, 140, 40], [200, 60, 50], [40, 70, 180]] {
+            for strength in [0.1f32, 0.5] {
+                let src = colour_noisy(96, 64, base, 8, 7);
+                let mut out = src.clone();
+                smart_denoise(&mut out, 96, 64, strength, 1.0);
+                let (a, b) = (channel_means(&src), channel_means(&out));
+                for c in 0..3 {
+                    assert!(
+                        (a[c] - b[c]).abs() <= 1.0,
+                        "{base:?} at {strength}: channel {c} mean {:.2} -> {:.2}",
+                        a[c],
+                        b[c]
+                    );
+                }
+            }
+        }
+    }
+
+    /// Standard deviation of Rec.601 luma and of the two chroma planes.
+    fn ycc_std(v: &[u8]) -> (f32, f32) {
+        let n = (v.len() / 4) as f32;
+        let mut sums = [0f32; 3];
+        let mut sq = [0f32; 3];
+        for p in v.chunks_exact(4) {
+            let (r, g, b) = (p[0] as f32, p[1] as f32, p[2] as f32);
+            let c = [
+                0.299 * r + 0.587 * g + 0.114 * b,
+                -0.168736 * r - 0.331264 * g + 0.5 * b,
+                0.5 * r - 0.418688 * g - 0.081312 * b,
+            ];
+            for k in 0..3 {
+                sums[k] += c[k];
+                sq[k] += c[k] * c[k];
+            }
+        }
+        let sd = |k: usize| (sq[k] / n - (sums[k] / n).powi(2)).max(0.0).sqrt();
+        (sd(0), (sd(1) + sd(2)) / 2.0)
+    }
+
+    #[test]
+    fn low_strength_is_chroma_first() {
+        // Independent per-channel noise carries both luma and chroma noise.
+        let src = colour_noisy(128, 96, [120, 110, 100], 10, 5);
+        let (y0, c0) = ycc_std(&src);
+        let mut low = src.clone();
+        smart_denoise(&mut low, 128, 96, 0.1, 1.0);
+        let (y1, c1) = ycc_std(&low);
+        assert!(c1 < c0 * 0.6, "chroma noise {c0:.2} -> {c1:.2} at 0.1 (want -40% or more)");
+        assert!(y1 > y0 * 0.95, "luma noise {y0:.2} -> {y1:.2} at 0.1 (want -5% at most)");
+        let mut full = src.clone();
+        smart_denoise(&mut full, 128, 96, 1.0, 1.0);
+        let (y2, _) = ycc_std(&full);
+        assert!(y2 < y0 * 0.8, "luma noise {y0:.2} -> {y2:.2} at 1.0 (want real smoothing)");
+    }
+
+    #[test]
+    fn luma_ramp_reaches_full_at_half() {
+        assert_eq!(luma_mix(0.0), 0.0);
+        assert!((luma_mix(0.1) - 0.04).abs() < 1e-6);
+        assert!((luma_mix(0.25) - 0.25).abs() < 1e-6);
+        assert_eq!(luma_mix(0.5), 1.0);
+        assert_eq!(luma_mix(1.0), 1.0);
+    }
 
     fn gray_noisy(w: usize, h: usize, base: u8, amp: i32, seed: u32) -> Vec<u8> {
         let mut v = vec![0u8; w * h * 4];

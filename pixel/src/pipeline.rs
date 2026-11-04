@@ -107,7 +107,10 @@ pub fn resize_wide(src: &[u16], w: usize, h: usize, target: Target) -> Frame16 {
 /// lacks (denoise, capture sharpen) is in use. Callers fall back to the
 /// legacy u8 pipeline otherwise, so an edit never silently loses a stage.
 pub fn neutral_eligible(edit: &EditParams) -> bool {
-    !edit.raw.is_identity() && edit.raw.denoise <= 0.0 && edit.raw.sharpen <= 0.0
+    // Denoise and capture sharpening run inside the neutral path (after the
+    // camera tone, in `rawops::detail_toned_wide`), so they no longer push a
+    // RAW back onto the legacy toned-then-develop rendering (#15).
+    !edit.raw.is_identity()
 }
 
 /// Selection mask for an edit at `w`×`h`, when the edit is masked.
@@ -223,11 +226,13 @@ pub fn finish_neutral_wide(
     mask: Option<&[u8]>,
     white: f32,
     tone: Option<&[u16]>,
+    px_scale: f32,
 ) {
     rawops::develop_neutral_wide(buf, w, h, &edit.raw, white);
     if let Some(table) = tone {
         rawops::apply_tone_wide(buf, table);
     }
+    rawops::detail_toned_wide(buf, w, h, &edit.raw, px_scale);
     if edit.is_color_touched() {
         color::apply_color_effects_wide(buf, w, h, edit, seed, mask);
     }
@@ -240,6 +245,7 @@ pub fn finish_neutral(
     seed: u32,
     white: f32,
     tone: Option<&[u16]>,
+    px_scale: f32,
 ) {
     let mask = if edit.is_color_touched() {
         mask_for_dims(frame.w, frame.h, edit)
@@ -255,6 +261,7 @@ pub fn finish_neutral(
         mask.as_deref(),
         white,
         tone,
+        px_scale,
     );
 }
 
@@ -269,8 +276,9 @@ pub fn render_neutral(
     white: f32,
     tone: Option<&[u16]>,
 ) -> Frame16 {
+    let px_scale = px_scale_for(w, h, target);
     let mut frame = prepare_neutral(src, w, h, edit, target);
-    finish_neutral(&mut frame, edit, seed, white, tone);
+    finish_neutral(&mut frame, edit, seed, white, tone, px_scale);
     frame
 }
 
@@ -477,6 +485,7 @@ mod tests {
             None,
             1.0,
             Some(&table),
+            1.0,
         );
         let mut out = vec![0u8; w * h * 4];
         wide::narrow_dithered(&buf, &mut out, w, h);
@@ -530,6 +539,76 @@ mod tests {
             for x in 20..40 {
                 let i = (y * 40 + x) * 4;
                 assert_eq!(&out.pixels[i..i + 4], &px[i..i + 4], "pixel ({x},{y}) moved");
+            }
+        }
+    }
+
+    /// Textured foliage-like fixture: a saturated green field with
+    /// per-channel noise and a few hard edges, in the un-toned neutral range.
+    fn neutral_foliage(w: usize, h: usize) -> Vec<u16> {
+        let mut v = vec![0u16; w * h * 4];
+        let mut s = 99u32;
+        for y in 0..h {
+            for x in 0..w {
+                let base: [i32; 3] = if (x / 16 + y / 16) % 2 == 0 { [70, 150, 45] } else { [40, 95, 30] };
+                for c in 0..3 {
+                    s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                    let d = ((s >> 16) as i32 % 13) - 6;
+                    v[(y * w + x) * 4 + c] = ((base[c] + d).clamp(0, 255) as u16) * 257;
+                }
+                v[(y * w + x) * 4 + 3] = 65535;
+            }
+        }
+        v
+    }
+
+    fn render_neutral_means(raw: RawAdjust) -> [f64; 3] {
+        let (w, h) = (128usize, 96usize);
+        let src = neutral_foliage(w, h);
+        let lut = tone_curve();
+        let table = rawops::tone_table(&lut);
+        let edit = EditParams { raw, ..EditParams::default() };
+        let frame = render_neutral(&src, w, h, &edit, Target::new(w, h), 1, 1.0, Some(&table));
+        let mut out = vec![0u8; w * h * 4];
+        wide::narrow_dithered(&frame.pixels, &mut out, w, h);
+        let n = (w * h) as f64;
+        let mut m = [0f64; 3];
+        for p in out.chunks_exact(4) {
+            for c in 0..3 {
+                m[c] += p[c] as f64;
+            }
+        }
+        m.map(|x| x / n)
+    }
+
+    #[test]
+    fn denoise_and_sharpen_keep_the_neutral_path() {
+        let mut edit = EditParams::default();
+        edit.raw.denoise = 10.0;
+        assert!(neutral_eligible(&edit), "denoise alone must render through the neutral path");
+        edit.raw.denoise = 0.0;
+        edit.raw.sharpen = 10.0;
+        assert!(neutral_eligible(&edit), "sharpening alone must render through the neutral path");
+        assert!(!neutral_eligible(&EditParams::default()));
+    }
+
+    #[test]
+    fn denoise_and_sharpen_are_tone_neutral_in_the_neutral_path() {
+        // #15: turning denoise on shifted the median ~+9 codes as shot and
+        // reshaped the curve under an exposure lift. Means must stay put.
+        for exposure in [0.0f32, 1.5] {
+            let base = RawAdjust { exposure, tint: 1.0, ..RawAdjust::default() };
+            let reference = render_neutral_means(base);
+            for (denoise, sharpen) in [(10.0f32, 0.0f32), (50.0, 0.0), (0.0, 30.0), (50.0, 30.0)] {
+                let got = render_neutral_means(RawAdjust { denoise, sharpen, ..base });
+                for c in 0..3 {
+                    assert!(
+                        (got[c] - reference[c]).abs() <= 1.0,
+                        "exposure {exposure}, denoise {denoise}, sharpen {sharpen}: channel {c} mean {:.2} vs {:.2}",
+                        got[c],
+                        reference[c]
+                    );
+                }
             }
         }
     }
