@@ -34,7 +34,14 @@ test.describe('perf marks (docs/PERF.md)', () => {
     expect(measures).toContain('hi.blit');
 
     await page.evaluate(() => (window as any).__pes.reset());
-    expect(await page.evaluate(() => (window as any).__pes.perf().length)).toBe(0);
+    // Work still in flight (a worker reply, a session save) can record a mark
+    // between the reset and this read. What reset guarantees is that nothing
+    // recorded before it survives; these marks can only predate it.
+    const after = await page.evaluate(() => (window as any).__pes.perf().map((e: any) => e.name));
+    for (const n of ['app.mount', 'ingest.read', 'ingest.decode', 'ingest.push', 'preview.render']) {
+      expect(after, `${n} survived __pes.reset() (after: ${after.join(', ')})`).not.toContain(n);
+    }
+    testInfo.annotations.push({ type: 'marks_after_reset', description: after.join(',') || '(none)' });
 
     recordMetrics(testInfo, {
       perf_marks: names.length,

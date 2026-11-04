@@ -22,6 +22,8 @@ thread_local! {
     static PENDING: RefCell<HashMap<u32, Box<dyn FnOnce(Reply)>>> = RefCell::new(HashMap::new());
     static PENDING_OP: RefCell<HashMap<u32, String>> = RefCell::new(HashMap::new());
     static NEXT_REQ: Cell<u32> = const { Cell::new(1) };
+    /// `perf::now()` of the last request posted to the pixel worker.
+    static LAST_POST_MS: Cell<f64> = const { Cell::new(0.0) };
     /// Worker failed to load or errored — ops use the caller's sync fallback.
     static DEAD: Cell<bool> = const { Cell::new(false) };
     /// Serial queue for destructive ops; each closure captures state at
@@ -164,7 +166,18 @@ fn call(op: &str, args: &[JsValue], transfer: &[JsValue], cb: Box<dyn FnOnce(Rep
         PENDING_OP.with(|m| m.borrow_mut().remove(&id));
         return false;
     }
+    LAST_POST_MS.with(|t| t.set(perf::now()));
     true
+}
+
+/// Requests posted to the pixel worker and not yet answered.
+pub(crate) fn pixel_in_flight() -> usize {
+    PENDING.with(|p| p.borrow().len())
+}
+
+/// `perf::now()` of the last request posted to the pixel worker.
+pub(crate) fn pixel_last_post_ms() -> f64 {
+    LAST_POST_MS.with(|t| t.get())
 }
 
 /// Record `worker.<op>` from the reply's `ms` (measured inside run.js), plus
