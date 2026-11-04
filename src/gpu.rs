@@ -35,6 +35,23 @@ pub struct BaseKey {
     pub fine_bits: u32,
     pub need_w: u32,
     pub need_h: u32,
+    /// Fingerprint of the RAW develop baked into the base (`raw_fingerprint`);
+    /// 0 for an undeveloped base.
+    pub raw_fp: u64,
+}
+
+/// 0 for an identity develop, else a hash of every RAW develop field: a base
+/// developed with other settings is stale.
+pub fn raw_fingerprint(raw: &pes_pixel::types::RawAdjust) -> u64 {
+    if raw.is_identity() {
+        return 0;
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for v in [raw.temp, raw.tint, raw.exposure, raw.highlights, raw.shadows, raw.noise, raw.denoise, raw.sharpen] {
+        h ^= v.to_bits() as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h | 1
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -119,7 +136,8 @@ pub fn latch_off() {
 /// The shader implements no mask or spatial stages; those edits keep the CPU
 /// path for the display render as well.
 pub fn eligible(edit: &EditParams) -> bool {
-    edit.selection.is_none() && edit.raw.denoise <= 0.0 && edit.raw.sharpen <= 0.0
+    // Denoise and sharpening reach the GPU only inside a developed base.
+    edit.selection.is_none()
 }
 
 /// `Some(stale_source)` when a base for the same item and geometry is large
@@ -140,7 +158,7 @@ pub fn base_match(key: &BaseKey) -> Option<bool> {
         if gpu.base_dims != Some((*bw, *bh)) {
             return None;
         }
-        Some(bk.src_id != key.src_id || bk.src_fp != key.src_fp)
+        Some(bk.src_id != key.src_id || bk.src_fp != key.src_fp || bk.raw_fp != key.raw_fp)
     })
 }
 
@@ -171,12 +189,12 @@ pub fn render(edit: &EditParams, seed: u32) -> Option<(HtmlCanvasElement, u32, u
     let _span = perf::Span::new("gpu.render");
     let res = STATE.with(|s| -> Result<(HtmlCanvasElement, u32, u32), String> {
         let mut st = s.borrow_mut();
-        let (w, h) = {
-            let (_, w, h) = st.base.as_ref().ok_or_else(|| "no base".to_string())?;
-            (*w, *h)
+        let (w, h, developed) = {
+            let (k, w, h) = st.base.as_ref().ok_or_else(|| "no base".to_string())?;
+            (*w, *h, k.raw_fp != 0)
         };
         let gpu = st.gpu.as_mut().ok_or_else(|| "gpu gone".to_string())?;
-        gpu.draw(edit, seed, w, h)?;
+        gpu.draw(edit, seed, w, h, developed)?;
         Ok((gpu.canvas.clone(), w, h))
     });
     match res {
@@ -594,7 +612,7 @@ impl Gpu {
         Ok(())
     }
 
-    fn draw(&mut self, edit: &EditParams, seed: u32, w: u32, h: u32) -> Result<(), String> {
+    fn draw(&mut self, edit: &EditParams, seed: u32, w: u32, h: u32, developed: bool) -> Result<(), String> {
         if self.canvas.width() != w {
             self.canvas.set_width(w);
         }
@@ -633,7 +651,8 @@ impl Gpu {
             gl.uniform1ui(Some(loc), seed);
         }
         u2f(gl, l("u_size"), w as f32, h as f32);
-        u1i(gl, l("u_raw_identity"), if edit.raw.is_identity() { 1 } else { 0 });
+        // A developed base already carries the RAW develop: draw it as identity.
+        u1i(gl, l("u_raw_identity"), if developed || edit.raw.is_identity() { 1 } else { 0 });
 
         let tables = color::compose_tables(&edit.levels, &edit.curves);
         let mut lut = [0u8; 768];
