@@ -69,6 +69,13 @@ function serveDist(): Promise<{ url: string; close: () => Promise<void> }> {
 }
 
 test.describe('memory (issue #10)', () => {
+  // performance.measureUserAgentSpecificMemory() exists only in full Chromium.
+  // Playwright's default headless shell throws SecurityError for it even when
+  // the page is cross-origin isolated, so run this spec on the full build in
+  // its new headless mode (installed alongside the shell by
+  // `npx playwright install chromium`).
+  test.use({ channel: 'chromium' });
+
   test('five 24 MP loads keep one full-res copy per item', async ({ page }, testInfo) => {
     test.setTimeout(300_000);
     const errors = trackErrors(page);
@@ -108,13 +115,34 @@ test.describe('memory (issue #10)', () => {
       await page.waitForTimeout(1500);
 
       const m = await page.evaluate(async () => {
-        const r = await (performance as any).measureUserAgentSpecificMemory();
         const pes = (window as any).__pes?.mem?.() || null;
         const heap = (performance as any).memory?.usedJSHeapSize ?? null;
-        return { bytes: r.bytes as number, pes, heap };
+        // Guard for runs on a browser without the API (for example a
+        // PES_CHROMIUM headless-shell build): report and skip, don't crash.
+        try {
+          const r = await (performance as any).measureUserAgentSpecificMemory();
+          return { bytes: r.bytes as number, pes, heap, error: null as string | null };
+        } catch (e) {
+          return { bytes: null as number | null, pes, heap, error: String(e) };
+        }
       });
+      if (m.bytes === null) {
+        // Record what this browser can see, so the run still carries numbers,
+        // then skip the gate rather than fail on a browser limitation.
+        recordMetrics(testInfo, {
+          mem_measure_unavailable: 1,
+          mem_pixel_worker_mb: m.pes?.pixel_worker ? Math.round(m.pes.pixel_worker / 1048576) : 0,
+          mem_main_mb: m.pes?.main ? Math.round(m.pes.main / 1048576) : 0,
+          mem_js_heap_mb: m.heap ? Math.round(m.heap / 1048576) : 0,
+        });
+        expect(m.pes?.pixel_worker, 'pixel worker memory telemetry missing').toBeGreaterThan(0);
+        expect(errors, errors.join('\n')).toEqual([]);
+        fs.rmSync(dir, { recursive: true, force: true });
+        test.skip(true, `measureUserAgentSpecificMemory unavailable in this browser build: ${m.error}`);
+        return;
+      }
 
-      const totalMb = Math.round(m.bytes / 1048576);
+      const totalMb = Math.round((m.bytes as number) / 1048576);
       const ratioPct = Math.round((1000 * totalMb) / BASELINE_MB) / 10;
       recordMetrics(testInfo, {
         mem_total_mb: totalMb,
