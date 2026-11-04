@@ -34,10 +34,19 @@ export function trackErrors(page: Page) {
   return errors;
 }
 
-/** Wait for the app shell (Leptos mounted) and return load timings. */
-export async function openApp(page: Page) {
+/**
+ * Wait for the app shell (Leptos mounted) and return load timings.
+ *
+ * Opens with `?gpu=0` by default. The specs that use this assert the CPU
+ * hi-res pipeline (hi.request, the worker base cache, export timings). Auto
+ * mode picks WebGL2 on a hardware GPU, and since the full Chromium build runs
+ * the suite (01ed1e4), a Mac run gets Metal and skips that pipeline; CI's
+ * software GL already falls back to the CPU, so CI is unchanged. 06-gpu covers
+ * the GPU and auto paths explicitly.
+ */
+export async function openApp(page: Page, url = './?gpu=0') {
   const t0 = Date.now();
-  await page.goto('./');
+  await page.goto(url);
   await expect(page.locator('header h1')).toHaveText('photo-edit-simplified');
   const shellMs = Date.now() - t0;
   const res = await page.evaluate(() => {

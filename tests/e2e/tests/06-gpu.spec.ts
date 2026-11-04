@@ -47,6 +47,24 @@ async function waitMark(page: Page, name: string, min = 1) {
   }).toBeGreaterThanOrEqual(min);
 }
 
+/**
+ * Wait until the developed RAW proxy has landed (#16). `proxy.raw_develop` is
+ * recorded when the worker returns; `land_proxy` then installs the develop.
+ * What the canvas shows next depends on the path: the CPU path seeds or
+ * re-renders its hi-res frame, while the GPU path keeps drawing the previous
+ * (camera-JPEG) base until the worker's base for the new source arrives
+ * (stale-while-revalidate). Callers therefore follow this with a long
+ * stability window rather than a single repeated sample.
+ */
+async function waitDevelopLanded(page: Page) {
+  await expect.poll(async () => {
+    const names = await markNames(page);
+    const dev = names.lastIndexOf('proxy.raw_develop');
+    if (dev < 0) return 'no develop yet';
+    return names.indexOf('proxy.land', dev) > dev ? 'landed' : 'develop not landed';
+  }, { timeout: 30_000, intervals: [100, 200, 400] }).toBe('landed');
+}
+
 /** Downscaled RGBA of the visible canvas, base64-encoded. */
 async function downscaled(page: Page, width = 512) {
   return page.evaluate((W) => {
@@ -62,7 +80,7 @@ async function downscaled(page: Page, width = 512) {
     for (let i = 0; i < d.length; i += 0x8000) {
       s += String.fromCharCode.apply(null, Array.from(d.subarray(i, i + 0x8000)) as number[]);
     }
-    return { w: W, h, b64: btoa(s) };
+    return { w: W, h, b64: btoa(s), srcW: src.width, srcH: src.height };
   }, width);
 }
 
@@ -89,7 +107,11 @@ function psnr(a: Buffer, b: Buffer) {
 }
 
 /** Wait until the sharp canvas (w>1200) has been unchanged across two samples. */
-async function waitStableSharpCanvas(page: Page, timeout = 90_000) {
+/**
+ * Wait for a sharp canvas whose content has not changed for `stableMs`
+ * (sampled every 250 ms).
+ */
+async function waitStableSharpCanvas(page: Page, timeout = 90_000, stableMs = 250) {
   const sample = () => page.evaluate(() => {
     const c = document.querySelector('.canvas-wrap canvas') as HTMLCanvasElement;
     if (!c || c.width <= 1200) return 'soft';
@@ -108,10 +130,16 @@ async function waitStableSharpCanvas(page: Page, timeout = 90_000) {
   });
   const deadline = Date.now() + timeout;
   let prev = '';
+  let since = 0;
   while (Date.now() < deadline) {
     const cur = await sample();
-    if (cur !== 'soft' && cur === prev) return;
-    prev = cur;
+    const now = Date.now();
+    if (cur === 'soft' || cur !== prev) {
+      prev = cur;
+      since = now;
+    } else if (now - since >= stableMs) {
+      return;
+    }
     await page.waitForTimeout(250);
   }
   throw new Error('sharp canvas never stabilised');
@@ -176,7 +204,7 @@ test.describe('WebGL2 parametric preview (docs/GPU.md)', () => {
         await openMode(page, mode);
         await importFiles(page, [raw]);
         await waitCanvasWidthAbove(page, 1200);
-        await waitMark(page, 'proxy.raw_develop');
+        await waitDevelopLanded(page);
         if (mode === '1') {
           // The GPU keeps the camera-JPEG base on screen until the developed
           // proxy lands (stale-while-revalidate). Wait for that re-upload so
@@ -187,12 +215,16 @@ test.describe('WebGL2 parametric preview (docs/GPU.md)', () => {
             return develop >= 0 && names.slice(develop).includes('gpu.base');
           }, { timeout: 60_000 }).toBe(true);
         }
-        await waitStableSharpCanvas(page);
+        // The CPU path likewise keeps its previous hi-res frame until the
+        // render for the new source lands, which can queue behind a ~200 ms
+        // proxy encode on the same worker. A frame unchanged for 1.5 s after
+        // the land is the settled one; a wrong image that long is a bug.
+        await waitStableSharpCanvas(page, 90_000, 1500);
         if (mode === '1') {
           // The untouched RAW is the GPU path's own case and must stay there.
           await expect.poll(() => gpuRenders(page), { timeout: 30_000 }).toBeGreaterThan(0);
         }
-        const out = { errors, frames: {} as Record<string, { w: number; h: number; b64: string }> };
+        const out = { errors, frames: {} as Record<string, { w: number; h: number; b64: string; srcW: number; srcH: number }> };
         out.frames.untouched = await downscaled(page, 512);
 
         // Let the tab switch (which may itself redraw) land before taking the
@@ -232,14 +264,23 @@ test.describe('WebGL2 parametric preview (docs/GPU.md)', () => {
       expect(c.h).toBe(g.h);
       const db = psnr(Buffer.from(g.b64, 'base64'), Buffer.from(c.b64, 'base64'));
       const max = maxDelta(Buffer.from(g.b64, 'base64'), Buffer.from(c.b64, 'base64'));
+      const sameRes = g.srcW === c.srcW && g.srcH === c.srcH;
       recordMetrics(testInfo, {
         raw_fixture: path.basename(raw),
         raw_canvas: `${g.w}x${g.h}`,
+        [`raw_parity_${name}_canvas_gpu`]: `${g.srcW}x${g.srcH}`,
+        [`raw_parity_${name}_canvas_cpu`]: `${c.srcW}x${c.srcH}`,
         [`raw_parity_${name}_psnr_db`]: Math.round(db * 100) / 100,
         [`raw_parity_${name}_max_delta`]: max,
       });
       expect(db, `${name} parity PSNR ${db.toFixed(2)} dB < 45 dB`).toBeGreaterThanOrEqual(45);
-      if (name === 'untouched') {
+      // Untouched must be bit-exact when both modes drew at the same backing
+      // size (the owner's ARW: 2888 px in both). When they settle at different
+      // sizes (the synthetic DNG: the CPU path keeps its 2600 px proxy, the GPU
+      // path draws a base resampled to the display), the 512 px comparison sees
+      // resampling differences at edges (0.2 % of pixels > 16 levels, mean
+      // difference ~0); the PSNR bar above still applies.
+      if (name === 'untouched' && sameRes) {
         expect(max, 'untouched RAW preview moved pixels').toBeLessThanOrEqual(1);
       }
     }
