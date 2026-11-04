@@ -108,6 +108,19 @@ bitmap decode.
 - `PROXY_DEVELOP_DELAY_MS` (750 ms) debounces selection changes before the
   sensor develop starts; a changed selection drops any in-flight result.
 
+### Proxy persistence encoding
+
+Display proxies are encoded off the main thread by the pixel worker's WS5
+`encode_jpeg` (4:4:4, q95, sRGB ICC) instead of `canvas.toBlob` (4:2:0, q0.9),
+so the pixels a reload shows keep the colour detail edits are judged against.
+Canvas q0.9 remains the fallback when the worker is unavailable.
+
+Measured 2026-11-04 (container Chromium 151): DSC05290.ARW 3096×2064 —
+341 KB → 1,290 KB, `createImageBitmap` decode 17–25 ms → 35–51 ms;
+synthetic-2600.dng 2600×2000 — 415 KB → 1,095 KB, decode 18–22 ms → 23–30 ms.
+Restore stays far inside the ≤600 ms gate; the larger record is the cost of
+dropping chroma subsampling.
+
 ### Batch RAW pool
 
 A drop of many RAWs develops display proxies in a small pool of workers instead

@@ -777,6 +777,31 @@ pub fn encode_jpeg(
     )
 }
 
+/// Like `encode_jpeg`, but structured-clones the pixels instead of
+/// transferring them: proxy persistence still needs its display copy on the
+/// app thread after the encode. Returns None when the worker is unavailable.
+pub fn encode_jpeg_copy(
+    rgba: &Uint8Array,
+    w: u32,
+    h: u32,
+    quality: u8,
+    cb: impl FnOnce(Option<Vec<u8>>) + 'static,
+) -> bool {
+    call(
+        "encode_jpeg",
+        &[
+            rgba.clone().into(),
+            JsValue::from(w),
+            JsValue::from(h),
+            JsValue::from(quality),
+        ],
+        &[],
+        Box::new(move |reply| {
+            cb(reply.ok().map(|v| Uint8Array::new(&v).to_vec()))
+        }),
+    )
+}
+
 fn parse_render(v: &JsValue) -> Option<RenderResult> {
     Some(RenderResult {
         pixels: get_buf(v, "pixels")?,

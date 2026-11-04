@@ -25,6 +25,10 @@ export default defineConfig({
     acceptDownloads: true,
     trace: 'retain-on-failure',
     video: 'off',
+    // Playwright's default headless binary ("headless shell") does not expose
+    // performance.measureUserAgentSpecificMemory, which 07-memory needs. The
+    // chromium channel runs the full browser in new headless mode instead.
+    channel: process.env.PES_CHROMIUM ? undefined : 'chromium',
     launchOptions: {
       // PES_CHROMIUM points at a system Chromium; otherwise Playwright's own build.
       executablePath: process.env.PES_CHROMIUM || undefined,
