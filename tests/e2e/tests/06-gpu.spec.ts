@@ -47,33 +47,22 @@ async function waitMark(page: Page, name: string, min = 1) {
   }).toBeGreaterThanOrEqual(min);
 }
 
-type TimedMark = { name: string; dur_ms: number; at: number };
-
 /**
- * Wait until the developed RAW proxy is what the canvas shows. The
- * `proxy.raw_develop` mark is recorded when the worker returns, before
- * `land_proxy` installs the result and before a frame is drawn from it; until
- * then the canvas still shows the camera-JPEG proxy, which is just as sharp and
- * stable, so a stability check alone can capture it (#16: untouched parity
- * 23.87 dB, the camera JPEG against the develop). Wait for the `proxy.land` that
- * follows the develop, then for a draw issued after it: a `gpu.render` that
- * started after the land, or a `hi.request` dispatched after the land followed
- * by its `hi.blit` (older replies are dropped once a newer request is issued).
+ * Wait until the developed RAW proxy has landed (#16). `proxy.raw_develop` is
+ * recorded when the worker returns; `land_proxy` then installs the develop.
+ * What the canvas shows next depends on the path: the CPU path seeds or
+ * re-renders its hi-res frame, while the GPU path keeps drawing the previous
+ * (camera-JPEG) base until the worker's base for the new source arrives
+ * (stale-while-revalidate). Callers therefore follow this with a long
+ * stability window rather than a single repeated sample.
  */
-async function waitDevelopedFrame(page: Page) {
+async function waitDevelopLanded(page: Page) {
   await expect.poll(async () => {
-    const ms = (await page.evaluate(() => (window as any).__pes.perf())) as TimedMark[];
-    const dev = ms.map((m) => m.name).lastIndexOf('proxy.raw_develop');
+    const names = await markNames(page);
+    const dev = names.lastIndexOf('proxy.raw_develop');
     if (dev < 0) return 'no develop yet';
-    const land = ms.findIndex((m, i) => i > dev && m.name === 'proxy.land');
-    if (land < 0) return 'develop not landed';
-    const landedAt = ms[land].at;
-    const startedAfter = (m: TimedMark) => m.at - m.dur_ms >= landedAt;
-    if (ms.some((m, i) => i > land && m.name === 'gpu.render' && startedAfter(m))) return 'drawn';
-    const req = ms.findIndex((m, i) => i > land && m.name === 'hi.request' && startedAfter(m));
-    if (req >= 0 && ms.some((m, i) => i > req && m.name === 'hi.blit')) return 'drawn';
-    return 'landed, not drawn';
-  }, { timeout: 30_000, intervals: [100, 200, 400] }).toBe('drawn');
+    return names.indexOf('proxy.land', dev) > dev ? 'landed' : 'develop not landed';
+  }, { timeout: 30_000, intervals: [100, 200, 400] }).toBe('landed');
 }
 
 /** Downscaled RGBA of the visible canvas, base64-encoded. */
@@ -118,7 +107,11 @@ function psnr(a: Buffer, b: Buffer) {
 }
 
 /** Wait until the sharp canvas (w>1200) has been unchanged across two samples. */
-async function waitStableSharpCanvas(page: Page, timeout = 90_000) {
+/**
+ * Wait for a sharp canvas whose content has not changed for `stableMs`
+ * (sampled every 250 ms).
+ */
+async function waitStableSharpCanvas(page: Page, timeout = 90_000, stableMs = 250) {
   const sample = () => page.evaluate(() => {
     const c = document.querySelector('.canvas-wrap canvas') as HTMLCanvasElement;
     if (!c || c.width <= 1200) return 'soft';
@@ -137,10 +130,16 @@ async function waitStableSharpCanvas(page: Page, timeout = 90_000) {
   });
   const deadline = Date.now() + timeout;
   let prev = '';
+  let since = 0;
   while (Date.now() < deadline) {
     const cur = await sample();
-    if (cur !== 'soft' && cur === prev) return;
-    prev = cur;
+    const now = Date.now();
+    if (cur === 'soft' || cur !== prev) {
+      prev = cur;
+      since = now;
+    } else if (now - since >= stableMs) {
+      return;
+    }
     await page.waitForTimeout(250);
   }
   throw new Error('sharp canvas never stabilised');
@@ -201,8 +200,10 @@ test.describe('WebGL2 parametric preview (docs/GPU.md)', () => {
         await openMode(page, mode);
         await importFiles(page, [raw]);
         await waitCanvasWidthAbove(page, 1200);
-        await waitDevelopedFrame(page);
-        await waitStableSharpCanvas(page);
+        await waitDevelopLanded(page);
+        // A base or hi-res render for the new source takes ~0.3-0.7 s on the
+        // M1; a wrong image still on screen 1.5 s after the land is a bug.
+        await waitStableSharpCanvas(page, 90_000, 1500);
         if (mode === '1') {
           // The untouched RAW is the GPU path's own case and must stay there.
           await expect.poll(() => gpuRenders(page), { timeout: 30_000 }).toBeGreaterThan(0);
