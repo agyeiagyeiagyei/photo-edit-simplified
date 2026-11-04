@@ -13,6 +13,48 @@ const SHELL = [
   './', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png',
 ];
 
+// Drive grid/loupe thumbnails. They are cross-origin <img> loads, so the
+// responses are opaque: no Content-Length to budget by, hence a count cap
+// (600 entries is roughly 200 MB at Drive's usual w1600 sizes). Kept separate
+// from the shell cache so the LRU trim never touches app files, and exempt
+// from the activate sweep for the same reason.
+const THUMB_CACHE = 'pes-drive-thumbs-v1';
+const THUMB_MAX = 600;
+
+function isDriveThumb(url) {
+  return url.startsWith('https://drive.google.com/thumbnail?');
+}
+
+async function trimThumbs(cache) {
+  const keys = await cache.keys();
+  if (keys.length <= THUMB_MAX) return;
+  // keys() is insertion order; a hit re-inserts its entry, so this drops the
+  // least recently served thumbnails.
+  await Promise.all(keys.slice(0, keys.length - THUMB_MAX).map((k) => cache.delete(k)));
+}
+
+async function driveThumb(e) {
+  const cache = await caches.open(THUMB_CACHE);
+  const hit = await cache.match(e.request);
+  if (hit) {
+    e.waitUntil(
+      cache.delete(e.request)
+        .then(() => cache.put(e.request, hit.clone()))
+        .then(() => trimThumbs(cache))
+    );
+    return hit;
+  }
+  try {
+    const res = await fetch(e.request);
+    if (res.ok || res.type === 'opaque') {
+      e.waitUntil(cache.put(e.request, res.clone()).then(() => trimThumbs(cache)));
+    }
+    return res;
+  } catch {
+    return Response.error();
+  }
+}
+
 // trunk fingerprints these with a 16-hex hash; anything matching that wasn't
 // referenced by the current index.html belongs to a previous deploy.
 const HASHED_ASSET = /(photo-edit-simplified-[a-f0-9]{16}(?:_bg)?\.(?:js|wasm)|style-[a-f0-9]{16}\.css)/g;
@@ -76,7 +118,7 @@ self.addEventListener('install', (e) => {
 self.addEventListener('activate', (e) => {
   e.waitUntil(
     caches.keys()
-      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
+      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE && k !== THUMB_CACHE).map((k) => caches.delete(k))))
       .then(() => pruneStaleAssets())
       .then(() => self.clients.claim())
       // Tell open pages to reload once so they pick up the fresh HTML/JS that
@@ -87,7 +129,12 @@ self.addEventListener('activate', (e) => {
 });
 
 self.addEventListener('fetch', (e) => {
-  if (e.request.method !== 'GET' || !e.request.url.startsWith(self.location.origin)) return;
+  if (e.request.method !== 'GET') return;
+  if (isDriveThumb(e.request.url)) {
+    e.respondWith(driveThumb(e));
+    return;
+  }
+  if (!e.request.url.startsWith(self.location.origin)) return;
 
   // HTML/navigations: network-first so deploys reach users immediately;
   // fall back to cache offline.

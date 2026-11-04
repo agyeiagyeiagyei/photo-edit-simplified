@@ -14,7 +14,7 @@ use crate::state::{
 };
 
 const DB_NAME: &str = "pes-session";
-const DB_VERSION: u32 = 4;
+const DB_VERSION: u32 = 5;
 const ITEMS: &str = "items";
 const META: &str = "meta";
 /// Filmstrip thumbnails (256 px JPEG), keyed by item id. Written at import so
@@ -32,6 +32,10 @@ const PREVIEWS: &str = "previews";
 /// keyed by item id. Let a reload show an editable preview without touching
 /// the 25MB RAW.
 const PROXIES: &str = "proxies";
+/// Camera-JPEG display proxies for RAWs browsed in Drive before import,
+/// keyed by Drive file id. Browsing the same file again reuses this instead
+/// of re-downloading the whole original for its embedded JPEG.
+const DRIVE_PROXIES: &str = "drive_proxies";
 
 fn err(e: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&format!("session: {e}"))
@@ -69,6 +73,10 @@ pub async fn open_db() -> Result<Database, JsValue> {
         if !db.store_names().iter().any(|n| n == THUMBS) {
             db.create_object_store(THUMBS, Default::default())
                 .expect("create thumbs store");
+        }
+        if !db.store_names().iter().any(|n| n == DRIVE_PROXIES) {
+            db.create_object_store(DRIVE_PROXIES, Default::default())
+                .expect("create drive_proxies store");
         }
     });
     req.await.map_err(err)
@@ -309,7 +317,7 @@ pub async fn delete_thumb(db: &Database, id: usize) -> Result<(), JsValue> {
 
 /// Proxy record: {kind, orientation, bytes, w, h, full_w, full_h}. `bytes` is
 /// a JPEG — the camera's embedded full-size one, or a worker-developed proxy
-/// re-encoded at quality 0.9.
+/// re-encoded as 4:4:4 q95.
 pub async fn put_proxy(db: &Database, id: usize, value: &JsValue) -> Result<(), JsValue> {
     let tx = db.transaction(&[PROXIES], TransactionMode::ReadWrite).map_err(err)?;
     let store = tx.object_store(PROXIES).map_err(err)?;
@@ -330,6 +338,60 @@ pub async fn get_proxy(db: &Database, id: usize) -> Result<Option<JsValue>, JsVa
         .map_err(err)?
         .await
         .map_err(err)
+}
+
+/// A Drive RAW's cached camera-JPEG proxy, valid only while the file's
+/// modifiedTime matches — a re-uploaded file falls through to a fresh
+/// download.
+pub async fn get_drive_proxy(
+    db: &Database,
+    drive_id: &str,
+    modified: &str,
+) -> Result<Option<JsValue>, JsValue> {
+    if modified.is_empty() {
+        return Ok(None);
+    }
+    let tx = db.transaction(&[DRIVE_PROXIES], TransactionMode::ReadOnly).map_err(err)?;
+    let store = tx.object_store(DRIVE_PROXIES).map_err(err)?;
+    let Some(rec) = store
+        .get(JsValue::from_str(drive_id))
+        .map_err(err)?
+        .await
+        .map_err(err)?
+    else {
+        return Ok(None);
+    };
+    let saved = crate::state::jget(&rec, "modified")
+        .and_then(|v| v.as_string())
+        .unwrap_or_default();
+    Ok((saved == modified).then_some(rec))
+}
+
+/// Record: {modified, bytes (camera JPEG Blob), w, h}. `keep` caps the store;
+/// entries are evicted in key order (the cache is small and every hit is
+/// local, so exact recency is not worth an index).
+pub async fn put_drive_proxy(
+    db: &Database,
+    drive_id: &str,
+    value: &JsValue,
+    keep: usize,
+) -> Result<(), JsValue> {
+    let tx = db.transaction(&[DRIVE_PROXIES], TransactionMode::ReadWrite).map_err(err)?;
+    let store = tx.object_store(DRIVE_PROXIES).map_err(err)?;
+    store
+        .put(value, Some(&JsValue::from_str(drive_id)))
+        .map_err(err)?
+        .await
+        .map_err(err)?;
+    let keys = store.get_all_keys(None, None).map_err(err)?.await.map_err(err)?;
+    let extra = keys.len().saturating_sub(keep);
+    for k in keys.into_iter().take(extra) {
+        if k.as_string().as_deref() != Some(drive_id) {
+            store.delete(k).map_err(err)?.await.map_err(err)?;
+        }
+    }
+    tx.commit().map_err(err)?.await.map_err(err)?;
+    Ok(())
 }
 
 /// The item's original RAW Blob out of IndexedDB — handed straight to a

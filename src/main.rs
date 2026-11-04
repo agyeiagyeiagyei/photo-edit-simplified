@@ -913,15 +913,38 @@ fn display_proxy_record(blob: &Blob, frame: (usize, usize)) -> JsValue {
     o.into()
 }
 
+/// Encode a display proxy through the worker's WS5 JPEG encoder (4:4:4 +
+/// sRGB ICC): canvas.toBlob's default 4:2:0 chroma smears colour on the
+/// pixels edits are judged against, and the encode stays off the main
+/// thread. Falls back to a q0.9 canvas encode when the worker is down.
+async fn encode_proxy_jpeg(px: &Pixels, w: usize, h: usize) -> Option<Blob> {
+    let view = match px {
+        Pixels::View(v) => Some(v.clone()),
+        Pixels::Owned(v) => Some(Uint8Array::from(v.as_slice())),
+    };
+    if let Some(view) = view {
+        let bytes = await_worker(move |cb| {
+            pworker::encode_jpeg_copy(&view, w as u32, h as u32, 95, cb)
+        })
+        .await;
+        if let Some(bytes) = bytes {
+            if let Ok(blob) = web::bytes_to_blob(&bytes, "image/jpeg") {
+                return Some(blob);
+            }
+        }
+    }
+    let canvas = web::create_canvas(w as u32, h as u32);
+    px.put_on_canvas(&canvas, w as u32, h as u32);
+    web::canvas_to_jpeg_blob(&canvas, 0.9).await.ok()
+}
+
 /// Persist camera-JPEG pixels already decoded and downscaled to display size.
 /// A reload then decodes one ≤3200px JPEG on the main thread instead of
 /// re-running the full camera decode in the RAW worker — the difference
 /// between a ~0.5 s and a ~2.5 s restore for a 26 MP file.
 fn persist_display_proxy(id: usize, px: Pixels, w: usize, h: usize, frame: (usize, usize)) {
     spawn_local(async move {
-        let canvas = web::create_canvas(w as u32, h as u32);
-        px.put_on_canvas(&canvas, w as u32, h as u32);
-        let Ok(blob) = web::canvas_to_jpeg_blob(&canvas, 0.9).await else { return };
+        let Some(blob) = encode_proxy_jpeg(&px, w, h).await else { return };
         let still_camera = CACHE.with(|c| {
             c.borrow()
                 .photos
@@ -1317,9 +1340,7 @@ fn persist_developed_proxy(
     tone: Option<[u8; 256]>,
 ) {
     spawn_local(async move {
-        let canvas = web::create_canvas(w as u32, h as u32);
-        px.put_on_canvas(&canvas, w as u32, h as u32);
-        let Ok(blob) = web::canvas_to_jpeg_blob(&canvas, 0.9).await else { return };
+        let Some(blob) = encode_proxy_jpeg(&px, w, h).await else { return };
         let still_lazy = CACHE.with(|c| {
             c.borrow()
                 .photos
@@ -5845,8 +5866,18 @@ fn drive_hover_prefetch(state: AppState, id: String, name: String) {
         });
         return;
     }
+    let modified = visible_drive_files(state)
+        .into_iter()
+        .find(|f| f.id == id)
+        .map(|f| f.modified)
+        .unwrap_or_default();
     spawn_local(async move {
         let decoded = async {
+            if arw {
+                if let Some((px, w, h)) = drive_cached_proxy(&id, &modified).await {
+                    return Some(((px, w, h), false, None));
+                }
+            }
             let token = fresh_drive_token(state).await?;
             let bytes = drive::download_file(token.as_str(), &id).await.ok()?;
             if raw {
@@ -5862,7 +5893,10 @@ fn drive_hover_prefetch(state: AppState, id: String, name: String) {
                                 if let Some((px, w, h)) = camera_jpeg_rgba(&jpeg).await {
                                     let (px, w, h) =
                                         raw::apply_orientation_code(px, w, h, meta.orientation);
-                                    return Some(((Pixels::owned(px), w, h), false));
+                                    let rec = web::view_to_blob(&jpeg, "image/jpeg")
+                                        .ok()
+                                        .map(|blob| (blob, w, h, meta.orientation));
+                                    return Some(((Pixels::owned(px), w, h), false, rec));
                                 }
                             }
                         }
@@ -5870,41 +5904,76 @@ fn drive_hover_prefetch(state: AppState, id: String, name: String) {
                 }
                 return raw_preview_async(&src)
                     .await
-                    .map(|r| ((Pixels::view(r.pixels), r.w, r.h), true));
+                    .map(|r| ((Pixels::view(r.pixels), r.w, r.h), true, None));
             }
             let blob = web::bytes_to_blob(&bytes, still_mime?).ok()?;
             let (img, _) = web::load_image(&blob).await.ok()?;
             let (px, w, h) = web::rgba_from_image(&img);
-            Some(((Pixels::owned(px), w, h), false))
+            Some(((Pixels::owned(px), w, h), false, None))
         }
         .await;
         DRIVE_HOVER_INFLIGHT.with(|s| {
             s.borrow_mut().remove(&id);
         });
-        if let Some(((px, w, h), preview)) = decoded {
-            DRIVE_HOVER_CACHE.with(|c| {
-                let mut c = c.borrow_mut();
-                c.0.retain(|k| k != &id);
-                c.0.push(id.clone());
-                c.1.insert(id.clone(), Rc::new((px, w, h)));
-                while c.0.len() > 2 {
-                    let old = c.0.remove(0);
-                    c.1.remove(&old);
-                    DRIVE_HOVER_PREVIEW.with(|s| {
-                        s.borrow_mut().remove(&old);
-                    });
+        if let Some(((px, w, h), preview, cache_rec)) = decoded {
+            drive_hover_install(state, id.clone(), px, w, h, preview);
+            if let Some((blob, cw, ch, orientation)) = cache_rec {
+                if !modified.is_empty() {
+                    if let Ok(db) = session::open_db().await {
+                        let rec = session::jobj();
+                        session::jset(&rec, "modified", modified.as_str());
+                        session::jset(&rec, "orientation", orientation as f64);
+                        session::jset(&rec, "bytes", blob);
+                        session::jset(&rec, "w", cw as f64);
+                        session::jset(&rec, "h", ch as f64);
+                        let _ = session::put_drive_proxy(&db, &id, &rec.into(), 24).await;
+                    }
                 }
-            });
-            DRIVE_HOVER_PREVIEW.with(|s| {
-                let mut s = s.borrow_mut();
-                s.remove(&id);
-                if preview {
-                    s.insert(id.clone());
-                }
-            });
-            state.drive_hover_ready.set(Some(id));
+            }
         }
     });
+}
+
+/// Install a decoded Drive hover frame in the two-slot cache and mark it ready.
+fn drive_hover_install(state: AppState, id: String, px: Pixels, w: usize, h: usize, preview: bool) {
+    DRIVE_HOVER_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        c.0.retain(|k| k != &id);
+        c.0.push(id.clone());
+        c.1.insert(id.clone(), Rc::new((px, w, h)));
+        while c.0.len() > 2 {
+            let old = c.0.remove(0);
+            c.1.remove(&old);
+            DRIVE_HOVER_PREVIEW.with(|s| {
+                s.borrow_mut().remove(&old);
+            });
+        }
+    });
+    DRIVE_HOVER_PREVIEW.with(|s| {
+        let mut s = s.borrow_mut();
+        s.remove(&id);
+        if preview {
+            s.insert(id.clone());
+        }
+    });
+    state.drive_hover_ready.set(Some(id));
+}
+
+/// Decode a Drive RAW's persisted camera-JPEG proxy when its modifiedTime
+/// still matches, so revisiting the file skips the original download.
+async fn drive_cached_proxy(id: &str, modified: &str) -> Option<(Pixels, usize, usize)> {
+    if modified.is_empty() {
+        return None;
+    }
+    let db = session::open_db().await.ok()?;
+    let rec = session::get_drive_proxy(&db, id, modified).await.ok()??;
+    let blob = state::jget(&rec, "bytes")?.dyn_into::<Blob>().ok()?;
+    let orientation = state::jget(&rec, "orientation")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0) as u16;
+    let (px, w, h) = web::rgba_from_blob(&blob).await.ok()?;
+    let (px, w, h) = raw::apply_orientation_code(px, w, h, orientation);
+    Some((Pixels::owned(px), w, h))
 }
 
 /// Decode an embedded camera JPEG through the browser's image pipeline.
@@ -6065,11 +6134,15 @@ fn DriveLoupe(state: AppState) -> impl IntoView {
                 // Warm pool: seen ids + immediate neighbors, minus current.
                 let n = files.len();
                 let mut warm: Vec<String> = state.drive_loupe_seen.get_untracked();
+                let mut neighbors: Vec<String> = Vec::new();
                 for d in [-1i64, 1] {
                     let nb = ((idx as i64 + d).rem_euclid(n as i64)) as usize;
                     if let Some(g) = files.get(nb) {
                         if !warm.contains(&g.id) {
                             warm.push(g.id.clone());
+                        }
+                        if g.id != f.id && !neighbors.contains(&g.id) {
+                            neighbors.push(g.id.clone());
                         }
                     }
                 }
@@ -6116,6 +6189,15 @@ fn DriveLoupe(state: AppState) -> impl IntoView {
                                     .into_iter()
                                     .map(|id| {
                                         view! { <img src=drive::thumb_url_sz(&id, 1600) loading="eager" decoding="async"/> }
+                                    })
+                                    .collect_view()}
+                                // The loupe paints w800 before the w1600 copy
+                                // arrives, so warm the neighbors' w800 too —
+                                // stepping to the next file then starts sharp.
+                                {neighbors
+                                    .into_iter()
+                                    .map(|id| {
+                                        view! { <img src=drive::thumb_url_sz(&id, 800) loading="eager" decoding="async"/> }
                                     })
                                     .collect_view()}
                             </div>
