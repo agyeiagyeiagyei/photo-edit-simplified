@@ -210,6 +210,19 @@ impl Default for EditParams {
 }
 
 impl EditParams {
+    /// Geometry and the RAW develop only, with every colour stage reset: what
+    /// a GPU base carries when the shader applies the colour edits itself.
+    pub fn develop_only(&self) -> EditParams {
+        EditParams {
+            aspect: self.aspect,
+            crop: self.crop,
+            rot90: self.rot90,
+            fine_angle: self.fine_angle,
+            raw: self.raw,
+            ..EditParams::default()
+        }
+    }
+
     pub fn is_color_touched(&self) -> bool {
         self.brightness != 0.0
             || self.contrast != 0.0
@@ -222,3 +235,26 @@ impl EditParams {
             || !self.raw.is_identity()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn develop_only_keeps_geometry_and_raw_and_drops_colour() {
+        let mut e = EditParams::default();
+        e.rot90 = 1;
+        e.fine_angle = 2.5;
+        e.brightness = 0.3;
+        e.saturation = -0.2;
+        e.grain = 10.0;
+        e.raw.exposure = 0.7;
+        e.raw.denoise = 25.0;
+        let d = e.develop_only();
+        assert_eq!((d.rot90, d.fine_angle), (1, 2.5));
+        assert_eq!(d.raw, e.raw);
+        assert_eq!((d.brightness, d.saturation, d.grain), (0.0, 0.0, 0.0));
+        assert!(d.levels.is_identity() && d.curves.is_identity());
+    }
+}
+

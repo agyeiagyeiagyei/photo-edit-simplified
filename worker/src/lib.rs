@@ -741,8 +741,31 @@ pub fn render_base(
     req_h: f64,
     max_edge: u32,
 ) -> Result<JsValue, JsValue> {
+    let edit = parse_edit(recipe);
+    // A RAW with develop edits gets a developed base: the neutral develop,
+    // camera tone and detail at the base size, without colour. The shader then
+    // applies only the colour edits, so colour drags stay on the GPU.
+    if !edit.raw.is_identity() {
+        let Some((fw, fh)) = neutral_dims(id, &edit) else {
+            return Err(JsValue::from_str("developed base needs the neutral frame"));
+        };
+        let dev = edit.develop_only();
+        let (buf, tw, th, t) = neutral_render(id, fw, fh, &dev, id, req_w, req_h, max_edge, None, None);
+        let timings = result_obj(&[
+            ("geometry", t[0].into()),
+            ("resample", t[1].into()),
+            ("develop", t[2].into()),
+            ("cache", t[4].into()),
+        ]);
+        return Ok(result_obj(&[
+            ("pixels", js_buf(buf)),
+            ("w", (tw as u32).into()),
+            ("h", (th as u32).into()),
+            ("timings", timings),
+            ("mem", wasm_mem_bytes().into()),
+        ]));
+    }
     with_buffer(id, |(full, fw, fh)| {
-        let edit = parse_edit(recipe);
         let (buf, tw, th, geometry_ms, resample_ms, hit) =
             base_pipeline(id, full, *fw, *fh, &edit, req_w, req_h, max_edge);
         let timings = result_obj(&[
