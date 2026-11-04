@@ -145,12 +145,12 @@ pub async fn load_all(
         .await
         .map_err(err)?;
     let mut item_out = Vec::new();
-    for (k, v) in item_keys.into_iter().zip(item_values.into_iter()) {
+    for (k, v) in item_keys.into_iter().zip(item_values) {
         let Some(id) = k.as_f64() else { continue };
         item_out.push((id as usize, v));
     }
     let mut thumb_out = Vec::new();
-    for (k, v) in thumb_keys.into_iter().zip(thumb_values.into_iter()) {
+    for (k, v) in thumb_keys.into_iter().zip(thumb_values) {
         let Some(id) = k.as_f64() else { continue };
         thumb_out.push((id as usize, v));
     }

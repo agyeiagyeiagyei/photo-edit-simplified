@@ -138,6 +138,8 @@ pub fn content_fill(pixels: &mut [u8], mask: &[u8], w: usize, h: usize) -> bool 
             // patch search.
             let mut best: i64 = -1;
             let mut score = f64::MAX;
+            // k < 4 indexes the neighbour array; the rest are random donors.
+            #[allow(clippy::needless_range_loop)]
             for k in 0..28 {
                 let q: i64 = if k < 4 {
                     match neighbors[k] {

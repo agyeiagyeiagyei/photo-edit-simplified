@@ -51,38 +51,6 @@ rawdb = [
 name = "rawler"
 path = "src/lib.rs"
 
-[[bin]]
-name = "benchmark"
-path = "src/bin/benchmark.rs"
-
-[[bin]]
-name = "identify"
-path = "src/bin/identify.rs"
-
-[[test]]
-name = "mod"
-path = "tests/mod.rs"
-
-[[bench]]
-name = "convert"
-path = "benches/convert.rs"
-harness = false
-
-[[bench]]
-name = "demosaic"
-path = "benches/demosaic.rs"
-harness = false
-
-[[bench]]
-name = "perf"
-path = "benches/perf.rs"
-harness = false
-
-[[bench]]
-name = "raw_decoder"
-path = "benches/raw_decoder.rs"
-harness = false
-
 [dependencies.bitstream-io]
 version = "4.1"
 

@@ -321,8 +321,8 @@ pub fn spot_heal(rgba: &mut [u8], coverage: &[u8], width: usize, height: usize, 
             }
         }
     }
-    for c in 0..4 {
-        mean[c] /= ring_count as f64;
+    for m in mean.iter_mut() {
+        *m /= ring_count as f64;
     }
     for p in 0..wn {
         if role[p] == HOLE {
@@ -332,8 +332,8 @@ pub fn spot_heal(rgba: &mut [u8], coverage: &[u8], width: usize, height: usize, 
         }
     }
     heal_solve(&mut value, &role, ww as usize, wh as usize, 0);
-    for c in 0..3 {
-        detail[c] = (detail[c] / ring_count as f64).sqrt() * 0.9;
+    for d in detail.iter_mut() {
+        *d = (*d / ring_count as f64).sqrt() * 0.9;
     }
 
     for y in 0..wh {

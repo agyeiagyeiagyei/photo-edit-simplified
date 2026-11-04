@@ -3,6 +3,9 @@
 //! No browser APIs outside the wasm-only perf clock, so it compiles for both
 //! wasm32 targets unchanged.
 
+// Fixed-width sample loops keep `chunks_exact`; see `pes-pixel`'s lint note.
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 use rawler::decoders::{Decoder, RawDecodeParams, RawMetadata};
 use rawler::imgop::develop::{Intermediate, RawDevelop};
 use rawler::imgop::sensor::SensorType;

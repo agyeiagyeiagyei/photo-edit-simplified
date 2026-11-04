@@ -101,8 +101,8 @@ fn lanczos3(x: f64) -> f64 {
         return 0.0;
     }
     let px = std::f64::consts::PI * x;
-    let s = (px.sin() / px) * ((px / 3.0).sin() / (px / 3.0));
-    s
+    
+    (px.sin() / px) * ((px / 3.0).sin() / (px / 3.0))
 }
 
 /// A channel sample the resampler can read and write.

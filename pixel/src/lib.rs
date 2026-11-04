@@ -1,6 +1,11 @@
 //! Pure pixel operations and the data/wire types they need, shared by the
 //! photo-edit-simplified app and its pixel worker.
 
+// Buffer kernels index fixed-width samples directly; the `as_chunks` rewrite
+// this lint wants is newer API and its autofix for the mutable case does not
+// compile. Kernel signatures stay flat because they are hot paths.
+#![allow(clippy::chunks_exact_to_as_chunks, clippy::too_many_arguments)]
+
 pub mod blur;
 pub mod clone;
 pub mod color;

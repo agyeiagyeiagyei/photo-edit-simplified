@@ -75,12 +75,6 @@ pub fn save_folder(id: &str, name: &str) {
     }
 }
 
-pub fn clear_folder() {
-    if let Ok(Some(s)) = crate::web::window().local_storage() {
-        let _ = s.remove_item(FOLDER_KEY);
-    }
-}
-
 // --- JS shims ------------------------------------------------------------------
 
 async fn call_shim(name: &str, args: &Array) -> Result<JsValue, JsValue> {

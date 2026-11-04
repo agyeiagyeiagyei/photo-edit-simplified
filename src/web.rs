@@ -271,7 +271,7 @@ pub fn download_blob(blob: &Blob, filename: &str) {
     a.set_attribute("style", "display:none").unwrap();
     let _ = doc.body().unwrap().append_child(&a);
     a.click();
-    let _ = a.remove();
+    a.remove();
 
     // Keep the object URL alive long enough for the browser's download manager
     // and any automation listener to observe the start of the download.

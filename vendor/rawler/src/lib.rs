@@ -43,6 +43,7 @@
   )]
 // Clippy configuration
 #![allow(
+  clippy::all, // PES: vendored code opts out of the workspace clippy gate
   clippy::needless_doctest_main,
   clippy::identity_op, // we often use x + 0 to better document an algorithm
   clippy::too_many_arguments,

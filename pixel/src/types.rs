@@ -50,6 +50,17 @@ impl Aspect {
         }
     }
 
+    /// Filename-safe label: `:` is not legal in Windows or macOS filenames.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Aspect::Original => "orig",
+            Aspect::Nine16 => "9x16",
+            Aspect::One1 => "1x1",
+            Aspect::Four5 => "4x5",
+            Aspect::Sixteen9 => "16x9",
+        }
+    }
+
     /// (ratio_w, ratio_h) if locked.
     pub fn ratio(self) -> Option<(f32, f32)> {
         match self {

@@ -2,6 +2,15 @@
 //! The app ships pixels in via `load`, then issues render/destructive ops;
 //! results come back as JS objects with transferable ArrayBuffers.
 
+// Op signatures mirror the JS wire protocol; pixel kernels use the same
+// fixed-width chunk idiom as `pes-pixel` (see its lint note).
+#![allow(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::chunks_exact_to_as_chunks,
+    clippy::missing_const_for_thread_local
+)]
+
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 

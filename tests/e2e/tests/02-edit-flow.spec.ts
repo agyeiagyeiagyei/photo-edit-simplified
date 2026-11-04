@@ -165,7 +165,7 @@ test.describe('24MP JPEG: import → edit → export', () => {
     const bytes = fs.readFileSync(p!);
     const exportMs = Date.now() - t0;
     fs.mkdirSync('results', { recursive: true }); fs.writeFileSync('results/export-1x1.jpg', bytes); // kept for encoder inspection
-    expect(dl.suggestedFilename()).toMatch(/^edited-1[:_]1-bird-a-24mp\.jpg$/);
+    expect(dl.suggestedFilename()).toMatch(/^edited-1x1-bird-a-24mp\.jpg$/);
     expect(bytes.subarray(0, 2)).toEqual(Buffer.from([0xff, 0xd8]));
     const dims = await imageDims(page, bytes, 'image/jpeg');
     // 6000x4000 source → 1:1 crop is 4000x4000 at native resolution (±2px trim).

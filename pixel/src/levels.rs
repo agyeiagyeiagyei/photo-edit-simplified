@@ -61,8 +61,8 @@ impl LevelsSettings {
     /// Per-channel LUTs for the pixel loop: [R,G,B] × 256, output 0..=255.
     pub fn build_tables(&self) -> [[f32; 256]; 3] {
         let mut tables = [[0f32; 256]; 3];
-        for ch in 0..3 {
-            for (v, slot) in tables[ch].iter_mut().enumerate() {
+        for (ch, table) in tables.iter_mut().enumerate() {
+            for (v, slot) in table.iter_mut().enumerate() {
                 *slot = self.apply(v as f64, ch + 1) as f32;
             }
         }
@@ -173,12 +173,12 @@ pub fn auto_settings(hist: &[[f64; 256]; 4], mode: AutoMode) -> LevelsSettings {
             }
         }
         _ => {
-            for c in 1..=3 {
-                let Some((low, high)) = endpoints(&hist[c]) else { continue };
+            for (c, bins) in hist.iter().enumerate().skip(1) {
+                let Some((low, high)) = endpoints(bins) else { continue };
                 let mut range = LevelRange { black: low, white: high, ..Default::default() };
                 if mode == AutoMode::ColorNeutral {
-                    let total: f64 = hist[c].iter().sum();
-                    let mean = hist[c]
+                    let total: f64 = bins.iter().sum();
+                    let mean = bins
                         .iter()
                         .enumerate()
                         .map(|(i, &b)| range.apply(i as f64) / 255.0 * b)

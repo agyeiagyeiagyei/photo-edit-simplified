@@ -300,12 +300,12 @@ fn point_in_polygon(x: f32, y: f32, poly: &[(f32, f32)]) -> bool {
 /// the image diagonal and is clamped to a reasonable pixel range.
 pub fn feather_mask(mask: &mut [u8], w: usize, h: usize, radius: f32) {
     let diag = ((w * w + h * h) as f32).sqrt();
-    let r = (radius * diag * 0.5).max(1.0).min(64.0) as usize;
+    let r = (radius * diag * 0.5).clamp(1.0, 64.0) as usize;
     if r <= 1 {
         return;
     }
-    let mut tmp = mask.to_vec();
-    box_blur_gray(&mut tmp, mask, w, h, r);
+    let tmp = mask.to_vec();
+    box_blur_gray(&tmp, mask, w, h, r);
 }
 
 fn box_blur_gray(src: &[u8], dst: &mut [u8], w: usize, h: usize, radius: usize) {
@@ -320,7 +320,7 @@ fn box_blur_gray(src: &[u8], dst: &mut [u8], w: usize, h: usize, radius: usize) 
         for x in 0..w {
             let left = (x as i32 - r - 1).max(0) as usize;
             let right = (x as i32 + r).min(w as i32 - 1) as usize;
-            if x as i32 - r - 1 >= 0 {
+            if x as i32 - r > 0 {
                 sum -= src[y * w + left] as u32;
             }
             if x as i32 + r < w as i32 {
@@ -339,7 +339,7 @@ fn box_blur_gray(src: &[u8], dst: &mut [u8], w: usize, h: usize, radius: usize) 
         for y in 0..h {
             let top = (y as i32 - r - 1).max(0) as usize;
             let bot = (y as i32 + r).min(h as i32 - 1) as usize;
-            if y as i32 - r - 1 >= 0 {
+            if y as i32 - r > 0 {
                 sum -= temp[top * w + x];
             }
             if y as i32 + r < h as i32 {
@@ -430,7 +430,7 @@ pub fn box_blur_rgba(data: &mut [u8], w: usize, h: usize, radius: usize) {
             let li = (y * w + left) * 4;
             let ri = (y * w + right) * 4;
             let oi = (y * w + x) * 4;
-            if x as i32 - r - 1 >= 0 {
+            if x as i32 - r > 0 {
                 for c in 0..4 {
                     sums[c] -= data[li + c] as u32;
                 }
@@ -461,7 +461,7 @@ pub fn box_blur_rgba(data: &mut [u8], w: usize, h: usize, radius: usize) {
             let ti = (top * w + x) * 4;
             let bi = (bot * w + x) * 4;
             let oi = (y * w + x) * 4;
-            if y as i32 - r - 1 >= 0 {
+            if y as i32 - r > 0 {
                 for c in 0..4 {
                     sums[c] -= temp[ti + c];
                 }

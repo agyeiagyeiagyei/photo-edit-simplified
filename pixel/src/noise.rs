@@ -32,7 +32,7 @@ pub fn noise_add(rgba: &mut [u8], width: usize, height: usize, amount: f32, gaus
         for x in 0..width {
             let p = &mut rgba[(y * width + x) * 4..];
             let base = noise_hash(seed ^ noise_hash((y * width + x) as u32));
-            for c in 0..3 {
+            for (c, px) in p.iter_mut().take(3).enumerate() {
                 let key = if monochromatic { base } else { base.wrapping_add((c as u32).wrapping_mul(0x9e3779b9)) };
                 let n = if gaussian {
                     let u1 = noise_unit(key);
@@ -41,7 +41,7 @@ pub fn noise_add(rgba: &mut [u8], width: usize, height: usize, amount: f32, gaus
                 } else {
                     (noise_unit(key) * 2.0 - 1.0) * spread
                 };
-                p[c] = (p[c] as f32 + n).clamp(0.0, 255.0).round() as u8;
+                *px = (*px as f32 + n).clamp(0.0, 255.0).round() as u8;
             }
         }
     }
@@ -87,7 +87,7 @@ pub fn noise_add_wide(
         for x in 0..width {
             let p = &mut rgba[(y * width + x) * 4..];
             let base = noise_hash(seed ^ noise_hash((y * width + x) as u32));
-            for c in 0..3 {
+            for (c, px) in p.iter_mut().take(3).enumerate() {
                 let key = if monochromatic { base } else { base.wrapping_add((c as u32).wrapping_mul(0x9e3779b9)) };
                 let n = if gaussian {
                     let u1 = noise_unit(key);
@@ -96,7 +96,7 @@ pub fn noise_add_wide(
                 } else {
                     (noise_unit(key) * 2.0 - 1.0) * spread
                 };
-                p[c] = (p[c] as f32 + n).clamp(0.0, 65535.0).round() as u16;
+                *px = (*px as f32 + n).clamp(0.0, 65535.0).round() as u16;
             }
         }
     }
