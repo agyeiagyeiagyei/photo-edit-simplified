@@ -1,11 +1,47 @@
-# photo-edit-simplified — Spec v0.3 (2026-08-28)
+# photo-edit-simplified — Spec v0.4 (2026-11-04)
 
 Owner: Agyei. Drafted by Atlas. Hand to a builder agent once evolved.
 
+Roadmap: [#4 — optimisation roadmap](https://github.com/agyeiagyeiagyei/photo-edit-simplified/issues/4).
+This file records product decisions; the roadmap tracks the delivery
+workstreams (WS1–WS7).
+
 ## One-liner
-A mobile-first web app to upload photos **and videos**, crop/rotate/straighten,
-adjust basic color, apply the same edits across a batch, and export
-ready-to-post sizes for social media.
+A desktop-first, fully client-side RAW culling and develop workflow for birding
+photography: import a shoot (folder or Google Drive), flip through frames with
+loupes and a filmstrip, star the keepers into a shortlist, develop the selected
+frames in linear light, and export a batch or save the edits back to Drive.
+
+> **Superseded:** the original v1 one-liner — "a mobile-first web app to
+> upload photos **and videos**, crop/rotate/straighten, adjust basic color,
+> apply the same edits across a batch, and export ready-to-post sizes for
+> social media" — no longer describes the product's focus. The social crop and
+> video features still ship, but the primary use case is desktop RAW culling
+> and develop. Mobile remains supported on a best-effort basis.
+
+## Product status (2026-11-04)
+
+v1 shipped, plus the creative suite and Drive integration. Current surface:
+
+- **Import** — drag/drop and picker (RAW, JPEG, PNG, HEIC), video, and Google
+  Drive folders. RAW import is camera-JPEG-first: the embedded preview is
+  shown immediately and sensor pixels are demosaiced on demand.
+- **Culling** — filmstrip, hover loupes, ★ shortlist persisted in
+  `photo-edit-shortlist.json` on Drive, unstarred filter, import-starred.
+- **Develop** — linear-light white balance (2500–9500 K, 5500 K neutral),
+  tint, exposure, highlight recovery, shadow lift, chroma-noise suppression,
+  edge-aware denoise and capture sharpening; neutral 16-bit path.
+- **Edit** — crop/rotate/straighten, brightness/contrast/saturation/warmth,
+  blur, grain, levels, curves, selections (rect/lasso/mask, magic wand,
+  subject), heal, clone, layers (raster, text, vector paths).
+- **Video** — crop/rotate/colour, trim, text overlay, local ffmpeg.wasm
+  transcode.
+- **Deliver** — JPEG export with sRGB ICC, exact social dimensions, batch
+  export + ZIP, ASCII-safe filenames, save-to-Drive, parametric edit restore.
+
+Priorities for further work, per the owner: **speed**, **image quality**, and
+**cached-image loading**; the renderer is open to moving onto the GPU where
+that pays for itself.
 
 ## Platform decisions
 - **PWA, single page, fully client-side.** No backend, no accounts, no server
@@ -145,11 +181,16 @@ verified end-to-end on a 27.6s clip with keep/strip audio).
    bigger lift; revisit after text-on-video ships.)
 
 ## UX sketch
-Grid of uploaded items → tap to edit one → bottom tool tabs
-(Crop | Rotate | Color | Trim [video] | Export) → "Apply to all" bar when
-multiple items loaded. Press-and-hold on canvas shows original.
+Filmstrip of the shoot with hover loupes → select a frame → tool tabs
+(Crop | Rotate | Color | Select | Heal | Clone | Layers | Trim [video] |
+Export) → develop panel for RAW frames → batch export or save to Drive.
+Press-and-hold on the canvas shows the original; edits are parametric and
+restored from the session store (and from the Drive shortlist manifest) on
+reload.
 
 ## Decisions log
+- 2026-10 (Agyei): desktop-first; priorities speed, image quality,
+  cached-image loading; open to GPU. (Supersedes the mobile-first framing.)
 - 2026-08-28 (Agyei): batch editing is important — apply same fix to many.
 - 2026-08-28 (Agyei): video support required, same edit functions.
 - 2026-08-28 (Agyei): support both HEIC and JPEG.
@@ -163,7 +204,8 @@ multiple items loaded. Press-and-hold on canvas shows original.
 
 ## Handoff notes for builder agent
 - This file is the source of truth; update in place as decisions land.
-- Verify on a real phone viewport (iOS Safari especially) before calling
-  done — ffmpeg.wasm + HEIC conversion are the two likeliest mobile breakage
-  points.
+- The primary target is desktop Chromium; check changes at the desktop viewport.
+  Mobile (iOS Safari especially) is best-effort — ffmpeg.wasm and HEIC
+  conversion are the likeliest mobile breakage points and are not release
+  gates.
 - Keep everything client-side; no server components without asking Agyei.
