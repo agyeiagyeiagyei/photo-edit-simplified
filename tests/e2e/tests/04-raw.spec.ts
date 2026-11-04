@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import type { Page } from '@playwright/test';
 import * as fs from 'fs';
 import * as path from 'path';
 import { openApp, trackErrors, recordMetrics, importFiles, canvasSize, clickTab, imageDims, rawFixtures } from './helpers';
@@ -6,6 +7,45 @@ import { openApp, trackErrors, recordMetrics, importFiles, canvasSize, clickTab,
 // One test per RAW in dl-raw/: CI generates a synthetic DNG (small embedded JPEG, so the
 // proxy timing covers the sensor-develop path) and may also have a real ARW (camera-JPEG path).
 const RAWS = rawFixtures();
+
+/**
+ * Widest proxy persisted at display size ("raw" develop or "display" camera
+ * decode), or 0 while none is usable. A legacy "camera" record stores the
+ * full-size embedded JPEG and is re-decoded in the worker on restore, so it
+ * does not count as a restorable display proxy.
+ */
+async function storedDisplayProxyWidth(page: Page): Promise<number> {
+  return page.evaluate(async () => {
+    const db = await new Promise<IDBDatabase>((res, rej) => {
+      const req = indexedDB.open('pes-session');
+      req.onsuccess = () => res(req.result);
+      req.onerror = () => rej(req.error);
+    });
+    let recs: any[] = [];
+    try {
+      recs = await new Promise<any[]>((res) => {
+        const req = db.transaction('proxies', 'readonly').objectStore('proxies').getAll();
+        req.onsuccess = () => res(req.result ?? []);
+        req.onerror = () => res([]);
+      });
+    } finally {
+      db.close();
+    }
+    let widest = 0;
+    for (const rec of recs) {
+      if (rec?.kind !== 'raw' && rec?.kind !== 'display') continue;
+      const bytes = rec?.bytes;
+      if (!bytes) continue;
+      const blob = bytes instanceof Blob ? bytes : new Blob([bytes], { type: 'image/jpeg' });
+      try {
+        const bmp = await createImageBitmap(blob);
+        widest = Math.max(widest, bmp.width);
+        bmp.close();
+      } catch {}
+    }
+    return widest;
+  });
+}
 
 test.describe('RAW (ARW/DNG) import → develop → export', () => {
   test.skip(RAWS.length === 0, 'no RAW fixture in dl-raw; run gen_dng.py to create one');
@@ -76,6 +116,67 @@ test.describe('RAW (ARW/DNG) import → develop → export', () => {
       const dims = await imageDims(page, bytes, 'image/jpeg');
       expect(dims.w * dims.h).toBeGreaterThan(4_000_000); // sensor-resolution develop, not the 1024px preview
       recordMetrics(testInfo, { raw_fixture: name, raw_import_to_canvas_ms: imp.canvasMs, raw_hires_proxy_ms: proxyMs, raw_developed_canvas_ms: developedMs, raw_first_sharp_width: swap.firstW, raw_proxy_swap_min_width: swap.min, raw_proxy_swap_frames: swap.frames, raw_export_ms: exportMs, raw_export_w: dims.w, raw_export_h: dims.h, raw_export_longest_task_ms: longestMs, raw_export_main_thread_blocked_ms: blockedMs, raw_export_long_tasks: longTasks.length });
+      expect(errors.filter((e) => !/favicon/.test(e)), errors.join('\n')).toEqual([]);
+    });
+
+    test(`RAW ${name} restores its stored proxy and is editable`, async ({ page }, testInfo) => {
+      test.setTimeout(300_000);
+      const errors = trackErrors(page);
+      await openApp(page);
+      await importFiles(page, [RAW]);
+      // Wait until a display-size proxy at least 1200 px wide is persisted:
+      // the ARW's downscaled camera decode ("display") or the synthetic DNG's
+      // sensor develop ("raw"). A legacy full-size "camera" record is not
+      // restorable within the budget, so it is not accepted here.
+      await expect.poll(() => storedDisplayProxyWidth(page), { timeout: 180_000 }).toBeGreaterThan(1200);
+      // The item record itself is written by the debounced session pass.
+      await expect
+        .poll(
+          () =>
+            page.evaluate(
+              () =>
+                ((window as any).__pes?.perf?.() || []).filter(
+                  (e: any) => e.name === 'session.persist' && e.detail === '1 items',
+                ).length,
+            ),
+          { timeout: 60_000 },
+        )
+        .toBeGreaterThan(0);
+
+      // Acceptance: the selected RAW is editable from its stored proxy within
+      // 600 ms of the reload, i.e. a >1200 px backing is on the canvas.
+      await page.addInitScript(() => {
+        const R: { proxy: number; overlayGone: number; width: number } = { proxy: -1, overlayGone: -1, width: 0 };
+        (window as any).__rawRestore = R;
+        const tick = () => {
+          const c = document.querySelector('.canvas-wrap canvas') as HTMLCanvasElement | null;
+          if (R.proxy < 0 && c && c.width > 1200) {
+            R.proxy = performance.now();
+            R.width = c.width;
+          }
+          if (R.proxy >= 0 && R.overlayGone < 0 && !document.querySelector('.overlay')) {
+            R.overlayGone = performance.now();
+          }
+          if (R.proxy < 0 || R.overlayGone < 0) requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
+      });
+      await page.reload();
+      await expect.poll(
+        () => page.evaluate(() => (window as any).__rawRestore?.proxy ?? -1),
+        { timeout: 60_000 },
+      ).toBeGreaterThan(0);
+      const probe = await page.evaluate(
+        () => (window as any).__rawRestore as { proxy: number; overlayGone: number; width: number },
+      );
+      recordMetrics(testInfo, {
+        raw_fixture: name,
+        raw_restore_proxy_ms: Math.round(probe.proxy),
+        raw_restore_overlay_gone_ms: Math.round(probe.overlayGone),
+        raw_restore_canvas_w: probe.width,
+      });
+      expect(probe.width, 'restored proxy on canvas is sharp').toBeGreaterThan(1200);
+      expect(probe.proxy, `stored proxy took ${Math.round(probe.proxy)} ms after reload (target ≤ 600 ms)`).toBeLessThanOrEqual(600);
       expect(errors.filter((e) => !/favicon/.test(e)), errors.join('\n')).toEqual([]);
     });
   }

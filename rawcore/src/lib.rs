@@ -564,11 +564,72 @@ pub fn camera_jpeg_rgba(jpeg: &[u8], orientation: u16) -> Option<(Vec<u8>, usize
 /// orientation applied — the worker-side replacement for an `<img>` decode
 /// plus a main-thread `getImageData` copy.
 pub fn photo_rgba(bytes: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
-    let img = image::load_from_memory(bytes).ok()?;
-    let rgba = img.to_rgba8();
-    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+    let (px, w, h) = match image::guess_format(bytes).ok()? {
+        image::ImageFormat::Jpeg => jpeg_rgba(bytes)?,
+        _ => {
+            let img = image::load_from_memory(bytes).ok()?;
+            let rgba = img.to_rgba8();
+            let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+            (rgba.into_raw(), w, h)
+        }
+    };
     let code = rawmeta::photo_orientation(bytes);
-    Some(rawmeta::apply_orientation_code(rgba.into_raw(), w, h, code))
+    Some(rawmeta::apply_orientation_code(px, w, h, code))
+}
+
+/// JPEG straight to RGBA: zune writes the alpha channel itself, where the
+/// image crate decodes RGB and then `to_rgba8` allocates the RGBA frame
+/// while the RGB one is still live — 165 MB peak for one 24 MP photo.
+fn jpeg_rgba(bytes: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
+    use zune_core::bytestream::ZCursor;
+    use zune_core::colorspace::ColorSpace;
+    use zune_core::options::DecoderOptions;
+    let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGBA);
+    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(bytes), options);
+    let px = decoder.decode().ok()?;
+    let (w, h) = decoder.dimensions()?;
+    Some((px, w, h))
+}
+
+#[cfg(test)]
+mod photo_rgba_tests {
+    use super::photo_rgba;
+
+    fn encode_jpeg(px: &[u8], w: u32, h: u32, color: image::ExtendedColorType) -> Vec<u8> {
+        let mut out = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 92)
+            .encode(px, w, h, color)
+            .unwrap();
+        out
+    }
+
+    /// The fast path must be pixel-identical to the DynamicImage path it
+    /// replaced, including grayscale JPEGs.
+    #[test]
+    fn jpeg_rgba_matches_image_crate() {
+        let (w, h) = (64usize, 48usize);
+        let mut rgb = Vec::with_capacity(w * h * 3);
+        for y in 0..h {
+            for x in 0..w {
+                rgb.push((x * 255 / (w - 1)) as u8);
+                rgb.push((y * 255 / (h - 1)) as u8);
+                rgb.push(if (x / 8 + y / 8) % 2 == 0 { 255 } else { 0 });
+            }
+        }
+        let jpeg = encode_jpeg(&rgb, w as u32, h as u32, image::ExtendedColorType::Rgb8);
+        assert_eq!(photo_rgba(&jpeg), image_rgba(&jpeg));
+
+        let gray: Vec<u8> = (0..w * h).map(|i| (i * 255 / (w * h - 1)) as u8).collect();
+        let jpeg = encode_jpeg(&gray, w as u32, h as u32, image::ExtendedColorType::L8);
+        assert_eq!(photo_rgba(&jpeg), image_rgba(&jpeg));
+    }
+
+    fn image_rgba(jpeg: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
+        let img = image::load_from_memory(jpeg).ok()?;
+        let rgba = img.to_rgba8();
+        let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+        Some((rgba.into_raw(), w, h))
+    }
 }
 
 // ---------- EXIF carry-through ----------

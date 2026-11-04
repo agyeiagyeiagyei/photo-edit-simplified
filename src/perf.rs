@@ -162,6 +162,11 @@ fn mem() -> JsValue {
     let _ = Reflect::set(&o, &JsValue::from_str("main"), &JsValue::from(main));
     let _ = Reflect::set(
         &o,
+        &JsValue::from_str("pixel_worker"),
+        &JsValue::from(crate::pworker::pixel_mem_high()),
+    );
+    let _ = Reflect::set(
+        &o,
         &JsValue::from_str("raw_worker"),
         &JsValue::from(crate::pworker::raw_mem_high()),
     );

@@ -210,6 +210,115 @@ pub fn load_neutral(id: u32, pixels: Uint16Array, w: u32, h: u32, white: f32, to
     });
 }
 
+/// Decode an encoded photo (JPEG/PNG) straight into this worker's stored
+/// buffer. The full-res RGBA never crosses back to the app thread, so the
+/// app owns no full-size copy at rest.
+#[wasm_bindgen]
+pub fn load_photo(id: u32, bytes: Uint8Array) -> Result<JsValue, JsValue> {
+    let (px, w, h) = rawcore::photo_rgba(&bytes.to_vec())
+        .ok_or_else(|| JsValue::from_str("photo decode failed"))?;
+    clear_render_caches();
+    drop_neutral(id);
+    BUFFERS.with(|b| {
+        b.borrow_mut().insert(id, (px, w, h));
+    });
+    Ok(result_obj(&[
+        ("w", (w as u32).into()),
+        ("h", (h as u32).into()),
+        ("mem", wasm_mem_bytes().into()),
+    ]))
+}
+
+/// Decode a stored display proxy into this worker's buffer and also hand the
+/// RGBA back as a transferred buffer. The app needs a main-thread view to seed
+/// the hi-res canvas and crop the focus loupe, but the decode and the worker's
+/// copy both stay off the app thread — on reload the proxy decode was the
+/// longest main-thread task.
+#[wasm_bindgen]
+pub fn load_photo_view(id: u32, bytes: Uint8Array) -> Result<JsValue, JsValue> {
+    let (px, w, h) = rawcore::photo_rgba(&bytes.to_vec())
+        .ok_or_else(|| JsValue::from_str("photo decode failed"))?;
+    clear_render_caches();
+    drop_neutral(id);
+    let view = js_buf(px.clone());
+    BUFFERS.with(|b| {
+        b.borrow_mut().insert(id, (px, w, h));
+    });
+    Ok(result_obj(&[
+        ("pixels", view),
+        ("w", (w as u32).into()),
+        ("h", (h as u32).into()),
+        ("mem", wasm_mem_bytes().into()),
+    ]))
+}
+
+/// Copy a native-resolution window out of the stored buffer. The focus loupe
+/// asks for a display-sized rect, so only that rect travels back.
+#[wasm_bindgen]
+pub fn crop_window(
+    id: u32,
+    sx: u32,
+    sy: u32,
+    cw: u32,
+    ch: u32,
+) -> Result<JsValue, JsValue> {
+    with_buffer(id, |(full, w, h)| {
+        let (sx, sy, cw, ch) = (sx as usize, sy as usize, cw as usize, ch as usize);
+        if cw == 0 || ch == 0 || sx + cw > *w || sy + ch > *h {
+            return Err(JsValue::from_str("crop out of bounds"));
+        }
+        let crop = crop_rows(full, *w, sx, sy, cw, ch, 4);
+        Ok(result_obj(&[
+            ("pixels", js_buf(crop)),
+            ("w", (cw as u32).into()),
+            ("h", (ch as u32).into()),
+        ]))
+    })?
+}
+
+/// Crop a margin-expanded window out of the stored buffer and run the
+/// pointwise edit pipeline over it at source density — the editor hover
+/// loupe's direct path, previously a main-thread crop of the full buffer.
+#[wasm_bindgen]
+pub fn loupe_window(
+    id: u32,
+    recipe: &str,
+    sx: u32,
+    sy: u32,
+    cw: u32,
+    ch: u32,
+    seed: u32,
+) -> Result<JsValue, JsValue> {
+    let edit = parse_edit(recipe);
+    with_buffer(id, |(full, fw, fh)| {
+        let (sx, sy, cw, ch) = (sx as usize, sy as usize, cw as usize, ch as usize);
+        if cw == 0 || ch == 0 || sx + cw > *fw || sy + ch > *fh {
+            return Err(JsValue::from_str("loupe window out of bounds"));
+        }
+        let margin = (edit.blur / 100.0 * 8.0 * 3.0).ceil() as usize + 2;
+        let x0 = sx.saturating_sub(margin);
+        let y0 = sy.saturating_sub(margin);
+        let x1 = (sx + cw + margin).min(*fw);
+        let y1 = (sy + ch + margin).min(*fh);
+        let (ew, eh) = (x1 - x0, y1 - y0);
+        let win = crop_rows(full, *fw, x0, y0, ew, eh, 4);
+        let mut frame = Frame::new(win, ew, eh);
+        pipeline::finish(&mut frame, &edit, seed, None, 1.0);
+        let win = frame.pixels;
+        let (ix, iy) = (sx - x0, sy - y0);
+        let mut out = Vec::with_capacity(cw * ch * 4);
+        for row in 0..ch {
+            let start = ((iy + row) * ew + ix) * 4;
+            out.extend_from_slice(&win[start..start + cw * 4]);
+        }
+        Ok(result_obj(&[
+            ("pixels", js_buf(out)),
+            ("w", (cw as u32).into()),
+            ("h", (ch as u32).into()),
+        ]))
+    })?
+}
+
 #[wasm_bindgen]
 pub fn unload(id: u32) {
     clear_render_caches();
@@ -516,6 +625,7 @@ fn render_reply(pixels: Vec<u8>, tw: usize, th: usize, t: [f64; 5]) -> JsValue {
         ("w", (tw as u32).into()),
         ("h", (th as u32).into()),
         ("timings", timings),
+        ("mem", wasm_mem_bytes().into()),
     ])
 }
 
@@ -631,6 +741,7 @@ pub fn render_base(
             ("w", (tw as u32).into()),
             ("h", (th as u32).into()),
             ("timings", timings),
+            ("mem", wasm_mem_bytes().into()),
         ])
     })
 }
@@ -810,10 +921,11 @@ fn commit(
     *fh = h;
 }
 
-/// Destructive-op result: new full buffer + 1024px preview.
-fn destructive_result(base: Vec<u8>, w: usize, h: usize) -> JsValue {    let (pv, pw, ph) = downscale(&base, w, h, 1024);
+/// Destructive-op result: the worker already holds the new full buffer, so
+/// only dims and the 1024px preview travel back.
+fn destructive_result(base: &[u8], w: usize, h: usize) -> JsValue {
+    let (pv, pw, ph) = downscale(base, w, h, 1024);
     result_obj(&[
-        ("pixels", js_buf(base)),
         ("w", (w as u32).into()),
         ("h", (h as u32).into()),
         ("preview", js_buf(pv)),
@@ -853,7 +965,7 @@ pub fn heal_stroke(
             return JsValue::NULL;
         }
         commit(id, full, fw, fh, &base, w, h);
-        destructive_result(base, w, h)
+        destructive_result(&base, w, h)
     })
 }
 
@@ -879,7 +991,7 @@ pub fn clone_stamp(
         stamp_stroke(&mut coverage, w, h, &pts, r);
         clone::clone_stamp(&mut base, w, h, &coverage, dx, dy);
         commit(id, full, fw, fh, &base, w, h);
-        destructive_result(base, w, h)
+        destructive_result(&base, w, h)
     })
 }
 
@@ -908,7 +1020,7 @@ pub fn cut(
         let mask = ops::selection_mask(&sel, w, h);
         delete_by_mask(&mut base, &mask);
         commit(id, full, fw, fh, &base, w, h);
-        destructive_result(base, w, h)
+        destructive_result(&base, w, h)
     })
 }
 
@@ -932,7 +1044,7 @@ pub fn fill_selection(
             return JsValue::NULL;
         }
         commit(id, full, fw, fh, &base, w, h);
-        destructive_result(base, w, h)
+        destructive_result(&base, w, h)
     })
 }
 
@@ -965,7 +1077,6 @@ pub fn extract(
             delete_by_mask(&mut base, &mask);
             commit(id, full, fw, fh, &base, w, h);
             let (pv, pw, ph) = downscale(&base, w, h, 1024);
-            pairs.push(("pixels", js_buf(base)));
             pairs.push(("w", (w as u32).into()));
             pairs.push(("h", (h as u32).into()));
             pairs.push(("preview", js_buf(pv)));
@@ -1057,20 +1168,6 @@ pub fn camera_proxy(jpeg: Uint8Array, orientation: u16, max_edge: u32) -> Result
         .ok_or_else(|| JsValue::from_str("camera JPEG decode failed"))?;
     let (px, pw, ph) = downscale(&rgba, w, h, max_edge);
     Ok(proxy_result(px, pw, ph, Vec::new(), 1.0, w, h, None))
-}
-
-/// Decode a non-RAW photo (JPEG) to full-res RGBA, applying its EXIF
-/// orientation. Off the app thread: no `<img>` decode or main-thread
-/// `getImageData` for a full-size frame.
-#[wasm_bindgen]
-pub fn decode_photo(bytes: Uint8Array) -> Result<JsValue, JsValue> {
-    let (px, w, h) = rawcore::photo_rgba(&bytes.to_vec())
-        .ok_or_else(|| JsValue::from_str("photo decode failed"))?;
-    Ok(result_obj(&[
-        ("pixels", js_buf(px)),
-        ("w", (w as u32).into()),
-        ("h", (h as u32).into()),
-    ]))
 }
 
 /// RAW metadata in one round-trip: EXIF payload, orientation, capture time,
@@ -1224,6 +1321,230 @@ impl jpeg_encoder::ImageBuffer for CanvasRows {
             buffers[2].push(cr);
         }
     }
+}
+
+/// RGBA rows borrowed straight from a wasm-side buffer for encoding, so a
+/// rendered export never has to be copied back out to JS first.
+struct SliceRows<'a> {
+    rgba: &'a [u8],
+    w: u16,
+    h: u16,
+}
+
+impl jpeg_encoder::ImageBuffer for SliceRows<'_> {
+    fn get_jpeg_color_type(&self) -> jpeg_encoder::JpegColorType {
+        jpeg_encoder::JpegColorType::Ycbcr
+    }
+
+    fn width(&self) -> u16 {
+        self.w
+    }
+
+    fn height(&self) -> u16 {
+        self.h
+    }
+
+    fn fill_buffers(&self, y: u16, buffers: &mut [Vec<u8>; 4]) {
+        let stride = self.w as usize * 4;
+        let start = y as usize * stride;
+        let row = &self.rgba[start..start + stride];
+        for px in row.chunks_exact(4) {
+            let (luma, cb, cr) = jpeg_encoder::rgb_to_ycbcr(px[0], px[1], px[2]);
+            buffers[0].push(luma);
+            buffers[1].push(cb);
+            buffers[2].push(cr);
+        }
+    }
+}
+
+fn encode_jpeg_slice(rgba: &[u8], w: u32, h: u32, quality: u8) -> Result<Vec<u8>, JsValue> {
+    if w == 0 || h == 0 || w > u16::MAX as u32 || h > u16::MAX as u32 {
+        return Err(JsValue::from_str("bad jpeg dimensions"));
+    }
+    let mut out = Vec::new();
+    let mut enc = jpeg_encoder::Encoder::new(&mut out, quality.clamp(1, 100));
+    enc.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1);
+    enc.add_icc_profile(srgb_icc::SRGB_ICC)
+        .map_err(|e| JsValue::from_str(&format!("icc: {e}")))?;
+    enc.encode_image(SliceRows { rgba, w: w as u16, h: h as u16 })
+        .map_err(|e| JsValue::from_str(&format!("jpeg: {e}")))?;
+    Ok(out)
+}
+
+fn encode_png_slice(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>, JsValue> {
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.set_compression(png::Compression::Fast);
+        let mut writer = enc
+            .write_header()
+            .map_err(|e| JsValue::from_str(&format!("png: {e}")))?;
+        writer
+            .write_image_data(rgba)
+            .map_err(|e| JsValue::from_str(&format!("png: {e}")))?;
+    }
+    Ok(out)
+}
+
+/// Encode an item's stored buffer as PNG for session persistence. Runs in the
+/// worker so the app never holds the raster to bake it.
+#[wasm_bindgen]
+pub fn encode_png(id: u32) -> Result<JsValue, JsValue> {
+    let bytes = with_buffer(id, |(full, w, h)| {
+        encode_png_slice(full, *w as u32, *h as u32)
+    })??;
+    Ok(js_buf(bytes))
+}
+
+fn export_mask(
+    edit: &EditParams,
+    ww: usize,
+    wh: usize,
+    rect: (usize, usize, usize, usize),
+    ew: usize,
+    eh: usize,
+    sel_json: Option<String>,
+    sel_mask: Option<Uint8Array>,
+) -> Option<Vec<u8>> {
+    if !edit.is_color_touched() {
+        return None;
+    }
+    let (cx, cy, cw, ch) = rect;
+    sel_json
+        .and_then(|j| selection_from_json(&j, sel_mask.map(|m| m.to_vec())))
+        .map(|sel| {
+            let full = ops::selection_mask(&sel, ww, wh);
+            let win = crop_rows(&full, ww, cx, cy, cw, ch, 1);
+            if (ew, eh) != (cw, ch) {
+                nearest_resample_mask(&win, cw, ch, ew, eh)
+            } else {
+                win
+            }
+        })
+}
+
+/// Render exactly the export rectangle at export dims. The rect is in working
+/// coordinates (the app derives it from dims + crop + aspect lock); the worker
+/// applies geometry, crop, resample and the full develop/colour pipeline.
+fn export_pixels(
+    id: u32,
+    fw: usize,
+    fh: usize,
+    edit: &EditParams,
+    rect: (usize, usize, usize, usize),
+    ew: usize,
+    eh: usize,
+    sel_json: Option<String>,
+    sel_mask: Option<Uint8Array>,
+) -> Result<(Vec<u8>, usize, usize), JsValue> {
+    let (ww, wh) = working_dims(fw, fh, edit);
+    let (cx, cy, cw, ch) = rect;
+    if cw == 0 || ch == 0 || cx + cw > ww || cy + ch > wh || ew == 0 || eh == 0 {
+        return Err(JsValue::from_str("export rect out of bounds"));
+    }
+    let neutral = NEUTRAL.with(|n| {
+        n.borrow()
+            .get(&id)
+            .is_some_and(|n| n.w == fw && n.h == fh)
+            && pipeline::neutral_eligible(edit)
+    });
+    if neutral {
+        let (mut buf, out_w, out_h) = NEUTRAL.with(|n| {
+            let n = n.borrow();
+            let src = n
+                .get(&id)
+                .ok_or_else(|| JsValue::from_str("neutral frame missing"))?;
+            let (p, gw, gh) = geometry_wide(&src.pixels, fw, fh, edit);
+            let win = if (cx, cy, cw, ch) == (0, 0, gw, gh) {
+                p.into_owned()
+            } else {
+                crop_rows(&p, gw, cx, cy, cw, ch, 4)
+            };
+            let f = pipeline::resize_wide(&win, cw, ch, Target::new(ew, eh));
+            Ok::<_, JsValue>((f.pixels, f.w, f.h))
+        })?;
+        let mask = export_mask(edit, ww, wh, rect, out_w, out_h, sel_json, sel_mask);
+        let (out, _, _) = NEUTRAL.with(|n| {
+            let n = n.borrow();
+            let src = n
+                .get(&id)
+                .ok_or_else(|| JsValue::from_str("neutral frame missing"))?;
+            Ok::<_, JsValue>(neutral_finish(
+                &mut buf,
+                out_w,
+                out_h,
+                edit,
+                id,
+                src.white,
+                src.tone.as_ref(),
+                mask.as_deref(),
+            ))
+        })?;
+        return Ok((out, out_w, out_h));
+    }
+    with_buffer(id, |(full, _, _)| {
+        let (p, gw, gh) = geometry(full, fw, fh, edit);
+        let win = if (cx, cy, cw, ch) == (0, 0, gw, gh) {
+            p.into_owned()
+        } else {
+            crop_rows(&p, gw, cx, cy, cw, ch, 4)
+        };
+        let resized = pipeline::resize(&win, cw, ch, Target::new(ew, eh));
+        let mut frame = Frame::new(resized.pixels, resized.w, resized.h);
+        let px_scale = pipeline::px_scale_for(fw, fh, Target::new(ww, wh))
+            * pipeline::px_scale_for(cw, ch, Target::new(ew, eh));
+        let wide_buf = pipeline::develop(&mut frame, edit, px_scale);
+        let mask = export_mask(edit, ww, wh, rect, frame.w, frame.h, sel_json, sel_mask);
+        pipeline::colour(&mut frame, edit, id, mask.as_deref(), wide_buf);
+        Ok::<_, JsValue>((frame.pixels, frame.w, frame.h))
+    })?
+}
+
+/// Full export render + encode in one call, so a layer-free export never puts
+/// a full-size RGBA frame on the app thread. `format`: 0 = JPEG, 1 = PNG.
+/// Returns the encoded bytes as a transferable ArrayBuffer.
+#[wasm_bindgen]
+pub fn export_photo(
+    id: u32,
+    recipe: &str,
+    cx: u32,
+    cy: u32,
+    cw: u32,
+    ch: u32,
+    ew: u32,
+    eh: u32,
+    format: u8,
+    quality: u8,
+    sel_json: Option<String>,
+    sel_mask: Option<Uint8Array>,
+) -> Result<JsValue, JsValue> {
+    let edit = parse_edit(recipe);
+    let (fw, fh) = BUFFERS
+        .with(|b| b.borrow().get(&id).map(|(_, w, h)| (*w, *h)))
+        .ok_or_else(|| JsValue::from_str("not loaded"))?;
+    let (px, out_w, out_h) = export_pixels(
+        id,
+        fw,
+        fh,
+        &edit,
+        (cx as usize, cy as usize, cw as usize, ch as usize),
+        ew as usize,
+        eh as usize,
+        sel_json,
+        sel_mask,
+    )?;
+    let bytes = if format == 1 {
+        encode_png_slice(&px, out_w as u32, out_h as u32)?
+    } else {
+        encode_jpeg_slice(&px, out_w as u32, out_h as u32, quality)?
+    };
+    Ok(result_obj(&[
+        ("bytes", js_buf(bytes)),
+        ("w", (out_w as u32).into()),
+        ("h", (out_h as u32).into()),
+    ]))
 }
 
 /// Encode RGBA pixels as a 4:4:4 JPEG carrying the sRGB ICC profile.

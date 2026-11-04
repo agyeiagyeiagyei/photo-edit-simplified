@@ -146,6 +146,47 @@ pub async fn downscale_blob(
     Ok((data.data().to_vec(), pw as usize, ph as usize))
 }
 
+/// Decode a JPEG/PNG blob to RGBA with the decode off the app thread.
+/// `load_image` + `drawImage` decodes lazily inside the draw (a synchronous
+/// main-thread JPEG decode); `createImageBitmap` decodes eagerly, so only the
+/// canvas readback blocks.
+pub async fn rgba_from_blob(blob: &Blob) -> Result<(Vec<u8>, usize, usize), JsValue> {
+    let bitmap = JsFuture::from(window().create_image_bitmap_with_blob(blob)?)
+        .await?
+        .dyn_into::<web_sys::ImageBitmap>()?;
+    let (w, h) = (bitmap.width(), bitmap.height());
+    if w == 0 || h == 0 {
+        bitmap.close();
+        return Err(JsValue::from_str("empty image"));
+    }
+    let canvas = web_sys::OffscreenCanvas::new(w, h)?;
+    let ctx = canvas
+        .get_context("2d")?
+        .ok_or_else(|| JsValue::from_str("no offscreen 2d context"))?
+        .dyn_into::<web_sys::OffscreenCanvasRenderingContext2d>()?;
+    ctx.draw_image_with_image_bitmap(&bitmap, 0.0, 0.0)?;
+    let data = ctx.get_image_data(0.0, 0.0, w as f64, h as f64)?;
+    bitmap.close();
+    Ok((data.data().to_vec(), w as usize, h as usize))
+}
+
+/// The reload prefetch (index.html) starts decoding the selected item's stored
+/// display proxy before the app wasm boots. Take it once: the caller paints
+/// the bitmap straight into the hi cache, so the first restored frame costs a
+/// `drawImage` instead of a 27 MB readback.
+pub fn take_prefetched_proxy(id: usize) -> Option<web_sys::ImageBitmap> {
+    let win = window();
+    let key = JsValue::from_str("__pesProxyBmp");
+    let obj = Reflect::get(&win, &key).ok()?;
+    let bid = Reflect::get(&obj, &JsValue::from_str("id")).ok()?.as_f64()? as usize;
+    if bid != id {
+        return None;
+    }
+    let bmp = Reflect::get(&obj, &JsValue::from_str("bmp")).ok()?;
+    let _ = Reflect::set(&win, &key, &JsValue::NULL);
+    bmp.dyn_into().ok()
+}
+
 /// Draw an image element to a canvas at natural size and read back RGBA.
 pub fn rgba_from_image(img: &HtmlImageElement) -> (Vec<u8>, usize, usize) {
     let w = img.natural_width();

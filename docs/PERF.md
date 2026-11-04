@@ -50,14 +50,45 @@ cleared right after the measure so the timeline never accumulates marks.
 | `pool.develop` | one batch-pool proxy develop: enqueue through landed | file name |
 | `ingest.raw_batch` | first pool enqueue of an import → last batch develop landed | `N files, pool K` |
 | `proxy.land` | installing a decoded proxy (cache, worker load, LRU) | item id |
+| `proxy.restore_decode` | stored proxy record decoded in the worker on restore (Blob → RGBA, transferred) | — |
 | `export.ensure_full` | waiting for full-res pixels to materialise | — |
-| `export.geometry` | geometry stage of the export pipeline | working `WxH` |
-| `export.color` | raw develop + colour/levels/curves/grain stage | — |
-| `export.encode` | composite → crop → encode → EXIF injection | output `WxH` |
+| `export.encode` | worker render → (layers) composite → crop → encode → EXIF injection | output `WxH` |
 | `export.total` | full export of one item (including `ensure_full`) | item name |
 | `session.persist` | one IndexedDB session write pass | item count |
 | `restore.session` | whole startup restore | item count |
 | `restore.item` | restoring one item | `name #id` |
+
+### Session restore
+
+A reload restores the filmstrip from stored thumbnails and decodes only the
+selected item's display proxy: `restore.session` → `restore.item` →
+`proxy.restore_decode` → `proxy.land` → `preview.render`. The stored record
+(`display` for camera JPEGs, `raw` for developed proxies) crosses to the pixel
+worker as a Blob; `load_photo_view` decodes it there and returns the RGBA
+buffer transferred, so the main thread never runs the JPEG decode. The
+`proxy.restore_decode` mark is the app-side wall time of that round trip;
+`proxy.land` installs the pixels once.
+
+The reload prefetch (`index.html`) starts earlier: before the app wasm boots it
+reads the session's selected id, pulls that item's proxy record and decodes it
+with `createImageBitmap` (off the main thread), then publishes the bitmap as
+`window.__pesProxyBmp`. Three consumers race to paint it, all through
+`web::take_prefetched_proxy`:
+
+- when the bitmap arrives after the restored selection is on screen, the inline
+  script dispatches `pes-proxy-bmp` and `Preview`'s listener blits it directly
+  (no render pass, no worker round-trip);
+- a render pass that has no low-res preview yet (a restored RAW decodes its
+  1024px preview lazily) paints it before returning;
+- otherwise the effect pulls it where it would fall back to the soft tier, and
+  a bitmap that lands after that pass nudges `hi_built` to run the effect again.
+
+Every path installs the bitmap as the hi frame and blits it in the same pass.
+It is the same pixels as the record the worker decodes, so the first
+`proxy.land` of matching dimensions re-stamps the cached frame's source
+fingerprint instead of scheduling a redundant render. Raw marks
+`pes.proxy.rec` and `pes.proxy.bmp` time the prefetch's IndexedDB read and
+bitmap decode.
 
 ## RAW display proxy
 
@@ -149,7 +180,7 @@ returns `ms` with the reply; the app records it as:
 
 | Name | Measures |
 |---|---|
-| `worker.<op>` | worker execution of `op` (`load`, `unload`, `render`, `render_window`, `render_base`, `raw_proxy`, `raw_meta`, `raw_develop`, `raw_preview`, `camera_proxy`, `heal_stroke`, `clone_stamp`, `cut`, `fill_selection`, `extract`) |
+| `worker.<op>` | worker execution of `op` (`load_photo`, `load_photo_view`, `load`, `load_view`, `load_neutral`, `unload`, `render`, `render_window`, `render_base`, `export_photo`, `encode_png`, `encode_jpeg`, `crop_window`, `loupe_window`, `raw_proxy`, `raw_meta`, `raw_develop`, `raw_preview`, `camera_proxy`, `heal_stroke`, `clone_stamp`, `cut`, `fill_selection`, `extract`) |
 
 `render` additionally returns a `timings` object, recorded as:
 
@@ -240,3 +271,31 @@ preview render with one WebGL2 draw from a worker base (see `docs/GPU.md`):
   op spends its time, not UI jank.
 - Worker stage timings use `Date.now()` (ms resolution); the op-level `ms`
   uses `performance.now()` in JS.
+
+## Memory (WS6 #10)
+
+`__pes.mem()` reports current bytes per context: `main`, `pixel_worker`,
+`raw_worker` and `raw_pool` (the last two are high-water: workers are
+terminated and re-created, and wasm pages never shrink).
+
+After WS6-B the app thread holds no full-res RGBA at all; the pixel worker
+holds exactly one buffer per materialised item (`PhotoData.full` is a flag,
+not pixels), and the RAW worker's full develop is moved out and the worker
+terminated. JPEGs decode straight into RGBA via zune-jpeg — going through
+`image`'s `DynamicImage` peaked 165 MB (RGB frame + RGBA frame) per 24 MP
+decode instead of 96 MB.
+
+The gate is `tests/e2e/tests/07-memory.spec.ts`. It serves `dist` from a
+COOP/COEP static server (the API is only available to cross-origin-isolated
+documents), imports five 24 MP JPEGs, selects each so every item's full
+buffer lands in the worker, collects garbage, then calls
+`performance.measureUserAgentSpecificMemory()`.
+
+| Build | Total | Pixel worker | Main | JS heap |
+|---|---|---|---|---|
+| `ce8e8e2` (main + worker copy) | 1086 MB | — | — | 461 MB |
+| WS6-B (worker only) | 540 MB | 513 MB | 25 MB | 3 MB |
+
+Ratio: **49.7 %** of the double-copy baseline (target ≤ 55 %). The five
+full RGBA frames are 5 × 91.6 MiB = 458 MiB, so the remaining ~55 MiB is the
+render target cache, decoder working space and wasm bookkeeping.
