@@ -68,14 +68,6 @@ function serveDist(): Promise<{ url: string; close: () => Promise<void> }> {
   });
 }
 
-// performance.measureUserAgentSpecificMemory() (recorded for reference) exists
-// only in full Chromium; Playwright's default headless shell throws
-// SecurityError for it even when the page is cross-origin isolated. Run this
-// file on the full build in its new headless mode, which
-// `npx playwright install chromium` installs next to the shell. A channel can
-// only be set at file level.
-test.use({ channel: 'chromium' });
-
 test.describe('memory (issue #10)', () => {
   test('five 24 MP loads keep one full-res copy per item', async ({ page }, testInfo) => {
     test.setTimeout(300_000);
