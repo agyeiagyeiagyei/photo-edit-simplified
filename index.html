@@ -21,6 +21,53 @@
       }
     })();
   </script>
+  <script>
+    // Start decoding the selected item's stored display proxy before the app
+    // wasm boots; web::take_prefetched_proxy paints it into the hi cache, so a
+    // restored session's first sharp frame doesn't wait on a 27 MB readback.
+    // Skipped when pes-session doesn't exist yet: opening it here would create
+    // it without the app's schema.
+    (function () {
+      if (!window.indexedDB || !indexedDB.databases) return;
+      function start() {
+        var req = indexedDB.open('pes-session');
+        req.onupgradeneeded = function () {
+          try { req.transaction.abort(); } catch (e) {}
+        };
+        req.onsuccess = function () {
+          var db = req.result;
+          try {
+            var tx = db.transaction(['meta', 'proxies'], 'readonly');
+            var meta = tx.objectStore('meta').get('session');
+            meta.onsuccess = function () {
+              var m = meta.result;
+              if (!m || typeof m.selected !== 'number') { db.close(); return; }
+              var proxy = tx.objectStore('proxies').get(m.selected);
+              proxy.onsuccess = function () {
+                db.close();
+                try { performance.mark('pes.proxy.rec'); } catch (e) {}
+                var rec = proxy.result;
+                if (!rec || (rec.kind !== 'raw' && rec.kind !== 'display')) return;
+                var bytes = rec.bytes;
+                var blob = bytes instanceof Blob ? bytes
+                  : new Blob([bytes], { type: 'image/jpeg' });
+                createImageBitmap(blob).then(function (bmp) {
+                  try { performance.mark('pes.proxy.bmp'); } catch (e) {}
+                  window.__pesProxyBmp = { id: m.selected, bmp: bmp };
+                  try { window.dispatchEvent(new Event('pes-proxy-bmp')); } catch (e) {}
+                }, function () {});
+              };
+            };
+          } catch (e) { db.close(); }
+        };
+      }
+      indexedDB.databases().then(function (dbs) {
+        for (var i = 0; i < dbs.length; i++) {
+          if (dbs[i].name === 'pes-session') { start(); return; }
+        }
+      }, function () {});
+    })();
+  </script>
   <title>photo-edit-simplified</title>
   <link rel="manifest" href="manifest.webmanifest"/>
   <link rel="icon" href="icon-192.png"/>

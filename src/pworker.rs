@@ -38,11 +38,20 @@ thread_local! {
     /// High-water of the RAW worker's wasm linear memory (bytes). Raw replies
     /// carry `mem`, measured after the develop.
     static RAW_MEM_HIGH: Cell<f64> = const { Cell::new(0.0) };
+    /// High-water of the interactive worker's wasm linear memory (bytes).
+    /// Load/render replies carry `mem`; the buffer cache lives there, so this
+    /// is the number the full-pixel budget has to fit inside.
+    static PIXEL_MEM_HIGH: Cell<f64> = const { Cell::new(0.0) };
 }
 
 /// Bytes of the RAW worker's wasm memory high-water (0 until the first reply).
 pub fn raw_mem_high() -> f64 {
     RAW_MEM_HIGH.with(|m| m.get())
+}
+
+/// Bytes of the interactive worker's wasm memory high-water.
+pub fn pixel_mem_high() -> f64 {
+    PIXEL_MEM_HIGH.with(|m| m.get())
 }
 
 /// Worker instance index.html created at parse time so its bundle downloads
@@ -166,6 +175,14 @@ fn record_worker_reply(op: &str, data: &JsValue, result: &JsValue) {
         .and_then(|v| v.as_f64())
     {
         perf::record(&format!("worker.{op}"), ms);
+    }
+    if let Some(mem) = Reflect::get(result, &JsValue::from_str("mem"))
+        .ok()
+        .and_then(|v| v.as_f64())
+    {
+        if mem > PIXEL_MEM_HIGH.with(|m| m.get()) {
+            PIXEL_MEM_HIGH.with(|m| m.set(mem));
+        }
     }
     if op != "render" && op != "render_window" && op != "render_base" {
         return;
@@ -733,30 +750,6 @@ pub fn camera_proxy(
     )
 }
 
-/// Decode a non-RAW photo blob to full-res RGBA inside the main pixel worker.
-/// The Blob crosses the boundary by reference; its bytes only materialize in
-/// the worker. Returns false when the worker is unavailable.
-pub fn decode_photo(
-    blob: &JsValue,
-    cb: impl FnOnce(Option<(Uint8Array, usize, usize)>) + 'static,
-) -> bool {
-    init();
-    call(
-        "decode_photo",
-        &[blob.clone()],
-        &[],
-        Box::new(move |reply| {
-            cb(reply.ok().and_then(|v| {
-                Some((
-                    get_buf(&v, "pixels")?,
-                    get_u32(&v, "w")? as usize,
-                    get_u32(&v, "h")? as usize,
-                ))
-            }))
-        }),
-    )
-}
-
 /// Encode RGBA pixels as a 4:4:4 JPEG carrying the sRGB ICC profile. The
 /// pixel buffer is transferred to the worker (the app view is detached).
 /// Returns None when the worker is unavailable; callers then fall back to
@@ -781,6 +774,113 @@ pub fn encode_jpeg(
         Box::new(move |reply| {
             cb(reply.ok().map(|v| Uint8Array::new(&v).to_vec()))
         }),
+    )
+}
+
+fn parse_render(v: &JsValue) -> Option<RenderResult> {
+    Some(RenderResult {
+        pixels: get_buf(v, "pixels")?,
+        w: get_u32(v, "w")?,
+        h: get_u32(v, "h")?,
+    })
+}
+
+/// Native-resolution crop straight out of the worker-held full frame. Raw
+/// pixels — no edit pipeline — for the focus loupe.
+pub fn crop_window(
+    id: usize,
+    sx: usize,
+    sy: usize,
+    cw: usize,
+    ch: usize,
+    cb: impl FnOnce(Option<RenderResult>) + 'static,
+) -> bool {
+    call(
+        "crop_window",
+        &[
+            JsValue::from(id as u32),
+            JsValue::from(sx as u32),
+            JsValue::from(sy as u32),
+            JsValue::from(cw as u32),
+            JsValue::from(ch as u32),
+        ],
+        &[],
+        Box::new(move |reply| cb(reply.ok().and_then(|v| parse_render(&v)))),
+    )
+}
+
+/// Edited native-resolution window for the canvas hover loupe: the worker
+/// crops with a blur margin, runs the pointwise pipeline, and trims.
+pub fn loupe_window(
+    id: usize,
+    recipe: &str,
+    sx: usize,
+    sy: usize,
+    cw: usize,
+    ch: usize,
+    seed: u32,
+    cb: impl FnOnce(Option<RenderResult>) + 'static,
+) -> bool {
+    call(
+        "loupe_window",
+        &[
+            JsValue::from(id as u32),
+            JsValue::from_str(recipe),
+            JsValue::from(sx as u32),
+            JsValue::from(sy as u32),
+            JsValue::from(cw as u32),
+            JsValue::from(ch as u32),
+            JsValue::from(seed),
+        ],
+        &[],
+        Box::new(move |reply| cb(reply.ok().and_then(|v| parse_render(&v)))),
+    )
+}
+
+/// Encode the worker-held frame as PNG (session persistence). Returns a view
+/// over the transferred bytes; the caller wraps it in a Blob.
+pub fn encode_png(id: usize, cb: impl FnOnce(Option<Uint8Array>) + 'static) -> bool {
+    call(
+        "encode_png",
+        &[JsValue::from(id as u32)],
+        &[],
+        Box::new(move |reply| cb(reply.ok().map(|v| Uint8Array::new(&v)))),
+    )
+}
+
+/// Full export encode inside the worker: geometry, develop, colour, crop and
+/// resize at the explicit rect, then JPEG (quality) or PNG. `png` selects the
+/// format; quality is ignored for PNG.
+pub fn export_photo(
+    id: usize,
+    recipe: &str,
+    rect: (usize, usize, usize, usize),
+    ew: usize,
+    eh: usize,
+    png: bool,
+    quality: u8,
+    sel: Option<&Selection>,
+    cb: impl FnOnce(Option<Uint8Array>) + 'static,
+) -> bool {
+    let (sargs, transfer) = sel_args(sel);
+    let mut args = vec![
+        JsValue::from(id as u32),
+        JsValue::from_str(recipe),
+        JsValue::from(rect.0 as u32),
+        JsValue::from(rect.1 as u32),
+        JsValue::from(rect.2 as u32),
+        JsValue::from(rect.3 as u32),
+        JsValue::from(ew as u32),
+        JsValue::from(eh as u32),
+        JsValue::from(if png { 1u32 } else { 0u32 }),
+        JsValue::from(quality as u32),
+    ];
+    args.extend(sargs);
+    call(
+        "export_photo",
+        &args,
+        &transfer,
+        Box::new(move |reply| cb(reply.ok().and_then(|v| get_buf(&v, "bytes")))),
     )
 }
 
@@ -1007,6 +1107,101 @@ pub fn load_neutral_view(
     );
 }
 
+/// Transfer a JS-owned full frame into the worker (RAW develop hand-off).
+/// The caller's view is detached; the worker's `load` makes the one copy.
+pub fn load_view_transfer(id: usize, pixels: &Uint8Array, w: usize, h: usize) -> bool {
+    let buf = pixels.buffer();
+    call(
+        "load",
+        &[
+            JsValue::from(id as u32),
+            pixels.clone().into(),
+            JsValue::from(w as u32),
+            JsValue::from(h as u32),
+        ],
+        &[buf.into()],
+        Box::new(|_| {}),
+    )
+}
+
+/// Transfer the 16-bit neutral develop into the worker alongside the u8
+/// frame; the caller keeps only a flag afterwards.
+pub fn load_neutral_transfer(
+    id: usize,
+    pixels: &Uint16Array,
+    w: usize,
+    h: usize,
+    white: f32,
+    tone: Option<&[u8; 256]>,
+) -> bool {
+    let tone_arr = match tone {
+        Some(lut) => Uint8Array::from(&lut[..]),
+        None => Uint8Array::new_with_length(0),
+    };
+    let tone_buf = tone_arr.buffer();
+    let buf = pixels.buffer();
+    call(
+        "load_neutral",
+        &[
+            JsValue::from(id as u32),
+            pixels.clone().into(),
+            JsValue::from(w as u32),
+            JsValue::from(h as u32),
+            JsValue::from(white),
+            tone_arr.into(),
+        ],
+        &[buf.into(), tone_buf.into()],
+        Box::new(|_| {}),
+    )
+}
+
+/// Decode a source Blob inside the worker and keep the pixels there. The Blob
+/// crosses the thread boundary by reference; returns its dimensions.
+pub fn load_photo(
+    id: usize,
+    blob: &JsValue,
+    cb: impl FnOnce(Option<(usize, usize)>) + 'static,
+) -> bool {
+    init();
+    call(
+        "load_photo",
+        &[JsValue::from(id as u32), blob.clone()],
+        &[],
+        Box::new(move |reply| {
+            cb(reply.ok().and_then(|v| {
+                Some((get_u32(&v, "w")? as usize, get_u32(&v, "h")? as usize))
+            }))
+        }),
+    )
+}
+
+/// Decode a stored display proxy inside the worker and return a transferred
+/// RGBA view for the app's proxy cache. The worker keeps its own copy, so the
+/// caller must not ship the pixels back with `load`/`load_view`.
+pub fn load_photo_view(
+    id: usize,
+    bytes: &JsValue,
+    cb: impl FnOnce(Option<(Uint8Array, usize, usize)>) + 'static,
+) -> bool {
+    init();
+    call(
+        "load_photo_view",
+        &[JsValue::from(id as u32), bytes.clone()],
+        &[],
+        Box::new(move |reply| {
+            cb(reply.ok().and_then(|v| {
+                let raw = Reflect::get(&v, &JsValue::from_str("pixels")).ok()?;
+                let buf = raw.dyn_into::<js_sys::ArrayBuffer>().ok()?;
+                Some((
+                    Uint8Array::new(&buf),
+                    get_u32(&v, "w")? as usize,
+                    get_u32(&v, "h")? as usize,
+                ))
+            }))
+        }),
+    )
+}
+
 pub fn unload(id: usize) {
     call("unload", &[JsValue::from(id as u32)], &[], Box::new(|_| {}));
     // The RAW worker holds the last proxy's full frame / tone curve for the
@@ -1053,7 +1248,6 @@ pub struct RenderResult {
 
 #[derive(Clone)]
 pub struct DestructiveResult {
-    pub pixels: Vec<u8>,
     pub w: usize,
     pub h: usize,
     pub preview: Vec<u8>,
@@ -1070,7 +1264,6 @@ pub struct ExtractResult {
 
 fn parse_destructive(v: &JsValue) -> Option<DestructiveResult> {
     Some(DestructiveResult {
-        pixels: get_buf(v, "pixels")?.to_vec(),
         w: get_u32(v, "w")? as usize,
         h: get_u32(v, "h")? as usize,
         preview: get_buf(v, "preview")?.to_vec(),
@@ -1321,13 +1514,13 @@ pub fn extract(
 }
 
 /// Queue a destructive op. `op` calls one of the destructive fns above and
-/// returns whether the worker accepted it; when false, `sync` runs on the
-/// main thread instead. Queued closures execute one at a time, in order.
-pub fn destructive(op: impl FnOnce() -> bool + 'static, sync: impl FnOnce() + 'static) {
+/// returns whether the worker accepted it. Queued closures execute one at a
+/// time, in order. The full-res pixels live only in the worker, so there is
+/// no main-thread fallback to run when the worker refuses.
+pub fn destructive(op: impl FnOnce() -> bool + 'static) {
     OP_QUEUE.with(|q| {
         q.borrow_mut().push_back(Box::new(move || {
             if !op() {
-                sync();
                 op_done();
             }
         }))

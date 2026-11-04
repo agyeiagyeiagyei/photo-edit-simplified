@@ -5,7 +5,12 @@ edition = "2021"
 license = "Apache-2.0"
 
 [dependencies]
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# JPEG decodes straight into RGBA. Going through image's DynamicImage holds an
+# RGB frame and then allocates the RGBA one — 165 MB of live buffers for a
+# single 24 MP decode. zune-jpeg is the decoder image uses anyway.
+zune-core = "0.5"
+zune-jpeg = "0.5"
 rawmeta = { path = "../rawmeta" }
 # rawler is the pure-Rust decoder from the dnglab project. Vendored: upstream
 # calls std::time::Instant::now() in demosaic timing logs, which panics on

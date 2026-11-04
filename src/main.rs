@@ -9,8 +9,8 @@ mod session;
 mod state;
 mod web;
 
-use pes_pixel::{blur, clone, color, curves, fill, heal, levels, ops, rawops, resample, stroke, wand, wide};
-use pes_pixel::geo::{crop_px, geometry, geometry_wide, hi_target, stamp_stroke, working_dims};
+use pes_pixel::{blur, color, curves, heal, levels, ops, rawops, resample, stroke, wand};
+use pes_pixel::geo::{crop_px, geometry, hi_target, working_dims};
 use pes_pixel::pipeline::{self, Frame as PipeFrame, Target as PipeTarget};
 use pes_pixel::types::RawAdjust;
 
@@ -62,14 +62,6 @@ impl Pixels {
         }
     }
 
-    /// Run a slice-based routine without cloning owned pixels.
-    fn with_slice<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
-        match self {
-            Pixels::Owned(v) => f(v.as_slice()),
-            Pixels::View(v) => f(&v.to_vec()),
-        }
-    }
-
     fn put_on_canvas(&self, canvas: &web_sys::HtmlCanvasElement, w: u32, h: u32) {
         match self {
             Pixels::View(v) => web::put_pixels_view(canvas, v, w, h),
@@ -81,6 +73,18 @@ impl Pixels {
         match self {
             Pixels::View(v) => pworker::load_view(id, v, w, h),
             Pixels::Owned(v) => pworker::load(id, v, w, h),
+        }
+    }
+
+    /// Hand the buffer to the worker without keeping a main-thread copy. The
+    /// view is detached; only call this when the pixels are not used again.
+    fn into_worker_transfer(&self, id: usize, w: usize, h: usize) -> bool {
+        match self {
+            Pixels::View(v) => pworker::load_view_transfer(id, v, w, h),
+            Pixels::Owned(v) => {
+                pworker::load(id, v, w, h);
+                true
+            }
         }
     }
 
@@ -102,27 +106,9 @@ impl Pixels {
         crop
     }
 
-    async fn to_png_blob(&self, w: usize, h: usize) -> Result<Blob, JsValue> {
-        let canvas = web::create_canvas(w as u32, h as u32);
-        self.put_on_canvas(&canvas, w as u32, h as u32);
-        web::canvas_to_blob(&canvas, "image/png").await
-    }
-
     fn downscale(&self, w: usize, h: usize, long_edge: u32) -> (Vec<u8>, usize, usize) {
         resample::fit_long_edge(&self.as_cow(), w, h, long_edge)
     }
-}
-
-/// Geometry on a cached source, materialised for callers that mutate.
-fn owned_geometry(
-    full: &Pixels,
-    fw: usize,
-    fh: usize,
-    edit: &EditParams,
-) -> (Vec<u8>, usize, usize) {
-    let src = full.as_cow();
-    let (p, w, h) = geometry(&src, fw, fh, edit);
-    (p.into_owned(), w, h)
 }
 
 // --- media cache (non-reactive) ---------------------------------------------
@@ -153,12 +139,13 @@ struct FullDevelop {
 
 #[derive(Clone)]
 struct PhotoData {
-    /// Full-res RGBA. None until materialized (imports decode preview-only);
-    /// may be evicted under memory pressure, but never while `dirty`.
-    full: Option<(Pixels, usize, usize)>,
-    /// Un-toned 16-bit develop at `full`'s dims (RAW only). Retained for
-    /// export parity; counted in the full-res budget.
-    neutral: Option<NeutralData>,
+    /// True when the pixel worker holds this item's full-res RGBA under the
+    /// item id. The app thread never keeps a copy; eviction unloads it.
+    /// False until materialized (imports decode preview-only).
+    full: bool,
+    /// True when the worker also holds the un-toned 16-bit develop (RAW
+    /// only), which the neutral render path starts from.
+    neutral: bool,
     /// Source dimensions, known without holding the pixels.
     full_dims: (usize, usize),
     preview: (Vec<u8>, usize, usize),
@@ -208,14 +195,26 @@ fn get_photo(id: usize) -> Option<Rc<PhotoData>> {
     CACHE.with(|c| c.borrow().photos.get(&id).cloned())
 }
 
-/// Decoded full-res budget across all items (~512 MB, e.g. ~5 25MP photos).
-/// The worker mirrors the same set, so the true footprint is ~2x this plus
-/// decode transients — keep it well under the renderer's memory cap.
-/// Dirty items (a destructive op landed since the last session save) are
-/// exempt — their cache copy is the only source of truth until persisted.
-const FULL_BUDGET: usize = 512 << 20;
+/// Decoded full-res budget for the worker's buffers. The worker is the only
+/// owner now, so there is no mirror to budget for: 1 GB on devices reporting
+/// at least 8 GB of RAM, else 512 MB. Dirty items (a destructive op landed
+/// since the last session save) are exempt — the worker copy is the only
+/// source of truth until persisted.
+fn full_budget() -> usize {
+    FULL_BUDGET.with(|b| {
+        if b.get() == 0 {
+            let gb = js_sys::Reflect::get(&web::window(), &JsValue::from_str("deviceMemory"))
+                .ok()
+                .and_then(|v| v.as_f64())
+                .unwrap_or(4.0);
+            b.set(if gb >= 8.0 { 1 << 30 } else { 512 << 20 });
+        }
+        b.get()
+    })
+}
 
 thread_local! {
+    static FULL_BUDGET: Cell<usize> = const { Cell::new(0) };
     static FULL_INFLIGHT: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
     static FULL_WAITERS: RefCell<HashMap<usize, Vec<Box<dyn FnOnce()>>>> =
         RefCell::new(HashMap::new());
@@ -228,7 +227,7 @@ fn full_present(id: usize) -> bool {
         c.borrow()
             .photos
             .get(&id)
-            .map(|p| p.full.is_some())
+            .map(|p| p.full)
             .unwrap_or(false)
     })
 }
@@ -241,10 +240,13 @@ fn touch_full(id: usize) {
     LAST_USE.with(|l| l.borrow_mut().insert(id, t));
 }
 
-/// Bytes a decoded item keeps alive (u8 frame + 16-bit neutral develop).
+/// Worker bytes a decoded item keeps alive (u8 frame + 16-bit develop).
 fn photo_bytes(p: &PhotoData) -> usize {
-    p.full.as_ref().map(|f| f.0.len()).unwrap_or(0)
-        + p.neutral.as_ref().map(|n| n.pixels.length() as usize * 2).unwrap_or(0)
+    if !p.full {
+        return 0;
+    }
+    let px = p.full_dims.0 * p.full_dims.1;
+    px * 4 + if p.neutral { px * 2 } else { 0 }
 }
 
 /// Drop least-recently-used clean full-res buffers until the decoded total
@@ -252,14 +254,15 @@ fn photo_bytes(p: &PhotoData) -> usize {
 fn evict_full_lru() {
     let evicted: Vec<usize> = CACHE.with(|c| {
         let mut c = c.borrow_mut();
+        let budget = full_budget();
         let mut total: usize = c.photos.values().map(|p| photo_bytes(p)).sum();
-        if total <= FULL_BUDGET {
+        if total <= budget {
             return Vec::new();
         }
         let mut candidates: Vec<(u64, usize, usize)> = c
             .photos
             .iter()
-            .filter(|(_, p)| !p.dirty && p.full.is_some())
+            .filter(|(_, p)| !p.dirty && p.full)
             .map(|(id, p)| {
                 (
                     LAST_USE.with(|l| l.borrow().get(id).copied()).unwrap_or(0),
@@ -271,13 +274,13 @@ fn evict_full_lru() {
         candidates.sort_by_key(|c| c.0);
         let mut evicted = Vec::new();
         for (_, id, len) in candidates {
-            if total <= FULL_BUDGET {
+            if total <= budget {
                 break;
             }
             if let Some(p) = c.photos.get_mut(&id) {
                 let p = Rc::make_mut(p);
-                p.full = None;
-                p.neutral = None;
+                p.full = false;
+                p.neutral = false;
                 total -= len;
                 evicted.push(id);
             }
@@ -289,13 +292,10 @@ fn evict_full_lru() {
     }
 }
 
-/// Install a freshly decoded full-res buffer: cache + worker + LRU, then run
-/// waiters and nudge items so pending hi-res renders reschedule.
-fn materialize_full(state: AppState, id: usize, full: FullDevelop) {
-    full.pixels.load_into_worker(id, full.w, full.h);
-    if let Some(n) = &full.neutral {
-        pworker::load_neutral_view(id, &n.pixels, n.w, n.h, n.white, n.tone.as_ref());
-    }
+/// Record that the worker now holds a freshly decoded full-res frame. The
+/// pixels themselves never come to this thread; only the flags land here.
+/// Runs waiters and nudges items so pending hi-res renders reschedule.
+fn materialize_full(state: AppState, id: usize, dims: (usize, usize), neutral: bool) {
     // Sensor pixels supersede the display proxy (and any render it fed).
     if proxy_in_mem(id) {
         drop_proxy(id);
@@ -303,9 +303,9 @@ fn materialize_full(state: AppState, id: usize, full: FullDevelop) {
     CACHE.with(|c| {
         if let Some(p) = c.borrow_mut().photos.get_mut(&id) {
             let p = Rc::make_mut(p);
-            p.full_dims = (full.w, full.h);
-            p.full = Some((full.pixels, full.w, full.h));
-            p.neutral = full.neutral;
+            p.full_dims = dims;
+            p.full = true;
+            p.neutral = neutral;
         }
     });
     touch_full(id);
@@ -319,6 +319,29 @@ fn materialize_full(state: AppState, id: usize, full: FullDevelop) {
     // render effect (the restored selection stayed on its 1024px preview);
     // `hi_built` is the signal that effect listens to for exactly this.
     state.hi_built.update(|g| *g += 1);
+}
+
+/// Install an eagerly developed RAW frame (the import fallback when the
+/// original could not be stored) into the worker. Returns the cache flags.
+fn install_full_develop(id: usize, full: Option<FullDevelop>) -> (bool, bool) {
+    let Some(mut f) = full else { return (false, false) };
+    let neutral = f.neutral.take();
+    if !f.pixels.into_worker_transfer(id, f.w, f.h) {
+        return (false, false);
+    }
+    let has_neutral = match &neutral {
+        Some(n) => pworker::load_neutral_transfer(
+            id,
+            &n.pixels,
+            n.w,
+            n.h,
+            n.white,
+            n.tone.as_ref(),
+        ),
+        None => false,
+    };
+    touch_full(id);
+    (true, has_neutral)
 }
 
 /// Decode an item's full-res pixels on demand from its source blob (healed
@@ -346,32 +369,53 @@ fn ensure_full(state: AppState, id: usize, waiter: Option<Box<dyn FnOnce()>>) {
         c.borrow().photos.get(&id).map(|p| p.raw).unwrap_or(false)
     });
     spawn_local(async move {
-        let decoded = if let Some(blob) = src {
-            match decode_full_source(&blob).await {
-                Some((px, w, h)) => Some(FullDevelop { pixels: px, w, h, neutral: None }),
-                None => None,
-            }
-        } else if is_raw {
-            // Lazy develop: hand the stored Blob to the worker, which reads it
-            // itself — the app thread never sees the file bytes.
-            match session::load_raw_blob(id).await {
+        // Whereever the pixels come from, they are installed in the worker
+        // and never reach this thread: a non-RAW source is decoded inside the
+        // worker straight from its Blob, and a RAW develop is transferred
+        // from the RAW worker into the interactive one.
+        let mut installed: Option<((usize, usize), bool)> = None;
+        if is_raw {
+            // Lazy develop: hand the stored Blob to the RAW worker, then move
+            // its transferred views into the interactive worker.
+            let decoded = match session::load_raw_blob(id).await {
                 Some(blob) => raw_develop_async(id, blob.as_ref()).await,
                 None => None,
+            };
+            if decoded.is_some() && !pworker::raw_busy() {
+                // The develop is in the interactive worker now; the RAW
+                // worker's wasm (hundreds of MB after a 24 MP develop, and
+                // never shrinking) would otherwise sit idle through composite
+                // + encode — the peak of the whole export. Recreated lazily.
+                pworker::raw_shutdown();
             }
-        } else {
-            None
-        };
-        if is_raw && decoded.is_some() && !pworker::raw_busy() {
-            // The full frame is on this thread now; the RAW worker's wasm
-            // (hundreds of MB after a 24 MP develop, and never shrinking)
-            // would otherwise sit idle through composite + encode — the
-            // peak of the whole export. Recreated lazily on the next RAW op.
-            pworker::raw_shutdown();
+            if let Some(mut full) = decoded {
+                let neutral = full.neutral.take();
+                let dims = (full.w, full.h);
+                let ok = full.pixels.into_worker_transfer(id, full.w, full.h);
+                let neutral_ok = match &neutral {
+                    Some(n) => pworker::load_neutral_transfer(
+                        id,
+                        &n.pixels,
+                        n.w,
+                        n.h,
+                        n.white,
+                        n.tone.as_ref(),
+                    ),
+                    None => false,
+                };
+                if ok {
+                    installed = Some((dims, neutral_ok));
+                }
+            }
+        } else if let Some(blob) = src {
+            installed = await_worker(move |cb| pworker::load_photo(id, blob.as_ref(), cb))
+                .await
+                .map(|dims| (dims, false));
         }
         FULL_INFLIGHT.with(|f| f.borrow_mut().remove(&id));
         let still_tracked = CACHE.with(|c| c.borrow().photos.contains_key(&id));
-        match (decoded, still_tracked) {
-            (Some(full), true) => materialize_full(state, id, full),
+        match (installed, still_tracked) {
+            (Some((dims, neutral)), true) => materialize_full(state, id, dims, neutral),
             _ => {
                 // Gone or undecodable — drop waiters; their fns re-check and bail.
                 let waiters =
@@ -406,31 +450,6 @@ async fn ensure_full_async(state: AppState, id: usize) -> bool {
         sleep_ms(50).await;
     }
     full_present(id)
-}
-
-/// Full-res RGBA for a non-RAW source blob. The decode runs in the pixel
-/// worker (zune-jpeg), so the app thread never does a full-size `<img>` +
-/// `getImageData` copy; `<img>` remains the fallback when the worker is
-/// unavailable or cannot decode the format.
-async fn decode_full_source(blob: &Blob) -> Option<(Pixels, usize, usize)> {
-    let slot: Rc<RefCell<Option<Option<(Uint8Array, usize, usize)>>>> =
-        Rc::new(RefCell::new(None));
-    let done = slot.clone();
-    if pworker::decode_photo(blob.as_ref(), move |d| *done.borrow_mut() = Some(d)) {
-        for _ in 0..1200 {
-            if slot.borrow().is_some() {
-                break;
-            }
-            sleep_ms(25).await;
-        }
-    }
-    if let Some(Some((px, w, h))) = slot.borrow_mut().take() {
-        return Some((Pixels::view(px), w, h));
-    }
-    let (img, url) = web::load_image(blob).await.ok()?;
-    let _ = Url::revoke_object_url(&url);
-    let (px, w, h) = web::rgba_from_image(&img);
-    Some((Pixels::owned(px), w, h))
 }
 
 // --- display proxies for lazy RAW items ---------------------------------------
@@ -637,6 +656,122 @@ struct DecodedProxy {
     /// Un-toned 16-bit develop at the proxy's dims, when the decode
     /// demosaiced (not for camera JPEGs and stored proxies).
     neutral: Option<NeutralData>,
+    /// The pixel worker decoded the record itself and already holds these
+    /// pixels; `land_proxy` must not ship them back.
+    in_worker: bool,
+}
+
+/// Paint a selected, unedited RAW's display proxy straight into the hi cache.
+/// An identity edit renders from the proxy to a resample of these same pixels,
+/// so seeding the cache skips the worker round trip that would otherwise keep
+/// a reopened session on the soft preview for half a second.
+fn seed_hi_from_proxy(state: AppState, id: usize) {
+    if state.selected.get_untracked() != Some(id) {
+        return;
+    }
+    let Some(photo) = get_photo(id) else { return };
+    if !photo.raw || photo.full || photo.dirty {
+        return;
+    }
+    let Some(item) = state.items.with(|v| v.iter().find(|m| m.id == id).cloned()) else {
+        return;
+    };
+    if !photo_unedited(&item) {
+        return;
+    }
+    let Some(p) = proxy_data(id) else { return };
+    if p.w == 0 || p.h == 0 {
+        return;
+    }
+    // A frame already on screen for this item wins unless the proxy is
+    // strictly larger (a develop upgrade); never downgrade the sharp frame.
+    let replace = HI_CACHE.with(|c| {
+        let b = c.borrow();
+        match b.as_ref() {
+            None => true,
+            Some(hi) => hi.item_id != id || hi.w < p.w,
+        }
+    });
+    if !replace {
+        return;
+    }
+    let canvas = web::create_canvas(p.w as u32, p.h as u32);
+    p.pixels.put_on_canvas(&canvas, p.w as u32, p.h as u32);
+    let hi = HiCache {
+        item_id: id,
+        edit_fp: edit_fingerprint(&item),
+        source_fp: source_fingerprint(photo.gen, proxy_gen(id)),
+        canvas: Some(canvas),
+        bitmap: None,
+        w: p.w,
+        h: p.h,
+        prefetched: false,
+    };
+    HI_CACHE.with(|c| *c.borrow_mut() = Some(hi));
+}
+
+/// Take the reload-prefetched proxy bitmap (see index.html) if it has arrived
+/// and install it as the hi frame. Its decode overlapped the wasm boot, so the
+/// first restored frame is a `drawImage`; the record decode that lands later
+/// only backs editing. Only a pristine RAW can show the stored display proxy
+/// as-is — anything edited renders from the proxy plus its params.
+fn seed_hi_from_prefetch(item: &MediaItem, photo: &PhotoData, edit_fp: u64, src_fp: u64) {
+    if !photo.raw || photo.full || photo.dirty || !photo_unedited(item) {
+        return;
+    }
+    let Some(bmp) = web::take_prefetched_proxy(item.id) else { return };
+    let (w, h) = (bmp.width(), bmp.height());
+    let replace = w > 0
+        && h > 0
+        && HI_CACHE.with(|c| {
+            let b = c.borrow();
+            match b.as_ref() {
+                None => true,
+                Some(hi) => hi.item_id != item.id || hi.w < w as usize,
+            }
+        });
+    if !replace {
+        bmp.close();
+        return;
+    }
+    HI_CACHE.with(|c| {
+        *c.borrow_mut() = Some(HiCache {
+            item_id: item.id,
+            edit_fp,
+            source_fp: src_fp,
+            canvas: None,
+            bitmap: Some(bmp),
+            w: w as usize,
+            h: h as usize,
+            prefetched: true,
+        })
+    });
+}
+
+/// Seed the prefetched frame and paint it onto the visible canvas if it is the
+/// current hi frame. Used both when the prefetch bitmap event fires and on a
+/// render pass that has no preview yet, so a restored session reaches its
+/// sharp frame without waiting for the low-res preview decode to drive a pass.
+fn paint_prefetched_hi(
+    item: &MediaItem,
+    photo: &PhotoData,
+    canvas: Option<&web_sys::HtmlCanvasElement>,
+) -> bool {
+    let edit_fp = edit_fingerprint(item);
+    let src_fp = source_fingerprint(photo.gen, proxy_gen(item.id));
+    seed_hi_from_prefetch(item, photo, edit_fp, src_fp);
+    let Some(canvas) = canvas else { return false };
+    let mut painted = false;
+    HI_CACHE.with(|c| {
+        let b = c.borrow();
+        if let Some(hi) = b.as_ref() {
+            if hi.prefetched && hi.item_id == item.id && hi.edit_fp == edit_fp {
+                blit_hi_frame(hi, canvas, None);
+                painted = true;
+            }
+        }
+    });
+    painted
 }
 
 /// Install a decoded proxy: cache, worker, dims, version bump. False when the
@@ -647,17 +782,25 @@ fn land_proxy(state: AppState, id: usize, decoded: DecodedProxy) -> bool {
         c.borrow()
             .photos
             .get(&id)
-            .map(|p| p.raw && p.full.is_none())
+            .map(|p| p.raw && !p.full)
             .unwrap_or(false)
     });
     if !lazy {
+        if decoded.in_worker {
+            pworker::unload(proxy_wid(id));
+        }
         return false;
     }
     // Never downgrade a sensor develop that landed while this was decoding.
     if !decoded.developed && proxy_developed(id) {
+        if decoded.in_worker {
+            pworker::unload(proxy_wid(id));
+        }
         return false;
     }
-    decoded.pixels.load_into_worker(proxy_wid(id), decoded.w, decoded.h);
+    if !decoded.in_worker {
+        decoded.pixels.load_into_worker(proxy_wid(id), decoded.w, decoded.h);
+    }
     if let Some(n) = &decoded.neutral {
         pworker::load_neutral_view(
             proxy_wid(id),
@@ -668,10 +811,12 @@ fn land_proxy(state: AppState, id: usize, decoded: DecodedProxy) -> bool {
             n.tone.as_ref(),
         );
     }
+    let first_land = !proxy_in_mem(id);
+    let (dw, dh) = (decoded.w, decoded.h);
     CACHE.with(|c| {
         if let Some(p) = c.borrow_mut().photos.get_mut(&id) {
             let p = Rc::make_mut(p);
-            if p.full.is_none() && p.raw && decoded.frame.0 > 0 && decoded.frame.1 > 0 {
+            if !p.full && p.raw && decoded.frame.0 > 0 && decoded.frame.1 > 0 {
                 p.full_dims = decoded.frame;
             }
         }
@@ -691,8 +836,27 @@ fn land_proxy(state: AppState, id: usize, decoded: DecodedProxy) -> bool {
     });
     touch_proxy(id);
     bump_proxy_gen(id);
+    // A first land of the record the prefetch bitmap came from: the seeded
+    // frame is the same pixels, so stamp it with the new proxy generation
+    // rather than schedule a redundant worker render.
+    if first_land {
+        let photo_gen = CACHE.with(|c| c.borrow().photos.get(&id).map(|p| p.gen).unwrap_or(0));
+        HI_CACHE.with(|c| {
+            if let Some(hi) = c.borrow_mut().as_mut() {
+                if hi.prefetched && hi.item_id == id && hi.w == dw && hi.h == dh {
+                    hi.source_fp = source_fingerprint(photo_gen, proxy_gen(id));
+                    hi.prefetched = false;
+                }
+            }
+        });
+    }
     evict_proxy_lru(state, id);
+    seed_hi_from_proxy(state, id);
     state.items.update(|_| {});
+    // Same spawned-task caveat as `materialize_full`: an `items` update from
+    // an async decode does not flush the render effect, so a restored RAW
+    // would stay on its 256px preview instead of re-rendering from the proxy.
+    state.hi_built.update(|g| *g += 1);
     true
 }
 
@@ -737,6 +901,41 @@ fn developed_proxy_record(
         session::jset(&o, "tone", Uint8Array::from(&t[..]));
     }
     o.into()
+}
+
+fn display_proxy_record(blob: &Blob, frame: (usize, usize)) -> JsValue {
+    let o = js_sys::Object::new();
+    session::jset(&o, "kind", "display");
+    session::jset(&o, "orientation", 1.0);
+    session::jset(&o, "bytes", blob);
+    session::jset(&o, "full_w", frame.0 as f64);
+    session::jset(&o, "full_h", frame.1 as f64);
+    o.into()
+}
+
+/// Persist camera-JPEG pixels already decoded and downscaled to display size.
+/// A reload then decodes one ≤3200px JPEG on the main thread instead of
+/// re-running the full camera decode in the RAW worker — the difference
+/// between a ~0.5 s and a ~2.5 s restore for a 26 MP file.
+fn persist_display_proxy(id: usize, px: Pixels, w: usize, h: usize, frame: (usize, usize)) {
+    spawn_local(async move {
+        let canvas = web::create_canvas(w as u32, h as u32);
+        px.put_on_canvas(&canvas, w as u32, h as u32);
+        let Ok(blob) = web::canvas_to_jpeg_blob(&canvas, 0.9).await else { return };
+        let still_camera = CACHE.with(|c| {
+            c.borrow()
+                .photos
+                .get(&id)
+                .map(|p| p.raw && !p.full)
+                .unwrap_or(false)
+        });
+        // A sensor develop landing first makes this record superseded.
+        if !still_camera || proxy_developed(id) {
+            return;
+        }
+        let Ok(db) = session::open_db().await else { return };
+        let _ = session::put_proxy(&db, id, &display_proxy_record(&blob, frame)).await;
+    });
 }
 
 fn parse_proxy_record(v: &JsValue) -> Option<StoredProxy> {
@@ -904,29 +1103,53 @@ async fn raw_source_src(id: usize) -> Option<JsValue> {
     session::load_raw_blob(id).await.map(JsValue::from)
 }
 
-/// Decode a stored proxy record. A "raw" record is already sensor pixels —
-/// only a JPEG decode remains; a "camera" record still needs the WASM decode.
+/// Decode a stored proxy record. "raw" (sensor develop) and "display"
+/// (downscaled camera JPEG) records are already at proxy size — only a JPEG
+/// decode remains; a legacy "camera" record holds the full-size embedded JPEG
+/// and still needs the WASM decode.
 async fn decode_stored_proxy(id: usize, rec: StoredProxy) -> Option<DecodedProxy> {
-    if rec.kind == "raw" {
+    if rec.kind == "raw" || rec.kind == "display" {
+        let developed = rec.kind == "raw";
+        if developed {
+            store_tone(id, rec.tone);
+        }
+        let t = perf::now();
         let blob = match rec.bytes.dyn_into::<Blob>() {
             Ok(b) => b,
             Err(v) => web::view_to_blob(&js_sys::Uint8Array::new(&v), "image/jpeg").ok()?,
         };
-        let (img, url) = web::load_image(&blob).await.ok()?;
-        let _ = Url::revoke_object_url(&url);
-        let (px, w, h) = web::rgba_from_image(&img);
-        store_tone(id, rec.tone);
+        // The worker decodes the record and keeps its own copy; the reply is a
+        // transferred buffer, so the app thread does neither the JPEG decode
+        // nor the canvas readback. The reload prefetch has already painted
+        // this record's bitmap — this decode only backs editing.
+        let for_worker = blob.clone();
+        let decoded = await_worker(move |cb| {
+            pworker::load_photo_view(proxy_wid(id), &for_worker, cb)
+        })
+        .await;
+        let (pixels, w, h, in_worker) = match decoded {
+            Some((p, w, h)) => (Pixels::view(p), w, h, true),
+            None => {
+                let (px, w, h) = web::rgba_from_blob(&blob).await.ok()?;
+                (Pixels::owned(px), w, h, false)
+            }
+        };
+        perf::record("proxy.restore_decode", perf::now() - t);
         Some(DecodedProxy {
-            pixels: Pixels::owned(px),
+            pixels,
             w,
             h,
             frame: rec.frame,
-            developed: true,
+            developed,
             neutral: None,
+            in_worker,
         })
     } else {
         let r = camera_proxy_async(&rec.bytes, rec.orientation).await?;
         let frame = if rec.frame.0 > 0 { rec.frame } else { (r.full_w, r.full_h) };
+        // Rewrite the record at display size so the next reload skips the
+        // worker camera decode.
+        persist_display_proxy(id, Pixels::view(r.pixels.clone()), r.w, r.h, frame);
         Some(DecodedProxy {
             pixels: Pixels::view(r.pixels),
             w: r.w,
@@ -934,6 +1157,7 @@ async fn decode_stored_proxy(id: usize, rec: StoredProxy) -> Option<DecodedProxy
             frame,
             developed: false,
             neutral: None,
+            in_worker: false,
         })
     }
 }
@@ -947,14 +1171,7 @@ async fn decode_camera_from_raw(id: usize, src: &JsValue) -> Option<DecodedProxy
             let frame = oriented_dims(meta.camera_w, meta.camera_h, orientation);
             if let Some(r) = camera_proxy_async(&jpeg.clone().into(), orientation).await {
                 let frame = if frame.0 > 0 { frame } else { (r.full_w, r.full_h) };
-                if let Ok(db) = session::open_db().await {
-                    let _ = session::put_proxy(
-                        &db,
-                        id,
-                        &camera_proxy_record(&jpeg, orientation, frame),
-                    )
-                    .await;
-                }
+                persist_display_proxy(id, Pixels::view(r.pixels.clone()), r.w, r.h, frame);
                 return Some(DecodedProxy {
                     pixels: Pixels::view(r.pixels),
                     w: r.w,
@@ -962,6 +1179,7 @@ async fn decode_camera_from_raw(id: usize, src: &JsValue) -> Option<DecodedProxy
                     frame,
                     developed: false,
                     neutral: None,
+                    in_worker: false,
                 });
             }
         }
@@ -974,6 +1192,7 @@ async fn decode_camera_from_raw(id: usize, src: &JsValue) -> Option<DecodedProxy
         h: r.h,
         frame: (r.full_w, r.full_h),
         developed: true,
+        in_worker: false,
     })
 }
 
@@ -1021,7 +1240,7 @@ fn pump_upgrade(state: AppState) {
     }
     let Some(id) = PROXY_UPGRADE_WANT.with(|w| w.get()) else { return };
     let Some(photo) = get_photo(id) else { return };
-    if !photo.raw || photo.full.is_some() {
+    if !photo.raw || photo.full {
         return;
     }
     // The user moved on; a new selection re-arms the request.
@@ -1073,6 +1292,7 @@ fn pump_upgrade(state: AppState) {
                     h: r.h,
                     frame,
                     developed: true,
+                    in_worker: false,
                 },
             );
             if landed {
@@ -1104,7 +1324,7 @@ fn persist_developed_proxy(
             c.borrow()
                 .photos
                 .get(&id)
-                .map(|p| p.raw && p.full.is_none())
+                .map(|p| p.raw && !p.full)
                 .unwrap_or(false)
         });
         if !still_lazy {
@@ -1124,7 +1344,7 @@ fn develop_proxy_pool(state: AppState, id: usize, name: String) {
         c.borrow()
             .photos
             .get(&id)
-            .map(|p| p.raw && p.full.is_none())
+            .map(|p| p.raw && !p.full)
             .unwrap_or(false)
     });
     if !eligible || proxy_developed(id) {
@@ -1165,6 +1385,7 @@ fn develop_proxy_pool(state: AppState, id: usize, name: String) {
                     h: p.h,
                     frame,
                     developed: true,
+                    in_worker: false,
                 },
             );
             if landed {
@@ -1233,7 +1454,7 @@ fn ensure_proxy(state: AppState, id: usize, develop: bool) {
         ensure_full(state, id, None);
         return;
     }
-    if photo.full.is_some() {
+    if photo.full {
         return;
     }
     touch_proxy(id);
@@ -1481,8 +1702,8 @@ fn prefetch_previews(state: AppState) {
 /// Worker id + pixel dims to render from: sensor pixels when loaded, else the
 /// display proxy.
 fn render_source(id: usize, photo: &PhotoData) -> (usize, (usize, usize)) {
-    if let Some((_, w, h)) = &photo.full {
-        (id, (*w, *h))
+    if photo.full {
+        (id, photo.full_dims)
     } else if let Some(p) = proxy_data(id) {
         (proxy_wid(id), (p.w, p.h))
     } else {
@@ -1735,16 +1956,7 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                 if let Some(b) = ing.fallback.take() {
                     CACHE.with(|c| c.borrow_mut().raw_fallback.insert(id, Rc::new(b)));
                 }
-                let mut full = ing.full.take();
-                if let Some(f) = &full {
-                    f.pixels.load_into_worker(id, f.w, f.h);
-                    if let Some(n) = &f.neutral {
-                        pworker::load_neutral_view(id, &n.pixels, n.w, n.h, n.white, n.tone.as_ref());
-                    }
-                    touch_full(id);
-                }
-                let neutral = full.as_mut().and_then(|f| f.neutral.take());
-                let full = full.map(|f| (f.pixels, f.w, f.h));
+                let (full, neutral) = install_full_develop(id, ing.full.take());
                 CACHE.with(|c| {
                     c.borrow_mut().photos.insert(
                         id,
@@ -1843,8 +2055,8 @@ fn ingest_files(state: AppState, files: Vec<File>) {
                     c.photos.insert(
                         id,
                         Rc::new(PhotoData {
-                            full: None,
-                            neutral: None,
+                            full: false,
+                            neutral: false,
                             full_dims: (fw, fh),
                             preview,
                             dirty: false,
@@ -1954,16 +2166,7 @@ async fn ingest_drive_bytes(
             if let Some(b) = ing.fallback.take() {
                 CACHE.with(|c| c.borrow_mut().raw_fallback.insert(id, Rc::new(b)));
             }
-            let mut full = ing.full.take();
-            if let Some(f) = &full {
-                f.pixels.load_into_worker(id, f.w, f.h);
-                if let Some(n) = &f.neutral {
-                    pworker::load_neutral_view(id, &n.pixels, n.w, n.h, n.white, n.tone.as_ref());
-                }
-                touch_full(id);
-            }
-            let neutral = full.as_mut().and_then(|f| f.neutral.take());
-            let full = full.map(|f| (f.pixels, f.w, f.h));
+            let (full, neutral) = install_full_develop(id, ing.full.take());
             CACHE.with(|c| {
                 c.borrow_mut().photos.insert(
                     id,
@@ -2028,8 +2231,8 @@ async fn ingest_drive_bytes(
                 c.photos.insert(
                     id,
                     Rc::new(PhotoData {
-                        full: None,
-                        neutral: None,
+                        full: false,
+                        neutral: false,
                         full_dims: (fw, fh),
                         preview,
                         dirty: false,
@@ -2346,9 +2549,69 @@ struct HiCache {
     item_id: usize,
     edit_fp: u64,
     source_fp: u64,
-    canvas: web_sys::HtmlCanvasElement,
+    /// The frame, as a canvas (worker renders, proxy seeds) or as the decoded
+    /// bitmap the reload prefetch produced — storing the bitmap skips a 27 MB
+    /// draw on the restore path and blits straight to the visible canvas.
+    canvas: Option<web_sys::HtmlCanvasElement>,
+    bitmap: Option<web_sys::ImageBitmap>,
     w: usize,
     h: usize,
+    /// Painted from the reload prefetch bitmap for the stored proxy, so a
+    /// matching record decode may re-stamp `source_fp` instead of re-rendering.
+    prefetched: bool,
+}
+
+/// Blit a cached hi frame into the visible canvas — whole, or a source window
+/// for the cropped view. The frame is either a canvas or (restore prefetch) an
+/// ImageBitmap; both blit without a readback.
+fn blit_hi_frame(
+    hi: &HiCache,
+    canvas: &web_sys::HtmlCanvasElement,
+    crop: Option<(usize, usize, usize, usize)>,
+) {
+    let (cw, ch) = crop.map_or((hi.w as u32, hi.h as u32), |(_, _, w, h)| {
+        (w as u32, h as u32)
+    });
+    canvas.set_width(cw);
+    canvas.set_height(ch);
+    let ctx = web::ctx2d(canvas);
+    match (&hi.canvas, &hi.bitmap) {
+        (Some(src), _) => {
+            if let Some((sx, sy, sw, sh)) = crop {
+                let _ = ctx.draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+                    src,
+                    sx as f64,
+                    sy as f64,
+                    sw as f64,
+                    sh as f64,
+                    0.0,
+                    0.0,
+                    sw as f64,
+                    sh as f64,
+                );
+            } else {
+                let _ = ctx.draw_image_with_html_canvas_element(src, 0.0, 0.0);
+            }
+        }
+        (None, Some(bmp)) => {
+            if let Some((sx, sy, sw, sh)) = crop {
+                let _ = ctx.draw_image_with_image_bitmap_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+                    bmp,
+                    sx as f64,
+                    sy as f64,
+                    sw as f64,
+                    sh as f64,
+                    0.0,
+                    0.0,
+                    sw as f64,
+                    sh as f64,
+                );
+            } else {
+                let _ = ctx.draw_image_with_image_bitmap(bmp, 0.0, 0.0);
+            }
+        }
+        (None, None) => {}
+    }
 }
 
 /// Crop-window render for the cropped view: the canvas holds only the crop
@@ -2596,56 +2859,6 @@ fn source_fingerprint(photo_gen: u64, proxy_gen: u64) -> u64 {
     h.finish()
 }
 
-/// Render the photo from its full-res original at (roughly) display
-/// resolution. Mirrors the preview pipeline and export.
-fn render_hi(item: &MediaItem, req_w: f64, req_h: f64) -> Option<HiCache> {
-    let photo = get_photo(item.id)?;
-    let edit_fp = edit_fingerprint(item);
-    let source_fp = source_fingerprint(photo.gen, proxy_gen(item.id));
-    let (fpix, fw, fh) = photo.full.as_ref()?;
-    let (ww, wh) = working_dims(*fw, *fh, &item.edit);
-    let (tw, th) = hi_target(req_w, req_h, ww, wh, HI_MAX_EDGE as u32);
-    let neutral = photo
-        .neutral
-        .as_ref()
-        .filter(|n| n.w == *fw && n.h == *fh && pipeline::neutral_eligible(&item.edit));
-    let buf = match neutral {
-        Some(n) => {
-            let src = n.pixels.to_vec();
-            let tone = n.tone.as_ref().map(|t| rawops::tone_table_for(t, item.edit.raw.highlights));
-            let frame = pipeline::render_neutral(
-                &src,
-                *fw,
-                *fh,
-                &item.edit,
-                PipeTarget::new(tw, th),
-                item.id as u32,
-                n.white,
-                tone.as_deref(),
-            );
-            let mut out = vec![0u8; tw * th * 4];
-            wide::narrow_dithered(&frame.pixels, &mut out, tw, th);
-            out
-        }
-        None => {
-            let src = fpix.as_cow();
-            pipeline::render(
-                &src,
-                *fw,
-                *fh,
-                &item.edit,
-                PipeTarget::new(tw, th),
-                item.id as u32,
-            )
-            .pixels
-        }
-    };
-    let canvas = web::create_canvas(tw as u32, th as u32);
-    web::put_pixels(&canvas, &buf, tw as u32, th as u32);
-    composite_layers(&canvas, &item.layers, tw, th);
-    Some(HiCache { item_id: item.id, edit_fp, source_fp, canvas, w: tw, h: th })
-}
-
 fn video_export_dims(edit: &EditParams, w: usize, h: usize) -> (usize, usize, usize, usize, usize, usize) {
     let (mut cw, mut ch) = (w, h);
     if edit.rot90 % 2 == 1 {
@@ -2721,128 +2934,65 @@ async fn render_photo_export(
         return None;
     }
     let photo = get_photo(item.id)?;
-    let (pix, fw, fh) = photo.full.as_ref()?;
-    // A full-res export must fit a ~4 GB box. An untouched unrotated frame is
-    // put on the canvas straight from the cached buffer (a JS view for RAW
-    // develops); a Rust copy only exists when geometry or colour edits need a
-    // mutable frame, and it is dropped before crop/encode.
-    let mut geometry_span = perf::Span::new("export.geometry");
-    let plain_geometry = item.edit.rot90 % 4 == 0 && item.edit.fine_angle.abs() <= 0.01;
-    let untouched = item.edit.raw.is_identity() && !item.edit.is_color_touched();
-    // A neutral develop re-runs geometry and the develop at 16-bit from the
-    // un-toned sensor frame, with the camera tone as the final stage, so the
-    // highlights slider acts on unclipped data exactly as in the worker.
-    let neutral = photo
-        .neutral
-        .as_ref()
-        .filter(|n| n.w == *fw && n.h == *fh && pipeline::neutral_eligible(&item.edit));
-    let geometry = if neutral.is_some() || plain_geometry {
-        None
-    } else {
-        Some(pix.with_slice(|s| {
-            let (p, w, h) = geometry(s, *fw, *fh, &item.edit);
-            (p.into_owned(), w, h)
-        }))
-    };
-    let (w, h) = match (&neutral, &geometry) {
-        (Some(_), _) => working_dims(*fw, *fh, &item.edit),
-        (None, Some((_, w, h))) => (*w, *h),
-        (None, None) => (*fw, *fh),
-    };
-    geometry_span.set_detail(format!("{}x{}", w, h));
-    drop(geometry_span);
-    let color_span = perf::Span::new("export.color");
-    let apply_color = |v: Vec<u8>| {
-        let mut frame = PipeFrame::new(v, w, h);
-        pipeline::finish_edit(&mut frame, &item.edit, item.id as u32, 1.0);
-        frame.pixels
-    };
-    let neutral_edited: Option<Vec<u8>> = neutral.map(|n| {
-        // Plain geometry borrows the source, so the old unconditionally copy
-        // held two full wide frames (~200 MB each at 26 MP) at once. Take the
-        // single copy we need directly.
-        let (mut p, w, h) = if plain_geometry {
-            (n.pixels.to_vec(), *fw, *fh)
-        } else {
-            let src = n.pixels.to_vec();
-            let (p, gw, gh) = geometry_wide(&src, *fw, *fh, &item.edit);
-            (p.into_owned(), gw, gh)
-        };
-        let tone = n.tone.as_ref().map(|t| rawops::tone_table_for(t, item.edit.raw.highlights));
-        let mask = pipeline::mask_for_dims(w, h, &item.edit);
-        pipeline::finish_neutral_wide(
-            &mut p,
-            w,
-            h,
-            &item.edit,
-            item.id as u32,
-            mask.as_deref(),
-            n.white,
-            tone.as_deref(),
-        );
-        let mut out = vec![0u8; w * h * 4];
-        wide::narrow_dithered(&p, &mut out, w, h);
-        out
-    });
-    let mut edited: Option<Vec<u8>> = if let Some(v) = neutral_edited {
-        Some(v)
-    } else {
-        match geometry {
-            Some((v, _, _)) if untouched => Some(v),
-            Some((v, _, _)) => Some(apply_color(v)),
-            None if untouched => None,
-            None => Some(apply_color(pix.as_cow().into_owned())),
-        }
-    };
-    drop(color_span);
-
-    let (cx, cy, cw, ch) = crop_px(&item.edit, w, h);
+    if !photo.full {
+        return None;
+    }
+    let (fw, fh) = photo.full_dims;
+    let (ww, wh) = working_dims(fw, fh, &item.edit);
+    let (cx, cy, cw, ch) = crop_px(&item.edit, ww, wh);
     let (cx, cy, cw, ch) = aspect_fit(cx, cy, cw, ch, item.edit.aspect);
-    // Photo exports keep the crop's native pixels; export_dims is the video cap.
+    // Photo exports keep the crop's native pixels; export_dims is the video
+    // cap, so the target size is the crop itself.
     let (ew, eh) = (cw, ch);
     let format = state.photo_format.get_untracked();
+    let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
+    let sel = item.edit.selection.clone();
+    let id = item.id;
     let mut encode_span = perf::Span::new("export.encode");
     encode_span.set_detail(format!("{}x{}", ew, eh));
 
-    // A full-frame export with no layers is exactly the pixel buffer we hold,
-    // so JPEG can go straight to the worker. Routing it through two full-size
-    // canvases plus a ~100 MB readback pushed 26 MP exports over the
-    // renderer's memory limit.
-    let direct = cx == 0
-        && cy == 0
-        && cw == w
-        && ch == h
-        && item.layers.is_empty()
-        && matches!(format, PhotoFormat::Jpeg | PhotoFormat::JpegMax);
-    let direct_pixels = if direct {
-        match edited.take() {
-            Some(v) => Some(Uint8Array::from(&v[..])),
-            None => match &pix {
-                Pixels::View(v) => Some(v.slice(0, v.length())),
-                Pixels::Owned(v) => Some(Uint8Array::from(&v[..])),
-            },
-        }
-    } else {
-        None
-    };
-    let encoded = if let Some(view) = direct_pixels {
-        let (quality, _) = if format == PhotoFormat::JpegMax { (97, 1.0) } else { (92, 0.92) };
+    let encoded = if item.layers.is_empty() {
+        // The worker renders exactly the export rect and encodes there, so a
+        // full-resolution RGBA frame never crosses to this thread.
+        let png = format == PhotoFormat::Png;
+        let quality = if format == PhotoFormat::JpegMax { 97 } else { 92 };
         await_worker(move |cb| {
-            pworker::encode_jpeg(&view, ew as u32, eh as u32, quality, cb)
+            pworker::export_photo(
+                id,
+                &recipe,
+                (cx, cy, cw, ch),
+                ew,
+                eh,
+                png,
+                quality,
+                sel.as_ref(),
+                cb,
+            )
         })
         .await
-        .and_then(|bytes| web::bytes_to_blob(&bytes, "image/jpeg").ok())
+        .and_then(|bytes| {
+            web::view_to_blob(&bytes, if png { "image/png" } else { "image/jpeg" }).ok()
+        })
     } else {
-        // Composite onto the full geometry-corrected canvas, then crop+scale
-        // straight into the export canvas (one resample instead of two).
-        let base = web::create_canvas(w as u32, h as u32);
-        match &edited {
-            Some(v) => web::put_pixels(&base, v, w as u32, h as u32),
-            None => pix.put_on_canvas(&base, w as u32, h as u32),
-        }
-        drop(edited);
-        composite_layers(&base, &item.layers, w, h);
-
+        // Layers composite on a canvas, so the edited base has to land here at
+        // working resolution: one worker render, then crop+scale into the
+        // export canvas.
+        let frame = await_worker(move |cb| {
+            let max_edge = ww.max(wh) as u32;
+            pworker::render(
+                id,
+                &recipe,
+                ww as f64,
+                wh as f64,
+                max_edge,
+                sel.as_ref(),
+                move |r| cb(r.ok()),
+            )
+        })
+        .await?;
+        let base = web::create_canvas(frame.w, frame.h);
+        web::put_pixels_view(&base, &frame.pixels, frame.w, frame.h);
+        composite_layers(&base, &item.layers, frame.w as usize, frame.h as usize);
         let out = web::create_canvas(ew as u32, eh as u32);
         web::ctx2d(&out)
             .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
@@ -2853,14 +3003,8 @@ async fn render_photo_export(
         drop(base);
         match format {
             PhotoFormat::Jpeg | PhotoFormat::JpegMax => {
-                let (quality, fallback) = if format == PhotoFormat::JpegMax {
-                    (97, 1.0)
-                } else {
-                    (92, 0.92)
-                };
-                // The encoder runs in the worker (4:4:4, sRGB ICC); the canvas
-                // readback is transferred, so the main thread never encodes a
-                // full-res frame.
+                let quality = if format == PhotoFormat::JpegMax { 97 } else { 92 };
+                let fallback = if format == PhotoFormat::JpegMax { 1.0 } else { 0.92 };
                 let jpeg = match web::image_data_view(&out, ew as u32, eh as u32) {
                     Some(view) => {
                         await_worker(move |cb| {
@@ -3529,6 +3673,8 @@ fn loupe_clear(state: AppState) {
 thread_local! {
     static LOUPE_SRC: RefCell<Option<(usize, u64, web_sys::HtmlCanvasElement, u32, u32)>> =
         RefCell::new(None);
+    /// Latest focus-loupe crop request; older worker replies are dropped.
+    static FOCUS_LOUPE_REQ: Cell<u32> = const { Cell::new(0) };
 }
 
 /// Filmstrip focus loupe: a floating 1:1 pixel window into the hovered thumb,
@@ -3568,10 +3714,29 @@ fn FocusLoupe(state: AppState) -> impl IntoView {
             web::put_pixels(&canvas, &crop, bw as u32, bh as u32);
             true
         };
-        if let Some((px, w, h)) = &photo.full {
-            tag.set("1:1");
-            if copy_crop(px, *w, *h) {
-                return;
+        if photo.full {
+            let (fw, fh) = photo.full_dims;
+            if fw >= bw && fh >= bh {
+                // The sensor buffer lives in the worker; ask it for just the
+                // 1:1 window instead of keeping a main-thread copy.
+                let sx = ((nx * fw as f64 - bw as f64 / 2.0) as isize)
+                    .clamp(0, (fw - bw) as isize) as usize;
+                let sy = ((ny * fh as f64 - bh as f64 / 2.0) as isize)
+                    .clamp(0, (fh - bh) as isize) as usize;
+                tag.set("1:1");
+                FOCUS_LOUPE_REQ.with(|c| c.set(c.get() + 1));
+                let rgen = FOCUS_LOUPE_REQ.with(|c| c.get());
+                let ok = pworker::crop_window(id, sx, sy, bw, bh, move |reply| {
+                    if FOCUS_LOUPE_REQ.with(|c| c.get()) != rgen {
+                        return;
+                    }
+                    let Some(r) = reply else { return };
+                    let Some(canvas) = canvas_ref.get() else { return };
+                    web::put_pixels_view(&canvas, &r.pixels, r.w, r.h);
+                });
+                if ok {
+                    return;
+                }
             }
         } else if let Some(p) = &proxy {
             tag.set("1:1 proxy");
@@ -3588,18 +3753,13 @@ fn FocusLoupe(state: AppState) -> impl IntoView {
             !matches!(&*s.borrow(), Some((sid, sver, ..)) if *sid == id && *sver == ver)
         });
         if rebuild {
-            let scratch = match (&photo.full, &proxy) {
-                (Some((px, w, h)), _) => {
-                    let c = web::create_canvas(*w as u32, *h as u32);
-                    px.put_on_canvas(&c, *w as u32, *h as u32);
-                    (c, *w as u32, *h as u32)
-                }
-                (None, Some(p)) => {
+            let scratch = match &proxy {
+                Some(p) => {
                     let c = web::create_canvas(p.w as u32, p.h as u32);
                     p.pixels.put_on_canvas(&c, p.w as u32, p.h as u32);
                     (c, p.w as u32, p.h as u32)
                 }
-                (None, None) => {
+                None => {
                     let (px, w, h) = &photo.preview;
                     if *w == 0 || *h == 0 {
                         return;
@@ -3873,11 +4033,36 @@ fn source_window(
 fn blit_window(canvas: &web_sys::HtmlCanvasElement, px: &[u8], w: u32, h: u32, bw: u32, bh: u32) {
     let scratch = web::create_canvas(w, h);
     web::put_pixels(&scratch, px, w, h);
+    blit_scratch(canvas, &scratch, w, h, bw, bh);
+}
+
+/// [`blit_window`] for a worker reply: the pixels are already a JS view.
+fn blit_window_view(
+    canvas: &web_sys::HtmlCanvasElement,
+    px: &Uint8Array,
+    w: u32,
+    h: u32,
+    bw: u32,
+    bh: u32,
+) {
+    let scratch = web::create_canvas(w, h);
+    web::put_pixels_view(&scratch, px, w, h);
+    blit_scratch(canvas, &scratch, w, h, bw, bh);
+}
+
+fn blit_scratch(
+    canvas: &web_sys::HtmlCanvasElement,
+    scratch: &web_sys::HtmlCanvasElement,
+    w: u32,
+    h: u32,
+    bw: u32,
+    bh: u32,
+) {
     let ctx = web::ctx2d(canvas);
     ctx.set_image_smoothing_enabled(true);
     high_quality(&ctx);
     let _ = ctx.draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
-        &scratch,
+        scratch,
         0.0,
         0.0,
         w as f64,
@@ -3995,13 +4180,38 @@ fn CanvasLoupe(
             && item.edit.selection.is_none()
             && !item.layers.iter().any(|l| l.visible && l.opacity > 0.01);
         if plain {
-            if let Some((px, fw, fh)) = photo.full.as_ref() {
-                if let Some(win) =
-                    source_window(px, *fw, *fh, sx, sy, cw, ch, &item.edit, id as u32)
-                {
-                    blit_window(&canvas, &win, cw as u32, ch as u32, bw as u32, bh as u32);
-                    tag.set(format!("{mag}:1"));
-                    return;
+            if photo.full {
+                let (fw, fh) = photo.full_dims;
+                if fw >= cw && fh >= ch {
+                    // Source pixels live in the worker; it crops the window,
+                    // runs the pointwise pipeline and returns only the loupe.
+                    let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
+                    CANVAS_LOUPE_REQ.with(|c| c.set(c.get() + 1));
+                    let rgen = CANVAS_LOUPE_REQ.with(|c| c.get());
+                    let tag_cb = tag;
+                    let ok = pworker::loupe_window(
+                        id,
+                        &recipe,
+                        sx,
+                        sy,
+                        cw,
+                        ch,
+                        id as u32,
+                        move |reply| {
+                            if CANVAS_LOUPE_REQ.with(|c| c.get()) != rgen {
+                                return;
+                            }
+                            let Some(r) = reply else { return };
+                            let Some(canvas) = canvas_ref.get() else { return };
+                            blit_window_view(
+                                &canvas, &r.pixels, r.w, r.h, bw as u32, bh as u32,
+                            );
+                            tag_cb.set(format!("{mag}:1"));
+                        },
+                    );
+                    if ok {
+                        return;
+                    }
                 }
             }
             if photo.raw {
@@ -4048,8 +4258,10 @@ fn CanvasLoupe(
         let hit = CANVAS_LOUPE_HI.with(|c| {
             let b = c.borrow();
             let hi = b.as_ref()?;
-            (hi.item_id == id && hi.edit_fp == edit_fp && hi.source_fp == source_fp)
-                .then(|| (hi.canvas.clone(), hi.w, hi.h))
+            if hi.item_id != id || hi.edit_fp != edit_fp || hi.source_fp != source_fp {
+                return None;
+            }
+            hi.canvas.clone().map(|canvas| (canvas, hi.w, hi.h))
         });
         if let Some((hi_canvas, hw, hh)) = hit {
             // The cached render covers the whole working frame; map the
@@ -4133,34 +4345,27 @@ fn CanvasLoupe(
                 if CANVAS_LOUPE_REQ.with(|c| c.get()) != rgen {
                     return;
                 }
-                let hi = match reply {
-                    Ok(r) => {
-                        let c = web::create_canvas(r.w, r.h);
-                        web::put_pixels_view(&c, &r.pixels, r.w, r.h);
-                        composite_layers(&c, &item_cb.layers, r.w as usize, r.h as usize);
-                        Some(HiCache {
+                if let Ok(r) = reply {
+                    let hi_canvas = web::create_canvas(r.w, r.h);
+                    web::put_pixels_view(&hi_canvas, &r.pixels, r.w, r.h);
+                    composite_layers(&hi_canvas, &item_cb.layers, r.w as usize, r.h as usize);
+                    CANVAS_LOUPE_HI.with(|c| {
+                        *c.borrow_mut() = Some(HiCache {
                             item_id: id,
                             edit_fp,
                             source_fp,
-                            canvas: c,
+                            canvas: Some(hi_canvas),
+                            bitmap: None,
                             w: r.w as usize,
                             h: r.h as usize,
+                            prefetched: false,
                         })
-                    }
-                    Err(_) => render_hi(&item_cb, fw as f64, fh as f64),
-                };
-                if let Some(hi) = hi {
-                    CANVAS_LOUPE_HI.with(|c| *c.borrow_mut() = Some(hi));
+                    });
                     state.items.update(|_| {});
                 }
             },
         );
-        if !accepted {
-            if let Some(hi) = render_hi(&item, fw as f64, fh as f64) {
-                CANVAS_LOUPE_HI.with(|c| *c.borrow_mut() = Some(hi));
-                state.items.update(|_| {});
-            }
-        }
+        let _ = accepted;
     });
 
     view! {
@@ -4899,16 +5104,17 @@ async fn persist_session(state: AppState) {
                     c.borrow().raw_fallback.get(&item.id).cloned()
                 })
                 .and_then(|b| web::bytes_to_blob(&b, "application/octet-stream").ok()),
-                // Healed: the cache's full-res raster is the source of truth.
-                // gen moved ⇒ the item is dirty ⇒ full is present (dirty
-                // items are eviction-exempt), so the None arm can't fire.
-                BytesSig::Photo(_, _) | BytesSig::Raw(_, _) => match get_photo(item.id) {
-                    Some(p) => match &p.full {
-                        Some((px, w, h)) => px.to_png_blob(*w, *h).await.ok(),
+                // Healed: the worker's full-res raster is the source of
+                // truth. gen moved ⇒ the item is dirty ⇒ the buffer is
+                // present (dirty items are eviction-exempt); encode in the
+                // worker so the app thread never reads back 100 MB.
+                BytesSig::Photo(_, _) | BytesSig::Raw(_, _) => {
+                    let pid = item.id;
+                    match await_worker(move |cb| pworker::encode_png(pid, cb)).await {
+                        Some(view) => web::view_to_blob(&view, "image/png").ok(),
                         None => None,
-                    },
-                    None => None,
-                },
+                    }
+                }
             };
             let Some(blob) = blob else { continue };
             if healed {
@@ -5101,8 +5307,8 @@ fn restore_session(state: AppState) {
                     c.borrow_mut().photos.insert(
                         id,
                         Rc::new(PhotoData {
-                            full: None,
-                            neutral: None,
+                            full: false,
+                            neutral: false,
                             full_dims: (w, h),
                             preview: (Vec::new(), 0, 0),
                             dirty: false,
@@ -5141,8 +5347,8 @@ fn restore_session(state: AppState) {
                     c.borrow_mut().photos.insert(
                         id,
                         Rc::new(PhotoData {
-                            full: None,
-                            neutral: None,
+                            full: false,
+                            neutral: false,
                             full_dims: (w, h),
                             preview,
                             dirty: false,
@@ -5197,17 +5403,24 @@ fn restore_session(state: AppState) {
                         CACHE.with(|c| c.borrow_mut().raw_fallback.insert(id, Rc::new(bytes)));
                     }
                 }
-                full.pixels.load_into_worker(id, fw, fh);
-                if let Some(n) = &full.neutral {
-                    pworker::load_neutral_view(id, &n.pixels, n.w, n.h, n.white, n.tone.as_ref());
-                }
-                let neutral = full.neutral.take();
+                let has_full = full.pixels.into_worker_transfer(id, fw, fh);
+                let has_neutral = match full.neutral.take() {
+                    Some(n) => pworker::load_neutral_transfer(
+                        id,
+                        &n.pixels,
+                        n.w,
+                        n.h,
+                        n.white,
+                        n.tone.as_ref(),
+                    ),
+                    None => false,
+                };
                 CACHE.with(|c| {
                     c.borrow_mut().photos.insert(
                         id,
                         Rc::new(PhotoData {
-                            full: Some((full.pixels, fw, fh)),
-                            neutral,
+                            full: has_full,
+                            neutral: has_neutral,
                             full_dims: (fw, fh),
                             preview: (pp, pw, ph),
                             dirty: false,
@@ -5253,8 +5466,8 @@ fn restore_session(state: AppState) {
                     c.photos.insert(
                         id,
                         Rc::new(PhotoData {
-                            full: None,
-                            neutral: None,
+                            full: false,
+                            neutral: false,
                             full_dims: (fw, fh),
                             preview: (Vec::new(), 0, 0),
                             dirty: false,
@@ -5295,8 +5508,8 @@ fn restore_session(state: AppState) {
                     c.photos.insert(
                         id,
                         Rc::new(PhotoData {
-                            full: None,
-                            neutral: None,
+                            full: false,
+                            neutral: false,
                             full_dims: (fw, fh),
                             preview,
                             dirty: false,
@@ -6758,6 +6971,36 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     });
     on_cleanup(move || rsz.remove());
 
+    // The reload prefetch (index.html) decodes the selected item's stored
+    // display proxy while the wasm boots. When it lands after the restored
+    // session has painted, install and blit it here — waiting for the next
+    // edit-driven pass would leave the soft tier up for no reason. If the
+    // item or canvas isn't ready, nudge the render effect instead; it pulls
+    // the same bitmap on its first preview-less pass.
+    {
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            let mut painted = false;
+            if let Some(item) = state.current() {
+                if item.kind == MediaKind::Photo {
+                    if let Some(photo) = get_photo(item.id) {
+                        painted = paint_prefetched_hi(&item, &photo, canvas_ref.get().as_ref().map(|v| &**v));
+                    }
+                }
+            }
+            if !painted {
+                state.hi_built.update(|g| *g += 1);
+            }
+        });
+        let w = web::window();
+        let _ = w.add_event_listener_with_callback("pes-proxy-bmp", cb.as_ref().unchecked_ref());
+        on_cleanup(move || {
+            let _ = web::window().remove_event_listener_with_callback(
+                "pes-proxy-bmp",
+                cb.as_ref().unchecked_ref(),
+            );
+        });
+    }
+
     // --- clone stamp stroke ----------------------------------------------------
     window_event_listener(leptos::ev::pointermove, move |ev| {
         let Some(Some(mut pts)) = clone_drag.try_get() else { return };
@@ -6962,9 +7205,13 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             let mut render_span = perf::Span::new("preview.render");
 
         // A lazily restored item has no preview until the selection effect's
-        // decode lands; skip this pass rather than render a 0×0 buffer.
+        // decode lands; skip this pass rather than render a 0×0 buffer. The
+        // reload prefetch may already hold the stored display proxy, though —
+        // paint it now so a restored session reaches its sharp frame one pass
+        // earlier (the proxy decode is the slow half of a restore).
         if photo.preview.1 == 0 || photo.preview.2 == 0 {
             ensure_preview(state, item.id);
+            paint_prefetched_hi(&item, &photo, Some(&canvas));
             return;
         }
         let (pix, w, h) = &photo.preview;
@@ -6985,7 +7232,21 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         let need_w = canvas.client_width() as f64 * dpr;
         let need_h = canvas.client_height() as f64 * dpr;
         let (need_w, need_h) = if need_w < 1.0 || need_h < 1.0 {
-            LAST_NEED.with(|n| n.get())
+            let last = LAST_NEED.with(|n| n.get());
+            if last.0 >= 1.0 && last.1 >= 1.0 {
+                last
+            } else {
+                // First paint of a restored session: the canvas is built
+                // before its first layout, so it has no client size and
+                // LAST_NEED is still empty. Use the viewport as an upper
+                // bound — it only decides hi vs preview and sizes the
+                // request, which is capped at HI_MAX_EDGE anyway.
+                let win = web::window();
+                (
+                    win.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(0.0) * dpr,
+                    win.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(0.0) * dpr,
+                )
+            }
         } else {
             LAST_NEED.with(|n| n.set((need_w, need_h)));
             (need_w, need_h)
@@ -7099,6 +7360,9 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 });
             }
             if sharp.is_none() {
+                seed_hi_from_prefetch(&item, &photo, edit_fp, src_fp);
+            }
+            if sharp.is_none() {
                 sharp = HI_CACHE.with(|c| {
                     let b = c.borrow();
                     let hi = b.as_ref()?;
@@ -7109,21 +7373,9 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                         return None;
                     }
                     if cropped_view {
-                        let (cx2, cy2, cw2, ch2) = crop_px(&item.edit, hi.w, hi.h);
-                        canvas.set_width(cw2 as u32);
-                        canvas.set_height(ch2 as u32);
-                        web::ctx2d(&canvas)
-                            .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
-                                &hi.canvas, cx2 as f64, cy2 as f64, cw2 as f64, ch2 as f64,
-                                0.0, 0.0, cw2 as f64, ch2 as f64,
-                            )
-                            .unwrap();
+                        blit_hi_frame(hi, &canvas, Some(crop_px(&item.edit, hi.w, hi.h)));
                     } else {
-                        canvas.set_width(hi.w as u32);
-                        canvas.set_height(hi.h as u32);
-                        web::ctx2d(&canvas)
-                            .draw_image_with_html_canvas_element(&hi.canvas, 0.0, 0.0)
-                            .unwrap();
+                        blit_hi_frame(hi, &canvas, None);
                     }
                     stale_source = hi.source_fp != src_fp;
                     Some(Sharp::Whole { w: hi.w })
@@ -7279,12 +7531,28 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 let Some(photo) = get_photo(item.id) else { return };
                 let (src_id, (sw2, sh2)) = render_source(item.id, &photo);
                 let (fw2, fh2) = working_dims(sw2, sh2, &item.edit);
+                let t2 = hi_target(req_w, req_h, fw2, fh2, HI_MAX_EDGE as u32);
                 HI_REQ_GEN.with(|d| d.set(d.get() + 1));
                 let rgen = HI_REQ_GEN.with(|d| d.get());
                 let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
                 let sel = item.edit.selection.clone();
                 let edit_fp = edit_fingerprint(&item);
                 let source_fp = source_fingerprint(photo.gen, proxy_gen(item.id));
+                // A direct-painted proxy may already cover this target; rendering
+                // again would swap it for a smaller worker copy of the same pixels.
+                if !cropped_view
+                    && HI_CACHE.with(|c| {
+                        c.borrow().as_ref().map_or(false, |hi| {
+                            hi.item_id == item.id
+                                && hi.edit_fp == edit_fp
+                                && hi.source_fp == source_fp
+                                && hi.w >= t2.0
+                                && hi.h >= t2.1
+                        })
+                    })
+                {
+                    return;
+                }
                 let item_id = item.id;
                 let item_cb = item.clone();
                 if cropped_view {
@@ -7294,7 +7562,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     let request = perf::Span::new("hi.request")
                         .detail(format!("{}x{}", win_target.0, win_target.1));
                     let hi_t0 = perf::now();
-                    let accepted = pworker::render_window(
+                    let _accepted = pworker::render_window(
                         src_id,
                         &recipe,
                         need_w,
@@ -7337,26 +7605,17 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                 }
                                 _ => {
                                     perf::record("hi.worker_reply", perf::now() - hi_t0);
-                                    if let Some(hi) = render_hi(&item_cb, req_w, req_h) {
-                                        HI_CACHE.with(|c| *c.borrow_mut() = Some(hi));
-                                        state.hi_built.update(|g| *g += 1);
-                                    }
                                 }
                             }
                         },
                     );
                     drop(request);
-                    if !accepted {
-                        if let Some(hi) = render_hi(&item, req_w, req_h) {
-                            HI_CACHE.with(|c| *c.borrow_mut() = Some(hi));
-                            state.hi_built.update(|g| *g += 1);
-                        }
-                    }
+
                 } else {
                     let request =
                         perf::Span::new("hi.request").detail(format!("{}x{}", req_w, req_h));
                     let hi_t0 = perf::now();
-                    let accepted = pworker::render(
+                    let _accepted = pworker::render(
                         src_id,
                         &recipe,
                         req_w,
@@ -7370,6 +7629,21 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                             match reply {
                                 Ok(r) => {
                                     perf::record("hi.worker_reply", perf::now() - hi_t0);
+                                    // Keep a strictly larger cached frame for the same
+                                    // edit and source instead of downgrading it.
+                                    if item_cb.layers.iter().all(|l| !l.visible)
+                                        && HI_CACHE.with(|c| {
+                                            c.borrow().as_ref().map_or(false, |hi| {
+                                                hi.item_id == item_id
+                                                    && hi.edit_fp == edit_fp
+                                                    && hi.source_fp == source_fp
+                                                    && hi.w >= r.w as usize
+                                                    && hi.h >= r.h as usize
+                                            })
+                                        })
+                                    {
+                                        return;
+                                    }
                                     let blit = perf::Span::new("hi.blit");
                                     let canvas = web::create_canvas(r.w, r.h);
                                     web::put_pixels_view(&canvas, &r.pixels, r.w, r.h);
@@ -7384,9 +7658,11 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                             item_id,
                                             edit_fp,
                                             source_fp,
-                                            canvas,
+                                            canvas: Some(canvas),
+                                            bitmap: None,
                                             w: r.w as usize,
                                             h: r.h as usize,
+                                            prefetched: false,
                                         })
                                     });
                                     state.hi_built.update(|g| *g += 1);
@@ -7394,21 +7670,12 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                 }
                                 _ => {
                                     perf::record("hi.worker_reply", perf::now() - hi_t0);
-                                    if let Some(hi) = render_hi(&item_cb, req_w, req_h) {
-                                        HI_CACHE.with(|c| *c.borrow_mut() = Some(hi));
-                                        state.hi_built.update(|g| *g += 1);
-                                    }
                                 }
                             }
                         },
                     );
                     drop(request);
-                    if !accepted {
-                        if let Some(hi) = render_hi(&item, req_w, req_h) {
-                            HI_CACHE.with(|c| *c.borrow_mut() = Some(hi));
-                            state.hi_built.update(|g| *g += 1);
-                        }
-                    }
+
                 }
             });
             let _ = web::window().set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -8140,55 +8407,11 @@ fn selection_to_layer(state: AppState, cut: bool) {
                         }
                     }
                     Ok(None) => {}
-                    Err(()) => selection_to_layer_sync(state, cut),
+                    Err(()) => {}
                 }
             })
         },
-        move || selection_to_layer_sync(state, cut),
     );
-}
-
-fn selection_to_layer_sync(state: AppState, cut: bool) {
-    let Some(item) = state.current() else { return; };
-    if item.kind != MediaKind::Photo {
-        return;
-    }
-    let Some(sel) = item.edit.selection.clone() else { return; };
-    let Some(photo) = get_photo(item.id) else { return; };
-    let Some((full, fw, fh)) = photo.full.clone() else { return };
-    let (base, w, h) = owned_geometry(&full, fw, fh, &item.edit);
-    let mask = ops::selection_mask(&sel, w, h);
-    let extracted = ops::extract_masked(&base, &mask);
-    let next_id = item.next_layer_id;
-    state.update_current_item(|m| {
-        m.next_layer_id += 1;
-        m.layers.push(Layer::new_raster(next_id, extracted, w, h));
-    });
-    if cut {
-        let mut cleared = base;
-        for (px, m) in cleared.chunks_exact_mut(4).zip(mask.iter()) {
-            let a = *m as f32 / 255.0;
-            px[3] = (px[3] as f32 * (1.0 - a)).min(255.0) as u8;
-        }
-        let preview = downscale_pixels(&cleared, w, h, 1024);
-        pworker::load(item.id, &cleared, w, h);
-        CACHE.with(|c| {
-            if let Some(pd) = c.borrow_mut().photos.get_mut(&item.id) {
-                let pd = Rc::make_mut(pd);
-                pd.full = Some((Pixels::owned(cleared), w, h));
-                pd.full_dims = (w, h);
-                pd.preview = preview;
-                pd.dirty = true;
-                pd.neutral = None;
-                pd.gen += 1;
-            }
-        });
-        state.update_current(|e| {
-            e.rot90 = 0;
-            e.fine_angle = 0.0;
-            e.selection = None;
-        });
-    }
 }
 
 fn delete_selection(state: AppState) {
@@ -8213,46 +8436,11 @@ fn delete_selection(state: AppState) {
                 match res {
                     Ok(Some(r)) => destructive_apply(state, item_id, r),
                     Ok(None) => {}
-                    Err(()) => delete_selection_sync(state),
+                    Err(()) => {}
                 }
             })
         },
-        move || delete_selection_sync(state),
     );
-}
-
-fn delete_selection_sync(state: AppState) {
-    let Some(item) = state.current() else { return; };
-    if item.kind != MediaKind::Photo {
-        return;
-    }
-    let Some(sel) = item.edit.selection.clone() else { return; };
-    let Some(photo) = get_photo(item.id) else { return; };
-    let Some((full, fw, fh)) = photo.full.clone() else { return };
-    let (mut base, w, h) = owned_geometry(&full, fw, fh, &item.edit);
-    let mask = ops::selection_mask(&sel, w, h);
-    for (px, m) in base.chunks_exact_mut(4).zip(mask.iter()) {
-        let a = *m as f32 / 255.0;
-        px[3] = (px[3] as f32 * (1.0 - a)).min(255.0) as u8;
-    }
-    let preview = downscale_pixels(&base, w, h, 1024);
-    pworker::load(item.id, &base, w, h);
-    CACHE.with(|c| {
-        if let Some(pd) = c.borrow_mut().photos.get_mut(&item.id) {
-            let pd = Rc::make_mut(pd);
-            pd.full = Some((Pixels::owned(base), w, h));
-            pd.full_dims = (w, h);
-            pd.preview = preview;
-            pd.dirty = true;
-            pd.neutral = None;
-            pd.gen += 1;
-        }
-    });
-    state.update_current(|e| {
-        e.rot90 = 0;
-        e.fine_angle = 0.0;
-        e.selection = None;
-    });
 }
 
 /// Content-aware fill: synthesize the selection from surrounding texture
@@ -8279,45 +8467,11 @@ fn content_fill_selection(state: AppState) {
                 match res {
                     Ok(Some(r)) => destructive_apply(state, item_id, r),
                     Ok(None) => {}
-                    Err(()) => content_fill_selection_sync(state),
+                    Err(()) => {}
                 }
             })
         },
-        move || content_fill_selection_sync(state),
     );
-}
-
-fn content_fill_selection_sync(state: AppState) {
-    let Some(item) = state.current() else { return; };
-    if item.kind != MediaKind::Photo {
-        return;
-    }
-    let Some(sel) = item.edit.selection.clone() else { return; };
-    let Some(photo) = get_photo(item.id) else { return; };
-    let Some((full, fw, fh)) = photo.full.clone() else { return };
-    let (mut base, w, h) = owned_geometry(&full, fw, fh, &item.edit);
-    let mask = ops::selection_mask(&sel, w, h);
-    if !fill::content_fill(&mut base, &mask, w, h) {
-        return;
-    }
-    let preview = downscale_pixels(&base, w, h, 1024);
-    pworker::load(item.id, &base, w, h);
-    CACHE.with(|c| {
-        if let Some(pd) = c.borrow_mut().photos.get_mut(&item.id) {
-            let pd = Rc::make_mut(pd);
-            pd.full = Some((Pixels::owned(base), w, h));
-            pd.full_dims = (w, h);
-            pd.preview = preview;
-            pd.dirty = true;
-            pd.neutral = None;
-            pd.gen += 1;
-        }
-    });
-    state.update_current(|e| {
-        e.rot90 = 0;
-        e.fine_angle = 0.0;
-        e.selection = None;
-    });
 }
 
 /// Swap an item's cached pixels after a destructive op (worker or sync).
@@ -8328,11 +8482,13 @@ fn destructive_apply(state: AppState, item_id: usize, r: pworker::DestructiveRes
     CACHE.with(|c| {
         if let Some(pd) = c.borrow_mut().photos.get_mut(&item_id) {
             let pd = Rc::make_mut(pd);
-            pd.full = Some((Pixels::owned(r.pixels), r.w, r.h));
+            // The worker committed the result into its own buffer; only the
+            // dimensions and flags change here.
+            pd.full = true;
             pd.full_dims = (r.w, r.h);
             pd.preview = (r.preview, r.pw, r.ph);
             pd.dirty = true;
-            pd.neutral = None;
+            pd.neutral = false;
             pd.gen += 1;
         }
     });
@@ -8370,7 +8526,6 @@ fn apply_heal(state: AppState, pts: &[(f32, f32)]) {
         return;
     }
     let pts = pts.to_vec();
-    let pts_sync = pts.clone();
     pworker::destructive(
         move || {
             let Some(item) = state.current() else { return false };
@@ -8381,56 +8536,15 @@ fn apply_heal(state: AppState, pts: &[(f32, f32)]) {
             let radius = state.heal_radius.get_untracked();
             let mode = heal_mode_u8(state.heal_mode.get_untracked());
             let item_id = item.id;
-            let pts_fb = pts.clone();
             pworker::heal(item_id, &recipe, &pts, radius, mode, move |res| {
                 match res {
                     Ok(Some(r)) => destructive_apply(state, item_id, r),
                     Ok(None) => {}
-                    Err(()) => apply_heal_sync(state, &pts_fb),
+                    Err(()) => {}
                 }
             })
         },
-        move || apply_heal_sync(state, &pts_sync),
     );
-}
-
-fn apply_heal_sync(state: AppState, pts: &[(f32, f32)]) {
-    if pts.is_empty() {
-        return;
-    }
-    let Some(item) = state.current() else { return };
-    if item.kind != MediaKind::Photo {
-        return;
-    }
-    let Some(photo) = get_photo(item.id) else { return };
-    let Some((full, fw, fh)) = photo.full.clone() else { return };
-    let (mut base, w, h) = owned_geometry(&full, fw, fh, &item.edit);
-    let diag = ((w * w + h * h) as f32).sqrt();
-    let r = (state.heal_radius.get_untracked() * diag).max(1.0);
-    let mut coverage = vec![0u8; w * h];
-    stamp_stroke(&mut coverage, w, h, pts, r);
-    let mode = state.heal_mode.get_untracked();
-    if !heal::spot_heal(&mut base, &coverage, w, h, 1.0, mode, item.id as u32) {
-        return;
-    }
-    let preview = downscale_pixels(&base, w, h, 1024);
-    pworker::load(item.id, &base, w, h);
-    CACHE.with(|c| {
-        if let Some(pd) = c.borrow_mut().photos.get_mut(&item.id) {
-            let pd = Rc::make_mut(pd);
-            pd.full = Some((Pixels::owned(base), w, h));
-            pd.full_dims = (w, h);
-            pd.preview = preview;
-            pd.dirty = true;
-            pd.neutral = None;
-            pd.gen += 1;
-        }
-    });
-    state.update_current(|e| {
-        e.rot90 = 0;
-        e.fine_angle = 0.0;
-        e.selection = None;
-    });
 }
 
 /// Clone stamp: copy from the source point through the stroke's coverage mask
@@ -8453,7 +8567,6 @@ fn apply_clone(state: AppState, pts: &[(f32, f32)]) {
         return;
     }
     let pts = pts.to_vec();
-    let pts_sync = pts.clone();
     pworker::destructive(
         move || {
             let Some(item) = state.current() else { return false };
@@ -8481,69 +8594,15 @@ fn apply_clone(state: AppState, pts: &[(f32, f32)]) {
             let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
             let radius = state.clone_radius.get_untracked();
             let item_id = item.id;
-            let pts_fb = pts.clone();
             pworker::clone_stamp(item_id, &recipe, &pts, radius, dx, dy, move |res| {
                 match res {
                     Ok(Some(r)) => destructive_apply(state, item_id, r),
                     Ok(None) => {}
-                    Err(()) => apply_clone_sync(state, &pts_fb),
+                    Err(()) => {}
                 }
             })
         },
-        move || apply_clone_sync(state, &pts_sync),
     );
-}
-
-fn apply_clone_sync(state: AppState, pts: &[(f32, f32)]) {
-    if pts.is_empty() {
-        return;
-    }
-    let Some(item) = state.current() else { return };
-    if item.kind != MediaKind::Photo {
-        return;
-    }
-    let Some(src) = state.clone_source.get_untracked() else { return };
-    let Some(photo) = get_photo(item.id) else { return };
-    let Some((full, fw, fh)) = photo.full.clone() else { return };
-    let (mut base, w, h) = owned_geometry(&full, fw, fh, &item.edit);
-    let aligned = state.clone_aligned.get_untracked();
-    let offset = if aligned {
-        match state.clone_offset.get_untracked() {
-            Some(off) => off,
-            None => {
-                let off = (src.0 - pts[0].0, src.1 - pts[0].1);
-                state.clone_offset.set(Some(off));
-                off
-            }
-        }
-    } else {
-        (src.0 - pts[0].0, src.1 - pts[0].1)
-    };
-    let dx = (offset.0 * w as f32).round() as i32;
-    let dy = (offset.1 * h as f32).round() as i32;
-    let diag = ((w * w + h * h) as f32).sqrt();
-    let r = (state.clone_radius.get_untracked() * diag).max(1.0);
-    let mut coverage = vec![0u8; w * h];
-    stamp_stroke(&mut coverage, w, h, pts, r);
-    clone::clone_stamp(&mut base, w, h, &coverage, dx, dy);
-    let preview = downscale_pixels(&base, w, h, 1024);
-    pworker::load(item.id, &base, w, h);
-    CACHE.with(|c| {
-        if let Some(pd) = c.borrow_mut().photos.get_mut(&item.id) {
-            let pd = Rc::make_mut(pd);
-            pd.full = Some((Pixels::owned(base), w, h));
-            pd.full_dims = (w, h);
-            pd.preview = preview;
-            pd.dirty = true;
-            pd.neutral = None;
-            pd.gen += 1;
-        }
-    });
-    state.update_current(|e| {
-        e.rot90 = 0;
-        e.fine_angle = 0.0;
-        e.selection = None;
-    });
 }
 
 /// Magic wand: flood-select pixels similar to the clicked one, sampled from
