@@ -485,12 +485,42 @@ pub(crate) async fn encode_proxy_jpeg(px: &Pixels, w: usize, h: usize) -> Option
     web::canvas_to_jpeg_blob(&canvas, 0.9).await.ok()
 }
 
+/// Background proxy persistence shares the pixel worker's FIFO with the
+/// display. Encoding a proxy takes ~200 ms (q95 4:4:4, 3200 px), and queued
+/// straight after a land it delayed the render that shows the new proxy: the
+/// camera JPEG stayed on screen 0.4-0.6 s after a develop instead of ~0.2 s
+/// (#16). Let the debounced display request be posted first, then wait until
+/// nothing is in flight and the worker has been quiet for a moment. A long
+/// drag cannot starve persistence: after `PERSIST_MAX_WAIT_MS` it goes ahead.
+const PERSIST_SETTLE_MS: i32 = 250;
+const PERSIST_QUIET_MS: f64 = 300.0;
+const PERSIST_MAX_WAIT_MS: f64 = 10_000.0;
+
+async fn wait_pixel_worker_quiet() {
+    sleep_ms(PERSIST_SETTLE_MS).await;
+    let t0 = perf::now();
+    loop {
+        let now = perf::now();
+        let quiet = pworker::pixel_in_flight() == 0
+            && now - pworker::pixel_last_post_ms() >= PERSIST_QUIET_MS;
+        if quiet || now - t0 >= PERSIST_MAX_WAIT_MS {
+            return;
+        }
+        sleep_ms(100).await;
+    }
+}
+
 /// Persist camera-JPEG pixels already decoded and downscaled to display size.
 /// A reload then decodes one ≤3200px JPEG on the main thread instead of
 /// re-running the full camera decode in the RAW worker — the difference
 /// between a ~0.5 s and a ~2.5 s restore for a 26 MP file.
 pub(crate) fn persist_display_proxy(id: usize, px: Pixels, w: usize, h: usize, frame: (usize, usize)) {
     spawn_local(async move {
+        wait_pixel_worker_quiet().await;
+        // A sensor develop that landed while this waited supersedes it.
+        if proxy_developed(id) {
+            return;
+        }
         let Some(blob) = encode_proxy_jpeg(&px, w, h).await else { return };
         let still_camera = CACHE.with(|c| {
             c.borrow()
@@ -887,6 +917,7 @@ pub(crate) fn persist_developed_proxy(
     tone: Option<[u8; 256]>,
 ) {
     spawn_local(async move {
+        wait_pixel_worker_quiet().await;
         let Some(blob) = encode_proxy_jpeg(&px, w, h).await else { return };
         let still_lazy = CACHE.with(|c| {
             c.borrow()
