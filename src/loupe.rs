@@ -758,6 +758,7 @@ pub(crate) fn CanvasLoupe(
                             w: r.w as usize,
                             h: r.h as usize,
                             prefetched: false,
+                            stand_in: false,
                         })
                     });
                     state.items.update(|_| {});

@@ -340,7 +340,21 @@ pub(crate) fn js_err(e: &JsValue) -> String {
 /// can pass the original bytes through instead of re-encoding (a JPEG would
 /// otherwise lose a generation on every save).
 pub(crate) fn photo_unedited(item: &MediaItem) -> bool {
-    let e = &item.edit;
+    edit_unedited(&item.edit, item)
+}
+
+/// Unedited apart from RAW detail (Smart denoise, Demosaic sharpening). Those
+/// stages are tone-neutral (#15), so an unedited frame is a faithful stand-in
+/// on screen until the detailed render lands. The ISO-based denoise start
+/// makes this the common case for a restored high-ISO RAW.
+pub(crate) fn photo_unedited_but_detail(item: &MediaItem) -> bool {
+    let mut e = item.edit.clone();
+    e.raw.denoise = 0.0;
+    e.raw.sharpen = 0.0;
+    edit_unedited(&e, item)
+}
+
+fn edit_unedited(e: &EditParams, item: &MediaItem) -> bool {
     e.aspect == Aspect::Original
         && e.crop == state::CropRect::default()
         && e.rot90 == 0
