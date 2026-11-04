@@ -245,6 +245,10 @@ pub(crate) struct HiCache {
     /// Painted from the reload prefetch bitmap for the stored proxy, so a
     /// matching record decode may re-stamp `source_fp` instead of re-rendering.
     pub(crate) prefetched: bool,
+    /// The pixels lack the item's RAW detail stage (denoise, sharpening): an
+    /// unedited frame shown while the detailed render is requested. Treated
+    /// like a stale source, so it is always replaced.
+    pub(crate) stand_in: bool,
 }
 
 /// Blit a cached hi frame into the visible canvas — whole, or a source window

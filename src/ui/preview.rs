@@ -436,7 +436,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     } else {
                         blit_hi_frame(hi, &canvas, None);
                     }
-                    stale_source = hi.source_fp != src_fp;
+                    stale_source = hi.source_fp != src_fp || hi.stand_in;
                     Some(Sharp::Whole { w: hi.w })
                 });
             }
@@ -724,6 +724,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                             w: r.w as usize,
                                             h: r.h as usize,
                                             prefetched: false,
+                                            stand_in: false,
                                         })
                                     });
                                     state.hi_built.update(|g| *g += 1);

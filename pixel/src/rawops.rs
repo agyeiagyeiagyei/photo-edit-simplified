@@ -288,6 +288,28 @@ pub fn develop_wide(buf: &mut [u16], w: usize, h: usize, adj: &RawAdjust, px_sca
 /// only the change it made is added back to the 16-bit values, so pixels the
 /// filter leaves alone keep their full precision (no 8-bit banding is
 /// introduced into gradients the 16-bit pipeline carries).
+/// Starting Smart denoise for a newly imported RAW shot at `iso`, so a
+/// high-ISO file opens with its noise handled (owner decision on #15). Anchors
+/// on the slider's 0..100 scale: ISO <= 800 -> 0, 1600 -> 15, 3200 -> 25,
+/// 6400 -> 35, >= 12800 -> 50. Between anchors it is linear in stops, rounded
+/// to a whole slider step: ISO 1250 -> 10, ISO 1000 -> 5.
+pub fn denoise_start_for_iso(iso: u32) -> f32 {
+    const ANCHORS: [(f32, f32); 5] =
+        [(800.0, 0.0), (1600.0, 15.0), (3200.0, 25.0), (6400.0, 35.0), (12800.0, 50.0)];
+    let iso = iso as f32;
+    if iso <= ANCHORS[0].0 {
+        return 0.0;
+    }
+    for pair in ANCHORS.windows(2) {
+        let ((i0, d0), (i1, d1)) = (pair[0], pair[1]);
+        if iso <= i1 {
+            let t = (iso / i0).log2() / (i1 / i0).log2();
+            return (d0 + t * (d1 - d0)).round();
+        }
+    }
+    ANCHORS[ANCHORS.len() - 1].1
+}
+
 pub fn denoise_wide(buf: &mut [u16], w: usize, h: usize, denoise: f32, px_scale: f32) {
     let strength = (denoise / 100.0).clamp(0.0, 1.0);
     if strength <= 0.0 || w == 0 || h == 0 {
@@ -504,6 +526,16 @@ pub fn apply(buf: &mut [u8], w: usize, h: usize, adj: &RawAdjust) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn denoise_start_follows_the_iso_table() {
+        for (iso, want) in [
+            (100, 0.0), (800, 0.0), (1000, 5.0), (1250, 10.0), (1600, 15.0),
+            (2500, 21.0), (3200, 25.0), (6400, 35.0), (12800, 50.0), (51200, 50.0),
+        ] {
+            assert_eq!(super::denoise_start_for_iso(iso), want, "ISO {iso}");
+        }
+    }
+
     use super::*;
 
     fn px(r: u8, g: u8, b: u8) -> Vec<u8> {

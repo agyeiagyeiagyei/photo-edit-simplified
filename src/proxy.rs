@@ -223,9 +223,10 @@ pub(crate) fn seed_hi_from_proxy(state: AppState, id: usize) {
     let Some(item) = state.items.with(|v| v.iter().find(|m| m.id == id).cloned()) else {
         return;
     };
-    if !photo_unedited(&item) {
+    if !photo_unedited_but_detail(&item) {
         return;
     }
+    let stand_in = !photo_unedited(&item);
     let Some(p) = proxy_data(id) else { return };
     if p.w == 0 || p.h == 0 {
         return;
@@ -253,6 +254,7 @@ pub(crate) fn seed_hi_from_proxy(state: AppState, id: usize) {
         w: p.w,
         h: p.h,
         prefetched: false,
+        stand_in,
     };
     HI_CACHE.with(|c| *c.borrow_mut() = Some(hi));
 }
@@ -263,9 +265,10 @@ pub(crate) fn seed_hi_from_proxy(state: AppState, id: usize) {
 /// only backs editing. Only a pristine RAW can show the stored display proxy
 /// as-is — anything edited renders from the proxy plus its params.
 pub(crate) fn seed_hi_from_prefetch(item: &MediaItem, photo: &PhotoData, edit_fp: u64, src_fp: u64) {
-    if !photo.raw || photo.full || photo.dirty || !photo_unedited(item) {
+    if !photo.raw || photo.full || photo.dirty || !photo_unedited_but_detail(item) {
         return;
     }
+    let stand_in = !photo_unedited(item);
     let Some(bmp) = web::take_prefetched_proxy(item.id) else { return };
     let (w, h) = (bmp.width(), bmp.height());
     let replace = w > 0
@@ -291,6 +294,7 @@ pub(crate) fn seed_hi_from_prefetch(item: &MediaItem, photo: &PhotoData, edit_fp
             w: w as usize,
             h: h as usize,
             prefetched: true,
+            stand_in,
         })
     });
 }
