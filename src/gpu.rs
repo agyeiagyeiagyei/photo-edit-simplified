@@ -146,6 +146,7 @@ pub fn base_match(key: &BaseKey) -> Option<bool> {
 
 /// Upload a new base. Returns false if there is no GPU or the upload failed.
 pub fn upload_base(key: BaseKey, pixels: &[u8], w: u32, h: u32) -> bool {
+    let _span = perf::Span::new("gpu.base");
     if w == 0 || h == 0 || pixels.len() < (w as usize) * (h as usize) * 4 {
         return false;
     }
