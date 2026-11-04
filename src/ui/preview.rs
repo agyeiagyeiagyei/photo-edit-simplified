@@ -349,13 +349,15 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         // base, which is pre-develop and pre-colour, so slider ticks never
         // touch the worker. With no usable base the 1024px preview stays up
         // until one lands; the CPU hi-res path below is then not requested.
-        // A RAW develop the neutral pipeline owns must not be shadowed by the
-        // shader's u8 approximation; the CPU neutral path is authoritative.
+        // A RAW with develop edits stays on the GPU only with a developed base
+        // (neutral develop + camera tone + detail rendered by the worker), so
+        // the shader never approximates the develop; without the neutral frame
+        // the CPU neutral path renders it.
         let mut gpu_ok = want_hi
             && !cropped_view
             && gpu::eligible(&item.edit)
             && gpu::active()
-            && !(photo.raw && !item.edit.raw.is_identity());
+            && !(photo.raw && !item.edit.raw.is_identity() && !source_has_neutral(item.id, &photo));
         let mut gkey: Option<gpu::BaseKey> = None;
         if gpu_ok {
             let key = gpu::BaseKey {
@@ -366,6 +368,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 fine_bits: item.edit.fine_angle.to_bits(),
                 need_w: target.0 as u32,
                 need_h: target.1 as u32,
+                raw_fp: gpu::raw_fingerprint(&item.edit.raw),
             };
             gkey = Some(key);
             if gpu::base_match(&key).is_some() {
@@ -498,6 +501,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     fine_bits: item.edit.fine_angle.to_bits(),
                     need_w: t2.0 as u32,
                     need_h: t2.1 as u32,
+                    raw_fp: gpu::raw_fingerprint(&item.edit.raw),
                 };
                 if gpu::base_match(&key) == Some(false) {
                     return;
@@ -509,6 +513,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                             && p.fine_bits == key.fine_bits
                             && p.src_id == key.src_id
                             && p.src_fp == key.src_fp
+                            && p.raw_fp == key.raw_fp
                             && p.need_w >= key.need_w
                             && p.need_h >= key.need_h
                     })
@@ -1359,5 +1364,15 @@ pub(crate) fn CropOverlay(
                 </div>
             }.into_view()
         }}
+    }
+}
+
+/// Whether the worker holds the neutral (un-toned 16-bit) frame for the source
+/// this item renders from, which a developed GPU base is built from.
+fn source_has_neutral(id: usize, photo: &PhotoData) -> bool {
+    if photo.full {
+        photo.neutral
+    } else {
+        proxy_data(id).is_some_and(|p| p.neutral)
     }
 }

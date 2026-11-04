@@ -74,10 +74,15 @@ texture is a follow-up).
   blit alone measured 273 ms at 2888×1925 in the CI container (a GPU copy on
   hardware).
 - `?gpu=1` forces the GPU path, `?gpu=0` forces CPU — used by the e2e suite.
-- A RAW source with a non-identity develop stays on the CPU path: the shader
-  approximates develop from the camera-toned u8 base, while the worker renders
-  the 16-bit neutral frame with the camera tone last (WS5 highlight recovery).
-  Letting the shader win would hide the recovered highlight detail.
+- A RAW source with a non-identity develop uses a **developed base**: the
+  worker renders the 16-bit neutral frame through develop, camera tone and
+  detail (denoise, sharpening) at the base size, without colour, and the shader
+  draws it as identity and applies only the colour edits. The shader never
+  approximates the develop, so recovered highlight detail survives. The base
+  key carries a fingerprint of the RAW develop (`raw_fingerprint`); a develop
+  slider tick keeps drawing the previous base (sharp) until the new one lands,
+  and colour drags never touch the worker. Without the neutral frame the CPU
+  neutral path renders it.
 - Any context/shader/link/upload failure latches the GPU off for the session;
   the existing CPU path runs untouched.
 

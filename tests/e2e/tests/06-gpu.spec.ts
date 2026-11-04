@@ -135,12 +135,12 @@ async function applyRawDevelop(page: Page) {
 }
 
 /** Wait for a new visible frame on `name`, then for the canvas to settle. */
-async function waitRenderTick(page: Page, name: string, before: number) {
+async function waitRenderTick(page: Page, name: string, before: number, stableMs = 250) {
   await expect.poll(async () => (await markNames(page)).filter((n) => n === name).length, {
     timeout: 60_000,
     intervals: [100, 200, 400],
   }).toBeGreaterThan(before);
-  await waitStableSharpCanvas(page);
+  await waitStableSharpCanvas(page, 90_000, stableMs);
 }
 
 test.describe('WebGL2 parametric preview (docs/GPU.md)', () => {
@@ -200,21 +200,25 @@ test.describe('WebGL2 parametric preview (docs/GPU.md)', () => {
         await clickTab(page, 'Color');
         await page.waitForTimeout(250);
         await waitStableSharpCanvas(page);
-        // A non-identity RAW develop belongs to the neutral CPU pipeline even
-        // in GPU mode (docs/GPU.md): the shader would hide recovered highlight
-        // detail, so every develop tick takes the CPU hi-res path.
+        // A non-identity RAW develop stays on the GPU through a developed base
+        // (docs/GPU.md): the worker renders the neutral develop, camera tone and
+        // detail into the base, and the shader applies only colour. Each
+        // develop slider requests a new base, so wait for the last one to land
+        // and the frame to hold still; a colour tick is a GPU redraw.
         const gpuBefore = mode === '1' ? await gpuRenders(page) : 0;
-        let before = (await markNames(page)).filter((n) => n === 'hi.blit').length;
+        const developTick = mode === '1' ? 'gpu.base' : 'hi.blit';
+        const colourTick = mode === '1' ? 'gpu.render' : 'hi.blit';
+        let before = (await markNames(page)).filter((n) => n === developTick).length;
         await applyRawDevelop(page);
-        await waitRenderTick(page, 'hi.blit', before);
+        await waitRenderTick(page, developTick, before, 1500);
         out.frames.develop = await downscaled(page, 512);
 
-        before = (await markNames(page)).filter((n) => n === 'hi.blit').length;
+        before = (await markNames(page)).filter((n) => n === colourTick).length;
         await setRange(page, /^Saturation/, 0.4);
-        await waitRenderTick(page, 'hi.blit', before);
+        await waitRenderTick(page, colourTick, before, 1500);
         out.frames.develop_saturation = await downscaled(page, 512);
         if (mode === '1') {
-          expect(await gpuRenders(page), 'GPU drew a develop the neutral path owns').toBe(gpuBefore);
+          expect(await gpuRenders(page), 'GPU did not draw the developed base').toBeGreaterThan(gpuBefore);
         }
         return out;
       } finally {
