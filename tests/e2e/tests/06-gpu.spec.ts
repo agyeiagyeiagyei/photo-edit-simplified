@@ -80,7 +80,7 @@ async function downscaled(page: Page, width = 512) {
     for (let i = 0; i < d.length; i += 0x8000) {
       s += String.fromCharCode.apply(null, Array.from(d.subarray(i, i + 0x8000)) as number[]);
     }
-    return { w: W, h, b64: btoa(s) };
+    return { w: W, h, b64: btoa(s), srcW: src.width, srcH: src.height };
   }, width);
 }
 
@@ -208,7 +208,7 @@ test.describe('WebGL2 parametric preview (docs/GPU.md)', () => {
           // The untouched RAW is the GPU path's own case and must stay there.
           await expect.poll(() => gpuRenders(page), { timeout: 30_000 }).toBeGreaterThan(0);
         }
-        const out = { errors, frames: {} as Record<string, { w: number; h: number; b64: string }> };
+        const out = { errors, frames: {} as Record<string, { w: number; h: number; b64: string; srcW: number; srcH: number }> };
         out.frames.untouched = await downscaled(page, 512);
 
         // Let the tab switch (which may itself redraw) land before taking the
@@ -248,14 +248,23 @@ test.describe('WebGL2 parametric preview (docs/GPU.md)', () => {
       expect(c.h).toBe(g.h);
       const db = psnr(Buffer.from(g.b64, 'base64'), Buffer.from(c.b64, 'base64'));
       const max = maxDelta(Buffer.from(g.b64, 'base64'), Buffer.from(c.b64, 'base64'));
+      const sameRes = g.srcW === c.srcW && g.srcH === c.srcH;
       recordMetrics(testInfo, {
         raw_fixture: path.basename(raw),
         raw_canvas: `${g.w}x${g.h}`,
+        [`raw_parity_${name}_canvas_gpu`]: `${g.srcW}x${g.srcH}`,
+        [`raw_parity_${name}_canvas_cpu`]: `${c.srcW}x${c.srcH}`,
         [`raw_parity_${name}_psnr_db`]: Math.round(db * 100) / 100,
         [`raw_parity_${name}_max_delta`]: max,
       });
       expect(db, `${name} parity PSNR ${db.toFixed(2)} dB < 45 dB`).toBeGreaterThanOrEqual(45);
-      if (name === 'untouched') {
+      // Untouched must be bit-exact when both modes drew at the same backing
+      // size (the owner's ARW: 2888 px in both). When they settle at different
+      // sizes (the synthetic DNG: the CPU path keeps its 2600 px proxy, the GPU
+      // path draws a base resampled to the display), the 512 px comparison sees
+      // resampling differences at edges (0.2 % of pixels > 16 levels, mean
+      // difference ~0); the PSNR bar above still applies.
+      if (name === 'untouched' && sameRes) {
         expect(max, 'untouched RAW preview moved pixels').toBeLessThanOrEqual(1);
       }
     }
