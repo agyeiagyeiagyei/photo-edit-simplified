@@ -196,7 +196,7 @@ pub(crate) fn ingest_files(state: AppState, files: Vec<File>) {
                     thumb_url: ing.thumb_url,
                     width: ing.dims.0,
                     height: ing.dims.1,
-                    edit: EditParams::default(),
+                    edit: raw_import_edit(ing.exif.as_deref().map(|v| v.as_slice())),
                     layers: Vec::new(),
                     next_layer_id: 0,
                     exif: ing.exif,
@@ -397,6 +397,12 @@ pub(crate) async fn ingest_drive_bytes(
             });
             evict_full_lru();
             let pool_name = name.clone();
+            // Stored Drive edits win; only a RAW without any gets the ISO start.
+            let edit = if edit == EditParams::default() && !drive_baked {
+                raw_import_edit(ing.exif.as_deref().map(|v| v.as_slice()))
+            } else {
+                edit
+            };
             push_item(state, MediaItem {
                 id,
                 kind: MediaKind::Photo,
@@ -558,4 +564,16 @@ pub(crate) async fn make_thumb(id: usize, pixels: &[u8], w: usize, h: usize) -> 
 
 pub(crate) fn downscale_pixels(pixels: &[u8], w: usize, h: usize, long_edge: u32) -> (Vec<u8>, usize, usize) {
     resample::fit_long_edge(pixels, w, h, long_edge)
+}
+
+
+/// A new RAW import's starting edit: the camera rendering, plus a Smart
+/// denoise start from the photo's ISO (#15). Only new imports get it, as a
+/// visible slider value; restored sessions and stored Drive edits keep theirs.
+fn raw_import_edit(exif: Option<&[u8]>) -> EditParams {
+    let mut edit = EditParams::default();
+    if let Some(iso) = exif.and_then(rawmeta::iso_from_tiff) {
+        edit.raw.denoise = pes_pixel::rawops::denoise_start_for_iso(iso);
+    }
+    edit
 }

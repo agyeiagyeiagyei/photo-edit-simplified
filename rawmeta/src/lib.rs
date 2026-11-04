@@ -325,6 +325,60 @@ fn transpose(src: &[u8], w: usize, h: usize) -> (Vec<u8>, usize, usize) {
 /// no zone, so the string is read as-if-UTC — only relative ordering matters.
 /// ExifIFD DateTimeOriginal (0x9003) → CreateDate (0x9004) → IFD0 DateTime
 /// (0x0132).
+/// The photo's ISO from a TIFF/EXIF payload: `ISOSpeedRatings` (0x8827) when
+/// it is set and not saturated at 65535, else `RecommendedExposureIndex`
+/// (0x8832). `None` when the EXIF IFD carries neither.
+pub fn iso_from_tiff(t: &[u8]) -> Option<u32> {
+    if t.len() < 8 {
+        return None;
+    }
+    let le = match &t[0..2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return None,
+    };
+    let u16at = |o: usize| -> Option<u16> {
+        let s = t.get(o..o + 2)?;
+        Some(if le { u16::from_le_bytes([s[0], s[1]]) } else { u16::from_be_bytes([s[0], s[1]]) })
+    };
+    let u32at = |o: usize| -> Option<u32> {
+        let s = t.get(o..o + 4)?;
+        Some(if le {
+            u32::from_le_bytes([s[0], s[1], s[2], s[3]])
+        } else {
+            u32::from_be_bytes([s[0], s[1], s[2], s[3]])
+        })
+    };
+    // First value of an inline SHORT or LONG entry.
+    let value = |e: usize| -> Option<u32> {
+        match u16at(e + 2)? {
+            3 => u16at(e + 8).map(u32::from),
+            4 => u32at(e + 8),
+            _ => None,
+        }
+    };
+    let ifd0 = u32at(4)? as usize;
+    let n0 = u16at(ifd0)? as usize;
+    let exif = (0..n0)
+        .map(|k| ifd0 + 2 + 12 * k)
+        .find(|&e| u16at(e) == Some(0x8769))
+        .and_then(|e| u32at(e + 8))? as usize;
+    let n = u16at(exif)? as usize;
+    let (mut ratings, mut rei) = (None, None);
+    for k in 0..n {
+        let e = exif + 2 + 12 * k;
+        match u16at(e)? {
+            0x8827 => ratings = value(e),
+            0x8832 => rei = value(e),
+            _ => {}
+        }
+    }
+    match ratings {
+        Some(v) if v > 0 && v < 65535 => Some(v),
+        _ => rei.filter(|&v| v > 0).or(ratings.filter(|&v| v > 0)),
+    }
+}
+
 pub fn taken_from_tiff(t: &[u8]) -> Option<f64> {
     if t.len() < 8 {
         return None;
@@ -545,6 +599,21 @@ pub mod tiff {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn iso_from_tiff_reads_ratings_then_recommended_index() {
+        use crate::tiff::{build_tiff, e_long, e_short};
+        let t = build_tiff(vec![], vec![e_short(0x8827, 1250)], vec![]);
+        assert_eq!(super::iso_from_tiff(&t), Some(1250));
+        // Saturated ratings fall back to the recommended exposure index.
+        let t = build_tiff(vec![], vec![e_short(0x8827, 65535), e_long(0x8832, 102400)], vec![]);
+        assert_eq!(super::iso_from_tiff(&t), Some(102400));
+        let t = build_tiff(vec![], vec![e_long(0x8832, 3200)], vec![]);
+        assert_eq!(super::iso_from_tiff(&t), Some(3200));
+        let t = build_tiff(vec![], vec![], vec![]);
+        assert_eq!(super::iso_from_tiff(&t), None);
+        assert_eq!(super::iso_from_tiff(b"not a tiff"), None);
+    }
+
     use super::*;
 
     fn px(r: u8, g: u8, b: u8) -> [u8; 4] {
