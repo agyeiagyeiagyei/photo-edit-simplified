@@ -65,7 +65,6 @@ fn range(sigma: f32) -> Vec<f32> {
 
 fn luma_horizontal(
     y: &[u8],
-    lin: &[u16],
     w: usize,
     h: usize,
     r: usize,
@@ -74,20 +73,25 @@ fn luma_horizontal(
 ) -> Vec<u16> {
     let mut out = vec![0u16; w * h];
     for yy in 0..h {
-        let row = yy * w;
-        for x in 0..w {
-            let c = y[row + x] as i32;
+        let row = &y[yy * w..(yy + 1) * w];
+        let orow = &mut out[yy * w..(yy + 1) * w];
+        for (x, o) in orow.iter_mut().enumerate() {
+            let c = row[x] as i32;
             let x0 = x.saturating_sub(r);
             let x1 = (x + r).min(w - 1);
+            // Same taps in the same order as the full window; at the edges the
+            // window is clipped and the spatial weights offset to match.
+            let win = &row[x0..=x1];
+            let swin = &sw[x0 + r - x..=x1 + r - x];
             let mut acc = 0.0f32;
             let mut wsum = 0.0f32;
-            for xx in x0..=x1 {
-                let gd = y[row + xx] as i32;
-                let wt = sw[xx + r - x] * lut[(gd - c).unsigned_abs() as usize];
-                acc += wt * lin[row + xx] as f32;
+            for (&g, &s) in win.iter().zip(swin) {
+                let wt = s * lut[(g as i32 - c).unsigned_abs() as usize];
+                // The 16-bit luma (code x 257), computed inline: exact in f32.
+                acc += wt * (g as f32 * 257.0);
                 wsum += wt;
             }
-            out[row + x] = (acc / wsum).round().clamp(0.0, 65535.0) as u16;
+            *o = (acc / wsum).round().clamp(0.0, 65535.0) as u16;
         }
     }
     out
@@ -104,28 +108,43 @@ fn luma_vertical(
     srgb: &[u8; 65536],
 ) -> Vec<u8> {
     let mut out = vec![0u8; w * h];
+    let mut acc = vec![0.0f32; w];
+    let mut wsum = vec![0.0f32; w];
     for yy in 0..h {
         let y0 = yy.saturating_sub(r);
         let y1 = (yy + r).min(h - 1);
-        for x in 0..w {
-            let c = y[yy * w + x] as i32;
-            let mut acc = 0.0f32;
-            let mut wsum = 0.0f32;
-            for yyy in y0..=y1 {
-                let gd = y[yyy * w + x] as i32;
-                let wt = sw[yyy + r - yy] * lut[(gd - c).unsigned_abs() as usize];
-                acc += wt * tmp[yyy * w + x] as f32;
-                wsum += wt;
+        let centre = &y[yy * w..(yy + 1) * w];
+        acc.iter_mut().for_each(|v| *v = 0.0);
+        wsum.iter_mut().for_each(|v| *v = 0.0);
+        // Row-major: each tap row is read sequentially, and every pixel still
+        // accumulates its taps in ascending row order, so the sums are
+        // bit-identical to the column walk.
+        for yyy in y0..=y1 {
+            let s = sw[yyy + r - yy];
+            let grow = &y[yyy * w..(yyy + 1) * w];
+            let trow = &tmp[yyy * w..(yyy + 1) * w];
+            for x in 0..w {
+                let wt = s * lut[(grow[x] as i32 - centre[x] as i32).unsigned_abs() as usize];
+                acc[x] += wt * trow[x] as f32;
+                wsum[x] += wt;
             }
-            let v = (acc / wsum).round().clamp(0.0, 65535.0) as usize;
-            out[yy * w + x] = srgb[v];
+        }
+        for (x, o) in out[yy * w..(yy + 1) * w].iter_mut().enumerate() {
+            let v = (acc[x] / wsum[x]).round().clamp(0.0, 65535.0) as usize;
+            *o = srgb[v];
         }
     }
     out
 }
 
-fn chroma_horizontal(
-    c: &[i16],
+/// Horizontal pass of the chroma bilateral, on Cb and Cr together: the
+/// spatial and luma-guide weights are the same for both planes, so each tap
+/// computes `spatial * guide` once and multiplies in each plane's own range
+/// weight, in the same order as filtering the planes separately (bit-exact).
+#[allow(clippy::too_many_arguments)]
+fn chroma_horizontal2(
+    cb: &[i16],
+    cr: &[i16],
     guide: &[u8],
     w: usize,
     h: usize,
@@ -133,34 +152,46 @@ fn chroma_horizontal(
     sw: &[f32],
     guide_lut: &[f32],
     chroma_lut: &[f32],
-) -> Vec<i16> {
-    let mut out = vec![0i16; w * h];
+) -> (Vec<i16>, Vec<i16>) {
+    let mut ob = vec![0i16; w * h];
+    let mut or = vec![0i16; w * h];
     for yy in 0..h {
-        let row = yy * w;
+        let rb = &cb[yy * w..(yy + 1) * w];
+        let rr = &cr[yy * w..(yy + 1) * w];
+        let grow = &guide[yy * w..(yy + 1) * w];
+        let (obr, orr) = (&mut ob[yy * w..(yy + 1) * w], &mut or[yy * w..(yy + 1) * w]);
         for x in 0..w {
-            let g = guide[row + x] as i32;
-            let cv = c[row + x] as i32;
+            let g = grow[x] as i32;
+            let (vb, vr) = (rb[x] as i32, rr[x] as i32);
             let x0 = x.saturating_sub(r);
             let x1 = (x + r).min(w - 1);
-            let mut acc = 0.0f32;
-            let mut wsum = 0.0f32;
-            for xx in x0..=x1 {
-                let s = c[row + xx] as i32;
-                let gd = guide[row + xx] as i32;
-                let wt = sw[xx + r - x]
-                    * guide_lut[(gd - g).unsigned_abs() as usize]
-                    * chroma_lut[(s - cv).unsigned_abs() as usize];
-                acc += wt * s as f32;
-                wsum += wt;
+            let swin = &sw[x0 + r - x..=x1 + r - x];
+            let (mut ab, mut wb, mut ar, mut wr) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            for (k, &sp) in swin.iter().enumerate() {
+                let xx = x0 + k;
+                let gw = sp * guide_lut[(grow[xx] as i32 - g).unsigned_abs() as usize];
+                let sb = rb[xx] as i32;
+                let sr = rr[xx] as i32;
+                let wtb = gw * chroma_lut[(sb - vb).unsigned_abs() as usize];
+                let wtr = gw * chroma_lut[(sr - vr).unsigned_abs() as usize];
+                ab += wtb * sb as f32;
+                wb += wtb;
+                ar += wtr * sr as f32;
+                wr += wtr;
             }
-            out[row + x] = (acc / wsum).round().clamp(-1024.0, 1023.0) as i16;
+            obr[x] = (ab / wb).round().clamp(-1024.0, 1023.0) as i16;
+            orr[x] = (ar / wr).round().clamp(-1024.0, 1023.0) as i16;
         }
     }
-    out
+    (ob, or)
 }
 
-fn chroma_vertical(
-    tmp: &[i16],
+/// Vertical pass of the paired chroma bilateral, row-major: every pixel
+/// accumulates its taps in ascending row order (bit-exact).
+#[allow(clippy::too_many_arguments)]
+fn chroma_vertical2(
+    tb: &[i16],
+    tr: &[i16],
     guide: &[u8],
     w: usize,
     h: usize,
@@ -168,29 +199,41 @@ fn chroma_vertical(
     sw: &[f32],
     guide_lut: &[f32],
     chroma_lut: &[f32],
-) -> Vec<i16> {
-    let mut out = vec![0i16; w * h];
+) -> (Vec<i16>, Vec<i16>) {
+    let mut ob = vec![0i16; w * h];
+    let mut or = vec![0i16; w * h];
+    let (mut ab, mut wb) = (vec![0.0f32; w], vec![0.0f32; w]);
+    let (mut ar, mut wr) = (vec![0.0f32; w], vec![0.0f32; w]);
     for y in 0..h {
         let y0 = y.saturating_sub(r);
         let y1 = (y + r).min(h - 1);
-        for x in 0..w {
-            let g = guide[y * w + x] as i32;
-            let cv = tmp[y * w + x] as i32;
-            let mut acc = 0.0f32;
-            let mut wsum = 0.0f32;
-            for yy in y0..=y1 {
-                let s = tmp[yy * w + x] as i32;
-                let gd = guide[yy * w + x] as i32;
-                let wt = sw[yy + r - y]
-                    * guide_lut[(gd - g).unsigned_abs() as usize]
-                    * chroma_lut[(s - cv).unsigned_abs() as usize];
-                acc += wt * s as f32;
-                wsum += wt;
+        let gc = &guide[y * w..(y + 1) * w];
+        let (cb, cr) = (&tb[y * w..(y + 1) * w], &tr[y * w..(y + 1) * w]);
+        for v in [&mut ab, &mut wb, &mut ar, &mut wr] {
+            v.iter_mut().for_each(|x| *x = 0.0);
+        }
+        for yy in y0..=y1 {
+            let sp = sw[yy + r - y];
+            let gr = &guide[yy * w..(yy + 1) * w];
+            let (rb, rr) = (&tb[yy * w..(yy + 1) * w], &tr[yy * w..(yy + 1) * w]);
+            for x in 0..w {
+                let gw = sp * guide_lut[(gr[x] as i32 - gc[x] as i32).unsigned_abs() as usize];
+                let sb = rb[x] as i32;
+                let sr = rr[x] as i32;
+                let wtb = gw * chroma_lut[(sb - cb[x] as i32).unsigned_abs() as usize];
+                let wtr = gw * chroma_lut[(sr - cr[x] as i32).unsigned_abs() as usize];
+                ab[x] += wtb * sb as f32;
+                wb[x] += wtb;
+                ar[x] += wtr * sr as f32;
+                wr[x] += wtr;
             }
-            out[y * w + x] = (acc / wsum).round().clamp(-1024.0, 1023.0) as i16;
+        }
+        for x in 0..w {
+            ob[y * w + x] = (ab[x] / wb[x]).round().clamp(-1024.0, 1023.0) as i16;
+            or[y * w + x] = (ar[x] / wr[x]).round().clamp(-1024.0, 1023.0) as i16;
         }
     }
-    out
+    (ob, or)
 }
 
 /// 2x2 box downsample of an i16 plane.
@@ -235,36 +278,76 @@ fn half_down_luma(src: &[u8], w: usize, h: usize, hw: usize, hh: usize) -> Vec<u
     out
 }
 
-/// Bilinear upsample of an i16 plane back to w x h.
-fn half_up(src: &[i16], sw: usize, sh: usize, w: usize, h: usize) -> Vec<i16> {
-    let mut out = vec![0i16; w * h];
-    let sx = sw as f32 / w as f32;
-    let sy = sh as f32 / h as f32;
-    for y in 0..h {
-        let fy = ((y as f32 + 0.5) * sy - 0.5).clamp(0.0, (sh - 1) as f32);
-        let y0 = fy.floor() as usize;
-        let y1 = (y0 + 1).min(sh - 1);
-        let wy = fy - y0 as f32;
-        for x in 0..w {
-            let fx = ((x as f32 + 0.5) * sx - 0.5).clamp(0.0, (sw - 1) as f32);
-            let x0 = fx.floor() as usize;
-            let x1 = (x0 + 1).min(sw - 1);
-            let wx = fx - x0 as f32;
-            let a = src[y0 * sw + x0] as f32;
-            let b = src[y0 * sw + x1] as f32;
-            let c = src[y1 * sw + x0] as f32;
-            let d = src[y1 * sw + x1] as f32;
-            let top = a + (b - a) * wx;
-            let bot = c + (d - c) * wx;
-            out[y * w + x] = (top + (bot - top) * wy).round() as i16;
+/// Denoise a 16-bit RGBA frame in place: narrow to 8 bits, filter, and add
+/// the 8-bit change back in steps of 257, so the 16-bit precision of
+/// unfiltered pixels is kept. The pre-filter 8-bit value is recomputed from
+/// the untouched u16 rather than kept in a second copy.
+pub fn smart_denoise_wide(buf: &mut [u16], w: usize, h: usize, strength: f32, px_scale: f32) {
+    if strength <= 0.0 || w == 0 || h == 0 || buf.len() < w * h * 4 {
+        return;
+    }
+    // Alpha is never filtered, so only the colour channels are narrowed and
+    // widened back.
+    let mut narrow = vec![255u8; w * h * 4];
+    for (n, v) in narrow.chunks_exact_mut(4).zip(buf.chunks_exact(4)) {
+        n[0] = to8(v[0]) as u8;
+        n[1] = to8(v[1]) as u8;
+        n[2] = to8(v[2]) as u8;
+    }
+    smart_denoise(&mut narrow, w, h, strength, px_scale);
+    for (dst, n) in buf.chunks_exact_mut(4).zip(narrow.chunks_exact(4)) {
+        for c in 0..3 {
+            let step = (n[c] as i32 - to8(dst[c])) * 257;
+            if step != 0 {
+                dst[c] = (dst[c] as i32 + step).clamp(0, 65535) as u16;
+            }
         }
     }
-    out
+}
+
+/// `(v + 128) / 257` without the division; exact for every u16 (checked
+/// exhaustively, and by `to8_matches_division`).
+#[inline]
+fn to8(v: u16) -> i32 {
+    ((v as u32 * 255 + 32895) >> 16) as i32
+}
+
+/// Taps for the 2x bilinear upsample of a half-resolution plane back to
+/// `w` x `h`: per output column (x0, x1, wx) and per output row (y0, y1, wy).
+struct UpTaps {
+    cols: Vec<(usize, usize, f32)>,
+    rows: Vec<(usize, usize, f32)>,
+}
+
+impl UpTaps {
+    fn new(sw: usize, sh: usize, w: usize, h: usize) -> Self {
+        let taps = |n: usize, sn: usize| -> Vec<(usize, usize, f32)> {
+            let s = sn as f32 / n as f32;
+            (0..n)
+                .map(|i| {
+                    let f = ((i as f32 + 0.5) * s - 0.5).clamp(0.0, (sn - 1) as f32);
+                    let i0 = f.floor() as usize;
+                    (i0, (i0 + 1).min(sn - 1), f - i0 as f32)
+                })
+                .collect()
+        };
+        UpTaps { cols: taps(w, sw), rows: taps(h, sh) }
+    }
+}
+
+#[inline]
+fn bilerp(a: i16, b: i16, c: i16, d: i16, wx: f32, wy: f32) -> i16 {
+    let (a, b, c, d) = (a as f32, b as f32, c as f32, d as f32);
+    let top = a + (b - a) * wx;
+    let bot = c + (d - c) * wx;
+    (top + (bot - top) * wy).round() as i16
 }
 
 /// Share of the luma filter applied at slider strength `t` (0..=1):
 /// `(t / LUMA_FULL_AT)²`, capped at 1. 0.1 → 0.04, 0.25 → 0.25, ≥0.5 → 1.
 const LUMA_FULL_AT: f32 = 0.5;
+/// Luma mixes below this are skipped outright (slider strength < ~0.11).
+const LUMA_SKIP_MIX: f32 = 0.05;
 fn luma_mix(t: f32) -> f32 {
     let r = (t / LUMA_FULL_AT).clamp(0.0, 1.0);
     r * r
@@ -324,10 +407,14 @@ pub fn smart_denoise(buf: &mut [u8], w: usize, h: usize, strength: f32, px_scale
     // the averaged samples within a few codes of each other, so the sRGB-
     // averaging bias is far below one code (measured: mean -0.6 codes at
     // denoise 50 on the owner's ARW before 189d5e5).
-    let y16: Vec<u16> = y.iter().map(|&v| v as u16 * 257).collect();
-    let tmp_y = luma_horizontal(&y, &y16, w, h, r_y, &sw_y, &lut_y);
-    drop(y16);
-    let filt_y = luma_vertical(&tmp_y, &y, w, h, r_y, &sw_y, &lut_y, luma_lut());
+    // Below `LUMA_SKIP_MIX` the luma pass changes nothing measurable (Smart
+    // denoise 10 on the owner's ARW: luma detail +0.05 % at 100 %), so the
+    // low range pays for chroma only.
+    let luma_mix = luma_mix(t);
+    let filt_y: Option<Vec<u8>> = (luma_mix >= LUMA_SKIP_MIX).then(|| {
+        let tmp_y = luma_horizontal(&y, w, h, r_y, &sw_y, &lut_y);
+        luma_vertical(&tmp_y, &y, w, h, r_y, &sw_y, &lut_y, luma_lut())
+    });
 
     let sw_c = spatial(r_c);
     let lut_g = range(sg);
@@ -335,31 +422,41 @@ pub fn smart_denoise(buf: &mut [u8], w: usize, h: usize, strength: f32, px_scale
     let (cb_h, hw, hh) = half_down(&cb, w, h);
     let (cr_h, _, _) = half_down(&cr, w, h);
     let y_h = half_down_luma(&y, w, h, hw, hh);
-    let tmp_cb = chroma_horizontal(&cb_h, &y_h, hw, hh, r_c, &sw_c, &lut_g, &lut_c);
-    let v_cb = chroma_vertical(&tmp_cb, &y_h, hw, hh, r_c, &sw_c, &lut_g, &lut_c);
-    let filt_cb = half_up(&v_cb, hw, hh, w, h);
-    let tmp_cr = chroma_horizontal(&cr_h, &y_h, hw, hh, r_c, &sw_c, &lut_g, &lut_c);
-    let v_cr = chroma_vertical(&tmp_cr, &y_h, hw, hh, r_c, &sw_c, &lut_g, &lut_c);
-    let filt_cr = half_up(&v_cr, hw, hh, w, h);
+    let (tmp_cb, tmp_cr) = chroma_horizontal2(&cb_h, &cr_h, &y_h, hw, hh, r_c, &sw_c, &lut_g, &lut_c);
+    let (v_cb, v_cr) = chroma_vertical2(&tmp_cb, &tmp_cr, &y_h, hw, hh, r_c, &sw_c, &lut_g, &lut_c);
 
     // Radii and sigmas already carry the strength. Chroma uses the filtered
     // result whole. Luma is mixed by `luma_mix`, which deliberately squares
     // the slider over its lower half (see the module docs), so the low range
     // leaves luminance texture nearly untouched.
-    let luma_mix = luma_mix(t);
-    for i in 0..n {
-        // The integer forward split and this float inverse are not exact
-        // inverses (up to 2 codes on saturated blues), so apply only the
-        // change the filter made: an unfiltered pixel comes back exactly.
-        let to_rgb = |yy: f32, cb: f32, cr: f32| {
-            [yy + 1.402 * cr, yy - 0.344136 * cb - 0.714136 * cr, yy + 1.772 * cb]
-        };
-        let a = to_rgb(y[i] as f32, cb[i] as f32, cr[i] as f32);
-        let fy = y[i] as f32 + luma_mix * (filt_y[i] as f32 - y[i] as f32);
-        let b = to_rgb(fy, filt_cb[i] as f32, filt_cr[i] as f32);
-        let p = i * 4;
-        for c in 0..3 {
-            buf[p + c] = (buf[p + c] as f32 + (b[c] - a[c])).round().clamp(0.0, 255.0) as u8;
+    // The bilinear upsample of the filtered chroma is folded into this pass
+    // (same arithmetic as a separate upsample, so bit-identical) instead of
+    // writing and re-reading two full-resolution planes.
+    let up = UpTaps::new(hw, hh, w, h);
+    for yy in 0..h {
+        let (y0, y1, wy) = up.rows[yy];
+        let (cb0, cb1) = (&v_cb[y0 * hw..(y0 + 1) * hw], &v_cb[y1 * hw..(y1 + 1) * hw]);
+        let (cr0, cr1) = (&v_cr[y0 * hw..(y0 + 1) * hw], &v_cr[y1 * hw..(y1 + 1) * hw]);
+        for (x, &(x0, x1, wx)) in up.cols.iter().enumerate() {
+            let i = yy * w + x;
+            // The integer forward split and this float inverse are not exact
+            // inverses (up to 2 codes on saturated blues), so apply only the
+            // change the filter made: an unfiltered pixel comes back exactly.
+            let to_rgb = |yy: f32, cb: f32, cr: f32| {
+                [yy + 1.402 * cr, yy - 0.344136 * cb - 0.714136 * cr, yy + 1.772 * cb]
+            };
+            let a = to_rgb(y[i] as f32, cb[i] as f32, cr[i] as f32);
+            let fy = match &filt_y {
+                Some(f) => y[i] as f32 + luma_mix * (f[i] as f32 - y[i] as f32),
+                None => y[i] as f32,
+            };
+            let fcb = bilerp(cb0[x0], cb0[x1], cb1[x0], cb1[x1], wx, wy) as f32;
+            let fcr = bilerp(cr0[x0], cr0[x1], cr1[x0], cr1[x1], wx, wy) as f32;
+            let b = to_rgb(fy, fcb, fcr);
+            let p = i * 4;
+            for c in 0..3 {
+                buf[p + c] = (buf[p + c] as f32 + (b[c] - a[c])).round().clamp(0.0, 255.0) as u8;
+            }
         }
     }
 }
@@ -499,6 +596,41 @@ mod tests {
             .collect();
         let m = vals.iter().sum::<f32>() / vals.len() as f32;
         (vals.iter().map(|v| (v - m) * (v - m)).sum::<f32>() / vals.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn to8_matches_division() {
+        for v in 0..=u16::MAX {
+            assert_eq!(to8(v), ((v as u32 + 128) / 257) as i32, "v = {v}");
+        }
+    }
+
+    #[test]
+    fn wide_matches_narrow_denoise_widen() {
+        // smart_denoise_wide must equal the old path: narrow to 8 bits,
+        // denoise, add the 8-bit change back in steps of 257.
+        let (w, h) = (96, 64);
+        let src8 = colour_noisy(w, h, [90, 140, 60], 9, 11);
+        let wide: Vec<u16> = src8
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (v as u16 * 257).saturating_add(i as u16 % 200))
+            .collect();
+        for strength in [0.05f32, 0.3, 1.0] {
+            let mut expect = wide.clone();
+            let before: Vec<u8> = wide.iter().map(|&v| ((v as u32 + 128) / 257) as u8).collect();
+            let mut after = before.clone();
+            smart_denoise(&mut after, w, h, strength, 1.0);
+            for ((d, &a), &b) in expect.iter_mut().zip(&after).zip(&before) {
+                let step = (a as i32 - b as i32) * 257;
+                if step != 0 {
+                    *d = (*d as i32 + step).clamp(0, 65535) as u16;
+                }
+            }
+            let mut got = wide.clone();
+            smart_denoise_wide(&mut got, w, h, strength, 1.0);
+            assert_eq!(got, expect, "strength {strength}");
+        }
     }
 
     #[test]

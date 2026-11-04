@@ -293,15 +293,7 @@ pub fn denoise_wide(buf: &mut [u16], w: usize, h: usize, denoise: f32, px_scale:
     if strength <= 0.0 || w == 0 || h == 0 {
         return;
     }
-    let before: Vec<u8> = buf.iter().map(|&v| ((v as u32 + 128) / 257) as u8).collect();
-    let mut after = before.clone();
-    crate::denoise::smart_denoise(&mut after, w, h, strength, px_scale);
-    for ((dst, &a), &b) in buf.iter_mut().zip(after.iter()).zip(before.iter()) {
-        let d = (a as i32 - b as i32) * 257;
-        if d != 0 {
-            *dst = (*dst as i32 + d).clamp(0, 65535) as u16;
-        }
-    }
+    crate::denoise::smart_denoise_wide(buf, w, h, strength, px_scale);
 }
 
 /// Denoise and capture sharpening on a camera-toned 16-bit frame: the
