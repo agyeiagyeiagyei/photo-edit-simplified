@@ -1,43 +1,105 @@
 # photo-edit-simplified
 
-A mobile-first, fully client-side photo and video editor for social media.
-Upload, crop to platform presets, rotate/straighten, adjust basic color, apply
-the same edits across a batch, and export ready-to-post files. No accounts, no
-server — media never leaves your device.
+A desktop-first, fully client-side RAW culling and develop app built for
+birding photography. Import a shoot straight from a folder or Google Drive,
+flip through frames with hover loupes, star the keepers, develop them in
+linear light, and export a batch or save the edits back to Drive. Nothing is
+uploaded: every pixel is decoded and edited in the browser.
 
-## Features
+## What it does
 
-- **Photos** (JPEG, PNG, HEIC): crop presets (9:16, 1:1, 4:5, 16:9, original),
-  90° rotation + fine straighten (±10°), brightness/contrast/saturation/warmth,
-  JPEG export at exact social dimensions (e.g. 1080×1920).
-- **Video**: same crop/rotate/color edits plus trim, transcoded in-browser to
-  MP4 (H.264 + AAC) via ffmpeg.wasm.
-- **Batch**: multi-select upload, "Apply edits to all", download all.
-- **PWA**: installable, works offline after first load.
+- **Fast RAW ingest** — drag/drop, file picker or a Google Drive folder.
+  A RAW frame shows the camera's embedded JPEG immediately; sensor pixels are
+  demosaiced only when a frame is developed or exported, so a full card is
+  browsable in seconds.
+- **Culling** — filmstrip across the shoot, hover loupes for focus checks,
+  a ★ shortlist stored in a Drive manifest (`photo-edit-shortlist.json`) that
+  survives reloads and machines, an "unstarred" filter for working through a
+  shoot, and "Import starred" to bring just the keepers back.
+- **RAW develop, in linear light** — temperature (2500–9500 K, 5500 K =
+  as-shot), tint, exposure, highlights, shadows, chroma-noise suppression,
+  edge-aware denoise and capture sharpening. A neutral 16-bit path preserves
+  highlight headroom before the camera tone curve.
+- **Editing** — crop with aspect presets or freeform, 90° rotation and fine
+  straighten, brightness/contrast/saturation/warmth, blur, film grain
+  (Gaussian or uniform, luma or colour), levels, tone curves, and a bracket
+  of social output sizes.
+- **Retouch and compose** — rect/lasso/per-pixel selections with feathering,
+  magic wand, subject masks, heal and clone, plus raster, text and vector-path
+  layers with opacity and reordering.
+- **Video** — the same crop/rotate/colour controls plus trim and text overlay,
+  transcoded locally to MP4 with ffmpeg.wasm.
+- **Delivery** — single or batch export to JPEG (with sRGB ICC), ZIP download,
+  ASCII-safe filenames (`edited-1x1-<name>.jpg`), and "Save to Drive". Edit
+  recipes persist per item, so reopening the app restores the develop state
+  without touching the original file.
 
-## Tech
+## Privacy and security
 
-- Rust + WebAssembly UI ([Leptos](https://leptos.dev)), pixel ops in Rust.
-- [ffmpeg.wasm](https://github.com/ffmpegwasm/ffmpeg.wasm) for video.
-- [heic2any](https://github.com/alexcorvi/heic2any) for HEIC import.
+Media never leaves the device; there is no backend and no account database.
+Google Drive is optional and uses OAuth (the `drive.readonly` and `drive.file`
+scopes only) — the app reads and writes only the files and folders you pick,
+and tokens stay in memory for the session.
 
-## Development
+The Drive API key and OAuth client ID in `src/drive.rs` are public client
+identifiers, not secrets — that is how Google's JS APIs work. They must be
+restricted in the Google Cloud console: the API key limited to the **Google
+Drive API** with **HTTP referrer** restrictions for the Pages origin
+(`https://agyeiagyeiagyei.github.io/photo-edit-simplified/*`) and localhost
+development, and the OAuth client limited to the same JavaScript origins. If
+you fork this and use your own project, apply the same restrictions; an
+unrestricted key can be used against other APIs under your quota.
 
-Requires [Rust](https://rustup.rs) with the wasm target and
-[trunk](https://trunkrs.dev):
+## Build
+
+Requires [Rust](https://rustup.rs) with the `wasm32-unknown-unknown` target and
+[trunk](https://trunkrs.dev). The pixel worker is a separate wasm module with
+its own build step:
 
 ```sh
 rustup target add wasm32-unknown-unknown
-trunk serve        # dev server on :8080
+./build.sh                 # pixel worker wasm + wasm-bindgen glue, content-hashed
 trunk build --release --public-url /photo-edit-simplified/
 ```
 
-## Deployment
+For local development, `./build.sh && trunk serve`; the app is then at
+`http://localhost:8080`. Re-run `./build.sh` whenever anything under `worker/`,
+`pixel/`, `rawcore/` or `rawmeta/` changes — the trunk post-build hook rewrites
+the worker filename in `index.html` from `target/pes-worker-meta.txt`.
 
-GitHub Actions builds and deploys to GitHub Pages on every push to `main`
-(`.github/workflows/deploy.yml`). Enable Pages (source: GitHub Actions) in the
-repo settings.
+Serve `dist/` over HTTP (not `file://`): workers, WASM and the service worker
+need an origin. A clean full rebuild:
+
+```sh
+./build.sh && trunk build --release --public-url /photo-edit-simplified/
+python3 -m http.server 8787 --directory dist
+```
+
+## Tests
+
+```sh
+cargo test --workspace
+cargo clippy --workspace -- -D warnings
+(cd tests/e2e && npm ci && npx playwright test)   # builds fixtures first
+```
+
+CI (`.github/workflows/deploy.yml`) runs the Rust tests, the clippy gate, a
+worker size budget, and the Playwright suite; the Pages deploy depends on all
+of them.
+
+## Documentation
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — workers, caches, storage,
+  render pipeline, service worker.
+- [`docs/PERF.md`](docs/PERF.md) — performance work and measured budgets.
+- [`docs/GPU.md`](docs/GPU.md) — WebGL/GPU status and plans.
+- [`docs/raw-preview-export-plan.md`](docs/raw-preview-export-plan.md) — RAW
+  preview/export design notes.
+- [`spec.md`](spec.md) — product spec and decisions log.
+- [`vendor/rawler/PATCHES.md`](vendor/rawler/PATCHES.md) — local patches to the
+  vendored RAW decoder.
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE).
+Apache-2.0 — see [LICENSE](LICENSE). The vendored `rawler` decoder is
+LGPL-2.1; see `vendor/rawler/LICENSE`.
