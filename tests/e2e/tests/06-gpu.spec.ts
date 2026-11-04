@@ -155,10 +155,14 @@ test.describe('WebGL2 parametric preview (docs/GPU.md)', () => {
     const raw = RAWS[0];
     // One context at a time: the two full-res pipelines together crash the
     // renderer in the 64 MB-/dev/shm container. A fresh context per mode also
-    // keeps both pages from restoring the persisted developed proxy (a q0.9
-    // JPEG), so both develop from the same raw and the bases are comparable.
+    // keeps both pages from restoring the persisted developed proxy (a JPEG),
+    // so both develop from the same raw and the bases are comparable.
+    // The wide viewport keeps the hi target at the source cap on both paths:
+    // at a narrower size a pre-layout first pass can size the CPU frame from
+    // the viewport fallback while the GPU base lands at the measured display
+    // target, and the capture then compares two backing resolutions.
     const contextOpts = {
-      viewport: { width: 1600, height: 1000 },
+      viewport: { width: 1920, height: 1080 },
       deviceScaleFactor: 2,
       baseURL: process.env.PES_BASE_URL || 'http://127.0.0.1:8787/',
     };
@@ -173,6 +177,16 @@ test.describe('WebGL2 parametric preview (docs/GPU.md)', () => {
         await importFiles(page, [raw]);
         await waitCanvasWidthAbove(page, 1200);
         await waitMark(page, 'proxy.raw_develop');
+        if (mode === '1') {
+          // The GPU keeps the camera-JPEG base on screen until the developed
+          // proxy lands (stale-while-revalidate). Wait for that re-upload so
+          // parity compares the same source as the CPU capture.
+          await expect.poll(async () => {
+            const names = (await marks(page)).map((m) => m.name);
+            const develop = names.lastIndexOf('proxy.raw_develop');
+            return develop >= 0 && names.slice(develop).includes('gpu.base');
+          }, { timeout: 60_000 }).toBe(true);
+        }
         await waitStableSharpCanvas(page);
         if (mode === '1') {
           // The untouched RAW is the GPU path's own case and must stay there.
@@ -244,7 +258,7 @@ test.describe('WebGL2 parametric preview (docs/GPU.md)', () => {
     expect(cpu.errors, cpu.errors.join('\n')).toEqual([]);
   });
 
-  test('gpu render matches the CPU pipeline within 45 dB', async ({ page }, testInfo) => {
+  test('gpu render matches the CPU pipeline within 45 dB', async ({ page, browser }, testInfo) => {
     const gpuPage = page;
     const gpuErrors = trackErrors(gpuPage);
     await openMode(gpuPage, '1');
@@ -255,7 +269,15 @@ test.describe('WebGL2 parametric preview (docs/GPU.md)', () => {
     await applyColorEdit(gpuPage);
     await waitStableSharpCanvas(gpuPage);
 
-    const cpuPage = await gpuPage.context().newPage();
+    // A fresh context keeps its IndexedDB empty: in the shared context the
+    // CPU page can restore the GPU page's debounced session and start with a
+    // second filmstrip item.
+    const cpuCtx = await browser.newContext({
+      viewport: { width: 1600, height: 1000 },
+      deviceScaleFactor: 2,
+      baseURL: process.env.PES_BASE_URL || 'http://127.0.0.1:8787/',
+    });
+    const cpuPage = await cpuCtx.newPage();
     const cpuErrors = trackErrors(cpuPage);
     await openMode(cpuPage, '0');
     await importFiles(cpuPage, [JPEG_A]);
@@ -287,7 +309,7 @@ test.describe('WebGL2 parametric preview (docs/GPU.md)', () => {
     expect(cpuErrors, cpuErrors.join('\n')).toEqual([]);
     expect(db, `parity PSNR ${db.toFixed(2)} dB < 45 dB`).toBeGreaterThanOrEqual(45);
 
-    await cpuPage.close();
+    await cpuCtx.close();
   });
 
   test('ten slider ticks run on the GPU with no worker round trip', async ({ page }, testInfo) => {
