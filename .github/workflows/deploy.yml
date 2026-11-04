@@ -3,6 +3,8 @@ name: Deploy to GitHub Pages
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -10,8 +12,10 @@ permissions:
   pages: write
   id-token: write
 
+# One run at a time per branch or PR; a newer push supersedes an older run.
+# Pull requests get their own group, so they never cancel a main deploy.
 concurrency:
-  group: pages
+  group: pages-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -35,6 +39,7 @@ jobs:
         run: trunk build --release --public-url /photo-edit-simplified/
 
       - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
         with:
           path: dist
 
@@ -130,6 +135,8 @@ jobs:
           if-no-files-found: ignore
 
   deploy:
+    # Pull requests only build and test; deploys happen from main.
+    if: github.event_name != 'pull_request'
     needs: [build, test]
     runs-on: ubuntu-latest
     environment:
