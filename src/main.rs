@@ -1,3 +1,11 @@
+// UI entry point: many signatures mirror the worker protocol and Leptos
+// callback shapes, so folding them into structs would be churn without payoff.
+#![allow(
+    clippy::type_complexity,
+    clippy::too_many_arguments,
+    clippy::missing_const_for_thread_local
+)]
+
 mod drive;
 mod exif;
 mod gpu;
@@ -78,7 +86,7 @@ impl Pixels {
 
     /// Hand the buffer to the worker without keeping a main-thread copy. The
     /// view is detached; only call this when the pixels are not used again.
-    fn into_worker_transfer(&self, id: usize, w: usize, h: usize) -> bool {
+    fn transfer_to_worker(&self, id: usize, w: usize, h: usize) -> bool {
         match self {
             Pixels::View(v) => pworker::load_view_transfer(id, v, w, h),
             Pixels::Owned(v) => {
@@ -326,7 +334,7 @@ fn materialize_full(state: AppState, id: usize, dims: (usize, usize), neutral: b
 fn install_full_develop(id: usize, full: Option<FullDevelop>) -> (bool, bool) {
     let Some(mut f) = full else { return (false, false) };
     let neutral = f.neutral.take();
-    if !f.pixels.into_worker_transfer(id, f.w, f.h) {
+    if !f.pixels.transfer_to_worker(id, f.w, f.h) {
         return (false, false);
     }
     let has_neutral = match &neutral {
@@ -391,7 +399,7 @@ fn ensure_full(state: AppState, id: usize, waiter: Option<Box<dyn FnOnce()>>) {
             if let Some(mut full) = decoded {
                 let neutral = full.neutral.take();
                 let dims = (full.w, full.h);
-                let ok = full.pixels.into_worker_transfer(id, full.w, full.h);
+                let ok = full.pixels.transfer_to_worker(id, full.w, full.h);
                 let neutral_ok = match &neutral {
                     Some(n) => pworker::load_neutral_transfer(
                         id,
@@ -1664,19 +1672,16 @@ fn ensure_thumb_observer(state: AppState, root: &web_sys::Element) {
     let init = web_sys::IntersectionObserverInit::new();
     init.set_root(Some(root));
     init.set_root_margin("96px");
-    match web_sys::IntersectionObserver::new_with_options(
+    if let Ok(obs) = web_sys::IntersectionObserver::new_with_options(
         cb.as_ref().unchecked_ref(),
         &init,
     ) {
-        Ok(obs) => {
-            THUMB_OBSERVER.with(|o| *o.borrow_mut() = Some(obs.clone()));
-            THUMB_PENDING.with(|p| {
-                for el in p.borrow_mut().drain(..) {
-                    obs.observe(&el);
-                }
-            });
-        }
-        Err(_) => {}
+        THUMB_OBSERVER.with(|o| *o.borrow_mut() = Some(obs.clone()));
+        THUMB_PENDING.with(|p| {
+            for el in p.borrow_mut().drain(..) {
+                obs.observe(&el);
+            }
+        });
     }
     cb.forget();
 }
@@ -2425,13 +2430,13 @@ fn draw_path_layer(ctx: &web_sys::CanvasRenderingContext2d, layer: &state::Layer
     let stroke_px = (p.stroke_width * h as f32) as f64;
     if !p.fill_color.is_empty() && p.fill_color != "none" {
         ctx.set_fill_style_str(&p.fill_color);
-        let _ = ctx.fill();
+        ctx.fill();
     }
     if stroke_px > 0.0 {
         ctx.set_line_width(stroke_px);
         ctx.set_stroke_style_str(&p.stroke_color);
         ctx.set_line_join("round");
-        let _ = ctx.stroke();
+        ctx.stroke();
     }
 }
 
@@ -2453,7 +2458,7 @@ fn draw_brush_layer(ctx: &web_sys::CanvasRenderingContext2d, layer: &state::Laye
             for &(x, y) in &stroke.points[1..] {
                 ctx.line_to((x * w as f32) as f64, (y * h as f32) as f64);
             }
-            let _ = ctx.stroke();
+            ctx.stroke();
         }
         return;
     }
@@ -2706,7 +2711,7 @@ fn preview_geometry_cached(
     preview: &(Vec<u8>, usize, usize),
     edit: &EditParams,
 ) -> Option<(Rc<Vec<u8>>, usize, usize)> {
-    if edit.rot90 % 4 == 0 && edit.fine_angle.abs() <= 0.01 {
+    if edit.rot90.is_multiple_of(4) && edit.fine_angle.abs() <= 0.01 {
         return None;
     }
     let (rot90, fine_bits) = (edit.rot90, edit.fine_angle.to_bits());
@@ -3073,7 +3078,7 @@ async fn render_photo_export(
     };
     drop(encode_span);
     let base = item.name.rsplitn(2, '.').last().unwrap_or("photo");
-    let filename = format!("edited-{}-{}.{}", item.edit.aspect.label(), base, ext);
+    let filename = format!("edited-{}-{}.{}", item.edit.aspect.slug(), base, ext);
     Some((blob, mime, filename))
 }
 
@@ -4196,7 +4201,7 @@ fn CanvasLoupe(
         // run the pointwise pipeline over it, so the loupe shows true source
         // pixels instead of a slice of a whole-image render. Exact only with
         // identity geometry and no selection or visible layers.
-        let plain = item.edit.rot90 % 4 == 0
+        let plain = item.edit.rot90.is_multiple_of(4)
             && item.edit.fine_angle.abs() <= 0.01
             && item.edit.selection.is_none()
             && !item.layers.iter().any(|l| l.visible && l.opacity > 0.01);
@@ -5424,7 +5429,7 @@ fn restore_session(state: AppState) {
                         CACHE.with(|c| c.borrow_mut().raw_fallback.insert(id, Rc::new(bytes)));
                     }
                 }
-                let has_full = full.pixels.into_worker_transfer(id, fw, fh);
+                let has_full = full.pixels.transfer_to_worker(id, fw, fh);
                 let has_neutral = match full.neutral.take() {
                     Some(n) => pworker::load_neutral_transfer(
                         id,
@@ -6750,6 +6755,8 @@ enum PenHandle {
     In,
 }
 
+// Variants name the handle being dragged; the shared prefix is the point.
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum PenDrag {
     MovePoint(usize),
@@ -6835,18 +6842,18 @@ fn draw_path_edit_handles(ctx: &web_sys::CanvasRenderingContext2d, layer: &state
         ctx.line_to(ox, oy);
         ctx.move_to(px, py);
         ctx.line_to(ix, iy);
-        let _ = ctx.stroke();
+        ctx.stroke();
 
-        ctx.set_fill_style_str(pt.smooth.then_some("#0a84ff").unwrap_or("#ffcc00"));
+        ctx.set_fill_style_str(if pt.smooth { "#0a84ff" } else { "#ffcc00" });
         ctx.begin_path();
         ctx.arc(px, py, 6.0, 0.0, std::f64::consts::PI * 2.0).unwrap();
-        let _ = ctx.fill();
+        ctx.fill();
 
         ctx.set_fill_style_str("#fff");
         for (hx, hy) in [(ox, oy), (ix, iy)] {
             ctx.begin_path();
             ctx.arc(hx, hy, 4.0, 0.0, std::f64::consts::PI * 2.0).unwrap();
-            let _ = ctx.fill();
+            ctx.fill();
         }
     }
 }
@@ -7065,7 +7072,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             if let Some(item) = state.current() {
                 if item.kind == MediaKind::Photo {
                     if let Some(photo) = get_photo(item.id) {
-                        painted = paint_prefetched_hi(&item, &photo, canvas_ref.get().as_ref().map(|v| &**v));
+                        painted = paint_prefetched_hi(&item, &photo, canvas_ref.get().as_deref());
                     }
                 }
             }
@@ -7493,7 +7500,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         }
         if want_hi
             && gpu_ok
-            && gkey.as_ref().map_or(false, |k| gpu::base_match(k) != Some(false))
+            && gkey.as_ref().is_some_and(|k| gpu::base_match(k) != Some(false))
         {
             // 60ms debounce so a fine-angle drag issues one base request, not
             // one per frame; a pending request that already covers this key
@@ -7529,7 +7536,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     return;
                 }
                 let covered = GPU_BASE_REQ.with(|r| {
-                    r.borrow().as_ref().map_or(false, |p| {
+                    r.borrow().as_ref().is_some_and(|p| {
                         p.item == key.item
                             && p.rot90 == key.rot90
                             && p.fine_bits == key.fine_bits
@@ -7624,7 +7631,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 // again would swap it for a smaller worker copy of the same pixels.
                 if !cropped_view
                     && HI_CACHE.with(|c| {
-                        c.borrow().as_ref().map_or(false, |hi| {
+                        c.borrow().as_ref().is_some_and(|hi| {
                             hi.item_id == item.id
                                 && hi.edit_fp == edit_fp
                                 && hi.source_fp == source_fp
@@ -7715,7 +7722,7 @@ fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                     // edit and source instead of downgrading it.
                                     if item_cb.layers.iter().all(|l| !l.visible)
                                         && HI_CACHE.with(|c| {
-                                            c.borrow().as_ref().map_or(false, |hi| {
+                                            c.borrow().as_ref().is_some_and(|hi| {
                                                 hi.item_id == item_id
                                                     && hi.edit_fp == edit_fp
                                                     && hi.source_fp == source_fp
@@ -8180,7 +8187,7 @@ fn CropOverlay(
                     }
                 }
                 let Some(((orig, mid0, d0), (a, b))) =
-                    snap.clone().zip(pts.first().copied().zip(pts.get(1).copied()))
+                    snap.zip(pts.first().copied().zip(pts.get(1).copied()))
                 else {
                     return;
                 };
@@ -10491,7 +10498,7 @@ fn ExportTab(state: AppState) -> impl IntoView {
             <label class="row" style="justify-content:flex-start;gap:0.5rem">
                 <input
                     type="checkbox"
-                    prop:checked=move || keep_audio()
+                    prop:checked=keep_audio
                     on:change=move |ev| {
                         let checked = event_target_checked(&ev);
                         state.update_current_item(|m| m.edit.keep_audio = checked);

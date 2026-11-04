@@ -205,8 +205,8 @@ fn chroma_vertical(
 
 /// 2x2 box downsample of an i16 plane.
 fn half_down(src: &[i16], w: usize, h: usize) -> (Vec<i16>, usize, usize) {
-    let hw = (w + 1) / 2;
-    let hh = (h + 1) / 2;
+    let hw = w.div_ceil(2);
+    let hh = h.div_ceil(2);
     let mut out = vec![0i16; hw * hh];
     for y in 0..hh {
         let y0 = y * 2;

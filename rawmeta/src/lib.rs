@@ -65,11 +65,11 @@ pub fn largest_embedded_jpeg(bytes: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
         if let (Some(o), Some(l)) = (joff, jlen) {
             let in_file = l >= 4
                 && o >= 8
-                && o.checked_add(l).map_or(false, |end| end <= bytes.len());
+                && o.checked_add(l).is_some_and(|end| end <= bytes.len());
             if in_file
                 && bytes[o] == 0xFF
                 && bytes[o + 1] == 0xD8
-                && best.map_or(true, |(_, bl)| l > bl)
+                && best.is_none_or(|(_, bl)| l > bl)
             {
                 best = Some((o, l));
             }
@@ -507,11 +507,11 @@ pub mod tiff {
         out.extend_from_slice(&data_area);
     }
 
-    fn patch_u32(out: &mut Vec<u8>, pos: usize, v: u32) {
+    fn patch_u32(out: &mut [u8], pos: usize, v: u32) {
         out[pos..pos + 4].copy_from_slice(&v.to_le_bytes());
     }
 
-    fn set_len_as_offset(out: &mut Vec<u8>, pos: usize) {
+    fn set_len_as_offset(out: &mut [u8], pos: usize) {
         let v = out.len() as u32;
         patch_u32(out, pos, v);
     }

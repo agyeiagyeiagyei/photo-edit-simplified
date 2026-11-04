@@ -136,10 +136,6 @@ impl PathPoint {
     pub fn new(x: f32, y: f32) -> Self {
         PathPoint { x, y, in_x: 0.0, in_y: 0.0, out_x: 0.0, out_y: 0.0, smooth: true }
     }
-
-    pub fn corner(x: f32, y: f32) -> Self {
-        PathPoint { x, y, in_x: 0.0, in_y: 0.0, out_x: 0.0, out_y: 0.0, smooth: false }
-    }
 }
 
 #[derive(Clone, PartialEq, Debug)]

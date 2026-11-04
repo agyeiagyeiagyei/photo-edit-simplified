@@ -59,7 +59,7 @@ pub fn tiff_from_png(b: &[u8]) -> Option<Vec<u8>> {
 /// In-place: set Orientation to 1, tag the colour space as sRGB, and detach
 /// the thumbnail IFD (IFD1). The canvas pipeline is sRGB end to end, so a
 /// source that says "uncalibrated" would mislead a colour-managed viewer.
-fn normalize_orientation(t: &mut Vec<u8>) {
+fn normalize_orientation(t: &mut [u8]) {
     if t.len() < 8 {
         return;
     }
@@ -102,9 +102,7 @@ fn normalize_orientation(t: &mut Vec<u8>) {
             if u16at(t, le, e + 2) != Some(3) {
                 continue;
             }
-            if tag == Some(0x0112) {
-                set_short(t, e, 1);
-            } else if tag == Some(0xA001) {
+            if tag == Some(0x0112) || tag == Some(0xA001) {
                 set_short(t, e, 1);
             }
         }

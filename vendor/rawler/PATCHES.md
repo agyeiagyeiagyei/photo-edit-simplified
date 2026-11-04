@@ -37,6 +37,21 @@ Chromium, this container).
 Effect: worker wasm 1,293,780 → 809,539 B gz locally (jxl-oxide was ~480 KB gz);
 CI runs ~0.6% larger than local. Budget ratcheted to 900,000 B.
 
+## Repository trim (2026-11-04, WS7 #11)
+
+Removed `data/testdata` (4.45 MB / 8,130 tracked fixture files, never
+compiled in), `benches/`, `src/bin/` and `tests/`, plus their `[[bin]]`,
+`[[test]]` and `[[bench]]` entries in `Cargo.toml`. PES builds this crate as a library dependency only;
+none of those targets were compiled or run.
+
+## Clippy opt-out (2026-11-04, WS7 #11)
+
+`src/lib.rs` adds `clippy::all` to the upstream allow list. The workspace CI
+gate runs `cargo clippy --workspace -- -D warnings`; upstream rawler predates
+several current lints (216 warnings, none PES-specific), and restyling vendored
+LGPL code would make future upstream merges harder. PES-owned crates keep the
+gate.
+
 ## wasm32 timing calls
 
 At import, `std::time::Instant`-based demosaic timing logs were stripped:

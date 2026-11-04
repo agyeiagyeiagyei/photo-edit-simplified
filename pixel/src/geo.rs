@@ -16,7 +16,7 @@ pub fn geometry<'a>(
     h: usize,
     edit: &EditParams,
 ) -> (Cow<'a, [u8]>, usize, usize) {
-    let (p, w, h): (Cow<'a, [u8]>, usize, usize) = if edit.rot90 % 4 != 0 {
+    let (p, w, h): (Cow<'a, [u8]>, usize, usize) = if !edit.rot90.is_multiple_of(4) {
         let (v, w, h) = ops::rotate_90(pixels, w, h, edit.rot90);
         (Cow::Owned(v), w, h)
     } else {
@@ -38,7 +38,7 @@ pub fn geometry_wide<'a>(
     h: usize,
     edit: &EditParams,
 ) -> (Cow<'a, [u16]>, usize, usize) {
-    let (p, w, h): (Cow<'a, [u16]>, usize, usize) = if edit.rot90 % 4 != 0 {
+    let (p, w, h): (Cow<'a, [u16]>, usize, usize) = if !edit.rot90.is_multiple_of(4) {
         let (v, w, h) = ops::rotate_90_wide(pixels, w, h, edit.rot90);
         (Cow::Owned(v), w, h)
     } else {

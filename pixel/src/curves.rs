@@ -87,8 +87,8 @@ impl CurvesSettings {
         if !self.is_valid() {
             return Self::default().build_tables();
         }
-        for ch in 0..3 {
-            for (v, slot) in tables[ch].iter_mut().enumerate() {
+        for (ch, table) in tables.iter_mut().enumerate() {
+            for (v, slot) in table.iter_mut().enumerate() {
                 *slot = self.value(self.value(v as f64, ch + 1), 0) as f32;
             }
         }
