@@ -345,6 +345,8 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         // A sharp frame from an older source stays on screen while the new
         // one renders, so a RAW proxy upgrade never flashes the soft preview.
         let mut stale_source = false;
+        // Source fingerprint of the sharp frame this pass draws, if any.
+        let mut drawn_src: Option<u64> = None;
         // GPU parametric preview: one shader draw per paint from the worker
         // base, which is pre-develop and pre-colour, so slider ticks never
         // touch the worker. With no usable base the 1024px preview stays up
@@ -386,6 +388,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                         if blitted {
                             composite_layers(&canvas, &item.layers, gw as usize, gh as usize);
                             sharp = Some(Sharp::Whole { w: gw as usize });
+                            drawn_src = gpu::base_src().map(|(_, fp)| fp);
                         } else {
                             gpu::latch_off();
                             gpu_ok = false;
@@ -415,6 +418,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                         .draw_image_with_html_canvas_element(&win.canvas, 0.0, 0.0)
                         .unwrap();
                     stale_source = win.source_fp != src_fp;
+                    drawn_src = Some(win.source_fp);
                     Some(Sharp::Window { w: win.w, cw: cw_p })
                 });
             }
@@ -437,8 +441,14 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                         blit_hi_frame(hi, &canvas, None);
                     }
                     stale_source = hi.source_fp != src_fp || hi.stand_in;
+                    drawn_src = (!hi.stand_in).then_some(hi.source_fp);
                     Some(Sharp::Whole { w: hi.w })
                 });
+            }
+        }
+        if let Some(fp) = drawn_src {
+            if state.shown_src.get_untracked() != Some((item.id, fp)) {
+                state.shown_src.set(Some((item.id, fp)));
             }
         }
 
@@ -1017,6 +1027,9 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                         on:pointerleave=move |_| canvas_loupe_clear(state)
                     >
                         <canvas node_ref=canvas_ref></canvas>
+                        <Show when=move || raw_develop_pending(state) fallback=|| ()>
+                            <div class="developing-badge" role="status" aria-live="polite">"Developing RAW…"</div>
+                        </Show>
                         <Show when=move || tab.get() == Tab::Crop fallback=|| ()>
                             <CropOverlay state=state working=working drag=crop_drag pinch=crop_pinch/>
                         </Show>
@@ -1377,3 +1390,28 @@ fn source_has_neutral(id: usize, photo: &PhotoData) -> bool {
         proxy_data(id).is_some_and(|p| p.neutral)
     }
 }
+
+/// True while the selected RAW is not yet shown from its own sensor develop:
+/// the camera-JPEG proxy is still up, the 16-bit develop that RAW edits need
+/// has not landed, or it has landed but the last sharp frame drawn (tracked
+/// in `shown_src` by the render pass) is still from an older source. Edits are drawn live meanwhile but approximately, so the badge says
+/// the look will still change (owner decision, 2026-11-05). Only the source
+/// is checked, not the edit, so ordinary slider drags never flash the badge.
+fn raw_develop_pending(state: AppState) -> bool {
+    // Re-evaluate when a proxy lands or a frame is built.
+    state.hi_built.track();
+    let Some(item) = state.current() else { return false };
+    if item.kind != MediaKind::Photo {
+        return false;
+    }
+    let Some(photo) = get_photo(item.id) else { return false };
+    if !photo.raw || photo.full {
+        return false;
+    }
+    if !proxy_developed(item.id) || proxy_wants_neutral(state, item.id) {
+        return true;
+    }
+    let src_fp = source_fingerprint(photo.gen, proxy_gen(item.id));
+    state.shown_src.get() != Some((item.id, src_fp))
+}
+

@@ -425,6 +425,9 @@ pub struct AppState {
     /// Bumped when the hi-res preview cache finishes rebuilding; the canvas
     /// render effect listens and swaps the sharp frame in.
     pub hi_built: RwSignal<u32>,
+    /// (item, source fingerprint) of the last sharp frame drawn on the canvas;
+    /// the "Developing RAW…" badge stays until it is the current source.
+    pub shown_src: RwSignal<Option<(usize, u64)>>,
     /// Bumped on window resize so the canvas backing can track display size.
     pub viewport_gen: RwSignal<u32>,
     pub drive_filter: RwSignal<DriveFilter>,
@@ -526,6 +529,7 @@ impl AppState {
             drive_save_gen: create_rw_signal(0),
             drive_save_pending: create_rw_signal(false),
             hi_built: create_rw_signal(0),
+            shown_src: create_rw_signal(None),
             viewport_gen: create_rw_signal(0),
             drive_filter: create_rw_signal(DriveFilter::All),
             drive_sort: create_rw_signal(DriveSort::DateDesc),

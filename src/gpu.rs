@@ -142,6 +142,11 @@ pub fn eligible(edit: &EditParams) -> bool {
 
 /// `Some(stale_source)` when a base for the same item and geometry is large
 /// enough; `None` when there is nothing usable.
+/// (item, source fingerprint) of the uploaded base, if any.
+pub fn base_src() -> Option<(u32, u64)> {
+    STATE.with(|s| s.borrow().base.as_ref().map(|(k, _, _)| (k.item, k.src_fp)))
+}
+
 pub fn base_match(key: &BaseKey) -> Option<bool> {
     STATE.with(|s| {
         let st = s.borrow();
