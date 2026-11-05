@@ -944,10 +944,11 @@ pub fn unload(id: usize) {
 }
 
 /// Post any adjustment-layer raster mask the worker has not seen at its
-/// current version. Called immediately before a recipe is sent, so the
-/// worker's FIFO message order guarantees the cache is filled first.
-fn sync_adjust_masks(item: usize, edit: &EditParams) {
-    let id = item as u32;
+/// current version for buffer `wid`. Called immediately before a recipe is
+/// sent, so the worker's FIFO message order guarantees the cache is filled
+/// first.
+fn sync_adjust_masks(wid: usize, edit: &EditParams) {
+    let id = wid as u32;
     for layer in &edit.adjust_layers {
         let Some(Selection {
             kind: SelectionKind::Mask { data, width, height },
@@ -987,11 +988,14 @@ fn sync_adjust_masks(item: usize, edit: &EditParams) {
     }
 }
 
-/// Recipe for a worker render of `item`: the global edit with the stack's
-/// adjustment layers lifted in, and their raster masks synced first.
-pub(crate) fn render_recipe(item: &crate::state::MediaItem) -> String {
+/// Recipe for a worker render of `item` against worker buffer `wid`: the
+/// global edit with the stack's adjustment layers lifted in, and their raster
+/// masks synced first. The worker resolves mask references by the id of the
+/// call that carries the recipe, so `wid` must be that id — a RAW shown from
+/// its proxy renders against `proxy_wid(item.id)`, not `item.id`.
+pub(crate) fn render_recipe(item: &crate::state::MediaItem, wid: usize) -> String {
     let edit = crate::state::render_edit(&item.edit, &item.layers);
-    sync_adjust_masks(item.id, &edit);
+    sync_adjust_masks(wid, &edit);
     pes_pixel::recipe::edit_params_full_json(&edit)
 }
 

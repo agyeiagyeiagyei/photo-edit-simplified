@@ -533,7 +533,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     return;
                 }
                 GPU_BASE_REQ.with(|r| *r.borrow_mut() = Some(key));
-                let recipe = pworker::render_recipe(&item);
+                let recipe = pworker::render_recipe(&item, src_id);
                 let accepted = pworker::render_base(
                     src_id,
                     &recipe,
@@ -606,7 +606,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 let t2 = hi_target(req_w, req_h, fw2, fh2, HI_MAX_EDGE as u32);
                 HI_REQ_GEN.with(|d| d.set(d.get() + 1));
                 let rgen = HI_REQ_GEN.with(|d| d.get());
-                let recipe = pworker::render_recipe(&item);
+                let recipe = pworker::render_recipe(&item, src_id);
                 let sel = item.edit.selection.clone();
                 let edit_fp = edit_fingerprint(&item);
                 let source_fp = source_fingerprint(photo.gen, proxy_gen(item.id));
