@@ -250,15 +250,7 @@ pub fn selection_mask(sel: &Selection, w: usize, h: usize) -> Vec<u8> {
             if poly.len() < 3 {
                 return mask;
             }
-            for y in 0..h {
-                for x in 0..w {
-                    let nx = (x as f32 + 0.5) / w as f32;
-                    let ny = (y as f32 + 0.5) / h as f32;
-                    if point_in_polygon(nx, ny, poly) {
-                        mask[y * w + x] = 255;
-                    }
-                }
-            }
+            lasso_fill(&mut mask, w, h, poly);
         }
         SelectionKind::Mask { data, width: mw, height: mh } => {
             if *mw == w && *mh == h && data.len() == w * h {
@@ -280,6 +272,49 @@ pub fn selection_mask(sel: &Selection, w: usize, h: usize) -> Vec<u8> {
     mask
 }
 
+/// Even-odd scanline fill of a normalized polygon, sampled at pixel centres.
+/// Per row it collects the x of every edge crossing (the same straddle test
+/// and intersection expression as [`point_in_polygon`]), sorts them, and marks
+/// a pixel inside when an odd number of crossings lie strictly to its right —
+/// so it selects exactly the pixels the per-pixel test does, in O(rows × edges
+/// + pixels) instead of O(pixels × edges).
+fn lasso_fill(mask: &mut [u8], w: usize, h: usize, poly: &[(f32, f32)]) {
+    let n = poly.len();
+    let mut xs: Vec<f32> = Vec::with_capacity(n);
+    for y in 0..h {
+        let ny = (y as f32 + 0.5) / h as f32;
+        xs.clear();
+        let mut j = n - 1;
+        for i in 0..n {
+            let (xi, yi) = poly[i];
+            let (xj, yj) = poly[j];
+            if (yi > ny) != (yj > ny) {
+                xs.push((xj - xi) * (ny - yi) / (yj - yi) + xi);
+            }
+            j = i;
+        }
+        if xs.is_empty() {
+            continue;
+        }
+        xs.sort_unstable_by(f32::total_cmp);
+        let row = &mut mask[y * w..(y + 1) * w];
+        // `k` counts crossings at or left of the pixel centre; the pixel is
+        // inside when the rest (those strictly right of it) are odd in number.
+        let mut k = 0;
+        for (x, px) in row.iter_mut().enumerate() {
+            let nx = (x as f32 + 0.5) / w as f32;
+            while k < xs.len() && xs[k] <= nx {
+                k += 1;
+            }
+            if (xs.len() - k) % 2 == 1 {
+                *px = 255;
+            }
+        }
+    }
+}
+
+/// Reference even-odd test the scanline fill must agree with pixel for pixel.
+#[cfg(test)]
 fn point_in_polygon(x: f32, y: f32, poly: &[(f32, f32)]) -> bool {
     let mut inside = false;
     let mut j = poly.len() - 1;
@@ -299,11 +334,14 @@ fn point_in_polygon(x: f32, y: f32, poly: &[(f32, f32)]) -> bool {
     inside
 }
 
-/// Approximate gaussian feather on a grayscale mask. radius is a fraction of
-/// the image diagonal and is clamped to a reasonable pixel range.
+/// Box feather on a grayscale mask. `radius` is a fraction of the image
+/// diagonal, so one selection feathers the same at every resolution — the
+/// preview, a windowed render and the full-size export see the same edge.
+/// (A pixel cap here made the export's edge a fraction of the preview's on
+/// large photos.) The running-sum blur costs the same at any radius.
 pub fn feather_mask(mask: &mut [u8], w: usize, h: usize, radius: f32) {
     let diag = ((w * w + h * h) as f32).sqrt();
-    let r = (radius * diag * 0.5).clamp(1.0, 64.0) as usize;
+    let r = ((radius * diag * 0.5).max(1.0) as usize).min(w.max(h));
     if r <= 1 {
         return;
     }
@@ -311,45 +349,49 @@ pub fn feather_mask(mask: &mut [u8], w: usize, h: usize, radius: f32) {
     box_blur_gray(&tmp, mask, w, h, r);
 }
 
+/// Mean over the window [i - radius, i + radius] (clipped to the frame) along
+/// x, then along y. The horizontal pass keeps 8 fractional bits in a u16, so
+/// the two passes round once; a uniform region stays exactly at its value.
 fn box_blur_gray(src: &[u8], dst: &mut [u8], w: usize, h: usize, radius: usize) {
-    let mut temp = vec![0u32; w * h];
-    let r = radius as i32;
-    // horizontal pass
+    let mut temp = vec![0u16; w * h];
     for y in 0..h {
-        let mut sum = 0u32;
-        for x in 0..(r + 1).min(w as i32) {
-            sum += src[y * w + x as usize] as u32;
-        }
+        let row = &src[y * w..(y + 1) * w];
+        let out = &mut temp[y * w..(y + 1) * w];
+        let mut sum: u32 = row[..(radius + 1).min(w)].iter().map(|&v| v as u32).sum();
         for x in 0..w {
-            let left = (x as i32 - r - 1).max(0) as usize;
-            let right = (x as i32 + r).min(w as i32 - 1) as usize;
-            if x as i32 - r > 0 {
-                sum -= src[y * w + left] as u32;
+            let count = ((x + radius).min(w - 1) - x.saturating_sub(radius) + 1) as u32;
+            out[x] = (((sum << 8) + count / 2) / count) as u16;
+            if x + 1 + radius < w {
+                sum += row[x + 1 + radius] as u32;
             }
-            if x as i32 + r < w as i32 {
-                sum += src[y * w + right] as u32;
+            if x >= radius {
+                sum -= row[x - radius] as u32;
             }
-            let count = (right - left + 1) as u32;
-            temp[y * w + x] = sum / count.max(1);
         }
     }
-    // vertical pass
-    for x in 0..w {
-        let mut sum = 0u32;
-        for y in 0..(r + 1).min(h as i32) {
-            sum += temp[(y as usize) * w + x];
+    let mut col_sum = vec![0u32; w];
+    for y in 0..(radius + 1).min(h) {
+        for (s, &v) in col_sum.iter_mut().zip(&temp[y * w..(y + 1) * w]) {
+            *s += v as u32;
         }
-        for y in 0..h {
-            let top = (y as i32 - r - 1).max(0) as usize;
-            let bot = (y as i32 + r).min(h as i32 - 1) as usize;
-            if y as i32 - r > 0 {
-                sum -= temp[top * w + x];
+    }
+    for y in 0..h {
+        let count = ((y + radius).min(h - 1) - y.saturating_sub(radius) + 1) as u32;
+        let div = count << 8;
+        for (d, &s) in dst[y * w..(y + 1) * w].iter_mut().zip(&col_sum) {
+            *d = ((s + div / 2) / div).min(255) as u8;
+        }
+        if y + 1 + radius < h {
+            let add = (y + 1 + radius) * w;
+            for (s, &v) in col_sum.iter_mut().zip(&temp[add..add + w]) {
+                *s += v as u32;
             }
-            if y as i32 + r < h as i32 {
-                sum += temp[bot * w + x];
+        }
+        if y >= radius {
+            let sub = (y - radius) * w;
+            for (s, &v) in col_sum.iter_mut().zip(&temp[sub..sub + w]) {
+                *s -= v as u32;
             }
-            let count = (bot - top + 1) as u32;
-            dst[y * w + x] = (sum / count.max(1)).min(255) as u8;
         }
     }
 }
@@ -513,6 +555,96 @@ mod tests {
         let mut data = vec![100, 100, 100, 255];
         adjust(&mut data, 0.2, 0.0, 0.0, 0.0);
         assert!(data[0] > 100 && data[1] > 100 && data[2] > 100);
+    }
+
+    #[test]
+    fn lasso_mask_handles_slanted_edges() {
+        // A diamond: every edge is slanted. Before the divisor fix a downward
+        // edge counted as a crossing on every row, so this selected a quarter
+        // of the frame and missed its own centre.
+        let sel = Selection {
+            kind: SelectionKind::Lasso(vec![(0.5, 0.25), (0.75, 0.5), (0.5, 0.75), (0.25, 0.5)]),
+            feather: 0.0,
+        };
+        let (w, h) = (200, 200);
+        let m = selection_mask(&sel, w, h);
+        let area = m.iter().filter(|&&v| v > 0).count() as f64 / (w * h) as f64;
+        assert!((area - 0.125).abs() < 0.005, "diamond covers {area:.3} of the frame, want 0.125");
+        assert_eq!(m[100 * w + 100], 255, "centre must be selected");
+        assert_eq!(m[60 * w + 60], 0, "bounding-box corner is outside the diamond");
+    }
+
+    #[test]
+    fn scanline_lasso_matches_the_per_pixel_test() {
+        // Random (often self-intersecting) polygons at awkward sizes: the
+        // scanline fill must select exactly the pixels point_in_polygon does.
+        let mut seed = 0x2545_f491_u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed as f32) / (u32::MAX as f32)
+        };
+        for case in 0..40 {
+            let n = 3 + (case * 7) % 60;
+            let poly: Vec<(f32, f32)> = (0..n).map(|_| (rnd() * 1.2 - 0.1, rnd() * 1.2 - 0.1)).collect();
+            let (w, h) = (37 + case * 11, 23 + case * 5);
+            let mut fast = vec![0u8; w * h];
+            lasso_fill(&mut fast, w, h, &poly);
+            for y in 0..h {
+                for x in 0..w {
+                    let nx = (x as f32 + 0.5) / w as f32;
+                    let ny = (y as f32 + 0.5) / h as f32;
+                    let want = if point_in_polygon(nx, ny, &poly) { 255 } else { 0 };
+                    assert_eq!(fast[y * w + x], want, "case {case} ({n} pts, {w}x{h}) pixel ({x},{y})");
+                }
+            }
+        }
+    }
+
+    /// 10%..90% rise of the mask along the middle row, as a fraction of width.
+    fn ramp_fraction(m: &[u8], w: usize, h: usize) -> f64 {
+        let row = &m[(h / 2) * w..(h / 2) * w + w / 2];
+        let a = row.iter().position(|&v| v >= 26).unwrap();
+        let b = row.iter().position(|&v| v >= 230).unwrap();
+        (b - a) as f64 / w as f64
+    }
+
+    #[test]
+    fn feather_is_resolution_independent() {
+        // The same feathered selection at preview and full-size export
+        // resolution must give the same edge relative to the frame.
+        for feather in [0.01f32, 0.05, 0.15] {
+            let sel = Selection {
+                kind: SelectionKind::Rect { x: 0.3, y: 0.25, w: 0.4, h: 0.5 },
+                feather,
+            };
+            let small = selection_mask(&sel, 1200, 800);
+            let large = selection_mask(&sel, 6000, 4000);
+            let (rs, rl) = (ramp_fraction(&small, 1200, 800), ramp_fraction(&large, 6000, 4000));
+            assert!(
+                (rs - rl).abs() <= 0.002 + 0.03 * rs,
+                "feather {feather}: ramp {rs:.4} of width at 1200 px vs {rl:.4} at 6000 px"
+            );
+        }
+    }
+
+    #[test]
+    fn feathered_mask_keeps_full_strength_inside() {
+        // The blur averages over the clipped window, so the inside of a
+        // feathered selection stays at 255 and the far outside at 0.
+        let sel = Selection {
+            kind: SelectionKind::Rect { x: 0.25, y: 0.25, w: 0.5, h: 0.5 },
+            feather: 0.02,
+        };
+        for (w, h) in [(300usize, 200usize), (1024, 683), (3000, 2000)] {
+            let m = selection_mask(&sel, w, h);
+            assert_eq!(m[(h / 2) * w + w / 2], 255, "{w}x{h}: centre not at full strength");
+            assert_eq!(m[5 * w + 5], 0, "{w}x{h}: far outside not zero");
+        }
+        let mut flat = vec![255u8; 64 * 48];
+        feather_mask(&mut flat, 64, 48, 0.2);
+        assert!(flat.iter().all(|&v| v == 255), "a fully selected frame must stay fully selected");
     }
 
     #[test]
