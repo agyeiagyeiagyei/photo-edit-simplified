@@ -78,6 +78,13 @@ test.describe('RAW (ARW/DNG) import → develop → export', () => {
       // fixture whose camera JPEG is too small to beat the soft preview.
       await expect.poll(async () => (await canvasSize(page)).w, { timeout: 60_000 }).toBeGreaterThan(2000);
       const developedMs = Date.now() - t0;
+      // The "Developing RAW…" badge marks the interim camera-JPEG look; once
+      // the sensor develop has landed it must be gone, never stuck on screen.
+      await expect.poll(
+        () => page.evaluate(() => ((window as any).__pes?.perf?.() || []).some((e: any) => e.name === 'proxy.raw_develop' || e.name === 'pool.develop')),
+        { timeout: 60_000 },
+      ).toBe(true);
+      await expect(page.locator('.developing-badge')).toHaveCount(0, { timeout: 30_000 });
       const swap = await page.evaluate(() => {
         const w = window as any;
         cancelAnimationFrame(w.__qaRawRaf);
