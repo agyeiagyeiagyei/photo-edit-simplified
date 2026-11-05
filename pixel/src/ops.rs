@@ -345,17 +345,18 @@ pub fn feather_mask(mask: &mut [u8], w: usize, h: usize, radius: f32) {
     if r <= 1 {
         return;
     }
-    let tmp = mask.to_vec();
-    box_blur_gray(&tmp, mask, w, h, r);
+    box_blur_gray(mask, w, h, r);
 }
 
-/// Mean over the window [i - radius, i + radius] (clipped to the frame) along
-/// x, then along y. The horizontal pass keeps 8 fractional bits in a u16, so
-/// the two passes round once; a uniform region stays exactly at its value.
-fn box_blur_gray(src: &[u8], dst: &mut [u8], w: usize, h: usize, radius: usize) {
+/// In-place mean over the window [i - radius, i + radius] (clipped to the
+/// frame) along x, then along y. The horizontal pass reads the whole mask into
+/// a u16 buffer with 8 fractional bits before the vertical pass writes it back,
+/// so no copy of the input is needed and the two passes round once; a uniform
+/// region stays exactly at its value.
+fn box_blur_gray(mask: &mut [u8], w: usize, h: usize, radius: usize) {
     let mut temp = vec![0u16; w * h];
     for y in 0..h {
-        let row = &src[y * w..(y + 1) * w];
+        let row = &mask[y * w..(y + 1) * w];
         let out = &mut temp[y * w..(y + 1) * w];
         let mut sum: u32 = row[..(radius + 1).min(w)].iter().map(|&v| v as u32).sum();
         for x in 0..w {
@@ -378,7 +379,7 @@ fn box_blur_gray(src: &[u8], dst: &mut [u8], w: usize, h: usize, radius: usize) 
     for y in 0..h {
         let count = ((y + radius).min(h - 1) - y.saturating_sub(radius) + 1) as u32;
         let div = count << 8;
-        for (d, &s) in dst[y * w..(y + 1) * w].iter_mut().zip(&col_sum) {
+        for (d, &s) in mask[y * w..(y + 1) * w].iter_mut().zip(&col_sum) {
             *d = ((s + div / 2) / div).min(255) as u8;
         }
         if y + 1 + radius < h {
