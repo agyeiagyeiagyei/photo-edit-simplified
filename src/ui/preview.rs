@@ -357,7 +357,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         // the CPU neutral path renders it.
         let mut gpu_ok = want_hi
             && !cropped_view
-            && gpu::eligible(&item.edit)
+            && gpu::eligible(&item.edit, &item.layers)
             && gpu::active()
             && !(photo.raw && !item.edit.raw.is_identity() && !source_has_neutral(item.id, &photo));
         let mut gkey: Option<gpu::BaseKey> = None;
@@ -455,7 +455,8 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         if sharp.is_none() {
             let mut frame = PipeFrame::new(p.into_owned(), w, h);
             let px_scale = pipeline::px_scale_for(sw, sh, PipeTarget::new(w, h));
-            pipeline::finish_edit(&mut frame, &item.edit, item.id as u32, px_scale);
+            let params = state::render_edit(&item.edit, &item.layers);
+            pipeline::finish_edit(&mut frame, &params, item.id as u32, px_scale);
             let p = frame.pixels;
             if cropped_view {
                 // Composite at full size offscreen, then blit the crop region —
@@ -532,7 +533,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     return;
                 }
                 GPU_BASE_REQ.with(|r| *r.borrow_mut() = Some(key));
-                let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
+                let recipe = pworker::render_recipe(&item);
                 let accepted = pworker::render_base(
                     src_id,
                     &recipe,
@@ -605,7 +606,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 let t2 = hi_target(req_w, req_h, fw2, fh2, HI_MAX_EDGE as u32);
                 HI_REQ_GEN.with(|d| d.set(d.get() + 1));
                 let rgen = HI_REQ_GEN.with(|d| d.get());
-                let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
+                let recipe = pworker::render_recipe(&item);
                 let sel = item.edit.selection.clone();
                 let edit_fp = edit_fingerprint(&item);
                 let source_fp = source_fingerprint(photo.gen, proxy_gen(item.id));
@@ -794,6 +795,19 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             if let Some(sel) = state.selected_layer.get() {
                 if let Some(layer) = item.layers.iter().find(|l| l.id == sel) {
                     draw_path_edit_handles(&web::ctx2d(&canvas), layer, w as f64, h as f64);
+                }
+            }
+        }
+
+        // Adjustment-layer mask tint: editor-only, drawn for every layer whose
+        // show_mask toggle is on (usually just the one being edited).
+        if tab.get() == Tab::Layers {
+            let ctx = web::ctx2d(&canvas);
+            for layer in item.layers.iter() {
+                if let LayerKind::Adjust(a) = &layer.kind {
+                    if a.show_mask {
+                        draw_layer_mask_overlay(&ctx, a.mask.as_ref(), a.invert, w as f64, h as f64);
+                    }
                 }
             }
         }

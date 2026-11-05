@@ -286,8 +286,11 @@ fn point_in_polygon(x: f32, y: f32, poly: &[(f32, f32)]) -> bool {
     for i in 0..poly.len() {
         let (xi, yi) = poly[i];
         let (xj, yj) = poly[j];
+        // The straddle test above guarantees yi != yj, so no zero divisor; the
+        // sign of yj - yi must be preserved (edges running upward and downward
+        // both count as crossings).
         if ((yi > y) != (yj > y))
-            && (x < (xj - xi) * (y - yi) / (yj - yi).max(f32::EPSILON) + xi)
+            && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)
         {
             inside = !inside;
         }
@@ -510,6 +513,31 @@ mod tests {
         let mut data = vec![100, 100, 100, 255];
         adjust(&mut data, 0.2, 0.0, 0.0, 0.0);
         assert!(data[0] > 100 && data[1] > 100 && data[2] > 100);
+    }
+
+    #[test]
+    fn lasso_mask_fills_only_the_polygon() {
+        // Both upward and downward edges: clamping the divisor to a positive
+        // epsilon used to make every row inside a downward-bounded span read
+        // as fully selected.
+        let sel = Selection {
+            kind: SelectionKind::Lasso(vec![
+                (0.25, 0.25),
+                (0.75, 0.25),
+                (0.75, 0.75),
+                (0.25, 0.75),
+            ]),
+            feather: 0.0,
+        };
+        let m = selection_mask(&sel, 100, 100);
+        assert_eq!(m[50 * 100 + 50], 255, "center must be selected");
+        assert_eq!(m[10 * 100 + 10], 0, "top-left corner outside");
+        assert_eq!(m[10 * 100 + 50], 0, "above the polygon");
+        assert_eq!(m[50 * 100 + 10], 0, "left of the polygon");
+        for y in 0..100 {
+            let count = m[y * 100..(y + 1) * 100].iter().filter(|&&v| v > 0).count();
+            assert!(count <= 51, "row {y} filled {count} px");
+        }
     }
 
     #[test]

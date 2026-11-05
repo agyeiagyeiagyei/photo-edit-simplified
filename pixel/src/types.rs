@@ -22,6 +22,54 @@ pub struct Selection {
     pub feather: f32,
 }
 
+/// Point operations an adjustment layer applies inside its mask. A subset of
+/// the global colour controls: every stage is per-pixel, so it can run through
+/// a mask in one pass.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct PointAdjust {
+    pub brightness: f32,
+    pub contrast: f32,
+    pub saturation: f32,
+    pub warmth: f32,
+    pub levels: LevelsSettings,
+    pub curves: CurvesSettings,
+}
+
+impl PointAdjust {
+    pub fn is_identity(&self) -> bool {
+        self.brightness == 0.0
+            && self.contrast == 0.0
+            && self.saturation == 0.0
+            && self.warmth == 0.0
+            && self.levels.is_identity()
+            && self.curves.is_identity()
+    }
+}
+
+/// One adjustment layer: point operations confined to a mask. Layers apply
+/// bottom to top, in vector order, each blended by mask × opacity.
+#[derive(Clone, PartialEq, Debug)]
+pub struct AdjustLayer {
+    /// Matches the app layer id; keys the worker's cached mask rasters.
+    pub id: u64,
+    pub visible: bool,
+    /// 0..=1, scales the mask's effect.
+    pub opacity: f32,
+    /// None applies to the whole frame.
+    pub mask: Option<Selection>,
+    pub invert: bool,
+    /// Bumped whenever the mask changes, so a stale cached raster is ignored.
+    pub mask_version: u64,
+    pub adjust: PointAdjust,
+}
+
+impl AdjustLayer {
+    /// Whether this layer can change any pixel.
+    pub fn active(&self) -> bool {
+        self.visible && self.opacity > 0.0 && !self.adjust.is_identity()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Aspect {
     Original,
@@ -178,6 +226,9 @@ pub struct EditParams {
     pub raw: RawAdjust,
     /// Active selection mask (rect, lasso, or derived from ML segmentation).
     pub selection: Option<Selection>,
+    /// Adjustment layers applied on top of the global colour stages, bottom
+    /// first. Empty for a photo without adjustment layers.
+    pub adjust_layers: Vec<AdjustLayer>,
     /// Video trim (start_s, end_s); None = untrimmed.
     pub trim: Option<(f32, f32)>,
     /// Keep original audio track on export; if false, strip audio.
@@ -203,6 +254,7 @@ impl Default for EditParams {
             curves: CurvesSettings::default(),
             raw: RawAdjust::default(),
             selection: None,
+            adjust_layers: Vec::new(),
             trim: None,
             keep_audio: true,
         }
@@ -223,7 +275,8 @@ impl EditParams {
         }
     }
 
-    pub fn is_color_touched(&self) -> bool {
+    /// True when a global (non-layer) colour or develop stage is active.
+    pub fn base_color_touched(&self) -> bool {
         self.brightness != 0.0
             || self.contrast != 0.0
             || self.saturation != 0.0
@@ -233,6 +286,10 @@ impl EditParams {
             || !self.levels.is_identity()
             || !self.curves.is_identity()
             || !self.raw.is_identity()
+    }
+
+    pub fn is_color_touched(&self) -> bool {
+        self.base_color_touched() || self.adjust_layers.iter().any(|l| l.active())
     }
 }
 

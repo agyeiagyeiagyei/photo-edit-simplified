@@ -143,22 +143,49 @@ pub(crate) fn draw_selection_overlay(ctx: &web_sys::CanvasRenderingContext2d, se
         SelectionKind::Mask { .. } => {
             let (wi, hi) = (w as usize, h as usize);
             let mask = ops::selection_mask(sel, wi, hi);
-            let mut tint = vec![0u8; wi * hi * 4];
-            for (i, &m) in mask.iter().enumerate() {
-                if m == 0 {
-                    continue;
-                }
-                tint[i * 4] = 10;
-                tint[i * 4 + 1] = 132;
-                tint[i * 4 + 2] = 255;
-                tint[i * 4 + 3] = m / 3;
-            }
-            let tmp = web::create_canvas(wi as u32, hi as u32);
-            web::put_pixels(&tmp, &tint, wi as u32, hi as u32);
-            let _ = ctx.draw_image_with_html_canvas_element(&tmp, 0.0, 0.0);
+            paint_mask_tint(ctx, &mask, wi, hi, [10, 132, 255]);
         }
     }
     ctx.restore();
+}
+
+fn paint_mask_tint(ctx: &web_sys::CanvasRenderingContext2d, mask: &[u8], w: usize, h: usize, rgb: [u8; 3]) {
+    let mut tint = vec![0u8; w * h * 4];
+    for (i, &m) in mask.iter().enumerate() {
+        if m == 0 {
+            continue;
+        }
+        tint[i * 4] = rgb[0];
+        tint[i * 4 + 1] = rgb[1];
+        tint[i * 4 + 2] = rgb[2];
+        tint[i * 4 + 3] = m / 3;
+    }
+    let tmp = web::create_canvas(w as u32, h as u32);
+    web::put_pixels(&tmp, &tint, w as u32, h as u32);
+    let _ = ctx.draw_image_with_html_canvas_element(&tmp, 0.0, 0.0);
+}
+
+/// Editor-only tint of an adjustment layer's mask. An unmasked layer has no
+/// shape to show, and a fully-inverted empty mask would only wash the frame.
+pub(crate) fn draw_layer_mask_overlay(
+    ctx: &web_sys::CanvasRenderingContext2d,
+    sel: Option<&Selection>,
+    invert: bool,
+    w: f64,
+    h: f64,
+) {
+    let Some(sel) = sel else { return };
+    let (wi, hi) = (w as usize, h as usize);
+    if wi == 0 || hi == 0 {
+        return;
+    }
+    let mut mask = ops::selection_mask(sel, wi, hi);
+    if invert {
+        for v in &mut mask {
+            *v = 255 - *v;
+        }
+    }
+    paint_mask_tint(ctx, &mask, wi, hi, [255, 59, 48]);
 }
 
 pub(crate) fn draw_select_drag(ctx: &web_sys::CanvasRenderingContext2d, drag: &SelectDrag, w: f64, h: f64) {

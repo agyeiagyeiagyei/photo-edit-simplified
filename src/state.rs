@@ -8,6 +8,7 @@ use std::rc::Rc;
 
 pub use pes_pixel::recipe::{edit_params_from_recipe, edit_recipe_json};
 pub use pes_pixel::types::{Aspect, CropRect, EditParams, Selection, SelectionKind};
+pub use pes_pixel::types::{AdjustLayer, PointAdjust};
 pub(crate) use pes_pixel::recipe::{jbool, jget, jnum};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -230,12 +231,51 @@ impl Default for BrushLayer {
     }
 }
 
+/// A non-destructive colour adjustment with its own mask, living in the layer
+/// stack. The mask selection is in working-image coordinates, the same frame
+/// the global selection uses.
+#[derive(Clone, PartialEq, Debug)]
+pub struct AdjustLayerState {
+    pub adjust: PointAdjust,
+    pub mask: Option<Selection>,
+    pub invert: bool,
+    /// Editor-only: paint the mask over the preview. Never rendered/exported.
+    pub show_mask: bool,
+    /// Bumped whenever mask bytes or feather change, so the worker's raster
+    /// cache for `(item, layer)` is replaced instead of reused.
+    pub mask_version: u64,
+}
+
+impl AdjustLayerState {
+    pub fn new() -> Self {
+        AdjustLayerState {
+            adjust: PointAdjust::default(),
+            mask: None,
+            invert: false,
+            show_mask: false,
+            mask_version: 0,
+        }
+    }
+
+    pub fn set_mask(&mut self, mask: Option<Selection>) {
+        self.mask = mask;
+        self.mask_version += 1;
+    }
+}
+
+impl Default for AdjustLayerState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub enum LayerKind {
     Text(TextLayer),
     Path(PathLayer),
     Brush(BrushLayer),
     Raster(RasterLayer),
+    Adjust(AdjustLayerState),
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -298,14 +338,107 @@ impl Layer {
         }
     }
 
+    pub fn new_adjust(id: usize) -> Self {
+        Layer {
+            id,
+            visible: true,
+            opacity: 1.0,
+            kind: LayerKind::Adjust(AdjustLayerState::new()),
+        }
+    }
+
     pub fn label(&self) -> String {
         match &self.kind {
             LayerKind::Text(t) => format!("T: {}", t.text),
             LayerKind::Path(_) => "Path".into(),
             LayerKind::Brush(_) => "Brush".into(),
             LayerKind::Raster(_) => "Image".into(),
+            LayerKind::Adjust(_) => "Adjust".into(),
         }
     }
+}
+
+/// Stack order is application order for adjustment layers: index 0 is the
+/// bottom of the photo stack. Overlay layers are composited after the whole
+/// photo pipeline, so their position relative to adjustments only affects the
+/// panel grouping, not pixels.
+pub fn adjust_layers_from_stack(layers: &[Layer]) -> Vec<AdjustLayer> {
+    layers
+        .iter()
+        .filter_map(|l| match &l.kind {
+            LayerKind::Adjust(a) => Some(AdjustLayer {
+                id: l.id as u64,
+                visible: l.visible,
+                opacity: l.opacity,
+                mask: a.mask.clone(),
+                invert: a.invert,
+                mask_version: a.mask_version,
+                adjust: a.adjust.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Edit params for a render: the global edit with the stack's adjustment
+/// layers lifted into it. `item.edit.adjust_layers` is always empty in app
+/// state (recipes are migrated into the stack on ingest).
+pub fn render_edit(edit: &EditParams, layers: &[Layer]) -> EditParams {
+    let mut out = edit.clone();
+    out.adjust_layers = adjust_layers_from_stack(layers);
+    out
+}
+
+/// Insert an overlay layer at the top of the overlay group — below the
+/// adjustment group in vector order, since adjustments apply to the photo and
+/// overlays composite above it.
+pub fn insert_overlay(layers: &mut Vec<Layer>, layer: Layer) {
+    let at = layers
+        .iter()
+        .position(|l| matches!(l.kind, LayerKind::Adjust(_)))
+        .unwrap_or(layers.len());
+    layers.insert(at, layer);
+}
+
+/// Move adjustment layers parsed from a stored recipe (Drive manifest, or a
+/// session written before layers lived in the stack) into the layer stack.
+/// Ids are renumbered so a recipe's ids can never collide with the overlays
+/// this item already has; the edit is left with no adjust layers.
+pub fn migrate_adjust_layers(
+    edit: &mut EditParams,
+    layers: &mut Vec<Layer>,
+    next_layer_id: &mut usize,
+) {
+    if edit.adjust_layers.is_empty() {
+        return;
+    }
+    let mut next = (*next_layer_id)
+        .max(layers.iter().map(|l| l.id + 1).max().unwrap_or(0));
+    for al in std::mem::take(&mut edit.adjust_layers) {
+        let id = next;
+        next += 1;
+        layers.push(Layer {
+            id,
+            visible: al.visible,
+            opacity: al.opacity,
+            kind: LayerKind::Adjust(AdjustLayerState {
+                adjust: al.adjust,
+                mask: al.mask,
+                invert: al.invert,
+                show_mask: false,
+                mask_version: al.mask_version,
+            }),
+        });
+    }
+    *next_layer_id = next;
+}
+
+/// True when any adjustment layer can change pixels (used to keep the GPU
+/// shader path, which implements no masking, off the render).
+pub fn has_visible_adjust_layers(layers: &[Layer]) -> bool {
+    layers
+        .iter()
+        .any(|l| l.visible && l.opacity > 0.01 && matches!(l.kind, LayerKind::Adjust(_)))
 }
 
 #[derive(Clone, PartialEq)]

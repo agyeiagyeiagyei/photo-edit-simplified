@@ -20,7 +20,7 @@ use crate::levels::LevelsSettings;
 use crate::noise;
 #[cfg(test)]
 use crate::ops;
-use crate::types::EditParams;
+use crate::types::{EditParams, PointAdjust};
 use crate::wide;
 
 type Tables = [[u8; 256]; 3];
@@ -352,6 +352,151 @@ pub fn apply_color_wide(data: &mut [u16], edit: &EditParams, mask: Option<&[u8]>
     match mask {
         Some(m) => apply_color_wide_masked(data, m, edit),
         None => apply_color_wide_unmasked(data, edit),
+    }
+}
+
+/// Per-pixel blend weight for one adjustment layer: mask byte × opacity,
+/// rounded. `None` means the whole frame.
+fn alpha_scale(opacity: f32) -> [u8; 256] {
+    let o = opacity.clamp(0.0, 1.0);
+    let mut s = [0u8; 256];
+    for (i, slot) in s.iter_mut().enumerate() {
+        *slot = (i as f32 * o).round().clamp(0.0, 255.0) as u8;
+    }
+    s
+}
+
+/// One adjustment layer over an RGBA8 buffer: levels, curves and adjust fused
+/// per pixel, then a single blend by mask × opacity. `mask` is at the buffer's
+/// pixel count; a mask shorter than the buffer is treated as "apply nothing"
+/// rather than risking a wrong global application.
+pub fn apply_point_adjust_u8(
+    data: &mut [u8],
+    adj: &PointAdjust,
+    mask: Option<&[u8]>,
+    opacity: f32,
+) {
+    let levels_identity = adj.levels.is_identity();
+    let curves_identity = adj.curves.is_identity();
+    let luts_identity = levels_identity && curves_identity;
+    let adjust_identity = adj.brightness == 0.0
+        && adj.contrast == 0.0
+        && adj.saturation == 0.0
+        && adj.warmth == 0.0;
+    if luts_identity && adjust_identity {
+        return;
+    }
+    if mask.is_some_and(|m| m.len() < data.len() / 4) {
+        return;
+    }
+    let fold = !adjust_identity && adj.saturation == 0.0 && adj.warmth == 0.0;
+    let mut t = compose_tables(&adj.levels, &adj.curves);
+    if fold {
+        t = tables_with_adjust(&t, adj.brightness, adj.contrast);
+    }
+    let scale = alpha_scale(opacity);
+    for (i, px) in data.chunks_exact_mut(4).enumerate() {
+        let m = match mask {
+            Some(m) => scale[m[i] as usize] as u32,
+            None => scale[255] as u32,
+        };
+        if m == 0 {
+            continue;
+        }
+        let orig = [px[0], px[1], px[2]];
+        let mut new = orig;
+        if px[3] != 0 && (fold || !luts_identity) {
+            for ch in 0..3 {
+                new[ch] = t[ch][new[ch] as usize];
+            }
+        }
+        if !fold && !adjust_identity {
+            let a = adjust_rgb(
+                new[0] as f32,
+                new[1] as f32,
+                new[2] as f32,
+                adj.brightness,
+                adj.contrast,
+                adj.saturation,
+                adj.warmth,
+            );
+            for ch in 0..3 {
+                new[ch] = a[ch] as u8;
+            }
+        }
+        for ch in 0..3 {
+            px[ch] = blend(orig[ch], new[ch], m);
+        }
+    }
+}
+
+/// Wide (16-bit sRGB) variant of [`apply_point_adjust_u8`], blended before the
+/// single final quantisation.
+pub fn apply_point_adjust_wide(
+    data: &mut [u16],
+    adj: &PointAdjust,
+    mask: Option<&[u8]>,
+    opacity: f32,
+) {
+    let levels_identity = adj.levels.is_identity();
+    let curves_identity = adj.curves.is_identity();
+    let luts_identity = levels_identity && curves_identity;
+    let adjust_identity = adj.brightness == 0.0
+        && adj.contrast == 0.0
+        && adj.saturation == 0.0
+        && adj.warmth == 0.0;
+    if luts_identity && adjust_identity {
+        return;
+    }
+    if mask.is_some_and(|m| m.len() < data.len() / 4) {
+        return;
+    }
+    let fold = !adjust_identity && adj.saturation == 0.0 && adj.warmth == 0.0;
+    let t: Option<Tables16> = if luts_identity && !fold {
+        None
+    } else {
+        let composed = compose_tables16(&adj.levels, &adj.curves);
+        Some(if fold {
+            fold_tables16(composed, adj.brightness, adj.contrast)
+        } else {
+            composed
+        })
+    };
+    let scale = alpha_scale(opacity);
+    for (i, px) in data.chunks_exact_mut(4).enumerate() {
+        let m = match mask {
+            Some(m) => scale[m[i] as usize] as u32,
+            None => scale[255] as u32,
+        };
+        if m == 0 {
+            continue;
+        }
+        let orig = [px[0], px[1], px[2]];
+        let mut new = orig;
+        if px[3] != 0 {
+            if let Some(t) = &t {
+                for ch in 0..3 {
+                    new[ch] = t[ch][new[ch] as usize];
+                }
+            }
+        }
+        if !fold && !adjust_identity {
+            let a = adjust_rgb(
+                new[0] as f32 / 257.0,
+                new[1] as f32 / 257.0,
+                new[2] as f32 / 257.0,
+                adj.brightness,
+                adj.contrast,
+                adj.saturation,
+                adj.warmth,
+            );
+            for ch in 0..3 {
+                new[ch] = (a[ch] * 257.0).round().clamp(0.0, 65535.0) as u16;
+            }
+        }
+        for ch in 0..3 {
+            px[ch] = wide::blend16(orig[ch], new[ch], m);
+        }
     }
 }
 

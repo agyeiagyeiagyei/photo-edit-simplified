@@ -349,7 +349,7 @@ pub(crate) async fn ingest_drive_bytes(
 
         // Params describe work-in-progress on the original pixels; a file the
         // app already flattened starts from identity.
-        let (edit, drive_baked) = if drive_edited {
+        let (mut edit, drive_baked) = if drive_edited {
             (EditParams::default(), true)
         } else {
             let recipe = state.drive_edits.with(|m| m.get(&drive_file_id).cloned());
@@ -363,6 +363,10 @@ pub(crate) async fn ingest_drive_bytes(
                 None => (EditParams::default(), false),
             }
         };
+        let stored_edit = edit != EditParams::default();
+        let mut layers = Vec::new();
+        let mut next_layer_id = 0usize;
+        state::migrate_adjust_layers(&mut edit, &mut layers, &mut next_layer_id);
 
         if raw::is_raw_name(&name) {
             let raw_len = bytes.len() as u64;
@@ -398,7 +402,7 @@ pub(crate) async fn ingest_drive_bytes(
             evict_full_lru();
             let pool_name = name.clone();
             // Stored Drive edits win; only a RAW without any gets the ISO start.
-            let edit = if edit == EditParams::default() && !drive_baked {
+            let edit = if !stored_edit && !drive_baked {
                 raw_import_edit(ing.exif.as_deref().map(|v| v.as_slice()))
             } else {
                 edit
@@ -412,8 +416,8 @@ pub(crate) async fn ingest_drive_bytes(
                 width: ing.dims.0,
                 height: ing.dims.1,
                 edit,
-                layers: Vec::new(),
-                next_layer_id: 0,
+                layers,
+                next_layer_id,
                 exif: ing.exif,
                 taken: ing.taken,
                 drive_file_id: Some(drive_file_id),
@@ -470,8 +474,8 @@ pub(crate) async fn ingest_drive_bytes(
                 width: fw,
                 height: fh,
                 edit,
-                layers: Vec::new(),
-                next_layer_id: 0,
+                layers,
+                next_layer_id,
                 exif,
                 taken,
                 drive_file_id: Some(drive_file_id),

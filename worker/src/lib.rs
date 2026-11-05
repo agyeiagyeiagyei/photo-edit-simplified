@@ -13,6 +13,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use js_sys::{Array, Object, Reflect, Uint16Array, Uint8Array};
 use wasm_bindgen::prelude::*;
@@ -22,7 +23,7 @@ use pes_pixel::geo::{crop_px, geometry, geometry_wide, hi_target, stamp_stroke, 
 use pes_pixel::pipeline::{self, Frame, Target};
 use pes_pixel::rawops;
 use pes_pixel::recipe::{edit_params_from_recipe, selection_from_json};
-use pes_pixel::types::EditParams;
+use pes_pixel::types::{EditParams, Selection, SelectionKind};
 use pes_pixel::{clone, color, fill, heal, ops, resample, wide};
 
 mod srgb_icc;
@@ -59,6 +60,17 @@ thread_local! {
     /// 16-bit counterparts of the two caches above, for the neutral path.
     static WIDE_BASE_CACHE: RefCell<Option<WideBaseCache>> = const { RefCell::new(None) };
     static WIDE_WINDOW_CACHE: RefCell<Option<WideWindowCache>> = const { RefCell::new(None) };
+    /// Raster masks for adjustment layers, keyed by (item, layer id). The app
+    /// sends one per mask version; render recipes carry a versioned reference
+    /// so a slider drag never re-ships the bytes. A miss disables the layer.
+    static ADJUST_MASKS: RefCell<HashMap<(u32, u64), CachedMask>> = RefCell::new(HashMap::new());
+}
+
+struct CachedMask {
+    version: u64,
+    w: usize,
+    h: usize,
+    data: Rc<Vec<u8>>,
 }
 
 struct Neutral {
@@ -298,7 +310,7 @@ pub fn loupe_window(
     ch: u32,
     seed: u32,
 ) -> Result<JsValue, JsValue> {
-    let edit = parse_edit(recipe);
+    let edit = parse_edit(id, recipe);
     with_buffer(id, |(full, fw, fh)| {
         let (sx, sy, cw, ch) = (sx as usize, sy as usize, cw as usize, ch as usize);
         if cw == 0 || ch == 0 || sx + cw > *fw || sy + ch > *fh {
@@ -312,7 +324,9 @@ pub fn loupe_window(
         let (ew, eh) = (x1 - x0, y1 - y0);
         let win = crop_rows(full, *fw, x0, y0, ew, eh, 4);
         let mut frame = Frame::new(win, ew, eh);
-        pipeline::finish(&mut frame, &edit, seed, None, 1.0);
+        let rebased =
+            pipeline::rebase_layer_masks(&edit, *fw, *fh, (x0, y0, ew, eh), ew, eh);
+        pipeline::finish(&mut frame, &rebased, seed, None, 1.0);
         let win = frame.pixels;
         let (ix, iy) = (sx - x0, sy - y0);
         let mut out = Vec::with_capacity(cw * ch * 4);
@@ -347,10 +361,78 @@ pub fn unload(id: u32) {
             *slot = None;
         }
     });
+    ADJUST_MASKS.with(|c| c.borrow_mut().retain(|(mid, _), _| *mid != id));
 }
 
-fn parse_edit(recipe: &str) -> EditParams {
-    edit_params_from_recipe(recipe).unwrap_or_default()
+/// Store an adjustment layer's raster mask. Layer recipes reference it by
+/// (layer id, mask version); sending the same version again is a no-op on the
+/// render path and a changed version replaces the old raster.
+#[wasm_bindgen]
+pub fn cache_adjust_mask(
+    id: u32,
+    layer: f64,
+    version: f64,
+    w: u32,
+    h: u32,
+    data: Uint8Array,
+) {
+    let (layer, version) = (layer as u64, version as u64);
+    let (w, h) = (w as usize, h as usize);
+    if w == 0 || h == 0 || data.length() as usize != w * h {
+        ADJUST_MASKS.with(|c| {
+            c.borrow_mut().remove(&(id, layer));
+        });
+        return;
+    }
+    ADJUST_MASKS.with(|c| {
+        c.borrow_mut().insert(
+            (id, layer),
+            CachedMask { version, w, h, data: Rc::new(data.to_vec()) },
+        );
+    });
+}
+
+fn parse_edit(id: u32, recipe: &str) -> EditParams {
+    let mut edit = edit_params_from_recipe(recipe).unwrap_or_default();
+    resolve_adjust_masks(id, &mut edit);
+    edit
+}
+
+/// Fill worker-side mask references from the mask cache. A reference whose
+/// version or dims don't match leaves the layer disabled: applying it without
+/// its mask would paint the whole frame.
+fn resolve_adjust_masks(id: u32, edit: &mut EditParams) {
+    for layer in &mut edit.adjust_layers {
+        let unresolved = matches!(
+            &layer.mask,
+            Some(Selection { kind: SelectionKind::Mask { data, .. }, .. }) if data.is_empty()
+        );
+        if !unresolved {
+            continue;
+        }
+        let Some(Selection {
+            kind: SelectionKind::Mask { width, height, .. },
+            feather,
+        }) = layer.mask.take()
+        else {
+            continue;
+        };
+        let cached = ADJUST_MASKS.with(|c| {
+            c.borrow().get(&(id, layer.id)).and_then(|m| {
+                (m.version == layer.mask_version && m.w == width && m.h == height)
+                    .then(|| m.data.clone())
+            })
+        });
+        match cached {
+            Some(data) => {
+                layer.mask = Some(Selection {
+                    kind: SelectionKind::Mask { data, width, height },
+                    feather,
+                });
+            }
+            None => layer.visible = false,
+        }
+    }
 }
 
 /// Geometry + resample front half of the render pipeline, with the base
@@ -599,9 +681,10 @@ fn neutral_finish(
     }
     rawops::detail_toned_wide(buf, w, h, &edit.raw, px_scale);
     let t1 = js_sys::Date::now();
-    if edit.is_color_touched() {
+    if edit.base_color_touched() {
         color::apply_color_effects_wide(buf, w, h, edit, seed, mask);
     }
+    pipeline::apply_adjust_layers_wide(buf, w, h, edit);
     let t2 = js_sys::Date::now();
     let mut out = vec![0u8; w * h * 4];
     wide::narrow_dithered(buf, &mut out, w, h);
@@ -615,7 +698,7 @@ fn selection_mask_for(
     sel_json: Option<String>,
     sel_mask: Option<Uint8Array>,
 ) -> Option<Vec<u8>> {
-    if !edit.is_color_touched() {
+    if !edit.base_color_touched() {
         return None;
     }
     sel_json
@@ -678,9 +761,11 @@ fn neutral_window_render(
     let (mut buf, tw, th, t) = wide_window_pipeline(id, fw, fh, edit, req_w, req_h, max_edge);
     let (ww, wh) = working_dims(fw, fh, edit);
     let (cx, cy, cw, ch) = crop_px(edit, ww, wh);
+    let rebased = pipeline::rebase_layer_masks(edit, ww, wh, (cx, cy, cw, ch), tw, th);
+    let edit = &rebased;
     let px_scale = pipeline::px_scale_for(fw, fh, Target::new(ww, wh))
         * pipeline::px_scale_for(cw, ch, Target::new(tw, th));
-    let mask = if edit.is_color_touched() {
+    let mask = if edit.base_color_touched() {
         sel_json
             .and_then(|j| selection_from_json(&j, sel_mask.map(|m| m.to_vec())))
             .map(|sel| {
@@ -714,7 +799,7 @@ pub fn render(
     sel_json: Option<String>,
     sel_mask: Option<Uint8Array>,
 ) -> Result<JsValue, JsValue> {
-    let edit = parse_edit(recipe);
+    let edit = parse_edit(id, recipe);
     if let Some((fw, fh)) = neutral_dims(id, &edit) {
         let (buf, tw, th, t) = neutral_render(
             id, fw, fh, &edit, id, req_w, req_h, max_edge, sel_json, sel_mask,
@@ -741,7 +826,7 @@ pub fn render_base(
     req_h: f64,
     max_edge: u32,
 ) -> Result<JsValue, JsValue> {
-    let edit = parse_edit(recipe);
+    let edit = parse_edit(id, recipe);
     // A RAW with develop edits gets a developed base: the neutral develop,
     // camera tone and detail at the base size, without colour. The shader then
     // applies only the colour edits, so colour drags stay on the GPU.
@@ -836,6 +921,10 @@ fn render_window_pipeline(
     let (ww, wh) = working_dims(fw, fh, edit);
     let (cx, cy, cw, ch) = crop_px(edit, ww, wh);
     let (tw, th) = hi_target(req_w, req_h, cw, ch, max_edge);
+    // Layer masks are normalized to the working frame; rasterize them there,
+    // take the window, then scale — exactly like the global selection below.
+    let rebased = pipeline::rebase_layer_masks(edit, ww, wh, (cx, cy, cw, ch), tw, th);
+    let edit = &rebased;
     let fine_bits = edit.fine_angle.to_bits();
     let cached = WINDOW_CACHE.with(|c| {
         c.borrow().as_ref().is_some_and(|w| {
@@ -883,7 +972,7 @@ fn render_window_pipeline(
     let wide_buf = pipeline::develop(&mut frame, edit, px_scale);
     let t3 = js_sys::Date::now();
     let hit = if cached { 1.0 } else { 0.0 };
-    let mask = if edit.is_color_touched() {
+    let mask = if edit.base_color_touched() {
         sel_json
             .and_then(|j| selection_from_json(&j, sel_mask.map(|m| m.to_vec())))
             .map(|sel| {
@@ -917,7 +1006,7 @@ pub fn render_window(
     sel_json: Option<String>,
     sel_mask: Option<Uint8Array>,
 ) -> Result<JsValue, JsValue> {
-    let edit = parse_edit(recipe);
+    let edit = parse_edit(id, recipe);
     if let Some((fw, fh)) = neutral_dims(id, &edit) {
         let (buf, tw, th, t) = neutral_window_render(
             id, fw, fh, &edit, id, req_w, req_h, max_edge, sel_json, sel_mask,
@@ -990,7 +1079,7 @@ pub fn heal_stroke(
     mode: u8,
 ) -> Result<JsValue, JsValue> {
     with_buffer(id, |(full, fw, fh)| {
-        let edit = parse_edit(recipe);
+        let edit = parse_edit(id, recipe);
         let (base, w, h) = geometry(full, *fw, *fh, &edit);
         let mut base = base.into_owned();
         let diag = ((w * w + h * h) as f32).sqrt();
@@ -1018,7 +1107,7 @@ pub fn clone_stamp(
     dy: i32,
 ) -> Result<JsValue, JsValue> {
     with_buffer(id, |(full, fw, fh)| {
-        let edit = parse_edit(recipe);
+        let edit = parse_edit(id, recipe);
         let (base, w, h) = geometry(full, *fw, *fh, &edit);
         let mut base = base.into_owned();
         let diag = ((w * w + h * h) as f32).sqrt();
@@ -1048,7 +1137,7 @@ pub fn cut(
     sel_mask: Option<Uint8Array>,
 ) -> Result<JsValue, JsValue> {
     with_buffer(id, |(full, fw, fh)| {
-        let edit = parse_edit(recipe);
+        let edit = parse_edit(id, recipe);
         let (base, w, h) = geometry(full, *fw, *fh, &edit);
         let mut base = base.into_owned();
         let Some(sel) = selection_from_json(sel_json, sel_mask.map(|m| m.to_vec())) else {
@@ -1070,7 +1159,7 @@ pub fn fill_selection(
     sel_mask: Option<Uint8Array>,
 ) -> Result<JsValue, JsValue> {
     with_buffer(id, |(full, fw, fh)| {
-        let edit = parse_edit(recipe);
+        let edit = parse_edit(id, recipe);
         let (base, w, h) = geometry(full, *fw, *fh, &edit);
         let mut base = base.into_owned();
         let Some(sel) = selection_from_json(sel_json, sel_mask.map(|m| m.to_vec())) else {
@@ -1097,7 +1186,7 @@ pub fn extract(
     also_cut: bool,
 ) -> Result<JsValue, JsValue> {
     with_buffer(id, |(full, fw, fh)| {
-        let edit = parse_edit(recipe);
+        let edit = parse_edit(id, recipe);
         let (base, w, h) = geometry(full, *fw, *fh, &edit);
         let mut base = base.into_owned();
         let Some(sel) = selection_from_json(sel_json, sel_mask.map(|m| m.to_vec())) else {
@@ -1445,7 +1534,7 @@ fn export_mask(
     sel_json: Option<String>,
     sel_mask: Option<Uint8Array>,
 ) -> Option<Vec<u8>> {
-    if !edit.is_color_touched() {
+    if !edit.base_color_touched() {
         return None;
     }
     let (cx, cy, cw, ch) = rect;
@@ -1481,6 +1570,10 @@ fn export_pixels(
     if cw == 0 || ch == 0 || cx + cw > ww || cy + ch > wh || ew == 0 || eh == 0 {
         return Err(JsValue::from_str("export rect out of bounds"));
     }
+    // Bake the layer masks at export resolution, from the working-frame
+    // coordinates their selections are normalized to.
+    let rebased = pipeline::rebase_layer_masks(edit, ww, wh, rect, ew, eh);
+    let edit = &rebased;
     let neutral = NEUTRAL.with(|n| {
         n.borrow()
             .get(&id)
@@ -1562,7 +1655,7 @@ pub fn export_photo(
     sel_json: Option<String>,
     sel_mask: Option<Uint8Array>,
 ) -> Result<JsValue, JsValue> {
-    let edit = parse_edit(recipe);
+    let edit = parse_edit(id, recipe);
     let (fw, fh) = BUFFERS
         .with(|b| b.borrow().get(&id).map(|(_, w, h)| (*w, *h)))
         .ok_or_else(|| JsValue::from_str("not loaded"))?;

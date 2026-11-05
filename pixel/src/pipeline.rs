@@ -6,12 +6,15 @@
 //! prepared base instead of re-rotating the sensor frame); every other site
 //! calls `render`.
 
+use std::borrow::Cow;
+use std::rc::Rc;
+
 use crate::color;
 use crate::geo::geometry;
 use crate::ops;
 use crate::rawops;
 use crate::resample;
-use crate::types::EditParams;
+use crate::types::{AdjustLayer, EditParams, Selection, SelectionKind};
 use crate::wide;
 
 /// RGBA8 pixels at a known size.
@@ -152,26 +155,163 @@ pub fn colour(
     wide_buf: Option<Vec<u16>>,
 ) {
     if let Some(mut buf) = wide_buf {
-        if edit.is_color_touched() {
+        if edit.base_color_touched() {
             color::apply_color_effects_wide(&mut buf, frame.w, frame.h, edit, seed, mask);
         }
+        apply_adjust_layers_wide(&mut buf, frame.w, frame.h, edit);
         wide::narrow_dithered(&buf, &mut frame.pixels, frame.w, frame.h);
         return;
     }
     if !edit.is_color_touched() {
         return;
     }
-    match mask {
-        Some(m) => color::apply_color_effects_masked(
-            &mut frame.pixels,
-            m,
-            frame.w,
-            frame.h,
-            edit,
-            seed,
-        ),
-        None => color::apply_color_effects(&mut frame.pixels, frame.w, frame.h, edit, seed),
+    if edit.base_color_touched() {
+        match mask {
+            Some(m) => color::apply_color_effects_masked(
+                &mut frame.pixels,
+                m,
+                frame.w,
+                frame.h,
+                edit,
+                seed,
+            ),
+            None => color::apply_color_effects(&mut frame.pixels, frame.w, frame.h, edit, seed),
+        }
     }
+    apply_adjust_layers_u8(&mut frame.pixels, frame.w, frame.h, edit);
+}
+
+enum LayerMask<'a> {
+    /// No mask: the layer applies to the whole frame.
+    Whole,
+    /// Mask bytes at the frame's size.
+    Bytes(Cow<'a, [u8]>),
+    /// The mask cannot be rebuilt (e.g. a wand raster the worker has not been
+    /// sent): skip the layer rather than apply it globally.
+    Skip,
+}
+
+fn layer_mask(layer: &AdjustLayer, w: usize, h: usize) -> LayerMask<'_> {
+    let Some(sel) = &layer.mask else {
+        return if layer.invert {
+            LayerMask::Skip
+        } else {
+            LayerMask::Whole
+        };
+    };
+    if let SelectionKind::Mask { data, width, height } = &sel.kind {
+        if *width == 0 || *height == 0 || data.len() != width * height {
+            return LayerMask::Skip;
+        }
+    }
+    let mut m = ops::selection_mask(sel, w, h);
+    if layer.invert {
+        for v in &mut m {
+            *v = 255 - *v;
+        }
+    }
+    LayerMask::Bytes(Cow::Owned(m))
+}
+
+pub fn apply_adjust_layers_u8(buf: &mut [u8], w: usize, h: usize, edit: &EditParams) {
+    for layer in edit.adjust_layers.iter().filter(|l| l.active()) {
+        match layer_mask(layer, w, h) {
+            LayerMask::Skip => {}
+            LayerMask::Whole => {
+                color::apply_point_adjust_u8(buf, &layer.adjust, None, layer.opacity)
+            }
+            LayerMask::Bytes(m) => {
+                color::apply_point_adjust_u8(buf, &layer.adjust, Some(&m), layer.opacity)
+            }
+        }
+    }
+}
+
+/// Apply every active adjustment layer to a 16-bit sRGB frame at `w`×`h`.
+/// Windowed renders must rebase the masks first with [`rebase_layer_masks`].
+pub fn apply_adjust_layers_wide(buf: &mut [u16], w: usize, h: usize, edit: &EditParams) {
+    for layer in edit.adjust_layers.iter().filter(|l| l.active()) {
+        match layer_mask(layer, w, h) {
+            LayerMask::Skip => {}
+            LayerMask::Whole => {
+                color::apply_point_adjust_wide(buf, &layer.adjust, None, layer.opacity)
+            }
+            LayerMask::Bytes(m) => {
+                color::apply_point_adjust_wide(buf, &layer.adjust, Some(&m), layer.opacity)
+            }
+        }
+    }
+}
+
+fn crop_mask(p: &[u8], w: usize, cx: usize, cy: usize, cw: usize, ch: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(cw * ch);
+    for y in cy..cy + ch {
+        out.extend_from_slice(&p[y * w + cx..y * w + cx + cw]);
+    }
+    out
+}
+
+fn resample_mask_nearest(p: &[u8], w: usize, h: usize, tw: usize, th: usize) -> Vec<u8> {
+    let mut out = vec![0u8; tw * th];
+    for y in 0..th {
+        let sy = y * h / th;
+        for x in 0..tw {
+            out[y * tw + x] = p[sy * w + x * w / tw];
+        }
+    }
+    out
+}
+
+/// Rebase each layer's mask from working-frame coordinates into the rendered
+/// window `rect` at `tw`×`th`. A windowed render must rasterize the mask over
+/// the full working frame (normalized selection coordinates refer to it), take
+/// the rect, then rescale — the same treatment the global selection gets.
+pub fn rebase_layer_masks(
+    edit: &EditParams,
+    work_w: usize,
+    work_h: usize,
+    rect: (usize, usize, usize, usize),
+    tw: usize,
+    th: usize,
+) -> EditParams {
+    if edit.adjust_layers.is_empty() || work_w == 0 || work_h == 0 || tw == 0 || th == 0 {
+        return edit.clone();
+    }
+    let (cx, cy, cw, ch) = rect;
+    if cw == 0 || ch == 0 || cx + cw > work_w || cy + ch > work_h {
+        return edit.clone();
+    }
+    let mut out = edit.clone();
+    for layer in &mut out.adjust_layers {
+        let Some(sel) = layer.mask.take() else {
+            if layer.invert {
+                layer.visible = false;
+            }
+            continue;
+        };
+        let mut full = ops::selection_mask(&sel, work_w, work_h);
+        if layer.invert {
+            for v in &mut full {
+                *v = 255 - *v;
+            }
+        }
+        let win = crop_mask(&full, work_w, cx, cy, cw, ch);
+        let mask = if (tw, th) != (cw, ch) {
+            resample_mask_nearest(&win, cw, ch, tw, th)
+        } else {
+            win
+        };
+        layer.mask = Some(Selection {
+            kind: SelectionKind::Mask {
+                data: Rc::new(mask),
+                width: tw,
+                height: th,
+            },
+            feather: 0.0,
+        });
+        layer.invert = false;
+    }
+    out
 }
 
 /// Develop + colour on a prepared frame.
@@ -189,7 +329,7 @@ pub fn finish(
 /// `finish` with the mask taken from `edit.selection`.
 pub fn finish_edit(frame: &mut Frame, edit: &EditParams, seed: u32, px_scale: f32) {
     let wide_buf = develop(frame, edit, px_scale);
-    let mask = if edit.is_color_touched() {
+    let mask = if edit.base_color_touched() {
         mask_for(frame, edit)
     } else {
         None
@@ -210,9 +350,10 @@ pub fn finish_wide(
     px_scale: f32,
 ) {
     rawops::develop_wide(buf, w, h, &edit.raw, px_scale);
-    if edit.is_color_touched() {
+    if edit.base_color_touched() {
         color::apply_color_effects_wide(buf, w, h, edit, seed, mask);
     }
+    apply_adjust_layers_wide(buf, w, h, edit);
 }
 
 /// Neutral develop (white-relative, on unclipped data), then the camera tone
@@ -233,9 +374,10 @@ pub fn finish_neutral_wide(
         rawops::apply_tone_wide(buf, table);
     }
     rawops::detail_toned_wide(buf, w, h, &edit.raw, px_scale);
-    if edit.is_color_touched() {
+    if edit.base_color_touched() {
         color::apply_color_effects_wide(buf, w, h, edit, seed, mask);
     }
+    apply_adjust_layers_wide(buf, w, h, edit);
 }
 
 /// `finish_neutral_wide` with the mask taken from `edit.selection`.
@@ -247,7 +389,7 @@ pub fn finish_neutral(
     tone: Option<&[u16]>,
     px_scale: f32,
 ) {
-    let mask = if edit.is_color_touched() {
+    let mask = if edit.base_color_touched() {
         mask_for_dims(frame.w, frame.h, edit)
     } else {
         None
@@ -309,7 +451,7 @@ pub fn px_scale_for(w: usize, h: usize, target: Target) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{RawAdjust, Selection, SelectionKind};
+    use crate::types::{AdjustLayer, PointAdjust, RawAdjust, Selection, SelectionKind};
 
     fn fixture(w: usize, h: usize) -> Vec<u8> {
         let mut px = vec![0u8; w * h * 4];
@@ -611,5 +753,358 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn point_edit(brightness: f32, contrast: f32) -> PointAdjust {
+        PointAdjust { brightness, contrast, ..PointAdjust::default() }
+    }
+
+    fn adjust_layer(adjust: PointAdjust, mask: Option<Selection>) -> AdjustLayer {
+        AdjustLayer {
+            id: 1,
+            visible: true,
+            opacity: 1.0,
+            mask,
+            invert: false,
+            mask_version: 1,
+            adjust,
+        }
+    }
+
+    fn only_layer(layer: AdjustLayer) -> EditParams {
+        EditParams { adjust_layers: vec![layer], ..EditParams::default() }
+    }
+
+    fn with_luts(mut adj: PointAdjust) -> PointAdjust {
+        let mut levels = crate::levels::LevelsSettings::default();
+        levels.ranges[0].gamma = 0.85;
+        levels.ranges[1].black = 12.0;
+        levels.ranges[1].white = 240.0;
+        let mut curves = crate::curves::CurvesSettings::default();
+        curves.channels[0] = vec![
+            crate::curves::CurvePoint { x: 0.0, y: 0.0 },
+            crate::curves::CurvePoint { x: 128.0, y: 150.0 },
+            crate::curves::CurvePoint { x: 255.0, y: 255.0 },
+        ];
+        adj.levels = levels;
+        adj.curves = curves;
+        adj
+    }
+
+    #[test]
+    fn rect_masked_adjust_layer_only_touches_inside_the_mask() {
+        let (w, h) = (40usize, 30usize);
+        let px = fixture(w, h);
+        let edit = only_layer(adjust_layer(
+            point_edit(0.25, 0.1),
+            Some(Selection {
+                kind: SelectionKind::Rect { x: 0.0, y: 0.0, w: 0.5, h: 1.0 },
+                feather: 0.0,
+            }),
+        ));
+        let mut applied = px.clone();
+        color::apply_point_adjust_u8(&mut applied, &point_edit(0.25, 0.1), None, 1.0);
+        assert_ne!(applied, px, "test adjustment is a no-op");
+        let out = render(&px, w, h, &edit, Target::new(w, h), 3);
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                if x < w / 2 {
+                    assert_eq!(&out.pixels[i..i + 4], &applied[i..i + 4], "inside pixel ({x},{y}) wrong");
+                } else {
+                    assert_eq!(&out.pixels[i..i + 4], &px[i..i + 4], "outside pixel ({x},{y}) moved");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inverted_adjust_layer_acts_outside_the_mask() {
+        let (w, h) = (40usize, 30usize);
+        let px = fixture(w, h);
+        let mut layer = adjust_layer(
+            point_edit(0.25, 0.0),
+            Some(Selection {
+                kind: SelectionKind::Rect { x: 0.0, y: 0.0, w: 0.5, h: 1.0 },
+                feather: 0.0,
+            }),
+        );
+        layer.invert = true;
+        let mut applied = px.clone();
+        color::apply_point_adjust_u8(&mut applied, &point_edit(0.25, 0.0), None, 1.0);
+        assert_ne!(applied, px, "test adjustment is a no-op");
+        let out = render(&px, w, h, &only_layer(layer), Target::new(w, h), 3);
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                if x >= w / 2 {
+                    assert_eq!(&out.pixels[i..i + 4], &applied[i..i + 4], "outside pixel ({x},{y}) wrong");
+                } else {
+                    assert_eq!(&out.pixels[i..i + 4], &px[i..i + 4], "inside pixel ({x},{y}) moved");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inactive_or_unresolvable_adjust_layers_are_identity() {
+        let (w, h) = (16usize, 12usize);
+        let px = fixture(w, h);
+
+        let mut invisible = only_layer(adjust_layer(point_edit(0.4, 0.2), None));
+        invisible.adjust_layers[0].visible = false;
+        assert!(!invisible.is_color_touched());
+        assert!(!invisible.base_color_touched());
+
+        let mut zero_opacity = only_layer(adjust_layer(point_edit(0.4, 0.2), None));
+        zero_opacity.adjust_layers[0].opacity = 0.0;
+
+        let identity = only_layer(adjust_layer(PointAdjust::default(), None));
+
+        // A Mask whose dims disagree with its bytes is an unresolved worker
+        // reference: skip the layer rather than apply it to the whole frame.
+        let mut unresolved = only_layer(adjust_layer(
+            point_edit(0.4, 0.2),
+            Some(Selection {
+                kind: SelectionKind::Mask {
+                    data: Rc::new(Vec::new()),
+                    width: 10,
+                    height: 10,
+                },
+                feather: 0.0,
+            }),
+        ));
+        unresolved.adjust_layers[0].mask_version = 2;
+
+        for edit in [invisible, zero_opacity, identity, unresolved] {
+            assert_eq!(
+                render(&px, w, h, &edit, Target::new(w, h), 5).pixels,
+                px,
+                "layer should not change pixels"
+            );
+        }
+    }
+
+    #[test]
+    fn active_adjust_layer_counts_as_a_color_edit() {
+        let mut edit = only_layer(adjust_layer(point_edit(0.2, 0.0), None));
+        assert!(edit.is_color_touched());
+        assert!(!edit.base_color_touched());
+        assert!(!edit.develop_only().is_color_touched());
+        edit.adjust_layers[0].adjust = PointAdjust::default();
+        assert!(!edit.is_color_touched());
+    }
+
+    #[test]
+    fn adjust_layers_apply_bottom_first() {
+        let (w, h) = (32usize, 24usize);
+        let px = fixture(w, h);
+        let contrast = adjust_layer(point_edit(0.0, 0.4), None);
+        let brightness = adjust_layer(point_edit(0.2, 0.0), None);
+        let mut forward = only_layer(contrast.clone());
+        forward.adjust_layers.push(brightness.clone());
+        let mut reverse = only_layer(brightness);
+        reverse.adjust_layers.push(contrast);
+
+        let mut expect = px.clone();
+        color::apply_point_adjust_u8(&mut expect, &forward.adjust_layers[0].adjust, None, 1.0);
+        color::apply_point_adjust_u8(&mut expect, &forward.adjust_layers[1].adjust, None, 1.0);
+        let out = render(&px, w, h, &forward, Target::new(w, h), 9).pixels;
+        assert_eq!(out, expect, "stack order is not applied bottom first");
+
+        let reversed = render(&px, w, h, &reverse, Target::new(w, h), 9).pixels;
+        assert_ne!(reversed, out, "order-dependent layers rendered identically");
+    }
+
+    #[test]
+    fn full_frame_adjust_layer_matches_the_global_stage() {
+        let (w, h) = (48usize, 36usize);
+        let px = fixture(w, h);
+        let adj = with_luts(PointAdjust {
+            brightness: 0.12,
+            contrast: 0.2,
+            saturation: -0.15,
+            warmth: 0.1,
+            ..PointAdjust::default()
+        });
+
+        let global = EditParams {
+            brightness: adj.brightness,
+            contrast: adj.contrast,
+            saturation: adj.saturation,
+            warmth: adj.warmth,
+            levels: adj.levels,
+            curves: adj.curves.clone(),
+            ..EditParams::default()
+        };
+        let want = render(&px, w, h, &global, Target::new(w, h), 11).pixels;
+        let unmasked = only_layer(adjust_layer(adj.clone(), None));
+        assert_eq!(render(&px, w, h, &unmasked, Target::new(w, h), 11).pixels, want);
+
+        let full_mask = only_layer(adjust_layer(
+            adj,
+            Some(Selection {
+                kind: SelectionKind::Mask {
+                    data: Rc::new(vec![255u8; w * h]),
+                    width: w,
+                    height: h,
+                },
+                feather: 0.0,
+            }),
+        ));
+        assert_eq!(render(&px, w, h, &full_mask, Target::new(w, h), 11).pixels, want);
+    }
+
+    #[test]
+    fn full_frame_adjust_layer_matches_the_global_stage_wide() {
+        let (w, h) = (32usize, 24usize);
+        let px = fixture(w, h);
+        let adj = with_luts(PointAdjust {
+            brightness: -0.08,
+            contrast: 0.3,
+            saturation: 0.2,
+            warmth: -0.1,
+            ..PointAdjust::default()
+        });
+        let global = EditParams {
+            brightness: adj.brightness,
+            contrast: adj.contrast,
+            saturation: adj.saturation,
+            warmth: adj.warmth,
+            levels: adj.levels,
+            curves: adj.curves.clone(),
+            ..EditParams::default()
+        };
+        let mut a: Vec<u16> = px.iter().map(|&v| v as u16 * 257).collect();
+        finish_wide(&mut a, w, h, &global, 4, None, 1.0);
+        let mut b: Vec<u16> = px.iter().map(|&v| v as u16 * 257).collect();
+        finish_wide(&mut b, w, h, &only_layer(adjust_layer(adj, None)), 4, None, 1.0);
+        assert_eq!(a, b);
+    }
+
+    fn crop_pixels(p: &[u8], w: usize, cx: usize, cy: usize, cw: usize, ch: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(cw * ch * 4);
+        for y in cy..cy + ch {
+            out.extend_from_slice(&p[(y * w + cx) * 4..(y * w + cx + cw) * 4]);
+        }
+        out
+    }
+
+    #[test]
+    fn rebased_layer_mask_window_equals_the_full_frame_crop() {
+        let (w, h) = (40usize, 30usize);
+        let (cx, cy, cw, ch) = (10usize, 6usize, 20usize, 12usize);
+        let px = fixture(w, h);
+        let edit = only_layer(adjust_layer(
+            point_edit(0.18, 0.15),
+            Some(Selection {
+                kind: SelectionKind::Rect { x: 0.2, y: 0.1, w: 0.5, h: 0.7 },
+                feather: 0.0,
+            }),
+        ));
+
+        let full = render(&px, w, h, &edit, Target::new(w, h), 2).pixels;
+        let want = crop_pixels(&full, w, cx, cy, cw, ch);
+
+        let rebased = rebase_layer_masks(&edit, w, h, (cx, cy, cw, ch), cw, ch);
+        let mask = rebased.adjust_layers[0].mask.as_ref().unwrap();
+        match &mask.kind {
+            SelectionKind::Mask { data, width, height } => {
+                assert_eq!((data.len(), *width, *height), (cw * ch, cw, ch));
+            }
+            other => panic!("rebased mask kind {other:?}"),
+        }
+        assert_eq!(mask.feather, 0.0);
+        assert!(!rebased.adjust_layers[0].invert);
+
+        let src = crop_pixels(&px, w, cx, cy, cw, ch);
+        let mut win = Frame::new(src, cw, ch);
+        finish_edit(&mut win, &rebased, 2, 1.0);
+        assert_eq!(win.pixels, want);
+    }
+
+    #[test]
+    fn all_zero_mask_is_bit_identical_to_no_layer() {
+        let (w, h) = (24usize, 18usize);
+        let px = fixture(w, h);
+        let edit = only_layer(adjust_layer(
+            point_edit(0.35, 0.2),
+            Some(Selection {
+                kind: SelectionKind::Mask {
+                    data: Rc::new(vec![0u8; w * h]),
+                    width: w,
+                    height: h,
+                },
+                feather: 0.0,
+            }),
+        ));
+        assert!(edit.is_color_touched());
+        assert_eq!(render(&px, w, h, &edit, Target::new(w, h), 6).pixels, px);
+    }
+
+    fn box_downscale(p: &[u8], w: usize, h: usize, f: usize) -> (Vec<u8>, usize, usize) {
+        let (tw, th) = (w / f, h / f);
+        let mut out = vec![0u8; tw * th * 4];
+        for y in 0..th {
+            for x in 0..tw {
+                for c in 0..4 {
+                    let mut sum = 0u32;
+                    for dy in 0..f {
+                        for dx in 0..f {
+                            sum += p[((y * f + dy) * w + x * f + dx) * 4 + c] as u32;
+                        }
+                    }
+                    out[(y * tw + x) * 4 + c] = (sum / (f * f) as u32) as u8;
+                }
+            }
+        }
+        (out, tw, th)
+    }
+
+    #[test]
+    fn feathered_mask_proxy_matches_full_resolution() {
+        let (w, h) = (256usize, 192usize);
+        let px = fixture(w, h);
+        let edit = only_layer(adjust_layer(
+            point_edit(0.2, 0.12),
+            Some(Selection {
+                kind: SelectionKind::Rect { x: 0.2, y: 0.2, w: 0.6, h: 0.6 },
+                feather: 0.05,
+            }),
+        ));
+        let full = render(&px, w, h, &edit, Target::new(w, h), 8).pixels;
+        let (small, sw, sh) = box_downscale(&px, w, h, 2);
+        let proxy = render(&small, sw, sh, &edit, Target::new(sw, sh), 8).pixels;
+        let (want, _, _) = box_downscale(&full, w, h, 2);
+        let mean = want
+            .chunks_exact(4)
+            .zip(proxy.chunks_exact(4))
+            .map(|(a, b)| (0..3).map(|c| (a[c] as i32 - b[c] as i32).abs()).sum::<i32>() as f64 / 3.0)
+            .sum::<f64>()
+            / (sw * sh) as f64;
+        assert!(mean <= 2.0, "proxy/full masked mean ΔRGB {mean:.2} > 2.0");
+    }
+
+    #[test]
+    fn rebase_handles_invert_and_whole_frame_layers() {
+        let mut inverted = adjust_layer(
+            point_edit(0.2, 0.0),
+            Some(Selection {
+                kind: SelectionKind::Rect { x: 0.5, y: 0.0, w: 0.5, h: 1.0 },
+                feather: 0.0,
+            }),
+        );
+        inverted.invert = true;
+        let mut whole = adjust_layer(point_edit(0.2, 0.0), None);
+        whole.invert = true;
+        let edit = EditParams { adjust_layers: vec![inverted, whole], ..EditParams::default() };
+        let out = rebase_layer_masks(&edit, 40, 30, (0, 0, 20, 30), 20, 30);
+        assert!(!out.adjust_layers[0].invert, "invert must be baked into the mask");
+        let SelectionKind::Mask { data, .. } = &out.adjust_layers[0].mask.as_ref().unwrap().kind else {
+            panic!("expected a baked mask");
+        };
+        // Right half was selected then inverted: the left half now carries it.
+        assert!(data.iter().take(10).all(|&v| v == 255));
+        assert!(!out.adjust_layers[1].visible, "an inverted no-mask layer covers nothing");
     }
 }

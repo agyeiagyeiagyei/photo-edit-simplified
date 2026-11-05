@@ -15,6 +15,7 @@ pub mod fill;
 pub mod geo;
 pub mod heal;
 pub mod levels;
+pub mod mask_png;
 pub mod noise;
 pub mod ops;
 pub mod pipeline;

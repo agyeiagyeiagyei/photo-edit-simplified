@@ -28,7 +28,7 @@ pub(crate) async fn render_photo_export(
     // cap, so the target size is the crop itself.
     let (ew, eh) = (cw, ch);
     let format = state.photo_format.get_untracked();
-    let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
+    let recipe = pworker::render_recipe(item);
     let sel = item.edit.selection.clone();
     let id = item.id;
     let mut encode_span = perf::Span::new("export.encode");

@@ -433,7 +433,8 @@ pub(crate) fn restore_session(state: AppState) {
             let drive_file_id = state::jget(&v, "dfid").and_then(|s| s.as_string());
             let drive_parent_id = state::jget(&v, "dpid").and_then(|s| s.as_string());
             let drive_baked = state::jbool(&v, "dbaked").unwrap_or(false);
-            let next_layer_id = state::jnum(&v, "nlid").unwrap_or(0.0) as usize;
+            let mut next_layer_id = state::jnum(&v, "nlid").unwrap_or(0.0) as usize;
+            state::migrate_adjust_layers(&mut edit, &mut layers, &mut next_layer_id);
             let taken = state::jnum(&v, "taken");
             // A stored thumbnail lets this item restore without decoding
             // anything; sessions written before the `thumbs` store fall back

@@ -199,6 +199,7 @@ pub(crate) fn composite_layers(canvas: &web_sys::HtmlCanvasElement, layers: &[st
             LayerKind::Path(_) => draw_path_layer(&ctx, layer, w as f64, h as f64),
             LayerKind::Brush(_) => draw_brush_layer(&ctx, layer, w as f64, h as f64),
             LayerKind::Raster(_) => draw_raster_layer(&ctx, layer, w as f64, h as f64),
+            LayerKind::Adjust(_) => {}
         }
         ctx.set_global_alpha(1.0);
     }
@@ -409,6 +410,43 @@ pub(crate) fn preview_geometry_cached(
 /// that changes rendered pixels EXCEPT the crop rect (crop only reframes the
 /// blit) and the source generation (kept separate so a source swap can show
 /// the stale frame while the new one renders).
+fn hash_selection(h: &mut std::collections::hash_map::DefaultHasher, sel: Option<&state::Selection>) {
+    use std::hash::{Hash, Hasher};
+    match sel {
+        None => h.write_u8(0),
+        Some(sel) => {
+            h.write_u32(sel.feather.to_bits());
+            match &sel.kind {
+                SelectionKind::Rect { x, y, w, h: rh } => {
+                    h.write_u8(1);
+                    for v in [*x, *y, *w, *rh] {
+                        h.write_u32(v.to_bits());
+                    }
+                }
+                SelectionKind::Lasso(pts) => {
+                    h.write_u8(2);
+                    pts.len().hash(h);
+                    for p in pts.first().into_iter().chain(pts.last()) {
+                        h.write_u32(p.0.to_bits());
+                        h.write_u32(p.1.to_bits());
+                    }
+                }
+                SelectionKind::Mask { data, width, height } => {
+                    h.write_u8(3);
+                    width.hash(h);
+                    height.hash(h);
+                    if !data.is_empty() {
+                        data.len().hash(h);
+                        for i in 0..8 {
+                            h.write_u8(data[i * data.len() / 8]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn edit_fingerprint(item: &MediaItem) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -440,39 +478,7 @@ pub(crate) fn edit_fingerprint(item: &MediaItem) -> u64 {
     }
     format!("{:?}", e.levels).hash(&mut h);
     format!("{:?}", e.curves).hash(&mut h);
-    match &e.selection {
-        None => h.write_u8(0),
-        Some(sel) => {
-            h.write_u32(sel.feather.to_bits());
-            match &sel.kind {
-                SelectionKind::Rect { x, y, w, h: rh } => {
-                    h.write_u8(1);
-                    for v in [*x, *y, *w, *rh] {
-                        h.write_u32(v.to_bits());
-                    }
-                }
-                SelectionKind::Lasso(pts) => {
-                    h.write_u8(2);
-                    pts.len().hash(&mut h);
-                    for p in pts.first().into_iter().chain(pts.last()) {
-                        h.write_u32(p.0.to_bits());
-                        h.write_u32(p.1.to_bits());
-                    }
-                }
-                SelectionKind::Mask { data, width, height } => {
-                    h.write_u8(3);
-                    width.hash(&mut h);
-                    height.hash(&mut h);
-                    if !data.is_empty() {
-                        data.len().hash(&mut h);
-                        for i in 0..8 {
-                            h.write_u8(data[i * data.len() / 8]);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    hash_selection(&mut h, e.selection.as_ref());
     item.layers.len().hash(&mut h);
     for l in &item.layers {
         l.id.hash(&mut h);
@@ -533,6 +539,16 @@ pub(crate) fn edit_fingerprint(item: &MediaItem) -> u64 {
                         h.write_u8(r.pixels[i * r.pixels.len() / 8]);
                     }
                 }
+            }
+            LayerKind::Adjust(a) => {
+                h.write_u8(5);
+                for v in [a.adjust.brightness, a.adjust.contrast, a.adjust.saturation, a.adjust.warmth] {
+                    h.write_u32(v.to_bits());
+                }
+                format!("{:?}", a.adjust.levels).hash(&mut h);
+                format!("{:?}", a.adjust.curves).hash(&mut h);
+                a.invert.hash(&mut h);
+                hash_selection(&mut h, a.mask.as_ref());
             }
         }
     }
@@ -633,7 +649,7 @@ pub(crate) fn selection_to_layer(state: AppState, cut: bool) {
                             if let Some(m) = v.iter_mut().find(|m| m.id == item_id) {
                                 let nid = m.next_layer_id;
                                 m.next_layer_id += 1;
-                                m.layers.push(Layer::new_raster(nid, r.layer, r.lw, r.lh));
+                                state::insert_overlay(&mut m.layers, Layer::new_raster(nid, r.layer, r.lw, r.lh));
                             }
                         });
                         if let Some(c) = r.cut {
@@ -855,9 +871,13 @@ pub(crate) fn wand_select(state: AppState, nx: f32, ny: f32) {
     if !item.edit.raw.is_identity() {
         rawops::apply(p.to_mut(), w, h, &item.edit.raw);
     }
-    if item.edit.is_color_touched() {
+    let rendered = state::render_edit(&item.edit, &item.layers);
+    if item.edit.base_color_touched() {
         blur::blur_apply(p.to_mut(), w, h, item.edit.blur);
         color::apply_color(p.to_mut(), &item.edit);
+    }
+    if !rendered.adjust_layers.is_empty() {
+        pipeline::apply_adjust_layers_u8(p.to_mut(), w, h, &rendered);
     }
     let sx = ((nx * w as f32) as usize).min(w - 1);
     let sy = ((ny * h as f32) as usize).min(h - 1);
@@ -918,8 +938,8 @@ pub(crate) fn isolate_subject(state: AppState) {
                     m.next_layer_id += 1;
                     let id1 = m.next_layer_id;
                     m.next_layer_id += 1;
-                    m.layers.push(Layer::new_raster(id0, bg, pw, ph));
-                    m.layers.push(Layer::new_raster(id1, subject, pw, ph));
+                    state::insert_overlay(&mut m.layers, Layer::new_raster(id0, bg, pw, ph));
+                    state::insert_overlay(&mut m.layers, Layer::new_raster(id1, subject, pw, ph));
                     next_id = id1;
                 });
                 state.selected_layer.set(Some(next_id));

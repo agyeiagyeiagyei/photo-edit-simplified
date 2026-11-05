@@ -416,8 +416,10 @@ pub(crate) fn source_window(
     let (ew, eh) = (x1 - x0, y1 - y0);
     let win = px.crop_rows(fw, y0, x0, ew, eh);
     let mut frame = PipeFrame::new(win, ew, eh);
-    // The loupe shows the whole window, not the selection.
-    pipeline::finish(&mut frame, edit, seed, None, 1.0);
+    // The loupe shows the whole window, not the selection. Layer masks are
+    // full-frame, so crop them to the window or they would paint the whole crop.
+    let rebased = pipeline::rebase_layer_masks(edit, fw, fh, (x0, y0, ew, eh), ew, eh);
+    pipeline::finish(&mut frame, &rebased, seed, None, 1.0);
     let win = frame.pixels;
     let (ix, iy) = (sx - x0, sy - y0);
     let mut out = Vec::with_capacity(cw * ch * 4);
@@ -573,18 +575,22 @@ pub(crate) fn CanvasLoupe(
         // Direct path: crop the window straight out of the sensor buffer and
         // run the pointwise pipeline over it, so the loupe shows true source
         // pixels instead of a slice of a whole-image render. Exact only with
-        // identity geometry and no selection or visible layers.
+        // identity geometry and no selection or visible overlay layers;
+        // adjustment layers ride the pointwise pipeline and rebase their masks.
+        let loupe_edit = state::render_edit(&item.edit, &item.layers);
         let plain = item.edit.rot90.is_multiple_of(4)
             && item.edit.fine_angle.abs() <= 0.01
             && item.edit.selection.is_none()
-            && !item.layers.iter().any(|l| l.visible && l.opacity > 0.01);
+            && !item.layers.iter().any(|l| {
+                l.visible && l.opacity > 0.01 && !matches!(l.kind, LayerKind::Adjust(_))
+            });
         if plain {
             if photo.full {
                 let (fw, fh) = photo.full_dims;
                 if fw >= cw && fh >= ch {
                     // Source pixels live in the worker; it crops the window,
                     // runs the pointwise pipeline and returns only the loupe.
-                    let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
+                    let recipe = pworker::render_recipe(&item);
                     CANVAS_LOUPE_REQ.with(|c| c.set(c.get() + 1));
                     let rgen = CANVAS_LOUPE_REQ.with(|c| c.get());
                     let tag_cb = tag;
@@ -626,7 +632,7 @@ pub(crate) fn CanvasLoupe(
                     let pw = ((cw as f64 * kx).round() as usize).max(1).min(cam.1 - px);
                     let phh = ((ch as f64 * ky).round() as usize).max(1).min(cam.2 - py);
                     if let Some(win) =
-                        source_window(&cam.0, cam.1, cam.2, px, py, pw, phh, &item.edit, id as u32)
+                        source_window(&cam.0, cam.1, cam.2, px, py, pw, phh, &loupe_edit, id as u32)
                     {
                         blit_window(&canvas, &win, pw as u32, phh as u32, bw as u32, bh as u32);
                         tag.set(format!("{mag}:1 camera"));
@@ -643,7 +649,7 @@ pub(crate) fn CanvasLoupe(
                 let pw = ((cw as f64 * kx).round() as usize).max(1).min(p.w - px);
                 let phh = ((ch as f64 * ky).round() as usize).max(1).min(p.h - py);
                 if let Some(win) = source_window(
-                    &p.pixels, p.w, p.h, px, py, pw, phh, &item.edit, id as u32,
+                    &p.pixels, p.w, p.h, px, py, pw, phh, &loupe_edit, id as u32,
                 ) {
                     blit_window(&canvas, &win, pw as u32, phh as u32, bw as u32, bh as u32);
                     tag.set(format!("{mag}:1 proxy"));
@@ -730,7 +736,7 @@ pub(crate) fn CanvasLoupe(
         // not be asked for sensor dimensions it can never produce.
         let (src_id, (sw, sh)) = render_source(id, &photo);
         let (fw, fh) = working_dims(sw, sh, &item.edit);
-        let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
+        let recipe = pworker::render_recipe(&item);
         let sel = item.edit.selection.clone();
         let item_cb = item.clone();
         let accepted = pworker::render(

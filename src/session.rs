@@ -9,8 +9,8 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::state::{
-    BrushLayer, BrushShape, Layer, LayerKind, PathLayer, PathPoint, RasterLayer, TextAlign,
-    TextLayer,
+    AdjustLayerState, BrushLayer, BrushShape, Layer, LayerKind, PathLayer, PathPoint, RasterLayer,
+    TextAlign, TextLayer,
 };
 
 const DB_NAME: &str = "pes-session";
@@ -565,6 +565,27 @@ pub fn layers_json(layers: &[Layer]) -> Option<String> {
                     num(r.scale),
                 ));
             }
+            LayerKind::Adjust(a) => {
+                out.push_str(&format!(
+                    ",\"t\":\"adjust\",\"adj\":{}",
+                    pes_pixel::recipe::point_adjust_json(&a.adjust)
+                ));
+                if a.invert {
+                    out.push_str(",\"inv\":true");
+                }
+                if a.show_mask {
+                    out.push_str(",\"sm\":true");
+                }
+                if a.mask_version != 0 {
+                    out.push_str(&format!(",\"mv\":{}", a.mask_version));
+                }
+                if let Some(m) = &a.mask {
+                    out.push_str(&format!(
+                        ",\"mask\":{}",
+                        pes_pixel::recipe::selection_portable_json(m)
+                    ));
+                }
+            }
         }
         out.push('}');
     }
@@ -688,6 +709,16 @@ pub fn layers_from_json(json: &str) -> Vec<Layer> {
                 x: crate::state::jnum(&lv, "x").unwrap_or(0.5) as f32,
                 y: crate::state::jnum(&lv, "y").unwrap_or(0.5) as f32,
                 scale: crate::state::jnum(&lv, "scale").unwrap_or(1.0) as f32,
+            }),
+            "adjust" => LayerKind::Adjust(AdjustLayerState {
+                adjust: crate::state::jget(&lv, "adj")
+                    .map(|a| pes_pixel::recipe::point_adjust_from_json(&a))
+                    .unwrap_or_default(),
+                mask: crate::state::jget(&lv, "mask")
+                    .and_then(|m| pes_pixel::recipe::selection_from_layer_value(&m)),
+                invert: crate::state::jbool(&lv, "inv").unwrap_or(false),
+                show_mask: crate::state::jbool(&lv, "sm").unwrap_or(false),
+                mask_version: crate::state::jnum(&lv, "mv").unwrap_or(0.0) as u64,
             }),
             _ => continue,
         };

@@ -134,10 +134,11 @@ pub fn latch_off() {
 }
 
 /// The shader implements no mask or spatial stages; those edits keep the CPU
-/// path for the display render as well.
-pub fn eligible(edit: &EditParams) -> bool {
+/// path for the display render as well. Adjustment layers carry their own
+/// masks, so any visible one also rules the shader out.
+pub fn eligible(edit: &EditParams, layers: &[crate::state::Layer]) -> bool {
     // Denoise and sharpening reach the GPU only inside a developed base.
-    edit.selection.is_none()
+    edit.selection.is_none() && !crate::state::has_visible_adjust_layers(layers)
 }
 
 /// `Some(stale_source)` when a base for the same item and geometry is large

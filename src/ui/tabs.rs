@@ -226,8 +226,8 @@ pub(crate) fn ColorTab(state: AppState) -> impl IntoView {
         {slider("Saturation", |e| e.saturation, |e, v| e.saturation = v)}
         {slider("Warmth", |e| e.warmth, |e, v| e.warmth = v)}
         <BlurPanel state=state />
-        <LevelsPanel state=state channel=channel />
-        <CurvesPanel state=state channel=channel />
+        <LevelsPanel state=state channel=channel target=AdjustTarget::Global />
+        <CurvesPanel state=state channel=channel target=AdjustTarget::Global />
         <GrainPanel state=state />
         <button class="btn dim-btn" on:click=move |_| state.update_current(|e| {
             e.brightness = 0.0; e.contrast = 0.0; e.saturation = 0.0; e.warmth = 0.0;
@@ -369,8 +369,74 @@ pub(crate) fn curve_color(ch: usize, alpha: f64) -> String {
     format!("rgba({r},{g},{b},{alpha})")
 }
 
+/// Which settings object a Levels/Curves panel edits: the photo's global
+/// colour stage or one adjustment layer's effect set.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum AdjustTarget {
+    Global,
+    Layer(usize),
+}
+
+pub(crate) fn levels_of(state: AppState, target: AdjustTarget) -> Option<levels::LevelsSettings> {
+    match target {
+        AdjustTarget::Global => state.current().map(|m| m.edit.levels),
+        AdjustTarget::Layer(id) => state.current_layers().into_iter().find_map(|l| match l.kind {
+            LayerKind::Adjust(a) if l.id == id => Some(a.adjust.levels),
+            _ => None,
+        }),
+    }
+}
+
+pub(crate) fn with_levels(
+    state: AppState,
+    target: AdjustTarget,
+    f: impl FnOnce(&mut levels::LevelsSettings),
+) {
+    match target {
+        AdjustTarget::Global => state.update_current(|e| f(&mut e.levels)),
+        AdjustTarget::Layer(id) => state.update_current_item(|m| {
+            if let Some(l) = m.layers.iter_mut().find(|l| l.id == id) {
+                if let LayerKind::Adjust(a) = &mut l.kind {
+                    f(&mut a.adjust.levels);
+                }
+            }
+        }),
+    }
+}
+
+pub(crate) fn curves_of(state: AppState, target: AdjustTarget) -> Option<curves::CurvesSettings> {
+    match target {
+        AdjustTarget::Global => state.current().map(|m| m.edit.curves),
+        AdjustTarget::Layer(id) => state.current_layers().into_iter().find_map(|l| match l.kind {
+            LayerKind::Adjust(a) if l.id == id => Some(a.adjust.curves),
+            _ => None,
+        }),
+    }
+}
+
+pub(crate) fn with_curves(
+    state: AppState,
+    target: AdjustTarget,
+    f: impl FnOnce(&mut curves::CurvesSettings),
+) {
+    match target {
+        AdjustTarget::Global => state.update_current(|e| f(&mut e.curves)),
+        AdjustTarget::Layer(id) => state.update_current_item(|m| {
+            if let Some(l) = m.layers.iter_mut().find(|l| l.id == id) {
+                if let LayerKind::Adjust(a) = &mut l.kind {
+                    f(&mut a.adjust.curves);
+                }
+            }
+        }),
+    }
+}
+
 #[component]
-pub(crate) fn LevelsPanel(state: AppState, channel: RwSignal<usize>) -> impl IntoView {
+pub(crate) fn LevelsPanel(
+    state: AppState,
+    channel: RwSignal<usize>,
+    target: AdjustTarget,
+) -> impl IntoView {
     let hist_ref = create_node_ref::<html::Canvas>();
     // Which Auto button produced the current settings. Cleared as soon as the
     // levels are edited by hand or the selection moves to another item.
@@ -409,10 +475,9 @@ pub(crate) fn LevelsPanel(state: AppState, channel: RwSignal<usize>) -> impl Int
     });
 
     let dirty = move |idx: usize| {
-        state
-            .current()
-            .map(|m| {
-                let r = &m.edit.levels.ranges;
+        levels_of(state, target)
+            .map(|l| {
+                let r = &l.ranges;
                 if idx == 0 {
                     (1..4).any(|ch| r[ch] != levels::LevelRange::default())
                 } else {
@@ -447,9 +512,9 @@ pub(crate) fn LevelsPanel(state: AppState, channel: RwSignal<usize>) -> impl Int
         view! {
             <label class="slider">
                 <span>{label} ": " {move || {
-                    let Some(m) = state.current() else { return "—".into() };
+                    let Some(levels) = levels_of(state, target) else { return "—".into() };
                     let ch = channel.get();
-                    let ranges = &m.edit.levels.ranges;
+                    let ranges = &levels.ranges;
                     let mut s = fmt(get(&ranges[ch]));
                     // In the RGB view, show the per-channel values once any
                     // channel differs from its default, so Auto color/neutral
@@ -466,13 +531,13 @@ pub(crate) fn LevelsPanel(state: AppState, channel: RwSignal<usize>) -> impl Int
                 }}</span>
                 <input
                     type="range" min=min.to_string() max=max.to_string() step=step.to_string()
-                    prop:value=move || state.current()
-                        .map(|m| get(&m.edit.levels.ranges[channel.get()]).to_string())
+                    prop:value=move || levels_of(state, target)
+                        .map(|l| get(&l.ranges[channel.get()]).to_string())
                         .unwrap_or_else(|| "0".into())
                     on:input=move |ev| {
                         let v: f64 = event_target_value(&ev).parse().unwrap_or(0.0);
                         let ch = channel.get_untracked();
-                        state.update_current(|e| set(&mut e.levels.ranges[ch], v));
+                        with_levels(state, target, |l| set(&mut l.ranges[ch], v));
                         last_auto.set(None);
                     }
                 />
@@ -485,7 +550,7 @@ pub(crate) fn LevelsPanel(state: AppState, channel: RwSignal<usize>) -> impl Int
         let Some(photo) = get_photo(item.id) else { return };
         let hist = levels::histogram(&photo.preview.0);
         let s = levels::auto_settings(&hist, mode);
-        state.update_current(|e| e.levels = s);
+        with_levels(state, target, |l| *l = s);
         last_auto.set(Some(mode));
     };
 
@@ -503,8 +568,8 @@ pub(crate) fn LevelsPanel(state: AppState, channel: RwSignal<usize>) -> impl Int
 
     let applied = move || {
         let Some(mode) = last_auto.get() else { return ().into_view() };
-        let Some(m) = state.current() else { return ().into_view() };
-        let r = &m.edit.levels.ranges;
+        let Some(levels) = levels_of(state, target) else { return ().into_view() };
+        let r = &levels.ranges;
         let span = |i: usize| format!("{:.0}–{:.0}", r[i].black, r[i].white);
         let title = match mode {
             levels::AutoMode::Contrast => "Auto contrast applied",
@@ -555,7 +620,7 @@ pub(crate) fn LevelsPanel(state: AppState, channel: RwSignal<usize>) -> impl Int
                 {auto_btn(levels::AutoMode::Color, "Auto color")}
                 {auto_btn(levels::AutoMode::ColorNeutral, "Auto neutral")}
                 <button class="btn small dim-btn" on:click=move |_| {
-                    state.update_current(|e| e.levels = levels::LevelsSettings::default());
+                    with_levels(state, target, |l| *l = levels::LevelsSettings::default());
                     last_auto.set(None);
                 }>"Reset levels"</button>
             </div>
@@ -565,7 +630,11 @@ pub(crate) fn LevelsPanel(state: AppState, channel: RwSignal<usize>) -> impl Int
 }
 
 #[component]
-pub(crate) fn CurvesPanel(state: AppState, channel: RwSignal<usize>) -> impl IntoView {
+pub(crate) fn CurvesPanel(
+    state: AppState,
+    channel: RwSignal<usize>,
+    target: AdjustTarget,
+) -> impl IntoView {
     let selected = create_rw_signal(None::<usize>);
     let dragging = store_value(None::<usize>);
     let canvas_ref = create_node_ref::<html::Canvas>();
@@ -576,10 +645,10 @@ pub(crate) fn CurvesPanel(state: AppState, channel: RwSignal<usize>) -> impl Int
         channel.track();
         selected.track();
         let Some(canvas) = canvas_ref.get() else { return };
-        let Some(item) = state.current() else { return };
+        let Some(curves_cfg) = curves_of(state, target) else { return };
         let ch = channel.get_untracked();
         let sel = selected.get_untracked();
-        let pts = &item.edit.curves.channels[ch];
+        let pts = &curves_cfg.channels[ch];
         let ctx = web::ctx2d(&canvas);
         ctx.clear_rect(0.0, 0.0, 256.0, 256.0);
         ctx.set_stroke_style_str("rgba(255,255,255,0.12)");
@@ -603,7 +672,7 @@ pub(crate) fn CurvesPanel(state: AppState, channel: RwSignal<usize>) -> impl Int
             ctx.set_line_width(1.0);
             ctx.begin_path();
             for x in 0..=255 {
-                let y = item.edit.curves.value(x as f64, other);
+                let y = curves_cfg.value(x as f64, other);
                 let px = x as f64 / 255.0 * 256.0;
                 let py = (1.0 - y / 255.0) * 256.0;
                 if x == 0 {
@@ -618,7 +687,7 @@ pub(crate) fn CurvesPanel(state: AppState, channel: RwSignal<usize>) -> impl Int
         ctx.set_line_width(2.0);
         ctx.begin_path();
         for x in 0..=255 {
-            let y = item.edit.curves.value(x as f64, ch);
+            let y = curves_cfg.value(x as f64, ch);
             let px = x as f64 / 255.0 * 256.0;
             let py = (1.0 - y / 255.0) * 256.0;
             if x == 0 {
@@ -664,8 +733,8 @@ pub(crate) fn CurvesPanel(state: AppState, channel: RwSignal<usize>) -> impl Int
             let _ = canvas.set_pointer_capture(ev.pointer_id());
         }
         let ch = channel.get_untracked();
-        let Some(item) = state.current() else { return };
-        let pts = item.edit.curves.channels[ch].clone();
+        let Some(curves_cfg) = curves_of(state, target) else { return };
+        let pts = curves_cfg.channels[ch].clone();
         let nearest = pts
             .iter()
             .enumerate()
@@ -682,7 +751,7 @@ pub(crate) fn CurvesPanel(state: AppState, channel: RwSignal<usize>) -> impl Int
             new_pts.push(curves::CurvePoint { x, y });
             new_pts.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap());
             let idx = new_pts.iter().position(|p| p.x == x).unwrap();
-            state.update_current(|e| e.curves.channels[ch] = new_pts);
+            with_curves(state, target, |c| c.channels[ch] = new_pts);
             dragging.set_value(Some(idx));
             selected.set(Some(idx));
         }
@@ -692,8 +761,8 @@ pub(crate) fn CurvesPanel(state: AppState, channel: RwSignal<usize>) -> impl Int
         let Some(i) = dragging.get_value() else { return };
         let Some((x, y)) = to_curve(&ev) else { return };
         let ch = channel.get_untracked();
-        state.update_current(|e| {
-            let pts = &mut e.curves.channels[ch];
+        with_curves(state, target, |c| {
+            let pts = &mut c.channels[ch];
             if i >= pts.len() {
                 return;
             }
@@ -707,13 +776,12 @@ pub(crate) fn CurvesPanel(state: AppState, channel: RwSignal<usize>) -> impl Int
     let on_up = move |_: web_sys::PointerEvent| dragging.set_value(None);
 
     let dirty = move |idx: usize| {
-        state
-            .current()
-            .map(|m| {
+        curves_of(state, target)
+            .map(|c| {
                 if idx == 0 {
-                    (1..4).any(|ch| !m.edit.curves.channel_is_identity(ch))
+                    (1..4).any(|ch| !c.channel_is_identity(ch))
                 } else {
-                    !m.edit.curves.channel_is_identity(idx)
+                    !c.channel_is_identity(idx)
                 }
             })
             .unwrap_or(false)
@@ -740,10 +808,9 @@ pub(crate) fn CurvesPanel(state: AppState, channel: RwSignal<usize>) -> impl Int
 
     let removable = move || {
         let Some(i) = selected.get() else { return false };
-        state
-            .current()
-            .map(|m| {
-                let n = m.edit.curves.channels[channel.get()].len();
+        curves_of(state, target)
+            .map(|c| {
+                let n = c.channels[channel.get()].len();
                 i > 0 && i < n - 1
             })
             .unwrap_or(false)
@@ -765,8 +832,8 @@ pub(crate) fn CurvesPanel(state: AppState, channel: RwSignal<usize>) -> impl Int
                 <span>{move || {
                     let ch = channel.get();
                     let detail = selected.get().and_then(|i| {
-                        state.current().and_then(|m| {
-                            m.edit.curves.channels[ch]
+                        curves_of(state, target).and_then(|c| {
+                            c.channels[ch]
                                 .get(i)
                                 .map(|p| format!("Input {} · Output {}", p.x as i32, p.y as i32))
                         })
@@ -779,8 +846,8 @@ pub(crate) fn CurvesPanel(state: AppState, channel: RwSignal<usize>) -> impl Int
                 <button class="btn small" disabled=move || !removable() on:click=move |_| {
                     if let Some(i) = selected.get_untracked() {
                         let ch = channel.get_untracked();
-                        state.update_current(|e| {
-                            let pts = &mut e.curves.channels[ch];
+                        with_curves(state, target, |c| {
+                            let pts = &mut c.channels[ch];
                             if i > 0 && i < pts.len() - 1 {
                                 pts.remove(i);
                             }
@@ -790,8 +857,8 @@ pub(crate) fn CurvesPanel(state: AppState, channel: RwSignal<usize>) -> impl Int
                 }>"Remove point"</button>
                 <button class="btn small dim-btn" on:click=move |_| {
                     let ch = channel.get_untracked();
-                    state.update_current(|e| {
-                        e.curves.channels[ch] = vec![
+                    with_curves(state, target, |c| {
+                        c.channels[ch] = vec![
                             curves::CurvePoint { x: 0.0, y: 0.0 },
                             curves::CurvePoint { x: 255.0, y: 255.0 },
                         ];

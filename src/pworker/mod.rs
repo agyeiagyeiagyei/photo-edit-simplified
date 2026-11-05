@@ -11,7 +11,7 @@ use wasm_bindgen::JsCast;
 use web_sys::{ErrorEvent, MessageEvent, Worker, WorkerOptions, WorkerType};
 
 use pes_pixel::recipe::selection_json;
-use pes_pixel::types::{Selection, SelectionKind};
+use pes_pixel::types::{EditParams, Selection, SelectionKind};
 
 use crate::perf;
 
@@ -50,6 +50,10 @@ thread_local! {
     /// Load/render replies carry `mem`; the buffer cache lives there, so this
     /// is the number the full-pixel budget has to fit inside.
     static PIXEL_MEM_HIGH: Cell<f64> = const { Cell::new(0.0) };
+    /// `(item, layer)` -> mask version already posted to the worker. Raster
+    /// masks travel out-of-band once per version, never inside a render
+    /// recipe.
+    static SYNCED_MASKS: RefCell<HashMap<(u32, u64), u64>> = RefCell::new(HashMap::new());
 }
 
 /// Bytes of the RAW worker's wasm memory high-water (0 until the first reply).
@@ -930,12 +934,65 @@ pub fn load_photo_view(
 }
 
 pub fn unload(id: usize) {
+    SYNCED_MASKS.with(|s| s.borrow_mut().retain(|(mid, _), _| *mid != id as u32));
     call("unload", &[JsValue::from(id as u32)], &[], Box::new(|_| {}));
     // The RAW worker holds the last proxy's full frame / tone curve for the
     // export reuse; drop that item there too.
     if RAW_WORKER.with(|w| w.borrow().is_some()) {
         raw_call("unload", &[JsValue::from(id as u32)], &[], Box::new(|_| {}));
     }
+}
+
+/// Post any adjustment-layer raster mask the worker has not seen at its
+/// current version. Called immediately before a recipe is sent, so the
+/// worker's FIFO message order guarantees the cache is filled first.
+fn sync_adjust_masks(item: usize, edit: &EditParams) {
+    let id = item as u32;
+    for layer in &edit.adjust_layers {
+        let Some(Selection {
+            kind: SelectionKind::Mask { data, width, height },
+            ..
+        }) = &layer.mask
+        else {
+            continue;
+        };
+        if data.is_empty() || *width == 0 || *height == 0 || data.len() != width * height {
+            continue;
+        }
+        let key = (id, layer.id);
+        if SYNCED_MASKS.with(|s| s.borrow().get(&key) == Some(&layer.mask_version)) {
+            continue;
+        }
+        init();
+        let arr = Uint8Array::from(&data[..]);
+        let buf = arr.buffer();
+        let posted = call(
+            "cache_adjust_mask",
+            &[
+                JsValue::from(id),
+                JsValue::from(layer.id as f64),
+                JsValue::from(layer.mask_version as f64),
+                JsValue::from(*width as u32),
+                JsValue::from(*height as u32),
+                arr.into(),
+            ],
+            &[buf.into()],
+            Box::new(|_| {}),
+        );
+        if posted {
+            SYNCED_MASKS.with(|s| {
+                s.borrow_mut().insert(key, layer.mask_version);
+            });
+        }
+    }
+}
+
+/// Recipe for a worker render of `item`: the global edit with the stack's
+/// adjustment layers lifted in, and their raster masks synced first.
+pub(crate) fn render_recipe(item: &crate::state::MediaItem) -> String {
+    let edit = crate::state::render_edit(&item.edit, &item.layers);
+    sync_adjust_masks(item.id, &edit);
+    pes_pixel::recipe::edit_params_full_json(&edit)
 }
 
 /// Selection wire args: (sel_json, sel_mask) + transfer list for mask bytes.

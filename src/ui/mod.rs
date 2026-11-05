@@ -69,7 +69,7 @@ pub(crate) fn App() -> impl IntoView {
         if item.drive_baked {
             return;
         }
-        let recipe = state::edit_recipe_json(&item.edit);
+        let recipe = state::edit_recipe_json(&state::render_edit(&item.edit, &item.layers));
         let stored = state.drive_edits.with(|m| m.get(&fid).cloned());
         if stored != recipe {
             state.drive_edits.update(|m| match &recipe {

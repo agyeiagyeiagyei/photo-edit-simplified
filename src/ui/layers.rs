@@ -1,6 +1,7 @@
 //! Layers tab and per-layer editors for text, vector paths, brush strokes and raster layers.
 
 use crate::prelude::*;
+use crate::state::{AdjustLayerState, PointAdjust};
 use crate::*;
 
 #[component]
@@ -13,7 +14,7 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
         state.update_current_item(|m| {
             let id = m.next_layer_id;
             m.next_layer_id += 1;
-            let layer = match kind {
+            let mut layer = match kind {
                 "text" => {
                     let mut l = Layer::new_text(id);
                     // Place new text at the center of the current crop, not
@@ -27,9 +28,18 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
                 }
                 "path" => Layer::new_path(id),
                 "brush" => Layer::new_brush(id),
+                "adjust" | "adjust-sel" => Layer::new_adjust(id),
                 _ => Layer::new_text(id),
             };
-            m.layers.push(layer);
+            if kind == "adjust-sel" {
+                if let (LayerKind::Adjust(a), Some(sel)) = (&mut layer.kind, m.edit.selection.take()) {
+                    a.set_mask(Some(sel));
+                }
+            }
+            match &layer.kind {
+                LayerKind::Adjust(_) => m.layers.push(layer),
+                _ => state::insert_overlay(&mut m.layers, layer),
+            }
             new_id = Some(id);
         });
         if let Some(id) = new_id {
@@ -53,13 +63,23 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
 
     let move_layer = move |id: usize, delta: isize| {
         state.update_current_item(|m| {
-            let idx = m.layers.iter().position(|l| l.id == id);
-            if let Some(i) = idx {
-                let new_i = (i as isize + delta)
-                    .clamp(0, m.layers.len() as isize - 1) as usize;
-                if new_i != i {
-                    m.layers.swap(i, new_i);
-                }
+            let Some(i) = m.layers.iter().position(|l| l.id == id) else { return };
+            // Reordering stays inside its group: overlay layers never cross the
+            // adjustment group, which keeps the panel grouping meaningful.
+            let is_adjust = matches!(m.layers[i].kind, LayerKind::Adjust(_));
+            let first_adjust = m
+                .layers
+                .iter()
+                .position(|l| matches!(l.kind, LayerKind::Adjust(_)))
+                .unwrap_or(m.layers.len());
+            let (lo, hi) = if is_adjust {
+                (first_adjust, m.layers.len())
+            } else {
+                (0, first_adjust)
+            };
+            let new_i = (i as isize + delta).clamp(lo as isize, hi as isize - 1) as usize;
+            if new_i != i {
+                m.layers.swap(i, new_i);
             }
         });
     };
@@ -85,6 +105,8 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
     };
 
     let layers = create_memo(move |_| state.current_layers());
+    let is_photo = move || state.current().map(|m| m.kind == MediaKind::Photo).unwrap_or(false);
+    let has_selection = move || state.current().map(|m| m.edit.selection.is_some()).unwrap_or(false);
 
     let image_input_ref = create_node_ref::<html::Input>();
     let import_image = move |file: File| {
@@ -101,7 +123,7 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
                 if let LayerKind::Raster(r) = &mut layer.kind {
                     r.scale = 0.5;
                 }
-                m.layers.push(layer);
+                state::insert_overlay(&mut m.layers, layer);
                 new_id = Some(id);
             });
             if let Some(id) = new_id {
@@ -117,6 +139,16 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
                 <button class="btn" on:click=move |_| add_layer("text")>"＋ Text"</button>
                 <button class="btn" on:click=move |_| add_layer("path")>"＋ Path"</button>
                 <button class="btn" on:click=move |_| add_layer("brush")>"＋ Brush"</button>
+                <button
+                    class="btn"
+                    disabled=move || !is_photo()
+                    on:click=move |_| add_layer("adjust")
+                >"＋ Adjust"</button>
+                <button
+                    class="btn"
+                    disabled=move || !is_photo() || !has_selection()
+                    on:click=move |_| add_layer("adjust-sel")
+                >"＋ Adjust from sel."</button>
                 <label class="btn">
                     "＋ Image"
                     <input
@@ -147,7 +179,24 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
                             layers.get().into_iter().find(|l| l.id == id)
                         });
                         let is_selected = move || state.selected_layer.get() == Some(id);
+                        let first_adjust = move || {
+                            let ls = layers.get();
+                            let is_adjust = ls
+                                .iter()
+                                .find(|l| l.id == id)
+                                .map(|l| matches!(l.kind, LayerKind::Adjust(_)))
+                                .unwrap_or(false);
+                            is_adjust
+                                && ls
+                                    .iter()
+                                    .find(|l| matches!(l.kind, LayerKind::Adjust(_)))
+                                    .map(|l| l.id == id)
+                                    .unwrap_or(false)
+                        };
                         view! {
+                            <Show when=first_adjust fallback=|| ()>
+                                <div class="layer-group-label">"Adjustments"</div>
+                            </Show>
                             <div
                                 class="layer-row"
                                 class:selected=is_selected
@@ -218,10 +267,151 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
                 />
             </div>
             <ToolBar state=state/>
+            {move || state.selected_layer.get().and_then(|id| {
+                let is_adjust = layers
+                    .get()
+                    .iter()
+                    .any(|l| l.id == id && matches!(l.kind, LayerKind::Adjust(_)));
+                is_adjust.then(|| view! { <AdjustLayerEditor state=state layer_id=id/> })
+            })}
             <TextLayerEditor state=state/>
             <PathLayerEditor state=state/>
             <BrushLayerEditor state=state/>
             <RasterLayerEditor state=state/>
+        </div>
+    }
+}
+
+/// Selected adjustment layer's state, if any.
+fn selected_adjust(state: AppState) -> Option<(usize, AdjustLayerState)> {
+    let id = state.selected_layer.get()?;
+    state
+        .current_layers()
+        .into_iter()
+        .find_map(|l| match l.kind {
+            LayerKind::Adjust(a) if l.id == id => Some((id, a)),
+            _ => None,
+        })
+}
+
+fn with_adjust(state: AppState, id: usize, f: impl FnOnce(&mut AdjustLayerState)) {
+    state.update_current_item(|m| {
+        if let Some(l) = m.layers.iter_mut().find(|l| l.id == id) {
+            if let LayerKind::Adjust(a) = &mut l.kind {
+                f(a);
+            }
+        }
+    });
+}
+
+#[component]
+pub(crate) fn AdjustLayerEditor(state: AppState, layer_id: usize) -> impl IntoView {
+    let adjust = move || selected_adjust(state).map(|(_, a)| a);
+    let channel = create_rw_signal(0usize);
+    let has_selection = move || state.current().map(|m| m.edit.selection.is_some()).unwrap_or(false);
+
+    let slider = move |label: &'static str,
+                       get: fn(&PointAdjust) -> f32,
+                       set: fn(&mut PointAdjust, f32)| {
+        view! {
+            <label class="slider">
+                <span>{label} ": " {move || format!(
+                    "{:+.0}%",
+                    adjust().map(|a| get(&a.adjust) * 100.0).unwrap_or(0.0)
+                )}</span>
+                <input
+                    type="range" min="-1" max="1" step="0.01"
+                    prop:value=move || adjust().map(|a| get(&a.adjust)).unwrap_or(0.0).to_string()
+                    on:input=move |ev| {
+                        let v: f32 = event_target_value(&ev).parse().unwrap_or(0.0);
+                        with_adjust(state, layer_id, |a| set(&mut a.adjust, v));
+                    }
+                />
+            </label>
+        }
+    };
+
+    let take_selection = move |_| {
+        state.update_current_item(|m| {
+            let Some(l) = m.layers.iter_mut().find(|l| l.id == layer_id) else { return };
+            let Some(sel) = m.edit.selection.take() else { return };
+            if let LayerKind::Adjust(a) = &mut l.kind {
+                a.set_mask(Some(sel));
+            }
+        });
+    };
+
+    let feather = move || {
+        adjust()
+            .and_then(|a| a.mask)
+            .map(|s| s.feather)
+            .unwrap_or(0.0)
+    };
+
+    view! {
+        <div class="adjust-editor">
+            <div class="panel-title">"Adjustment layer"</div>
+            {slider("Brightness", |a| a.brightness, |a, v| a.brightness = v)}
+            {slider("Contrast", |a| a.contrast, |a, v| a.contrast = v)}
+            {slider("Saturation", |a| a.saturation, |a, v| a.saturation = v)}
+            {slider("Warmth", |a| a.warmth, |a, v| a.warmth = v)}
+            <LevelsPanel state=state channel=channel target=AdjustTarget::Layer(layer_id)/>
+            <CurvesPanel state=state channel=channel target=AdjustTarget::Layer(layer_id)/>
+            <div class="panel-title">"Mask"</div>
+            <div class="row">
+                <button
+                    class="btn"
+                    disabled=move || !has_selection()
+                    on:click=take_selection
+                >"New adjustment from selection"</button>
+                <button
+                    class="btn"
+                    disabled=move || adjust().and_then(|a| a.mask).is_none()
+                    on:click=move |_| with_adjust(state, layer_id, |a| a.set_mask(None))
+                >"Clear mask"</button>
+            </div>
+            <label class="row" style="justify-content:flex-start;gap:0.5rem">
+                <input
+                    type="checkbox"
+                    prop:checked=move || adjust().map(|a| a.invert).unwrap_or(false)
+                    on:change=move |ev| {
+                        let v = event_target_checked(&ev);
+                        with_adjust(state, layer_id, |a| a.invert = v);
+                    }
+                />
+                "Invert"
+            </label>
+            <label class="row" style="justify-content:flex-start;gap:0.5rem">
+                <input
+                    type="checkbox"
+                    prop:checked=move || adjust().map(|a| a.show_mask).unwrap_or(false)
+                    on:change=move |ev| {
+                        let v = event_target_checked(&ev);
+                        with_adjust(state, layer_id, |a| a.show_mask = v);
+                    }
+                />
+                "Show mask"
+            </label>
+            <label class="slider">
+                <span>"Feather: " {move || format!("{:.0}%", feather() * 100.0)}</span>
+                <input
+                    type="range" min="0" max="0.25" step="0.01"
+                    prop:value=move || feather().to_string()
+                    on:input=move |ev| {
+                        let v: f32 = event_target_value(&ev).parse().unwrap_or(0.0);
+                        with_adjust(state, layer_id, |a| {
+                            if let Some(ref mut s) = a.mask {
+                                s.feather = v.clamp(0.0, 0.25);
+                                a.mask_version += 1;
+                            }
+                        });
+                    }
+                />
+            </label>
+            <p class="dim">
+                "Masks come from the Select tab (rect, lasso or wand). Without a mask the \
+                 adjustment applies to the whole photo. Feather only applies to masked areas."
+            </p>
         </div>
     }
 }
