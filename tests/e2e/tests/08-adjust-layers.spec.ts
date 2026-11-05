@@ -2,7 +2,7 @@ import { test, expect, Page } from '@playwright/test';
 import * as fs from 'fs';
 import {
   openApp, trackErrors, recordMetrics, importFiles, canvas, canvasSize, clickTab, setRange,
-  thumbs, PNG_SMALL,
+  thumbs, PNG_SMALL, rawFixtures,
 } from './helpers';
 
 type Frame = { w: number; h: number; bytes: Buffer };
@@ -470,6 +470,98 @@ test.describe('adjustment layers (issue #26)', () => {
       legacy_restore_psnr_db: Math.round(db * 100) / 100,
     });
     expect(delta, 'legacy session restore changed the frame').toBeLessThanOrEqual(1);
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  // A RAW shows from its proxy, which lives under a different worker buffer id
+  // than the item; raster (wand) masks are sent to the worker by id, so this
+  // covers the preview of a raster-masked layer on the proxy path.
+  const RAW = rawFixtures()[0];
+  test('a wand-masked layer on a RAW shows in the preview and matches the export', async ({ page }, testInfo) => {
+    test.skip(!RAW, 'no RAW fixture in dl-raw');
+    test.setTimeout(300_000);
+    const errors = trackErrors(page);
+    await openApp(page, './?gpu=1');
+    await importFiles(page, [RAW]);
+    await expect.poll(
+      () => page.evaluate(() => ((window as any).__pes?.perf?.() || []).some((e: any) => e.name === 'proxy.raw_develop' || e.name === 'pool.develop')),
+      { timeout: 120_000 },
+    ).toBe(true);
+    await expect(page.locator('.developing-badge')).toHaveCount(0, { timeout: 60_000 });
+    await settle(page, 1000);
+    const SMALL = 512;
+    // Downscale the stage canvas (or a decoded export) in the page; RAW frames
+    // are far too large to ship to the test process.
+    const small = (src: 'canvas' | string) => page.evaluate(async ([src, W]) => {
+      let img: CanvasImageSource & { width: number; height: number };
+      let close = () => {};
+      if (src === 'canvas') {
+        img = document.querySelector('.canvas-wrap canvas') as HTMLCanvasElement;
+      } else {
+        const bin = atob(src as string);
+        const u8 = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+        const bmp = await createImageBitmap(new Blob([u8], { type: 'image/png' }));
+        img = bmp;
+        close = () => bmp.close();
+      }
+      const H = Math.round(((W as number) * 2) / 3);
+      const c = document.createElement('canvas');
+      c.width = W as number;
+      c.height = H;
+      const x = c.getContext('2d')!;
+      x.imageSmoothingQuality = 'high';
+      x.drawImage(img, 0, 0, W as number, H);
+      close();
+      const d = x.getImageData(0, 0, W as number, H).data;
+      let s = '';
+      for (let i = 0; i < d.length; i += 0x8000) {
+        s += String.fromCharCode.apply(null, Array.from(d.subarray(i, i + 0x8000)) as number[]);
+      }
+      return btoa(s);
+    }, [src, SMALL] as const).then(b64ToBytes);
+    const baseline = await small('canvas');
+
+    // Non-contiguous wand at full tolerance: a raster mask covering most of
+    // the frame, so the layer's effect is unmistakable.
+    await clickTab(page, 'Select');
+    await page.locator('.select-tab .chip', { hasText: /^Wand$/ }).click();
+    await setRange(page, /^Tolerance/, 100);
+    const contiguous = page.locator('.select-tab label.row', { hasText: 'Contiguous' }).locator('input');
+    if (await contiguous.isChecked()) await contiguous.uncheck();
+    const b = await wrapBox(page);
+    await page.mouse.click(b.x + b.width * 0.5, b.y + b.height * 0.5);
+    await clickTab(page, 'Layers');
+    await expect(addAdjustFromSel(page)).toBeEnabled({ timeout: 10_000 });
+    await addAdjustFromSel(page).click();
+    await setRange(page, /^Brightness/, 0.45);
+    await settle(page, 1500);
+    const layered = await small('canvas');
+    const effect = meanDiff(baseline, layered);
+
+    const png = await exportPng(page);
+    const exported = await small(png.toString('base64'));
+    // Compare at 128 px (4x4 box average of the 512 px frames): a
+    // non-contiguous wand mask on real foliage is noise-like at its 1024 px
+    // working resolution, so per-pixel comparisons at 512 px mostly measure
+    // how two different downscales alias that pattern, not mask placement.
+    const box4 = (f: Buffer) => {
+      const w = SMALL, h = Math.round((SMALL * 2) / 3), tw = w / 4, th = Math.floor(h / 4);
+      const out = Buffer.alloc(tw * th * 4);
+      for (let y = 0; y < th; y++) for (let x = 0; x < tw; x++) for (let c = 0; c < 4; c++) {
+        let sum = 0;
+        for (let dy = 0; dy < 4; dy++) for (let dx = 0; dx < 4; dx++) sum += f[((y * 4 + dy) * w + x * 4 + dx) * 4 + c];
+        out[(y * tw + x) * 4 + c] = Math.round(sum / 16);
+      }
+      return out;
+    };
+    const db = psnr(box4(layered), box4(exported));
+    recordMetrics(testInfo, {
+      raw_wand_layer_preview_delta: Math.round(effect * 100) / 100,
+      raw_wand_layer_parity_psnr_db: Math.round(db * 100) / 100,
+    });
+    expect(effect, 'the wand-masked layer did not change the RAW preview').toBeGreaterThan(3);
+    expect(db, `RAW wand layer preview vs export PSNR ${db.toFixed(2)} dB at 128 px < 30 dB`).toBeGreaterThanOrEqual(30);
     expect(errors, errors.join('\n')).toEqual([]);
   });
 });

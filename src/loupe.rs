@@ -590,7 +590,7 @@ pub(crate) fn CanvasLoupe(
                 if fw >= cw && fh >= ch {
                     // Source pixels live in the worker; it crops the window,
                     // runs the pointwise pipeline and returns only the loupe.
-                    let recipe = pworker::render_recipe(&item);
+                    let recipe = pworker::render_recipe(&item, id);
                     CANVAS_LOUPE_REQ.with(|c| c.set(c.get() + 1));
                     let rgen = CANVAS_LOUPE_REQ.with(|c| c.get());
                     let tag_cb = tag;
@@ -736,7 +736,7 @@ pub(crate) fn CanvasLoupe(
         // not be asked for sensor dimensions it can never produce.
         let (src_id, (sw, sh)) = render_source(id, &photo);
         let (fw, fh) = working_dims(sw, sh, &item.edit);
-        let recipe = pworker::render_recipe(&item);
+        let recipe = pworker::render_recipe(&item, src_id);
         let sel = item.edit.selection.clone();
         let item_cb = item.clone();
         let accepted = pworker::render(

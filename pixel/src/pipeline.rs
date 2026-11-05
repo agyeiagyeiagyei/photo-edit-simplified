@@ -203,6 +203,11 @@ fn layer_mask(layer: &AdjustLayer, w: usize, h: usize) -> LayerMask<'_> {
         if *width == 0 || *height == 0 || data.len() != width * height {
             return LayerMask::Skip;
         }
+        // A raster already at the frame's size (every rebased mask) is used
+        // in place: copying it would add a full-frame buffer per layer.
+        if (*width, *height) == (w, h) && sel.feather <= 0.001 && !layer.invert {
+            return LayerMask::Bytes(Cow::Borrowed(data.as_slice()));
+        }
     }
     let mut m = ops::selection_mask(sel, w, h);
     if layer.invert {
@@ -282,7 +287,13 @@ pub fn rebase_layer_masks(
         return edit.clone();
     }
     let mut out = edit.clone();
+    let whole = (cx, cy, cw, ch) == (0, 0, work_w, work_h);
     for layer in &mut out.adjust_layers {
+        // An inactive layer is never applied; rasterizing its mask at the
+        // working size would only cost memory.
+        if !layer.active() {
+            continue;
+        }
         let Some(sel) = layer.mask.take() else {
             if layer.invert {
                 layer.visible = false;
@@ -295,7 +306,7 @@ pub fn rebase_layer_masks(
                 *v = 255 - *v;
             }
         }
-        let win = crop_mask(&full, work_w, cx, cy, cw, ch);
+        let win = if whole { full } else { crop_mask(&full, work_w, cx, cy, cw, ch) };
         let mask = if (tw, th) != (cw, ch) {
             resample_mask_nearest(&win, cw, ch, tw, th)
         } else {

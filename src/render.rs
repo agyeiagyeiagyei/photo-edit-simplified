@@ -548,6 +548,10 @@ pub(crate) fn edit_fingerprint(item: &MediaItem) -> u64 {
                 format!("{:?}", a.adjust.levels).hash(&mut h);
                 format!("{:?}", a.adjust.curves).hash(&mut h);
                 a.invert.hash(&mut h);
+                // Every mask change bumps the version; the selection hash
+                // only samples 8 bytes of a raster mask, so two wand masks of
+                // the same size can collide without it.
+                a.mask_version.hash(&mut h);
                 hash_selection(&mut h, a.mask.as_ref());
             }
         }

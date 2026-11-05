@@ -28,13 +28,16 @@ pub(crate) async fn render_photo_export(
     // cap, so the target size is the crop itself.
     let (ew, eh) = (cw, ch);
     let format = state.photo_format.get_untracked();
-    let recipe = pworker::render_recipe(item);
+    let recipe = pworker::render_recipe(item, item.id);
     let sel = item.edit.selection.clone();
     let id = item.id;
     let mut encode_span = perf::Span::new("export.encode");
     encode_span.set_detail(format!("{}x{}", ew, eh));
 
-    let encoded = if item.layers.is_empty() {
+    // Adjustment layers are part of the worker's pixel pipeline (the recipe
+    // carries them); only overlay layers need the canvas composite below.
+    let has_overlays = item.layers.iter().any(|l| !matches!(l.kind, state::LayerKind::Adjust(_)));
+    let encoded = if !has_overlays {
         // The worker renders exactly the export rect and encodes there, so a
         // full-resolution RGBA frame never crosses to this thread.
         let png = format == PhotoFormat::Png;
