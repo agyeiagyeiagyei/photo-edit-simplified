@@ -42,6 +42,8 @@ thread_local! {
     pub(crate) static PROXY_UPGRADE_WANT: Cell<Option<usize>> = const { Cell::new(None) };
     pub(crate) static PROXY_UPGRADE_BUSY: Cell<bool> = const { Cell::new(false) };
     pub(crate) static PROXY_UPGRADE_TIMER: Cell<u32> = const { Cell::new(0) };
+    /// A pump timer is armed and has not fired yet.
+    pub(crate) static PROXY_UPGRADE_PENDING: Cell<bool> = const { Cell::new(false) };
     /// Newest hover decode. A request superseded while another decode runs is
     /// dropped; selected-item requests are never gated.
     pub(crate) static PROXY_DECODE_WANT: Cell<Option<usize>> = const { Cell::new(None) };
@@ -817,17 +819,35 @@ pub(crate) async fn decode_proxy_source(id: usize, priority: bool) -> Option<Dec
 /// Ask for sensor pixels for `id`, debounced so a develop only starts after
 /// the selection has been stable for a moment.
 pub(crate) fn request_upgrade(state: AppState, id: usize) {
-    PROXY_UPGRADE_WANT.with(|w| w.set(Some(id)));
+    // A develop already queued on the batch pool runs whatever happens, so
+    // moving it to the front wastes no work: do it now rather than after the
+    // debounce, which only guards against starting new develops for items the
+    // user is flicking past.
+    if POOL_INFLIGHT.with(|s| s.borrow().contains(&id)) {
+        pworker::raw_pool_prioritize(id);
+    }
+    let same = PROXY_UPGRADE_WANT.with(|w| w.replace(Some(id))) == Some(id);
+    // The debounce waits for the *selection* to settle, so only a new id
+    // restarts it. Render passes re-request the same id several times a
+    // second while a batch is landing; re-arming on each of them starved the
+    // pump until the batch finished, so the photo being edited developed in
+    // import order and showed its pre-develop look for seconds (2026-11-05:
+    // 14th of 16, ~6 s after the edit).
+    if same && PROXY_UPGRADE_PENDING.with(|p| p.get()) {
+        return;
+    }
     schedule_pump(state, PROXY_DEVELOP_DELAY_MS);
 }
 
 pub(crate) fn schedule_pump(state: AppState, ms: i32) {
     PROXY_UPGRADE_TIMER.with(|t| t.set(t.get() + 1));
     let gen = PROXY_UPGRADE_TIMER.with(|t| t.get());
+    PROXY_UPGRADE_PENDING.with(|p| p.set(true));
     let cb = Closure::once(move || {
         if PROXY_UPGRADE_TIMER.with(|t| t.get()) != gen {
             return;
         }
+        PROXY_UPGRADE_PENDING.with(|p| p.set(false));
         pump_upgrade(state);
     });
     let _ = web::window().set_timeout_with_callback_and_timeout_and_arguments_0(
