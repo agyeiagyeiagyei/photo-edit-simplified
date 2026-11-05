@@ -353,12 +353,16 @@ pub(crate) fn ensure_full(state: AppState, id: usize, waiter: Option<Box<dyn FnO
                 Some(blob) => raw_develop_async(id, blob.as_ref()).await,
                 None => None,
             };
-            if decoded.is_some() && !pworker::raw_busy() {
+            if decoded.is_some() {
                 // The develop is in the interactive worker now; the RAW
                 // worker's wasm (hundreds of MB after a 24 MP develop, and
                 // never shrinking) would otherwise sit idle through composite
-                // + encode — the peak of the whole export. Recreated lazily.
-                pworker::raw_shutdown();
+                // + encode — the peak of the whole export. A pending display
+                // proxy only delays this until the queue drains; checking
+                // `raw_busy()` once here would lose that race and leave the
+                // worker resident for the rest of the session. Recreated
+                // lazily.
+                pworker::raw_shutdown_when_idle();
             }
             if let Some(mut full) = decoded {
                 let neutral = full.neutral.take();

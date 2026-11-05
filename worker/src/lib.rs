@@ -1566,6 +1566,34 @@ pub fn export_photo(
     let (fw, fh) = BUFFERS
         .with(|b| b.borrow().get(&id).map(|(_, w, h)| (*w, *h)))
         .ok_or_else(|| JsValue::from_str("not loaded"))?;
+    // An untouched full-frame export is a re-encode of the stored frame:
+    // geometry, resize, develop and colour are all provable no-ops. Encoding
+    // straight from the buffer skips two full-size copies (~200 MB each at
+    // 26 MP) that would otherwise raise this worker's wasm high-water for the
+    // rest of the session.
+    let untouched = edit.raw.is_identity()
+        && !edit.is_color_touched()
+        && edit.rot90.is_multiple_of(4)
+        && edit.fine_angle.abs() <= 0.01
+        && working_dims(fw, fh, &edit) == (fw, fh)
+        && (cx as usize, cy as usize, cw as usize, ch as usize) == (0, 0, fw, fh)
+        && (ew as usize, eh as usize) == (fw, fh);
+    if untouched {
+        let bytes = BUFFERS.with(|b| {
+            let b = b.borrow();
+            let (full, w, h) = b.get(&id).ok_or_else(|| JsValue::from_str("not loaded"))?;
+            if format == 1 {
+                encode_png_slice(full, *w as u32, *h as u32)
+            } else {
+                encode_jpeg_slice(full, *w as u32, *h as u32, quality)
+            }
+        })?;
+        return Ok(result_obj(&[
+            ("bytes", js_buf(bytes)),
+            ("w", (fw as u32).into()),
+            ("h", (fh as u32).into()),
+        ]));
+    }
     let (px, out_w, out_h) = export_pixels(
         id,
         fw,

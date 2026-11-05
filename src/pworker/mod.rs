@@ -38,8 +38,14 @@ thread_local! {
     static RAW_NEXT_REQ: Cell<u32> = const { Cell::new(1) };
     static RAW_DEAD: Cell<bool> = const { Cell::new(false) };
     /// High-water of the RAW worker's wasm linear memory (bytes). Raw replies
-    /// carry `mem`, measured after the develop.
+    /// carry `mem`, measured after the develop. Reset when the worker is
+    /// terminated, since that frees the memory the figure described.
     static RAW_MEM_HIGH: Cell<f64> = const { Cell::new(0.0) };
+    /// Set once a full develop is installed and the RAW worker is no longer
+    /// needed for it: terminate as soon as its queue drains. A one-shot
+    /// `raw_busy()` check loses the race against a queued display proxy and
+    /// would leave the worker's wasm resident for the rest of the session.
+    static RAW_SHUTDOWN_IDLE: Cell<bool> = const { Cell::new(false) };
     /// High-water of the interactive worker's wasm linear memory (bytes).
     /// Load/render replies carry `mem`; the buffer cache lives there, so this
     /// is the number the full-pixel budget has to fit inside.
@@ -120,6 +126,11 @@ pub fn init() {
             if let Some(op) = op {
                 record_worker_reply(&op, &data, &val);
             }
+            if let Some(mem) = reply_mem(&val) {
+                if mem > PIXEL_MEM_HIGH.with(|m| m.get()) {
+                    PIXEL_MEM_HIGH.with(|m| m.set(mem));
+                }
+            }
             cb(if ok { Ok(val) } else { Err(val) });
         }
     });
@@ -181,21 +192,15 @@ pub(crate) fn pixel_last_post_ms() -> f64 {
 }
 
 /// Record `worker.<op>` from the reply's `ms` (measured inside run.js), plus
-/// the render pipeline's own stage breakdown when present.
+/// the render pipeline's own stage breakdown when present. The linear-memory
+/// high-water is recorded by each worker's own reply handler, so the RAW
+/// worker's peaks never masquerade as the interactive worker's.
 fn record_worker_reply(op: &str, data: &JsValue, result: &JsValue) {
     if let Some(ms) = Reflect::get(data, &JsValue::from_str("ms"))
         .ok()
         .and_then(|v| v.as_f64())
     {
         perf::record(&format!("worker.{op}"), ms);
-    }
-    if let Some(mem) = Reflect::get(result, &JsValue::from_str("mem"))
-        .ok()
-        .and_then(|v| v.as_f64())
-    {
-        if mem > PIXEL_MEM_HIGH.with(|m| m.get()) {
-            PIXEL_MEM_HIGH.with(|m| m.set(mem));
-        }
     }
     if op != "render" && op != "render_window" && op != "render_base" {
         return;
@@ -258,6 +263,11 @@ fn raw_init() -> bool {
                 }
             }
             cb(if ok { Ok(val) } else { Err(val) });
+            if RAW_PENDING.with(|p| p.borrow().is_empty())
+                && RAW_SHUTDOWN_IDLE.with(|f| f.replace(false))
+            {
+                raw_shutdown();
+            }
         }
     });
     worker.set_onmessage(Some(onmsg.as_ref().unchecked_ref()));
@@ -265,6 +275,7 @@ fn raw_init() -> bool {
     let onerr = Closure::<dyn FnMut(ErrorEvent)>::new(|_| {
         RAW_DEAD.with(|d| d.set(true));
         RAW_WORKER.with(|w| *w.borrow_mut() = None);
+        RAW_MEM_HIGH.with(|m| m.set(0.0));
         RAW_PENDING_OP.with(|m| m.borrow_mut().clear());
         let cbs: Vec<_> = RAW_PENDING.with(|p| p.borrow_mut().drain().map(|(_, c)| c).collect());
         for cb in cbs {
@@ -361,17 +372,32 @@ pub fn raw_busy() -> bool {
 
 /// Terminate the raw worker and free its wasm memory (which never shrinks
 /// while it lives). The worker is recreated lazily by the next RAW op, so this
-/// costs one decoder init + develop if the item is edited again. Callers must
-/// check `raw_busy()` first; queued replies are failed rather than dropped.
+/// costs one decoder init + develop if the item is edited again. Queued
+/// replies are failed rather than dropped.
 pub fn raw_shutdown() {
+    RAW_SHUTDOWN_IDLE.with(|f| f.set(false));
     let worker = RAW_WORKER.with(|w| w.borrow_mut().take());
     if let Some(worker) = worker {
         worker.terminate();
     }
+    // The wasm is gone; a surviving high-water would overstate live memory
+    // for every later `__pes.mem()` sample.
+    RAW_MEM_HIGH.with(|m| m.set(0.0));
     let cbs: Vec<_> = RAW_PENDING.with(|p| p.borrow_mut().drain().map(|(_, c)| c).collect());
     RAW_PENDING_OP.with(|m| m.borrow_mut().clear());
     for cb in cbs {
         cb(Err(JsValue::from_str("worker shutdown")));
+    }
+}
+
+/// Terminate the raw worker once its currently queued work drains. The caller
+/// has just taken the full develop it needs; anything still pending (a display
+/// proxy, say) is unrelated. If the queue is already empty this shuts down now.
+pub fn raw_shutdown_when_idle() {
+    if raw_busy() {
+        RAW_SHUTDOWN_IDLE.with(|f| f.set(true));
+    } else {
+        raw_shutdown();
     }
 }
 
