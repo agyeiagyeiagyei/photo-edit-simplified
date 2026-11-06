@@ -256,11 +256,15 @@ pub fn selection_mask(sel: &Selection, w: usize, h: usize) -> Vec<u8> {
             if *mw == w && *mh == h && data.len() == w * h {
                 mask.copy_from_slice(data);
             } else if *mw > 0 && *mh > 0 && data.len() == mw * mh {
-                for y in 0..h {
-                    let sy = (y * *mh / h).min(mh - 1);
-                    for x in 0..w {
-                        let sx = (x * *mw / w).min(mw - 1);
-                        mask[y * w + x] = data[sy * mw + sx];
+                if *mw <= w && *mh <= h {
+                    resample_bilinear(data, *mw, *mh, &mut mask, w, h);
+                } else {
+                    for y in 0..h {
+                        let sy = (y * *mh / h).min(mh - 1);
+                        for x in 0..w {
+                            let sx = (x * *mw / w).min(mw - 1);
+                            mask[y * w + x] = data[sy * mw + sx];
+                        }
                     }
                 }
             }
@@ -270,6 +274,40 @@ pub fn selection_mask(sel: &Selection, w: usize, h: usize) -> Vec<u8> {
         feather_mask(&mut mask, w, h, sel.feather);
     }
     mask
+}
+
+/// Bilinear upsample of a raster mask, with pixel centres aligned and edge
+/// samples clamped. A wand mask made on the 1024 px preview would otherwise
+/// become a ~6 px block per cell at export size; this turns each step into a
+/// one-cell ramp without changing the stored mask.
+fn resample_bilinear(src: &[u8], sw: usize, sh: usize, dst: &mut [u8], w: usize, h: usize) {
+    let axis = |n: usize, sn: usize| -> Vec<(usize, f32)> {
+        (0..n)
+            .map(|i| {
+                if sn <= 1 {
+                    return (0, 0.0);
+                }
+                let s = ((i as f32 + 0.5) * sn as f32 / n as f32 - 0.5)
+                    .clamp(0.0, (sn - 1) as f32);
+                let s0 = (s.floor() as usize).min(sn - 2);
+                (s0, s - s0 as f32)
+            })
+            .collect()
+    };
+    let xs = axis(w, sw);
+    let ys = axis(h, sh);
+    for (y, &(y0, fy)) in ys.iter().enumerate() {
+        let y1 = (y0 + 1).min(sh - 1);
+        let row0 = &src[y0 * sw..(y0 + 1) * sw];
+        let row1 = &src[y1 * sw..(y1 + 1) * sw];
+        let out = &mut dst[y * w..(y + 1) * w];
+        for (x, &(x0, fx)) in xs.iter().enumerate() {
+            let x1 = (x0 + 1).min(sw - 1);
+            let top = row0[x0] as f32 * (1.0 - fx) + row0[x1] as f32 * fx;
+            let bottom = row1[x0] as f32 * (1.0 - fx) + row1[x1] as f32 * fx;
+            out[x] = (top * (1.0 - fy) + bottom * fy + 0.5) as u8;
+        }
+    }
 }
 
 /// Even-odd scanline fill of a normalized polygon, sampled at pixel centres.
@@ -573,6 +611,25 @@ mod tests {
         assert!((area - 0.125).abs() < 0.005, "diamond covers {area:.3} of the frame, want 0.125");
         assert_eq!(m[100 * w + 100], 255, "centre must be selected");
         assert_eq!(m[60 * w + 60], 0, "bounding-box corner is outside the diamond");
+    }
+
+    #[test]
+    fn raster_mask_upsamples_with_a_bilinear_ramp() {
+        // Nearest-neighbour turns a 2x1 step into four identical blocky cells;
+        // the export upsample must instead ramp across one source cell.
+        let sel = Selection {
+            kind: SelectionKind::Mask { data: vec![0u8, 255].into(), width: 2, height: 1 },
+            feather: 0.0,
+        };
+        let m = selection_mask(&sel, 8, 1);
+        assert_eq!(&m[..2], &[0, 0], "left stays fully outside: {m:?}");
+        assert_eq!(&m[6..], &[255, 255], "right stays fully inside: {m:?}");
+        assert!(m[2] > 0 && m[2] < 128, "ramp starts inside the cell: {m:?}");
+        assert!(m[3] > m[2] && m[3] < m[4], "ramp is monotone: {m:?}");
+        assert!(m[4] > 128 && m[4] < 255, "ramp ends inside the cell: {m:?}");
+        for pair in m.windows(2) {
+            assert!(pair[0] <= pair[1], "not monotone: {m:?}");
+        }
     }
 
     #[test]
