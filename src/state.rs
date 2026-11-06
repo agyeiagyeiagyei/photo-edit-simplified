@@ -62,16 +62,19 @@ pub enum SelectTool {
     Rect,
     Lasso,
     Wand,
+    Subject,
 }
 
 impl SelectTool {
-    pub const ALL: [SelectTool; 3] = [SelectTool::Rect, SelectTool::Lasso, SelectTool::Wand];
+    pub const ALL: [SelectTool; 4] =
+        [SelectTool::Rect, SelectTool::Lasso, SelectTool::Wand, SelectTool::Subject];
 
     pub fn label(self) -> &'static str {
         match self {
             SelectTool::Rect => "Rect",
             SelectTool::Lasso => "Lasso",
             SelectTool::Wand => "Wand",
+            SelectTool::Subject => "Subject",
         }
     }
 }
@@ -505,6 +508,11 @@ pub struct AppState {
     /// Magic wand options-bar settings.
     pub wand_tolerance: RwSignal<i32>,
     pub wand_contiguous: RwSignal<bool>,
+    /// Subject tool: next tap removes from the mask instead of adding.
+    pub subject_remove: RwSignal<bool>,
+    /// Photo whose subject prompt set is live; None means the next tap starts
+    /// a fresh segmentation.
+    pub subject_photo: RwSignal<Option<usize>>,
     /// Spot-heal brush: radius as a fraction of the image diagonal.
     pub heal_radius: RwSignal<f32>,
     pub heal_mode: RwSignal<crate::heal::HealMode>,
@@ -638,6 +646,8 @@ impl AppState {
             next_id: create_rw_signal(0),
             fonts: create_rw_signal(vec!["Inter".into(), "Oswald".into()]),
             wand_tolerance: create_rw_signal(32),
+            subject_remove: create_rw_signal(false),
+            subject_photo: create_rw_signal(None),
             wand_contiguous: create_rw_signal(true),
             heal_radius: create_rw_signal(0.02),
             heal_mode: create_rw_signal(crate::heal::HealMode::ContentAware),

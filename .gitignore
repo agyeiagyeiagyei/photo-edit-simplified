@@ -8,4 +8,6 @@ tests/e2e/node_modules/
 tests/e2e/fixtures/
 tests/e2e/results/
 tests/e2e/results-*
+tests/e2e/__pycache__/
+test-results/
 dl-raw/

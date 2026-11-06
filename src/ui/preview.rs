@@ -194,12 +194,24 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     select_drag.set(Some(SelectDrag::Lasso(pts)));
                 }
             }
+            SelectDrag::Subject(start, _) => {
+                select_drag.set(Some(SelectDrag::Subject(start, (nx, ny))));
+            }
         }
     });
 
     window_event_listener(leptos::ev::pointerup, move |_| {
         let Some(drag) = select_drag.try_get().flatten() else { return };
+        let _ = select_drag.try_set(None);
         let new_sel = match drag {
+            SelectDrag::Subject((x0, y0), (x1, y1)) => {
+                if (x1 - x0).abs() > 0.02 && (y1 - y0).abs() > 0.02 {
+                    subject_box(state, x0, y0, x1, y1);
+                } else {
+                    subject_select(state, x0, y0, state.subject_remove.get_untracked());
+                }
+                return;
+            }
             SelectDrag::Rect((x0, y0), (x1, y1)) => {
                 let x = x0.min(x1);
                 let y = y0.min(y1);
@@ -228,7 +240,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         state.update_current_item(|m| {
             m.edit.selection = new_sel;
         });
-        let _ = select_drag.try_set(None);
+        state.subject_photo.set(None);
     });
 
     create_effect(move |_| {
@@ -948,6 +960,9 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                     }
                                     SelectTool::Wand => {
                                         wand_select(state, nx, ny);
+                                    }
+                                    SelectTool::Subject => {
+                                        select_drag.set(Some(SelectDrag::Subject((nx, ny), (nx, ny))));
                                     }
                                 }
                                 return;

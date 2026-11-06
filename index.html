@@ -80,6 +80,8 @@
   <link data-trunk rel="copy-dir" href="public/fonts"/>
   <link data-trunk rel="copy-dir" href="public/vendor"/>
   <link data-trunk rel="copy-dir" href="public/pixel-worker"/>
+  <link data-trunk rel="copy-dir" href="public/models"/>
+  <link data-trunk rel="copy-dir" href="public/mobilesam"/>
   <link data-trunk rel="rust" data-wasm-opt="3"/>
   <script>
     function _pesLoadScript(src) {
@@ -167,6 +169,96 @@
         out[i] = data[i] > 0 ? 255 : 0;
       }
       return out;
+    };
+
+    // MobileSAM subject segmentation (birds/animals) in a dedicated worker.
+    // Called from Rust: (image, photoId, op, resetFirst, onProgress).
+    // op: { type: 'tap', x, y, label } | { type: 'box', x0, y0, x1, y1 }.
+    // Returns { mask, outW, outH, iou, candidate, usedCrop, wasmPeakBytes }.
+    // The worker holds the encoder/decoder and per-photo embeddings; closing
+    // the tool terminates it so its wasm memory returns to the tab.
+    let _subjectWorker = null;
+    let _subjectSeq = 0;
+    let _subjectPhoto = 0;
+    const _subjectPending = new Map();
+    const _subjectProgress = new Map();
+
+    function _pesSubjectWorker() {
+      if (_subjectWorker) return _subjectWorker;
+      _subjectWorker = new Worker(new URL('./mobilesam/worker.js', document.baseURI), {
+        type: 'module',
+      });
+      _subjectWorker.addEventListener('message', (e) => {
+        const msg = e.data;
+        if (msg.type === 'progress') {
+          const cb = _subjectProgress.get(msg.reqId);
+          if (!cb) return;
+          if (msg.phase === 'download') {
+            const frac = msg.total ? msg.loaded / msg.total : 0;
+            cb(frac * 0.9, 'Downloading subject model ' + Math.round(frac * 100) + '%');
+          } else if (msg.phase === 'session') {
+            cb(0.92, 'Starting subject model…');
+          } else {
+            cb(0.95, 'Segmenting subject…');
+          }
+        } else if (msg.type === 'reply') {
+          const p = _subjectPending.get(msg.reqId);
+          if (!p) return;
+          _subjectPending.delete(msg.reqId);
+          _subjectProgress.delete(msg.reqId);
+          if (msg.ok) p.resolve(msg.result);
+          else p.reject(new Error(msg.error));
+        }
+      });
+      _subjectWorker.addEventListener('error', (e) => {
+        const detail = [e.message || 'subject worker failed', e.filename, e.lineno]
+          .filter((v) => v !== undefined && v !== '' && v !== 0)
+          .join(' @ ');
+        console.error('subject worker error:', detail, e.error && e.error.stack);
+        const err = new Error(detail);
+        for (const p of _subjectPending.values()) p.reject(err);
+        _subjectPending.clear();
+        _subjectProgress.clear();
+        _subjectWorker.terminate();
+        _subjectWorker = null;
+      });
+      return _subjectWorker;
+    }
+
+    function _subjectCall(req, onProgress) {
+      const worker = _pesSubjectWorker();
+      return new Promise((resolve, reject) => {
+        const reqId = ++_subjectSeq;
+        _subjectPending.set(reqId, { resolve, reject });
+        if (onProgress) _subjectProgress.set(reqId, onProgress);
+        worker.postMessage({ ...req, reqId }, req.bitmap ? [req.bitmap] : []);
+      });
+    }
+
+    window.pesSegmentSubject = async function (image, photoId, op, resetFirst, onProgress) {
+      if (_subjectPhoto !== photoId) {
+        if (_subjectPhoto) {
+          try {
+            await _subjectCall({ type: 'release', id: _subjectPhoto });
+          } catch (_) {}
+        }
+        _subjectPhoto = photoId;
+      }
+      if (resetFirst) await _subjectCall({ type: 'reset', id: photoId });
+      if (!image) return await _subjectCall({ ...op, id: photoId }, onProgress);
+      const bitmap = await createImageBitmap(image);
+      return await _subjectCall({ ...op, id: photoId, bitmap }, onProgress);
+    };
+
+    window.pesSegmentSubjectClose = function () {
+      if (_subjectWorker) {
+        _subjectWorker.terminate();
+        _subjectWorker = null;
+      }
+      for (const p of _subjectPending.values()) p.reject(new Error('subject worker closed'));
+      _subjectPending.clear();
+      _subjectProgress.clear();
+      _subjectPhoto = 0;
     };
 
     // Video transcode via ffmpeg.wasm. Called from Rust.

@@ -1,0 +1,12 @@
+{
+  "version": "v1-56663f87",
+  "source": "MobileSAM (ChaoningZhang/MobileSAM), official mobile_sam.pt",
+  "checkpoint_sha256": "6dbb90523a35330fedd7f1d3dfc66f995213d81b29a5ca8108dbcdd4e37d6c2f",
+  "export": "published scripts/export_onnx_model.py + companion encoder script, torch 2.15.0+cpu, opset 16, legacy TorchScript exporter",
+  "quantize": "onnxruntime 1.31.1 quantize_dynamic, op_types_to_quantize=[MatMul,Gemm], QUInt8, per_channel=false, reduce_range=false",
+  "files": {
+    "encoder.int8.onnx": {"sha256": "057e82532b172e4cf87cb77138ed269a51a2778ecd77a8e60d19bbfaa256e8fc", "bytes": 14040628},
+    "decoder.int8.onnx": {"sha256": "a7184be39963f313ad22beac884b0f8fa92fae1067cd724492aaba1af8e90ec1", "bytes": 4761904}
+  },
+  "license": "Apache-2.0"
+}

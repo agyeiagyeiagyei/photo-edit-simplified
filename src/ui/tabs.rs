@@ -100,6 +100,36 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
                     "Contiguous"
                 </label>
             </Show>
+            <Show
+                when=move || state.selected_select_tool.get() == SelectTool::Subject
+                fallback=|| ()
+            >
+                <div class="chips">
+                    <button
+                        class="chip"
+                        class:active=move || !state.subject_remove.get()
+                        on:click=move |_| state.subject_remove.set(false)
+                    >
+                        "Add"
+                    </button>
+                    <button
+                        class="chip"
+                        class:active=move || state.subject_remove.get()
+                        on:click=move |_| state.subject_remove.set(true)
+                    >
+                        "Remove"
+                    </button>
+                    <button
+                        class="chip"
+                        on:click=move |_| {
+                            state.subject_photo.set(None);
+                            state.update_current(|e| e.selection = None);
+                        }
+                    >
+                        "Start over"
+                    </button>
+                </div>
+            </Show>
             <div class="row select-row">
                 <button
                     class="btn"
@@ -131,7 +161,10 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
                 </button>
                 <button
                     class="btn"
-                    on:click=move |_| state.update_current(|e| e.selection = None)
+                    on:click=move |_| {
+                        state.subject_photo.set(None);
+                        state.update_current(|e| e.selection = None);
+                    }
                 >
                     "Clear"
                 </button>
@@ -152,13 +185,14 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
                 />
             </label>
             <button class="btn primary" on:click=move |_| isolate_subject(state)>
-                "Isolate subject"
+                "Isolate person"
             </button>
             <p class="dim">
                 "Rect/Lasso select a region; Wand selects pixels similar to the one you click. \
-                 Cut/Copy lift it to a raster layer; Content fill synthesizes it from the \
-                 surroundings. \
-                 Isolate subject runs MediaPipe Selfie Segmentation (photo-only)."
+                 Subject taps a bird or animal and refines with Add/Remove taps or a drag-box; \
+                 the model downloads ~15 MB on first use (photo-only). \
+                 Cut/Copy lift the selection to a raster layer; Content fill synthesizes it from \
+                 the surroundings. Isolate person runs MediaPipe Selfie Segmentation."
             </p>
         </div>
     }

@@ -888,6 +888,7 @@ pub(crate) fn wand_select(state: AppState, nx: f32, ny: f32) {
     let tol = state.wand_tolerance.get_untracked();
     let contig = state.wand_contiguous.get_untracked();
     let (mask, count) = wand::wand_mask(&p, w, h, sx, sy, 0, tol, contig);
+    state.subject_photo.set(None);
     state.update_current(|e| {
         e.selection = if count > 0 {
             Some(state::Selection {
@@ -897,6 +898,102 @@ pub(crate) fn wand_select(state: AppState, nx: f32, ny: f32) {
         } else {
             None
         };
+    });
+}
+
+/// MobileSAM subject selection. `nx`/`ny` are full-image normalized coords
+/// (post-geometry, pre-crop). Taps refine the live prompt set for this photo;
+/// `negative` removes from the mask instead of adding.
+pub(crate) fn subject_select(state: AppState, nx: f32, ny: f32, negative: bool) {
+    subject_run(state, move |w, h| {
+        let op = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&op, &"type".into(), &"tap".into());
+        let _ = js_sys::Reflect::set(&op, &"x".into(), &JsValue::from_f64((nx * w as f32) as f64));
+        let _ = js_sys::Reflect::set(&op, &"y".into(), &JsValue::from_f64((ny * h as f32) as f64));
+        let label = if negative { 0.0 } else { 1.0 };
+        let _ = js_sys::Reflect::set(&op, &"label".into(), &JsValue::from_f64(label));
+        op.into()
+    });
+}
+
+/// Drag-box subject prompt: one box replaces the prompt set (the worker sends
+/// the top-left / bottom-right corner pair).
+pub(crate) fn subject_box(state: AppState, x0: f32, y0: f32, x1: f32, y1: f32) {
+    let (x0, x1) = (x0.min(x1), x0.max(x1));
+    let (y0, y1) = (y0.min(y1), y0.max(y1));
+    subject_run(state, move |w, h| {
+        let op = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&op, &"type".into(), &"box".into());
+        for (k, v) in [("x0", x0), ("y0", y0), ("x1", x1), ("y1", y1)] {
+            let px = match k {
+                "x0" | "x1" => v * w as f32,
+                _ => v * h as f32,
+            };
+            let _ = js_sys::Reflect::set(&op, &k.into(), &JsValue::from_f64(px as f64));
+        }
+        op.into()
+    });
+}
+
+fn subject_run(state: AppState, make_op: impl FnOnce(usize, usize) -> JsValue + 'static) {
+    let Some(item) = state.current() else { return };
+    if item.kind != MediaKind::Photo {
+        return;
+    }
+    let Some(photo) = get_photo(item.id) else { return };
+    let (pix, pw, ph) = photo.preview.clone();
+    if pw == 0 || ph == 0 {
+        return;
+    }
+    // Segment the geometry-corrected preview: the tap coords are in that space
+    // and the model should see the same frame the canvas shows.
+    let (p, w, h) = geometry(&pix, pw, ph, &item.edit);
+    let pix = p.into_owned();
+    state.busy.set(Some("Segmenting subject…".into()));
+    state.progress.set(0.0);
+    spawn_local(async move {
+        let canvas = web::create_canvas(w as u32, h as u32);
+        web::put_pixels(&canvas, &pix, w as u32, h as u32);
+        let Ok(blob) = web::canvas_to_blob(&canvas, "image/jpeg").await else {
+            state.busy.set(None);
+            return;
+        };
+        let Ok((img, url)) = web::load_image(&blob).await else {
+            state.busy.set(None);
+            return;
+        };
+        let fresh = state.subject_photo.get_untracked() != Some(item.id);
+        let op = make_op(w, h);
+        let on_progress = Closure::<dyn FnMut(f64, String)>::new(move |frac: f64, label: String| {
+            state.progress.set(frac as f32);
+            state.busy.set(Some(label));
+        });
+        let res = web::segment_subject(&img, item.id, &op, fresh, &on_progress).await;
+        let _ = Url::revoke_object_url(&url);
+        state.busy.set(None);
+        state.progress.set(0.0);
+        match res {
+            Ok(m) if m.width > 0 && m.height > 0 && m.mask.len() == m.width * m.height => {
+                let set = m.mask.iter().filter(|&&v| v > 0).count();
+                web::log(&format!(
+                    "subject mask iou={:.3} crop={} {}x{} set={}",
+                    m.iou, m.used_crop, m.width, m.height, set
+                ));
+                state.update_current(|e| {
+                    e.selection = Some(state::Selection {
+                        kind: state::SelectionKind::Mask {
+                            data: Rc::new(m.mask),
+                            width: m.width,
+                            height: m.height,
+                        },
+                        feather: 0.0,
+                    });
+                });
+                state.subject_photo.set(Some(item.id));
+            }
+            Ok(_) => web::log("subject mask size mismatch"),
+            Err(e) => web::log_err(&format!("subject segmentation failed: {e:?}")),
+        }
     });
 }
 

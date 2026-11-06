@@ -23,6 +23,8 @@ pub(crate) enum PenDrag {
 pub(crate) enum SelectDrag {
     Rect((f32, f32), (f32, f32)),
     Lasso(Vec<(f32, f32)>),
+    /// Subject prompt drag; a release below the box threshold is a tap.
+    Subject((f32, f32), (f32, f32)),
 }
 
 pub(crate) fn crop_is_full(c: &state::CropRect) -> bool {
@@ -193,7 +195,7 @@ pub(crate) fn draw_select_drag(ctx: &web_sys::CanvasRenderingContext2d, drag: &S
     ctx.set_stroke_style_str("rgba(10,132,255,0.8)");
     ctx.set_line_width(2.0);
     match drag {
-        SelectDrag::Rect((x0, y0), (x1, y1)) => {
+        SelectDrag::Rect((x0, y0), (x1, y1)) | SelectDrag::Subject((x0, y0), (x1, y1)) => {
             let x = x0.min(*x1);
             let y = y0.min(*y1);
             let rw = (x1 - x0).abs();

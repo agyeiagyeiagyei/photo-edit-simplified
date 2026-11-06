@@ -8,7 +8,7 @@
 // v5: the pixel worker is content-hashed (run.<hash>.js imports
 // pixel_worker.<hash>.js, which loads pixel_worker_bg.<hash>.wasm), so it is
 // cache-first like the other fingerprinted assets instead of network-first.
-const CACHE = 'pes-v5';
+const CACHE = 'pes-v6';
 const SHELL = [
   './', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png',
 ];
@@ -87,6 +87,32 @@ async function liveWorkerFiles(html) {
   }
 }
 
+// Model files live under models/mobilesam/<version>/, which is not trunk-
+// hashed; the version pointer decides what to keep. A failed read (offline
+// activate) keeps everything so an offline session doesn't lose its model.
+async function pruneStaleModels(cache) {
+  const current = await modelVersion(cache);
+  if (!current) return;
+  const keys = await cache.keys();
+  await Promise.all(keys.map((req) => {
+    const m = new URL(req.url).pathname.match(/\/models\/mobilesam\/([^/]+)\//);
+    if (m && m[1] !== current) return cache.delete(req);
+    return undefined;
+  }));
+}
+
+async function modelVersion(cache) {
+  try {
+    const res = await fetch('./models/mobilesam/current.json', { cache: 'no-cache' });
+    if (res.ok) return (await res.json()).version || null;
+  } catch {}
+  try {
+    const hit = await cache.match('./models/mobilesam/current.json');
+    if (hit) return (await hit.json()).version || null;
+  } catch {}
+  return null;
+}
+
 async function pruneStaleAssets() {
   let html = '';
   try {
@@ -120,6 +146,8 @@ self.addEventListener('activate', (e) => {
     caches.keys()
       .then((keys) => Promise.all(keys.filter((k) => k !== CACHE && k !== THUMB_CACHE).map((k) => caches.delete(k))))
       .then(() => pruneStaleAssets())
+      .then(() => caches.open(CACHE))
+      .then((c) => pruneStaleModels(c))
       .then(() => self.clients.claim())
       // Tell open pages to reload once so they pick up the fresh HTML/JS that
       // the old cache-first worker was pinning. index.html listens for this.
@@ -147,6 +175,21 @@ self.addEventListener('fetch', (e) => {
         }
         return res;
       }).catch(() => caches.match(e.request).then((hit) => hit || caches.match('./index.html')))
+    );
+    return;
+  }
+
+  // Un-hashed control files: a deploy must never be pinned behind the cache.
+  const path = new URL(e.request.url).pathname;
+  if (path.endsWith('/mobilesam/worker.js') || path.endsWith('/models/mobilesam/current.json')) {
+    e.respondWith(
+      fetch(e.request).then((res) => {
+        if (res.ok) {
+          const copy = res.clone();
+          e.waitUntil(caches.open(CACHE).then((c) => c.put(e.request, copy)));
+        }
+        return res;
+      }).catch(() => caches.match(e.request).then((hit) => hit || Response.error()))
     );
     return;
   }

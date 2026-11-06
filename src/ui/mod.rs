@@ -285,6 +285,18 @@ pub(crate) fn TabBtn(tab: RwSignal<Tab>, t: Tab, label: &'static str) -> impl In
 #[component]
 pub(crate) fn Editor(state: AppState) -> impl IntoView {
     let tab = create_rw_signal(Tab::Crop);
+    // The subject worker holds the encoder/decoder and wasm pages that never
+    // shrink: close it when the Select tool is left so the tab gets them back.
+    create_effect(move |_| {
+        if tab.get() != Tab::Select {
+            web::segment_subject_close();
+            state.subject_photo.set(None);
+        }
+    });
+    on_cleanup(move || {
+        web::segment_subject_close();
+        state.subject_photo.set(None);
+    });
     view! {
         <Show when=move || state.current().is_some() fallback=|| ()>
             <div class="editor">

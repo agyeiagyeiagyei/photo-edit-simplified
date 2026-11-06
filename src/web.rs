@@ -213,6 +213,55 @@ pub async fn segment_selfie(image: &HtmlImageElement) -> Result<Vec<u8>, JsValue
     Ok(arr.to_vec())
 }
 
+/// One MobileSAM prompt's result, in the source bitmap's pixel space.
+pub struct SubjectMask {
+    pub mask: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+    pub iou: f64,
+    pub used_crop: bool,
+}
+
+/// Segment a subject via window.pesSegmentSubject (MobileSAM worker).
+/// `op` is a JS object: `{type:'tap', x, y, label}` or
+/// `{type:'box', x0, y0, x1, y1}`. `reset_first` starts a fresh prompt set.
+pub async fn segment_subject(
+    image: &HtmlImageElement,
+    photo_id: usize,
+    op: &JsValue,
+    reset_first: bool,
+    on_progress: &Closure<dyn FnMut(f64, String)>,
+) -> Result<SubjectMask, JsValue> {
+    let args = Array::new();
+    args.push(image);
+    args.push(&JsValue::from_f64(photo_id as f64));
+    args.push(op);
+    args.push(&JsValue::from_bool(reset_first));
+    args.push(on_progress.as_ref());
+    let out = call_global("pesSegmentSubject", &args)?;
+    let result = JsFuture::from(Promise::from(out)).await?;
+    let obj: js_sys::Object = result.unchecked_into();
+    let field = |k: &str| Reflect::get(&obj, &JsValue::from_str(k));
+    Ok(SubjectMask {
+        mask: Uint8Array::from(field("mask")?).to_vec(),
+        width: field("outW")?.as_f64().unwrap_or(0.0) as usize,
+        height: field("outH")?.as_f64().unwrap_or(0.0) as usize,
+        iou: field("iou")?.as_f64().unwrap_or(0.0),
+        used_crop: field("usedCrop")?.as_bool().unwrap_or(false),
+    })
+}
+
+/// Terminate the subject worker; wasm memory never shrinks, so closing the
+/// tool is the only way the tab gets it back.
+pub fn segment_subject_close() {
+    let Ok(f) = Reflect::get(&window(), &JsValue::from_str("pesSegmentSubjectClose")) else {
+        return;
+    };
+    if let Ok(f) = f.dyn_into::<Function>() {
+        let _ = f.call0(&JsValue::NULL);
+    }
+}
+
 /// HEIC blob -> JPEG blob via window.pesHeicToJpeg (heic2any CDN script).
 pub async fn heic_to_jpeg(blob: Blob) -> Result<Blob, JsValue> {
     let args = Array::new();
