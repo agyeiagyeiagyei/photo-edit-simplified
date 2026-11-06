@@ -22,7 +22,7 @@ for photo in manifest["photos"]:
         subprocess.run(
             [
                 "curl", "-fsSL",
-                "-A", "AjayPhotoEditQA/1.0 (hello@agyei.design)",
+                "-A", "photo-edit-simplified-fixtures/1.0 (+https://github.com/agyeiagyeiagyei/photo-edit-simplified)",
                 "-o", path,
                 photo["source_url"],
             ],

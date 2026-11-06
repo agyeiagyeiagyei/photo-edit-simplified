@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { openApp, importFiles, canvas, recordMetrics, trackErrors, JPEG_A } from './helpers';
+import { openApp, importFiles, canvas, recordMetrics, trackErrors, JPEG_A, RING } from './helpers';
 
 // Bars (approved scope, issue #3 comment 6681440642): encode <= 6 s,
 // refine decode <= 0.5 s, worker peak <= 400 MB, tab within +50 MB of
@@ -155,5 +155,49 @@ test('subject tool segments, refines, and releases the worker', async ({ page },
   expect(peakMb, 'worker wasm peak over the 400 MB bar').toBeLessThanOrEqual(400);
   expect(deltaMb, 'tab grew more than 50 MB after closing the subject worker').toBeLessThanOrEqual(50);
   expect([...thirdParty], 'subject tool made third-party requests').toEqual([]);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+// A Remove tap inside the subject must stay removed (issue #3 QA): the mask is
+// SAM's own (logit 0, highest predicted IoU) with no hole fill or component
+// pruning on top. The ring fixture is a textured ring on grey noise; the first
+// tap may select the ring or the whole disc, but after a Remove tap in the
+// middle the middle is unselected and the ring is still selected.
+test('a Remove tap inside the subject stays removed', async ({ page }) => {
+  test.setTimeout(240_000);
+  const errors = trackErrors(page);
+  await openApp(page);
+  await importFiles(page, [RING]);
+  await page.evaluate(() => {
+    const w = window as any;
+    w.__ringSamples = [];
+    const orig = w.pesSegmentSubject;
+    w.pesSegmentSubject = async function (...args: any[]) {
+      const res = await orig.apply(this, args);
+      const W = res.outW, H = res.outH, m = res.mask as Uint8Array;
+      const at = (nx: number, ny: number) => m[Math.floor(ny * H) * W + Math.floor(nx * W)];
+      w.__ringSamples.push({ centre: at(0.5, 0.5), ring: at(0.5 + 250 / 1536, 0.5) });
+      return res;
+    };
+  });
+  await page.locator('.tabs .tab', { hasText: 'Select' }).click();
+  await page.locator('.select-tab .chip', { hasText: 'Subject' }).click();
+  await page.waitForTimeout(1000);
+  const click = async (nx: number, ny: number) => {
+    const b = await canvas(page).boundingBox();
+    await canvas(page).click({ position: { x: b!.width * nx, y: b!.height * ny } });
+  };
+  const samples = () => page.evaluate(() => (window as any).__ringSamples as { centre: number; ring: number }[]);
+
+  await click(0.5 + 250 / 1536, 0.5);
+  await expect.poll(async () => (await samples()).length, { timeout: 200_000 }).toBe(1);
+  expect((await samples())[0].ring, 'the tap did not select the ring').toBeGreaterThan(0);
+
+  await page.locator('.select-tab .chip', { hasText: /^Remove$/ }).click();
+  await click(0.5, 0.5);
+  await expect.poll(async () => (await samples()).length, { timeout: 60_000 }).toBe(2);
+  const after = (await samples())[1];
+  expect(after.centre, 'the Remove tap in the middle was undone (hole refilled)').toBe(0);
+  expect(after.ring, 'the Remove tap dropped the ring itself').toBeGreaterThan(0);
   expect(errors, errors.join('\n')).toEqual([]);
 });
