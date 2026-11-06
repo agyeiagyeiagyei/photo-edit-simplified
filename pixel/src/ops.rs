@@ -633,6 +633,59 @@ mod tests {
     }
 
     #[test]
+    fn upscaled_wand_mask_has_no_wide_stair_steps() {
+        // 10x mirrors a 1024 px wand mask on a 24 MP export. Nearest-neighbour
+        // repeats each source row ten times, so the 50% edge sits at the same x
+        // for ten rows; the bilinear ramp must keep every flat run to 2 rows.
+        let (sw, sh) = (64usize, 64usize);
+        let mut data = vec![0u8; sw * sh];
+        for y in 0..sh {
+            for x in 0..sw {
+                if x + y < 32 {
+                    data[y * sw + x] = 255;
+                }
+            }
+        }
+        let sel = Selection {
+            kind: SelectionKind::Mask { data: data.clone().into(), width: sw, height: sh },
+            feather: 0.0,
+        };
+        let (w, h) = (sw * 10, sh * 10);
+        let m = selection_mask(&sel, w, h);
+        // Skip the clamped top rows; the diagonal must be measured in the
+        // interior, where the source edge actually moves.
+        let flat_run = |mask: &[u8]| -> usize {
+            let mut prev: Option<usize> = None;
+            let mut run = 0usize;
+            let mut max_run = 0usize;
+            for y in h / 8..h / 2 {
+                let Some(edge) = mask[y * w..(y + 1) * w].iter().rposition(|&v| v >= 128) else {
+                    prev = None;
+                    continue;
+                };
+                if prev == Some(edge) {
+                    run += 1;
+                } else {
+                    run = 1;
+                    prev = Some(edge);
+                }
+                max_run = max_run.max(run);
+            }
+            max_run
+        };
+        let mut nearest = vec![0u8; w * h];
+        for y in 0..h {
+            let sy = (y * sh / h).min(sh - 1);
+            for x in 0..w {
+                nearest[y * w + x] = data[sy * sw + (x * sw / w).min(sw - 1)];
+            }
+        }
+        assert_eq!(flat_run(&nearest), 10, "nearest baseline steps once per source row");
+        let bilinear = flat_run(&m);
+        assert!(bilinear <= 2, "longest flat edge run is {bilinear} rows");
+    }
+
+    #[test]
     fn scanline_lasso_matches_the_per_pixel_test() {
         // Random (often self-intersecting) polygons at awkward sizes: the
         // scanline fill must select exactly the pixels point_in_polygon does.
