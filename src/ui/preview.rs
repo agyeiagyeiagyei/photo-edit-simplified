@@ -11,6 +11,8 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     let pen_drag = create_rw_signal(None::<(usize, PenDrag, f32, f32)>);
     let brush_draw = create_rw_signal(None::<usize>);
     let select_drag = create_rw_signal(None::<SelectDrag>);
+    let brush_drag = create_rw_signal(None::<BrushDrag>);
+    let brush_hover = create_rw_signal(None::<(f32, f32)>);
     let heal_drag = create_rw_signal(None::<Vec<(f32, f32)>>);
     let clone_drag = create_rw_signal(None::<Vec<(f32, f32)>>);
     // Hoisted out of CropOverlay: crop edits re-render the preview, which
@@ -200,6 +202,31 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         }
     });
 
+    // Selection brush: track the outline and extend the in-flight stroke.
+    window_event_listener(leptos::ev::pointermove, move |ev| {
+        if tab.get_untracked() != Tab::Select
+            || state.selected_select_tool.get_untracked() != SelectTool::Brush
+        {
+            if brush_hover.try_get().flatten().is_some() {
+                brush_hover.set(None);
+            }
+            return;
+        }
+        let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop)).flatten() else { return };
+        brush_hover.set(Some((nx, ny)));
+        let Some(Some(mut drag)) = brush_drag.try_get() else { return };
+        if drag.points.last().map(|last| dist2(*last, (nx, ny)) > 0.00005).unwrap_or(true) {
+            drag.points.push((nx, ny));
+            brush_drag.set(Some(drag));
+        }
+    });
+
+    window_event_listener(leptos::ev::pointerup, move |_| {
+        let Some(drag) = brush_drag.try_get().flatten() else { return };
+        let _ = brush_drag.try_set(None);
+        brush_commit(state, drag);
+    });
+
     window_event_listener(leptos::ev::pointerup, move |_| {
         let Some(drag) = select_drag.try_get().flatten() else { return };
         let _ = select_drag.try_set(None);
@@ -239,6 +266,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         };
         state.update_current_item(|m| {
             m.edit.selection = new_sel;
+            m.edit.selection_rev += 1;
         });
         state.subject_photo.set(None);
     });
@@ -260,6 +288,9 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         state.clone_radius.track();
         tab.track();
         select_drag.track();
+        brush_drag.track();
+        brush_hover.track();
+        state.brush_size.track();
         // Paint on the leading edge so the change that opened this frame shows
         // in it; a burst of further changes this frame coalesces into one
         // trailing rAF pass, so there is still at most one extra paint/frame.
@@ -824,14 +855,40 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             }
         }
 
-        // Draw selection overlay on the Select tab.
+        // Draw selection overlay on the Select tab. The brush shows its target
+        // mask (global blue, layer red) and the stroke being drawn on top.
         if tab.get() == Tab::Select {
             let ctx = web::ctx2d(&canvas);
-            if let Some(sel) = &item.edit.selection {
+            let brush_tool = state.selected_select_tool.get() == SelectTool::Brush;
+            if let Some(drag) = brush_drag.get() {
+                draw_brush_drag(&ctx, &drag);
+            } else if brush_tool {
+                match brush_target(state, &item) {
+                    BrushTarget::Layer(id) => {
+                        if let Some(layer) = item.layers.iter().find(|l| l.id == id) {
+                            if let LayerKind::Adjust(a) = &layer.kind {
+                                draw_layer_mask_overlay(&ctx, a.mask.as_ref(), false, w as f64, h as f64);
+                            }
+                        }
+                    }
+                    BrushTarget::Global => {
+                        if let Some(sel) = &item.edit.selection {
+                            draw_selection_overlay(&ctx, sel, w as f64, h as f64);
+                        }
+                    }
+                }
+            } else if let Some(sel) = &item.edit.selection {
                 draw_selection_overlay(&ctx, sel, w as f64, h as f64);
             }
             if let Some(drag) = select_drag.get() {
                 draw_select_drag(&ctx, &drag, w as f64, h as f64);
+            }
+            if brush_tool {
+                if let Some((nx, ny)) = brush_hover.get() {
+                    let diag = ((w * w + h * h) as f64).sqrt();
+                    let r = state.brush_size.get() as f64 * diag * 0.5;
+                    draw_brush_outline(&ctx, nx, ny, r, w as f64, h as f64);
+                }
             }
         }
 
@@ -963,6 +1020,12 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                     }
                                     SelectTool::Subject => {
                                         select_drag.set(Some(SelectDrag::Subject((nx, ny), (nx, ny))));
+                                    }
+                                    SelectTool::Brush => {
+                                        if let Some(drag) = brush_begin(state, nx, ny) {
+                                            brush_hover.set(Some((nx, ny)));
+                                            brush_drag.set(Some(drag));
+                                        }
                                     }
                                 }
                                 return;

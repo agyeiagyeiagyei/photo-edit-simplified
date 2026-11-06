@@ -7,6 +7,7 @@
 #![allow(clippy::chunks_exact_to_as_chunks, clippy::too_many_arguments)]
 
 pub mod blur;
+pub mod brush;
 pub mod clone;
 pub mod color;
 pub mod curves;

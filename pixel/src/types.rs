@@ -226,6 +226,10 @@ pub struct EditParams {
     pub raw: RawAdjust,
     /// Active selection mask (rect, lasso, or derived from ML segmentation).
     pub selection: Option<Selection>,
+    /// Bumped on every in-place change to `selection`'s mask bytes. The
+    /// selection hash samples 8 bytes, so a brush stroke that misses those
+    /// positions would not invalidate the render caches without this.
+    pub selection_rev: u64,
     /// Adjustment layers applied on top of the global colour stages, bottom
     /// first. Empty for a photo without adjustment layers.
     pub adjust_layers: Vec<AdjustLayer>,
@@ -254,6 +258,7 @@ impl Default for EditParams {
             curves: CurvesSettings::default(),
             raw: RawAdjust::default(),
             selection: None,
+            selection_rev: 0,
             adjust_layers: Vec::new(),
             trim: None,
             keep_audio: true,

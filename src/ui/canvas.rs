@@ -27,6 +27,22 @@ pub(crate) enum SelectDrag {
     Subject((f32, f32), (f32, f32)),
 }
 
+/// In-flight selection-brush stroke: the target's mask captured at
+/// pointerdown plus the pointer path in normalized working coords.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) struct BrushDrag {
+    pub item_id: usize,
+    pub target: BrushTarget,
+    pub w: usize,
+    pub h: usize,
+    pub base: Rc<Vec<u8>>,
+    pub points: Vec<(f32, f32)>,
+    /// Stroke radius in mask pixels.
+    pub radius: f32,
+    pub softness: f32,
+    pub add: bool,
+}
+
 pub(crate) fn crop_is_full(c: &state::CropRect) -> bool {
     c.x <= 0.0005 && c.y <= 0.0005 && c.w >= 0.999 && c.h >= 0.999
 }
@@ -221,6 +237,41 @@ pub(crate) fn draw_select_drag(ctx: &web_sys::CanvasRenderingContext2d, drag: &S
             ctx.stroke();
         }
     }
+    ctx.restore();
+}
+
+/// Live selection-brush tint: the captured mask plus the in-progress stroke.
+pub(crate) fn draw_brush_drag(ctx: &web_sys::CanvasRenderingContext2d, drag: &BrushDrag) {
+    let mask = brush_live_mask(drag);
+    let rgb = match drag.target {
+        BrushTarget::Global => [10, 132, 255],
+        BrushTarget::Layer(_) => [255, 59, 48],
+    };
+    paint_mask_tint(ctx, &mask, drag.w, drag.h, rgb);
+}
+
+/// Brush outline: a white ring with a dark backing so it reads on any photo.
+pub(crate) fn draw_brush_outline(
+    ctx: &web_sys::CanvasRenderingContext2d,
+    nx: f32,
+    ny: f32,
+    radius: f64,
+    w: f64,
+    h: f64,
+) {
+    let px = nx as f64 * w;
+    let py = ny as f64 * h;
+    ctx.save();
+    ctx.set_line_width(2.0);
+    ctx.set_stroke_style_str("rgba(0,0,0,0.55)");
+    ctx.begin_path();
+    let _ = ctx.arc(px, py, radius + 1.0, 0.0, std::f64::consts::PI * 2.0);
+    ctx.stroke();
+    ctx.set_line_width(1.5);
+    ctx.set_stroke_style_str("rgba(255,255,255,0.95)");
+    ctx.begin_path();
+    let _ = ctx.arc(px, py, radius, 0.0, std::f64::consts::PI * 2.0);
+    ctx.stroke();
     ctx.restore();
 }
 

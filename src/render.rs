@@ -479,6 +479,7 @@ pub(crate) fn edit_fingerprint(item: &MediaItem) -> u64 {
     format!("{:?}", e.levels).hash(&mut h);
     format!("{:?}", e.curves).hash(&mut h);
     hash_selection(&mut h, e.selection.as_ref());
+    h.write_u64(e.selection_rev);
     item.layers.len().hash(&mut h);
     for l in &item.layers {
         l.id.hash(&mut h);
@@ -751,6 +752,7 @@ pub(crate) fn destructive_apply(state: AppState, item_id: usize, r: pworker::Des
             m.edit.rot90 = 0;
             m.edit.fine_angle = 0.0;
             m.edit.selection = None;
+            m.edit.selection_rev += 1;
         }
     });
 }
@@ -898,7 +900,352 @@ pub(crate) fn wand_select(state: AppState, nx: f32, ny: f32) {
         } else {
             None
         };
+        e.selection_rev += 1;
     });
+}
+
+// --- selection brush ---------------------------------------------------------
+
+/// One stroke's undo budget: dirty-tile patches, never full-mask snapshots.
+const BRUSH_HISTORY_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+/// Where the brush writes: the global selection, or an adjustment layer's mask
+/// when that layer is the active one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BrushTarget {
+    Global,
+    Layer(usize),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MaskPatch {
+    pub x: usize,
+    pub y: usize,
+    pub w: usize,
+    pub h: usize,
+    pub before: Vec<u8>,
+    pub after: Vec<u8>,
+}
+
+impl MaskPatch {
+    fn bytes(&self) -> usize {
+        self.before.len() + self.after.len()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BrushStep {
+    pub item_id: usize,
+    pub target: BrushTarget,
+    pub w: usize,
+    pub h: usize,
+    pub patches: Vec<MaskPatch>,
+}
+
+impl BrushStep {
+    fn bytes(&self) -> usize {
+        self.patches.iter().map(MaskPatch::bytes).sum()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BrushHistory {
+    pub undo: Vec<BrushStep>,
+    pub redo: Vec<BrushStep>,
+    pub bytes: usize,
+}
+
+impl BrushHistory {
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    fn recount(&mut self) {
+        self.bytes = self.undo.iter().chain(self.redo.iter()).map(BrushStep::bytes).sum();
+    }
+}
+
+fn push_brush_step(state: AppState, step: BrushStep) {
+    state.brush_history.update(|h| {
+        h.redo.clear();
+        h.undo.push(step);
+        h.recount();
+        while h.bytes > BRUSH_HISTORY_MAX_BYTES && h.undo.len() > 1 {
+            h.undo.remove(0);
+            h.recount();
+        }
+    });
+}
+
+fn invalidate_brush_history(state: AppState) {
+    state.brush_history.update(|h| {
+        h.undo.clear();
+        h.redo.clear();
+        h.bytes = 0;
+    });
+}
+
+/// The active adjustment layer's mask, else the global selection.
+pub(crate) fn brush_target(state: AppState, item: &MediaItem) -> BrushTarget {
+    match state.selected_layer.get_untracked() {
+        Some(id)
+            if item
+                .layers
+                .iter()
+                .any(|l| l.id == id && matches!(l.kind, LayerKind::Adjust(_))) =>
+        {
+            BrushTarget::Layer(id)
+        }
+        _ => BrushTarget::Global,
+    }
+}
+
+/// Mask space for brush edits: the geometry-corrected preview, the same frame
+/// wand and subject masks use (well under the 3200 px raster cap).
+fn brush_dims(item: &MediaItem) -> Option<(usize, usize)> {
+    let photo = get_photo(item.id)?;
+    if photo.preview.1 == 0 || photo.preview.2 == 0 {
+        return None;
+    }
+    Some(match preview_geometry_cached(item.id, photo.gen, &photo.preview, &item.edit) {
+        Some((_, w, h)) => (w, h),
+        None => (photo.preview.1, photo.preview.2),
+    })
+}
+
+fn brush_selection(item: &MediaItem, target: BrushTarget) -> Option<&Selection> {
+    match target {
+        BrushTarget::Global => item.edit.selection.as_ref(),
+        BrushTarget::Layer(id) => item.layers.iter().find_map(|l| match (&l.kind, l.id == id) {
+            (LayerKind::Adjust(a), true) => a.mask.as_ref(),
+            _ => None,
+        }),
+    }
+}
+
+/// Rasterize the target into mask bytes; a vector selection is baked (feather
+/// included) on the first stroke.
+fn brush_base_mask(item: &MediaItem, target: BrushTarget, w: usize, h: usize) -> Vec<u8> {
+    match brush_selection(item, target) {
+        Some(sel) => ops::selection_mask(sel, w, h),
+        None => vec![0u8; w * h],
+    }
+}
+
+fn stroke_points_px(drag: &BrushDrag) -> Vec<(f32, f32)> {
+    drag.points.iter().map(|&(x, y)| (x * drag.w as f32, y * drag.h as f32)).collect()
+}
+
+fn apply_brush_stroke(mask: &mut [u8], drag: &BrushDrag) {
+    let pts = stroke_points_px(drag);
+    if let Some(s) = brush::stroke_mask(drag.w, drag.h, &pts, drag.radius, drag.softness) {
+        brush::apply_stroke(mask, drag.w, drag.h, &s, drag.add);
+    }
+}
+
+/// Base mask plus the in-progress stroke, for the live tint. The stroke is
+/// rasterized into the stroke's bbox only; the base copy is one memcpy.
+pub(crate) fn brush_live_mask(drag: &BrushDrag) -> Vec<u8> {
+    let mut mask = (*drag.base).clone();
+    apply_brush_stroke(&mut mask, drag);
+    mask
+}
+
+pub(crate) fn brush_begin(state: AppState, nx: f32, ny: f32) -> Option<BrushDrag> {
+    let item = state.current()?;
+    if item.kind != MediaKind::Photo {
+        return None;
+    }
+    let (w, h) = brush_dims(&item)?;
+    let target = brush_target(state, &item);
+    let base = brush_base_mask(&item, target, w, h);
+    let diag = ((w * w + h * h) as f32).sqrt();
+    let radius = (state.brush_size.get_untracked() * diag * 0.5).max(0.5);
+    Some(BrushDrag {
+        item_id: item.id,
+        target,
+        w,
+        h,
+        base: Rc::new(base),
+        points: vec![(nx, ny)],
+        radius,
+        softness: state.brush_softness.get_untracked().clamp(0.0, 1.0),
+        add: !state.brush_remove.get_untracked(),
+    })
+}
+
+fn copy_rect(src: &[u8], sw: usize, x: usize, y: usize, w: usize, h: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(w * h);
+    for row in y..y + h {
+        out.extend_from_slice(&src[row * sw + x..row * sw + x + w]);
+    }
+    out
+}
+
+pub(crate) fn brush_commit(state: AppState, drag: BrushDrag) {
+    let Some(item) = state.current() else { return };
+    if item.id != drag.item_id || item.kind != MediaKind::Photo {
+        return;
+    }
+    let mut after = (*drag.base).clone();
+    apply_brush_stroke(&mut after, &drag);
+    if after == *drag.base {
+        return;
+    }
+    let base: &[u8] = &drag.base;
+    let (mut x0, mut y0) = (drag.w, drag.h);
+    let (mut x1, mut y1) = (0usize, 0usize);
+    for y in 0..drag.h {
+        let row = y * drag.w;
+        for x in 0..drag.w {
+            if base[row + x] != after[row + x] {
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+        }
+    }
+    if x1 < x0 || y1 < y0 {
+        return;
+    }
+    let pw = x1 - x0 + 1;
+    let ph = y1 - y0 + 1;
+    let patch = MaskPatch {
+        x: x0,
+        y: y0,
+        w: pw,
+        h: ph,
+        before: copy_rect(base, drag.w, x0, y0, pw, ph),
+        after: copy_rect(&after, drag.w, x0, y0, pw, ph),
+    };
+    if !brush_store(state, drag.item_id, drag.target, after, drag.w, drag.h) {
+        return;
+    }
+    push_brush_step(
+        state,
+        BrushStep { item_id: drag.item_id, target: drag.target, w: drag.w, h: drag.h, patches: vec![patch] },
+    );
+}
+
+fn brush_store(
+    state: AppState,
+    item_id: usize,
+    target: BrushTarget,
+    data: Vec<u8>,
+    w: usize,
+    h: usize,
+) -> bool {
+    let sel = Selection {
+        kind: SelectionKind::Mask { data: Rc::new(data), width: w, height: h },
+        feather: 0.0,
+    };
+    match target {
+        BrushTarget::Global => {
+            state.update_item_by_id(item_id, |m| {
+                m.edit.selection = Some(sel);
+                m.edit.selection_rev += 1;
+            });
+            true
+        }
+        BrushTarget::Layer(id) => {
+            let mut ok = false;
+            state.update_item_by_id(item_id, |m| {
+                if let Some(l) = m.layers.iter_mut().find(|l| l.id == id) {
+                    if let LayerKind::Adjust(a) = &mut l.kind {
+                        a.set_mask(Some(sel));
+                        ok = true;
+                    }
+                }
+            });
+            ok
+        }
+    }
+}
+
+fn patch_region_matches(mask: &[u8], mask_w: usize, p: &MaskPatch, expected: &[u8]) -> bool {
+    if mask_w == 0 || expected.len() != p.w * p.h {
+        return false;
+    }
+    let mask_h = mask.len() / mask_w;
+    if p.x + p.w > mask_w || p.y + p.h > mask_h {
+        return false;
+    }
+    for row in 0..p.h {
+        let start = (p.y + row) * mask_w + p.x;
+        if mask[start..start + p.w] != expected[row * p.w..(row + 1) * p.w] {
+            return false;
+        }
+    }
+    true
+}
+
+fn apply_patch_region(mask: &mut [u8], mask_w: usize, p: &MaskPatch, src: &[u8]) {
+    for row in 0..p.h {
+        let start = (p.y + row) * mask_w + p.x;
+        mask[start..start + p.w].copy_from_slice(&src[row * p.w..(row + 1) * p.w]);
+    }
+}
+
+/// Undo/redo replays dirty tiles. The stacks are only trusted while the mask
+/// still matches the recorded bytes — any other selection edit (wand, Clear, a
+/// fresh layer mask) invalidates them rather than corrupting the mask.
+fn brush_history_step(state: AppState, undo: bool) -> bool {
+    let step = state.brush_history.with(|h| {
+        if undo { h.undo.last().cloned() } else { h.redo.last().cloned() }
+    });
+    let Some(step) = step else { return false };
+    let Some(item) = state.current() else { return false };
+    if item.id != step.item_id {
+        return false;
+    }
+    let Some((w, h)) = brush_dims(&item) else { return false };
+    if (w, h) != (step.w, step.h) {
+        invalidate_brush_history(state);
+        return false;
+    }
+    let Some(current) = brush_selection(&item, step.target) else {
+        invalidate_brush_history(state);
+        return false;
+    };
+    let current = ops::selection_mask(current, w, h);
+    let all_valid = step.patches.iter().all(|p| {
+        patch_region_matches(&current, w, p, if undo { &p.after } else { &p.before })
+    });
+    if !all_valid {
+        invalidate_brush_history(state);
+        return false;
+    }
+    let mut next = current;
+    for p in &step.patches {
+        apply_patch_region(&mut next, w, p, if undo { &p.before } else { &p.after });
+    }
+    if !brush_store(state, item.id, step.target, next, w, h) {
+        invalidate_brush_history(state);
+        return false;
+    }
+    state.brush_history.update(|h| {
+        if undo {
+            if let Some(s) = h.undo.pop() {
+                h.redo.push(s);
+            }
+        } else if let Some(s) = h.redo.pop() {
+            h.undo.push(s);
+        }
+    });
+    true
+}
+
+pub(crate) fn brush_undo(state: AppState) -> bool {
+    brush_history_step(state, true)
+}
+
+pub(crate) fn brush_redo(state: AppState) -> bool {
+    brush_history_step(state, false)
 }
 
 /// MobileSAM subject selection. `nx`/`ny` are full-image normalized coords
@@ -988,6 +1335,7 @@ fn subject_run(state: AppState, make_op: impl FnOnce(usize, usize) -> JsValue + 
                         },
                         feather: 0.0,
                     });
+                    e.selection_rev += 1;
                 });
                 state.subject_photo.set(Some(item.id));
             }

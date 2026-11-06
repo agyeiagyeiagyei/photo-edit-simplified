@@ -123,12 +123,85 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
                         class="chip"
                         on:click=move |_| {
                             state.subject_photo.set(None);
-                            state.update_current(|e| e.selection = None);
+                            state.update_current(|e| {
+                                e.selection = None;
+                                e.selection_rev += 1;
+                            });
                         }
                     >
                         "Start over"
                     </button>
                 </div>
+            </Show>
+            <Show
+                when=move || state.selected_select_tool.get() == SelectTool::Brush
+                fallback=|| ()
+            >
+                <div class="chips">
+                    <button
+                        class="chip"
+                        class:active=move || !state.brush_remove.get()
+                        on:click=move |_| state.brush_remove.set(false)
+                    >
+                        "Add"
+                    </button>
+                    <button
+                        class="chip"
+                        class:active=move || state.brush_remove.get()
+                        on:click=move |_| state.brush_remove.set(true)
+                    >
+                        "Remove"
+                    </button>
+                    <button
+                        class="chip"
+                        disabled=move || !state.brush_history.with(|h| h.can_undo())
+                        on:click=move |_| {
+                            brush_undo(state);
+                        }
+                    >
+                        "Undo"
+                    </button>
+                    <button
+                        class="chip"
+                        disabled=move || !state.brush_history.with(|h| h.can_redo())
+                        on:click=move |_| {
+                            brush_redo(state);
+                        }
+                    >
+                        "Redo"
+                    </button>
+                </div>
+                <label class="slider">
+                    <span>"Size: " {move || format!("{:.1}%", state.brush_size.get() * 100.0)}</span>
+                    <input
+                        type="range" min="0.005" max="0.3" step="0.005"
+                        prop:value=move || state.brush_size.get().to_string()
+                        on:input=move |ev| {
+                            let v: f32 = event_target_value(&ev).parse().unwrap_or(0.04);
+                            state.brush_size.set(v.clamp(0.005, 0.3));
+                        }
+                    />
+                </label>
+                <label class="slider">
+                    <span>"Softness: " {move || format!("{:.0}%", state.brush_softness.get() * 100.0)}</span>
+                    <input
+                        type="range" min="0" max="1" step="0.01"
+                        prop:value=move || state.brush_softness.get().to_string()
+                        on:input=move |ev| {
+                            let v: f32 = event_target_value(&ev).parse().unwrap_or(0.0);
+                            state.brush_softness.set(v.clamp(0.0, 1.0));
+                        }
+                    />
+                </label>
+                <p class="dim">
+                    {move || {
+                        state.selected_layer.track();
+                        match state.current().map(|m| brush_target(state, &m)) {
+                            Some(BrushTarget::Layer(_)) => "Brush edits the selected adjustment layer's mask (red tint).",
+                            _ => "Brush edits the global selection (blue tint).",
+                        }
+                    }}
+                </p>
             </Show>
             <div class="row select-row">
                 <button
@@ -163,7 +236,10 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
                     class="btn"
                     on:click=move |_| {
                         state.subject_photo.set(None);
-                        state.update_current(|e| e.selection = None);
+                        state.update_current(|e| {
+                            e.selection = None;
+                            e.selection_rev += 1;
+                        });
                     }
                 >
                     "Clear"
@@ -190,7 +266,9 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
             <p class="dim">
                 "Rect/Lasso select a region; Wand selects pixels similar to the one you click. \
                  Subject taps a bird or animal and refines with Add/Remove taps or a drag-box; \
-                 the model downloads ~15 MB on first use (photo-only). \
+                 the model downloads ~15 MB on first use (photo-only). Brush paints into or out \
+                 of the selection (or the selected adjustment layer's mask) with Size and \
+                 Softness; each stroke is one undo step. \
                  Cut/Copy lift the selection to a raster layer; Content fill synthesizes it from \
                  the surroundings. Isolate person runs MediaPipe Selfie Segmentation."
             </p>

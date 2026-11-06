@@ -63,11 +63,12 @@ pub enum SelectTool {
     Lasso,
     Wand,
     Subject,
+    Brush,
 }
 
 impl SelectTool {
-    pub const ALL: [SelectTool; 4] =
-        [SelectTool::Rect, SelectTool::Lasso, SelectTool::Wand, SelectTool::Subject];
+    pub const ALL: [SelectTool; 5] =
+        [SelectTool::Rect, SelectTool::Lasso, SelectTool::Wand, SelectTool::Subject, SelectTool::Brush];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -75,6 +76,7 @@ impl SelectTool {
             SelectTool::Lasso => "Lasso",
             SelectTool::Wand => "Wand",
             SelectTool::Subject => "Subject",
+            SelectTool::Brush => "Brush",
         }
     }
 }
@@ -513,6 +515,14 @@ pub struct AppState {
     /// Photo whose subject prompt set is live; None means the next tap starts
     /// a fresh segmentation.
     pub subject_photo: RwSignal<Option<usize>>,
+    /// Selection brush: diameter as a fraction of the image diagonal.
+    pub brush_size: RwSignal<f32>,
+    /// 0 = hard edge, 1 = falloff from the centre.
+    pub brush_softness: RwSignal<f32>,
+    /// Next stroke removes from the mask instead of adding.
+    pub brush_remove: RwSignal<bool>,
+    /// Dirty-tile undo/redo for brush strokes.
+    pub brush_history: RwSignal<crate::render::BrushHistory>,
     /// Spot-heal brush: radius as a fraction of the image diagonal.
     pub heal_radius: RwSignal<f32>,
     pub heal_mode: RwSignal<crate::heal::HealMode>,
@@ -649,6 +659,10 @@ impl AppState {
             subject_remove: create_rw_signal(false),
             subject_photo: create_rw_signal(None),
             wand_contiguous: create_rw_signal(true),
+            brush_size: create_rw_signal(0.04),
+            brush_softness: create_rw_signal(0.0),
+            brush_remove: create_rw_signal(false),
+            brush_history: create_rw_signal(crate::render::BrushHistory::default()),
             heal_radius: create_rw_signal(0.02),
             heal_mode: create_rw_signal(crate::heal::HealMode::ContentAware),
             clone_source: create_rw_signal(None),
