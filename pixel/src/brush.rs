@@ -7,6 +7,8 @@
 //! mask down by the coverage, so at softness 0 an Add followed by Remove over
 //! the same path returns an empty mask exactly.
 
+use std::rc::Rc;
+
 use crate::stroke;
 
 /// Bounding box of a stroke's coverage, in mask pixels, plus the coverage.
@@ -17,6 +19,239 @@ pub struct StrokeMask {
     pub w: usize,
     pub h: usize,
     pub data: Vec<u8>,
+}
+
+/// Axis-aligned region in mask pixels.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Rect {
+    pub x: usize,
+    pub y: usize,
+    pub w: usize,
+    pub h: usize,
+}
+
+impl Rect {
+    fn union(self, other: Rect) -> Rect {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let right = (self.x + self.w).max(other.x + other.w);
+        let bottom = (self.y + self.h).max(other.y + other.h);
+        Rect { x, y, w: right - x, h: bottom - y }
+    }
+}
+
+fn union_opt(acc: Option<Rect>, next: Rect) -> Rect {
+    match acc {
+        Some(acc) => acc.union(next),
+        None => next,
+    }
+}
+
+/// Bounds `stamp` would touch for a dab, clipped to the mask.
+fn dab_bounds(cx: f32, cy: f32, radius: f32, w: usize, h: usize) -> Option<Rect> {
+    let x0 = ((cx - radius).floor().max(0.0) as usize).min(w);
+    let y0 = ((cy - radius).floor().max(0.0) as usize).min(h);
+    let x1 = (((cx + radius).ceil().max(0.0) as usize) + 1).min(w);
+    let y1 = (((cy + radius).ceil().max(0.0) as usize) + 1).min(h);
+    (x1 > x0 && y1 > y0).then_some(Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 })
+}
+
+/// Coverage of one dab at a pixel centre; 0 outside the radius.
+fn dab_alpha(cx: f32, cy: f32, radius: f32, softness: f32, px: usize, py: usize) -> u8 {
+    let dx = px as f32 + 0.5 - cx;
+    let dy = py as f32 + 0.5 - cy;
+    let d = (dx * dx + dy * dy).sqrt() / radius;
+    if d >= 1.0 {
+        return 0;
+    }
+    if softness <= 0.001 {
+        255
+    } else {
+        let t = ((1.0 - d) / softness).clamp(0.0, 1.0);
+        (t * t * (3.0 - 2.0 * t) * 255.0).round() as u8
+    }
+}
+
+fn combine(base: u8, coverage: u8, add: bool) -> u8 {
+    if add {
+        base.max(coverage)
+    } else {
+        ((base as u16 * (255 - coverage as u16) + 127) / 255) as u8
+    }
+}
+
+/// Incremental coverage for one in-flight brush stroke.
+///
+/// Dabs are stamped once as the pointer path grows instead of re-rasterizing
+/// the whole path every frame. The current path end is stamped analytically
+/// rather than into `coverage`, so when it moves it leaves no residue behind.
+/// `Rect`s are reported in mask pixels: `take_dirty` for the pixels whose live
+/// value changed since the last call, `bounds` for the whole stroke.
+pub struct LiveStroke {
+    mask_w: usize,
+    mask_h: usize,
+    base: Rc<Vec<u8>>,
+    radius: f32,
+    softness: f32,
+    add: bool,
+    coverage: Vec<u8>,
+    points: Vec<(f32, f32)>,
+    stamped: usize,
+    endpoint: Option<(f32, f32)>,
+    dirty: Option<Rect>,
+    bounds: Option<Rect>,
+}
+
+impl LiveStroke {
+    pub fn new(
+        mask_w: usize,
+        mask_h: usize,
+        base: Rc<Vec<u8>>,
+        radius: f32,
+        softness: f32,
+        add: bool,
+        first: (f32, f32),
+    ) -> Self {
+        let mut live = Self {
+            mask_w,
+            mask_h,
+            base,
+            radius,
+            softness,
+            add,
+            coverage: vec![0u8; mask_w * mask_h],
+            points: Vec::new(),
+            stamped: 0,
+            endpoint: None,
+            dirty: None,
+            bounds: None,
+        };
+        live.push_point(first.0, first.1);
+        live
+    }
+
+    /// Extends the path in mask pixels. Returns false for a duplicate point.
+    pub fn push_point(&mut self, x: f32, y: f32) -> bool {
+        if self.points.last().is_some_and(|&(lx, ly)| lx == x && ly == y) {
+            return false;
+        }
+        // The old tip was only ever painted analytically; mark it for repaint.
+        if let Some((ox, oy)) = self.endpoint {
+            if let Some(r) = dab_bounds(ox, oy, self.radius, self.mask_w, self.mask_h) {
+                self.dirty = Some(union_opt(self.dirty, r));
+            }
+        }
+        self.points.push((x, y));
+        let spacing = (self.radius * 0.25).max(0.75);
+        let dabs = stroke::dab_positions(&self.points, spacing);
+        for d in dabs.iter().skip(self.stamped) {
+            stamp(&mut self.coverage, self.mask_w, self.mask_h, 0, 0, d.x, d.y, self.radius, self.softness);
+            if let Some(r) = dab_bounds(d.x, d.y, self.radius, self.mask_w, self.mask_h) {
+                self.dirty = Some(union_opt(self.dirty, r));
+                self.bounds = Some(union_opt(self.bounds, r));
+            }
+        }
+        self.stamped = dabs.len();
+        self.endpoint = Some((x, y));
+        if let Some(r) = dab_bounds(x, y, self.radius, self.mask_w, self.mask_h) {
+            self.dirty = Some(union_opt(self.dirty, r));
+            self.bounds = Some(union_opt(self.bounds, r));
+        }
+        true
+    }
+
+    pub fn points(&self) -> &[(f32, f32)] {
+        &self.points
+    }
+
+    pub fn radius(&self) -> f32 {
+        self.radius
+    }
+
+    pub fn softness(&self) -> f32 {
+        self.softness
+    }
+
+    pub fn add(&self) -> bool {
+        self.add
+    }
+
+    /// Pixels changed since the previous call, as one bounding rect.
+    pub fn take_dirty(&mut self) -> Option<Rect> {
+        self.dirty.take()
+    }
+
+    /// Bounds of everything this stroke can affect, for the commit diff.
+    pub fn bounds(&self) -> Option<Rect> {
+        self.bounds
+    }
+
+    fn live_at(&self, x: usize, y: usize) -> u8 {
+        let i = y * self.mask_w + x;
+        let mut a = self.coverage[i];
+        if let Some((cx, cy)) = self.endpoint {
+            a = a.max(dab_alpha(cx, cy, self.radius, self.softness, x, y));
+        }
+        combine(self.base[i], a, self.add)
+    }
+
+    /// Live mask values for a dirty rect, row-major.
+    pub fn fill_live_rect(&self, r: Rect, out: &mut [u8]) {
+        for row in 0..r.h {
+            for col in 0..r.w {
+                out[row * r.w + col] = self.live_at(r.x + col, r.y + row);
+            }
+        }
+    }
+
+    /// Stamp the moving endpoint into the coverage buffer and return the final
+    /// mask plus the bbox of pixels the stroke actually changed. Consumes the
+    /// analytic endpoint, so a later `compose` no longer re-evaluates it.
+    pub fn finish(&mut self) -> (Vec<u8>, Option<Rect>) {
+        if let Some((x, y)) = self.endpoint.take() {
+            stamp(&mut self.coverage, self.mask_w, self.mask_h, 0, 0, x, y, self.radius, self.softness);
+            if let Some(r) = dab_bounds(x, y, self.radius, self.mask_w, self.mask_h) {
+                self.bounds = Some(union_opt(self.bounds, r));
+            }
+        }
+        let mut out = (*self.base).clone();
+        let mut changed: Option<Rect> = None;
+        if let Some(b) = self.bounds {
+            for y in b.y..b.y + b.h {
+                for x in b.x..b.x + b.w {
+                    let i = y * self.mask_w + x;
+                    let v = combine(self.base[i], self.coverage[i], self.add);
+                    if v != self.base[i] {
+                        out[i] = v;
+                        changed = Some(match changed {
+                            None => Rect { x, y, w: 1, h: 1 },
+                            Some(c) => {
+                                let x0 = c.x.min(x);
+                                let y0 = c.y.min(y);
+                                let x1 = (c.x + c.w).max(x + 1);
+                                let y1 = (c.y + c.h).max(y + 1);
+                                Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        (out, changed)
+    }
+
+    /// Base mask with the stroke applied. Equivalent to `stroke_mask` plus
+    /// `apply_stroke`, without re-stamping the path.
+    pub fn compose(&self) -> Vec<u8> {
+        let mut out = (*self.base).clone();
+        let Some(b) = self.bounds else { return out };
+        for y in b.y..b.y + b.h {
+            for x in b.x..b.x + b.w {
+                out[y * self.mask_w + x] = self.live_at(x, y);
+            }
+        }
+        out
+    }
 }
 
 /// Coverage of a stroke over a `mask_w` × `mask_h` mask. Points are in mask
@@ -84,19 +319,11 @@ fn stamp(
         .min(origin_y + h)
         .saturating_sub(origin_y);
     for py in y0..y1 {
-        let dy = (origin_y + py) as f32 + 0.5 - cy;
         for px in x0..x1 {
-            let dx = (origin_x + px) as f32 + 0.5 - cx;
-            let d = (dx * dx + dy * dy).sqrt() / radius;
-            if d >= 1.0 {
+            let a = dab_alpha(cx, cy, radius, softness, origin_x + px, origin_y + py);
+            if a == 0 {
                 continue;
             }
-            let a = if softness <= 0.001 {
-                255
-            } else {
-                let t = ((1.0 - d) / softness).clamp(0.0, 1.0);
-                (t * t * (3.0 - 2.0 * t) * 255.0).round() as u8
-            };
             let v = &mut data[py * w + px];
             if a > *v {
                 *v = a;
@@ -216,5 +443,68 @@ mod tests {
         for x in [10, 20, 32, 44, 54] {
             assert_eq!(m[32 * w + x], 255, "gap at x={x}");
         }
+    }
+
+    #[test]
+    fn live_stroke_matches_batch_rasterization() {
+        let (w, h) = (96, 72);
+        let base: Rc<Vec<u8>> =
+            Rc::new((0..w * h).map(|i| ((i * 37) % 256) as u8).collect());
+        let pts = [(8.0, 10.0), (30.0, 12.0), (50.0, 40.0), (80.0, 50.0)];
+        for (softness, add) in [(0.35, true), (0.0, false), (1.0, true)] {
+            let mut live = LiveStroke::new(w, h, base.clone(), 7.0, softness, add, pts[0]);
+            for &p in &pts[1..] {
+                assert!(live.push_point(p.0, p.1));
+            }
+            let mut batch = (*base).clone();
+            let s = stroke_mask(w, h, &pts, 7.0, softness).unwrap();
+            apply_stroke(&mut batch, w, h, &s, add);
+            assert_eq!(live.compose(), batch, "softness={softness} add={add}");
+        }
+    }
+
+    #[test]
+    fn finish_matches_batch_and_reports_changed_bbox() {
+        let (w, h) = (96, 72);
+        let base: Rc<Vec<u8>> = Rc::new(vec![0u8; w * h]);
+        let pts = [(8.0, 10.0), (30.0, 12.0), (50.0, 40.0), (80.0, 50.0)];
+        let mut live = LiveStroke::new(w, h, base.clone(), 7.0, 0.4, true, pts[0]);
+        for &p in &pts[1..] {
+            assert!(live.push_point(p.0, p.1));
+        }
+        let (mask, changed) = live.finish();
+        let mut batch = (*base).clone();
+        let s = stroke_mask(w, h, &pts, 7.0, 0.4).unwrap();
+        apply_stroke(&mut batch, w, h, &s, true);
+        assert_eq!(mask, batch);
+        let b = changed.expect("stroke changed pixels");
+        let mut x0 = w;
+        let mut y0 = h;
+        let (mut x1, mut y1) = (0, 0);
+        for y in 0..h {
+            for x in 0..w {
+                if mask[y * w + x] != base[y * w + x] {
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x + 1);
+                    y1 = y1.max(y + 1);
+                }
+            }
+        }
+        assert_eq!((b.x, b.y, b.x + b.w, b.y + b.h), (x0, y0, x1, y1));
+    }
+
+    #[test]
+    fn live_stroke_reports_dirty_only_for_the_tip() {
+        let (w, h) = (64, 64);
+        let base = Rc::new(vec![0u8; w * h]);
+        let mut live = LiveStroke::new(w, h, base, 4.0, 0.0, true, (10.0, 10.0));
+        let first = live.take_dirty().unwrap();
+        assert!(first.x <= 6 && first.y <= 6 && first.w <= 9 && first.h <= 9);
+        assert!(live.take_dirty().is_none());
+        // A tiny move repaints at most the old and new tip areas.
+        live.push_point(12.0, 10.0);
+        let next = live.take_dirty().unwrap();
+        assert!(next.w <= 14 && next.h <= 9, "{next:?}");
     }
 }

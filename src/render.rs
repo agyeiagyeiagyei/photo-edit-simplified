@@ -755,6 +755,8 @@ pub(crate) fn destructive_apply(state: AppState, item_id: usize, r: pworker::Des
             m.edit.selection_rev += 1;
         }
     });
+    state.subject_photo.set(None);
+    clear_subject_brush_ops_for(item_id);
 }
 
 pub(crate) fn heal_mode_u8(m: heal::HealMode) -> u8 {
@@ -891,6 +893,7 @@ pub(crate) fn wand_select(state: AppState, nx: f32, ny: f32) {
     let contig = state.wand_contiguous.get_untracked();
     let (mask, count) = wand::wand_mask(&p, w, h, sx, sy, 0, tol, contig);
     state.subject_photo.set(None);
+    clear_subject_brush_ops(state);
     state.update_current(|e| {
         e.selection = if count > 0 {
             Some(state::Selection {
@@ -933,6 +936,72 @@ impl MaskPatch {
     }
 }
 
+/// A global brush stroke made on a subject-derived selection, in normalized
+/// image coords. `subject_run` replays these onto every fresh decode so a
+/// refinement tap refines the subject instead of discarding the strokes.
+#[derive(Clone, Debug)]
+pub(crate) struct GlobalBrushOp {
+    pub points: Vec<(f32, f32)>,
+    /// Brush size as a fraction of the image diagonal, same as the UI slider.
+    pub size: f32,
+    pub softness: f32,
+    pub add: bool,
+}
+
+thread_local! {
+    static SUBJECT_BRUSH_OPS: RefCell<HashMap<usize, Vec<GlobalBrushOp>>> =
+        RefCell::new(HashMap::new());
+}
+
+fn subject_brush_ops(item_id: usize) -> Vec<GlobalBrushOp> {
+    SUBJECT_BRUSH_OPS.with(|m| m.borrow().get(&item_id).cloned().unwrap_or_default())
+}
+
+fn push_subject_brush_op(item_id: usize, op: GlobalBrushOp) {
+    SUBJECT_BRUSH_OPS.with(|m| m.borrow_mut().entry(item_id).or_default().push(op));
+}
+
+fn pop_subject_brush_op(item_id: usize) {
+    SUBJECT_BRUSH_OPS.with(|m| {
+        if let Some(v) = m.borrow_mut().get_mut(&item_id) {
+            v.pop();
+        }
+    });
+}
+
+/// The selection those strokes refined is gone (wand, Clear, vector select,
+/// handed to a layer, destructive edit): drop the replay list with it.
+pub(crate) fn clear_subject_brush_ops(state: AppState) {
+    if let Some(item) = state.current() {
+        clear_subject_brush_ops_for(item.id);
+    }
+}
+
+pub(crate) fn clear_subject_brush_ops_for(item_id: usize) {
+    SUBJECT_BRUSH_OPS.with(|m| {
+        m.borrow_mut().remove(&item_id);
+    });
+}
+
+fn replay_subject_brush_ops(item_id: usize, mask: &mut [u8], w: usize, h: usize) {
+    let ops = subject_brush_ops(item_id);
+    if ops.is_empty() || w == 0 || h == 0 || mask.len() != w * h {
+        return;
+    }
+    let diag = ((w * w + h * h) as f32).sqrt();
+    for op in ops {
+        let pts: Vec<(f32, f32)> = op
+            .points
+            .iter()
+            .map(|&(x, y)| (x * w as f32, y * h as f32))
+            .collect();
+        let radius = (op.size * diag * 0.5).max(0.5);
+        if let Some(s) = brush::stroke_mask(w, h, &pts, radius, op.softness) {
+            brush::apply_stroke(mask, w, h, &s, op.add);
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct BrushStep {
     pub item_id: usize,
@@ -940,6 +1009,7 @@ pub(crate) struct BrushStep {
     pub w: usize,
     pub h: usize,
     pub patches: Vec<MaskPatch>,
+    pub op: Option<GlobalBrushOp>,
 }
 
 impl BrushStep {
@@ -970,6 +1040,9 @@ impl BrushHistory {
 }
 
 fn push_brush_step(state: AppState, step: BrushStep) {
+    if let Some(op) = &step.op {
+        push_subject_brush_op(step.item_id, op.clone());
+    }
     state.brush_history.update(|h| {
         h.redo.clear();
         h.undo.push(step);
@@ -1004,9 +1077,9 @@ pub(crate) fn brush_target(state: AppState, item: &MediaItem) -> BrushTarget {
     }
 }
 
-/// Mask space for brush edits: the geometry-corrected preview, the same frame
-/// wand and subject masks use (well under the 3200 px raster cap).
-fn brush_dims(item: &MediaItem) -> Option<(usize, usize)> {
+/// Preview-resolution mask space: the geometry-corrected preview, the frame
+/// the live tint paints in.
+fn brush_view_dims(item: &MediaItem) -> Option<(usize, usize)> {
     let photo = get_photo(item.id)?;
     if photo.preview.1 == 0 || photo.preview.2 == 0 {
         return None;
@@ -1015,6 +1088,25 @@ fn brush_dims(item: &MediaItem) -> Option<(usize, usize)> {
         Some((_, w, h)) => (w, h),
         None => (photo.preview.1, photo.preview.2),
     })
+}
+
+/// Committed mask space for brush edits: the geometry-corrected working frame
+/// capped at the 3200 px raster cap. A 1024 px raster softens a lasso edge to
+/// ~5 px when upsampled to a 6192 px export; 3200 keeps it near the source
+/// resolution. The live tint stays at `brush_view_dims` so the drag cost does
+/// not grow with this.
+fn brush_dims(item: &MediaItem) -> Option<(usize, usize)> {
+    let photo = get_photo(item.id)?;
+    let view = brush_view_dims(item)?;
+    let (fw, fh) = photo.full_dims;
+    if fw == 0 || fh == 0 {
+        return Some(view);
+    }
+    let (fw, fh) = working_dims(fw, fh, &item.edit);
+    let scale = (HI_MAX_EDGE as f32 / fw.max(fh) as f32).min(1.0);
+    let w = (fw as f32 * scale).round().max(1.0) as usize;
+    let h = (fh as f32 * scale).round().max(1.0) as usize;
+    Some((w, h))
 }
 
 fn brush_selection(item: &MediaItem, target: BrushTarget) -> Option<&Selection> {
@@ -1036,45 +1128,38 @@ fn brush_base_mask(item: &MediaItem, target: BrushTarget, w: usize, h: usize) ->
     }
 }
 
-fn stroke_points_px(drag: &BrushDrag) -> Vec<(f32, f32)> {
-    drag.points.iter().map(|&(x, y)| (x * drag.w as f32, y * drag.h as f32)).collect()
-}
-
-fn apply_brush_stroke(mask: &mut [u8], drag: &BrushDrag) {
-    let pts = stroke_points_px(drag);
-    if let Some(s) = brush::stroke_mask(drag.w, drag.h, &pts, drag.radius, drag.softness) {
-        brush::apply_stroke(mask, drag.w, drag.h, &s, drag.add);
-    }
-}
-
-/// Base mask plus the in-progress stroke, for the live tint. The stroke is
-/// rasterized into the stroke's bbox only; the base copy is one memcpy.
-pub(crate) fn brush_live_mask(drag: &BrushDrag) -> Vec<u8> {
-    let mut mask = (*drag.base).clone();
-    apply_brush_stroke(&mut mask, drag);
-    mask
-}
-
 pub(crate) fn brush_begin(state: AppState, nx: f32, ny: f32) -> Option<BrushDrag> {
     let item = state.current()?;
     if item.kind != MediaKind::Photo {
         return None;
     }
     let (w, h) = brush_dims(&item)?;
+    let (vw, vh) = brush_view_dims(&item)?;
     let target = brush_target(state, &item);
-    let base = brush_base_mask(&item, target, w, h);
+    let base = Rc::new(brush_base_mask(&item, target, w, h));
+    let view_base = Rc::new(brush_base_mask(&item, target, vw, vh));
+    let size = state.brush_size.get_untracked();
     let diag = ((w * w + h * h) as f32).sqrt();
-    let radius = (state.brush_size.get_untracked() * diag * 0.5).max(0.5);
+    let radius = (size * diag * 0.5).max(0.5);
+    let view_diag = ((vw * vw + vh * vh) as f32).sqrt();
+    let view_radius = (size * view_diag * 0.5).max(0.5);
+    let softness = state.brush_softness.get_untracked().clamp(0.0, 1.0);
+    let add = !state.brush_remove.get_untracked();
+    let live = brush::LiveStroke::new(w, h, base.clone(), radius, softness, add, (nx * w as f32, ny * h as f32));
+    let view_live =
+        brush::LiveStroke::new(vw, vh, view_base.clone(), view_radius, softness, add, (nx * vw as f32, ny * vh as f32));
     Some(BrushDrag {
         item_id: item.id,
         target,
         w,
         h,
-        base: Rc::new(base),
-        points: vec![(nx, ny)],
-        radius,
-        softness: state.brush_softness.get_untracked().clamp(0.0, 1.0),
-        add: !state.brush_remove.get_untracked(),
+        base,
+        live: Rc::new(RefCell::new(live)),
+        view_w: vw,
+        view_h: vh,
+        view_base,
+        view_live: Rc::new(RefCell::new(view_live)),
+        tint: Rc::new(RefCell::new(None)),
     })
 }
 
@@ -1091,44 +1176,48 @@ pub(crate) fn brush_commit(state: AppState, drag: BrushDrag) {
     if item.id != drag.item_id || item.kind != MediaKind::Photo {
         return;
     }
-    let mut after = (*drag.base).clone();
-    apply_brush_stroke(&mut after, &drag);
-    if after == *drag.base {
-        return;
-    }
+    let (after, changed) = { drag.live.borrow_mut().finish() };
+    let Some(b) = changed else { return };
     let base: &[u8] = &drag.base;
-    let (mut x0, mut y0) = (drag.w, drag.h);
-    let (mut x1, mut y1) = (0usize, 0usize);
-    for y in 0..drag.h {
-        let row = y * drag.w;
-        for x in 0..drag.w {
-            if base[row + x] != after[row + x] {
-                x0 = x0.min(x);
-                y0 = y0.min(y);
-                x1 = x1.max(x);
-                y1 = y1.max(y);
-            }
-        }
-    }
-    if x1 < x0 || y1 < y0 {
-        return;
-    }
-    let pw = x1 - x0 + 1;
-    let ph = y1 - y0 + 1;
     let patch = MaskPatch {
-        x: x0,
-        y: y0,
-        w: pw,
-        h: ph,
-        before: copy_rect(base, drag.w, x0, y0, pw, ph),
-        after: copy_rect(&after, drag.w, x0, y0, pw, ph),
+        x: b.x,
+        y: b.y,
+        w: b.w,
+        h: b.h,
+        before: copy_rect(base, drag.w, b.x, b.y, b.w, b.h),
+        after: copy_rect(&after, drag.w, b.x, b.y, b.w, b.h),
     };
     if !brush_store(state, drag.item_id, drag.target, after, drag.w, drag.h) {
         return;
     }
+    let op = if drag.target == BrushTarget::Global
+        && state.subject_photo.get_untracked() == Some(drag.item_id)
+    {
+        let live = drag.live.borrow();
+        let diag = ((drag.w * drag.w + drag.h * drag.h) as f32).sqrt();
+        Some(GlobalBrushOp {
+            points: live
+                .points()
+                .iter()
+                .map(|&(x, y)| (x / drag.w as f32, y / drag.h as f32))
+                .collect(),
+            size: live.radius() * 2.0 / diag,
+            softness: live.softness(),
+            add: live.add(),
+        })
+    } else {
+        None
+    };
     push_brush_step(
         state,
-        BrushStep { item_id: drag.item_id, target: drag.target, w: drag.w, h: drag.h, patches: vec![patch] },
+        BrushStep {
+            item_id: drag.item_id,
+            target: drag.target,
+            w: drag.w,
+            h: drag.h,
+            patches: vec![patch],
+            op,
+        },
     );
 }
 
@@ -1228,6 +1317,13 @@ fn brush_history_step(state: AppState, undo: bool) -> bool {
         invalidate_brush_history(state);
         return false;
     }
+    match (undo, &step.op) {
+        (true, Some(_)) => pop_subject_brush_op(step.item_id),
+        (false, Some(op)) if state.subject_photo.get_untracked() == Some(step.item_id) => {
+            push_subject_brush_op(step.item_id, op.clone());
+        }
+        _ => {}
+    }
     state.brush_history.update(|h| {
         if undo {
             if let Some(s) = h.undo.pop() {
@@ -1321,7 +1417,9 @@ fn subject_run(state: AppState, make_op: impl FnOnce(usize, usize) -> JsValue + 
         state.progress.set(0.0);
         match res {
             Ok(m) if m.width > 0 && m.height > 0 && m.mask.len() == m.width * m.height => {
-                let set = m.mask.iter().filter(|&&v| v > 0).count();
+                let mut mask = m.mask;
+                replay_subject_brush_ops(item.id, &mut mask, m.width, m.height);
+                let set = mask.iter().filter(|&&v| v > 0).count();
                 web::log(&format!(
                     "subject mask iou={:.3} crop={} {}x{} set={}",
                     m.iou, m.used_crop, m.width, m.height, set
@@ -1329,7 +1427,7 @@ fn subject_run(state: AppState, make_op: impl FnOnce(usize, usize) -> JsValue + 
                 state.update_current(|e| {
                     e.selection = Some(state::Selection {
                         kind: state::SelectionKind::Mask {
-                            data: Rc::new(m.mask),
+                            data: Rc::new(mask),
                             width: m.width,
                             height: m.height,
                         },

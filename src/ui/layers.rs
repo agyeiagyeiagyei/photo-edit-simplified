@@ -11,6 +11,7 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
             ensure_fonts();
         }
         let mut new_id = None;
+        let mut took_selection = false;
         state.update_current_item(|m| {
             let id = m.next_layer_id;
             m.next_layer_id += 1;
@@ -34,6 +35,7 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
             if kind == "adjust-sel" {
                 if let (LayerKind::Adjust(a), Some(sel)) = (&mut layer.kind, m.edit.selection.take()) {
                     a.set_mask(Some(sel));
+                    took_selection = true;
                 }
             }
             match &layer.kind {
@@ -42,6 +44,10 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
             }
             new_id = Some(id);
         });
+        if took_selection {
+            state.subject_photo.set(None);
+            clear_subject_brush_ops(state);
+        }
         if let Some(id) = new_id {
             state.selected_layer.set(Some(id));
             state.selected_tool.set(match kind {
@@ -332,13 +338,19 @@ pub(crate) fn AdjustLayerEditor(state: AppState, layer_id: usize) -> impl IntoVi
     };
 
     let take_selection = move |_| {
+        let mut took = false;
         state.update_current_item(|m| {
             let Some(l) = m.layers.iter_mut().find(|l| l.id == layer_id) else { return };
             let Some(sel) = m.edit.selection.take() else { return };
             if let LayerKind::Adjust(a) = &mut l.kind {
                 a.set_mask(Some(sel));
+                took = true;
             }
         });
+        if took {
+            state.subject_photo.set(None);
+            clear_subject_brush_ops(state);
+        }
     };
 
     let feather = move || {

@@ -201,6 +201,8 @@ async function selectRect(page: Page) {
 
 const addAdjust = (page: Page) =>
   page.locator('button.btn', { hasText: /＋ Adjust\s*$/ });
+const addAdjustFromSel = (page: Page) =>
+  page.locator('button.btn', { hasText: /＋ Adjust from sel\./ });
 
 async function exportPng(page: Page): Promise<Buffer> {
   await clickTab(page, 'Export');
@@ -210,6 +212,73 @@ async function exportPng(page: Page): Promise<Buffer> {
     page.locator('button.btn.primary', { hasText: 'Download this' }).click(),
   ]);
   return fs.readFileSync((await dl.path())!);
+}
+
+/** Signed luminance delta (a - b) along one scanline of two PNGs, as a strip. */
+async function stripDelta(
+  page: Page,
+  a: Buffer,
+  b: Buffer,
+  yFrac: number,
+  x0Frac: number,
+  x1Frac: number,
+): Promise<number[]> {
+  // Cross-origin on purpose: the app's service worker passes non-same-origin
+  // requests straight through, and page.route cannot intercept fetches the
+  // worker handles.
+  const cors = { 'access-control-allow-origin': '*' };
+  const urlA = 'http://edge.test/__edge-a.png';
+  const urlB = 'http://edge.test/__edge-b.png';
+  await page.route(urlA, (r) => r.fulfill({ body: a, contentType: 'image/png', headers: cors }));
+  await page.route(urlB, (r) => r.fulfill({ body: b, contentType: 'image/png', headers: cors }));
+  try {
+    return await page.evaluate(async ({ yFrac, x0Frac, x1Frac, urlA, urlB }) => {
+      const load = async (u: string) => createImageBitmap(await (await fetch(u)).blob());
+      const [ia, ib] = await Promise.all([load(urlA), load(urlB)]);
+      const X0 = Math.floor(ia.width * x0Frac);
+      const X1 = Math.ceil(ia.width * x1Frac);
+      const Y = Math.floor(ia.height * yFrac);
+      const w = X1 - X0;
+      const c = document.createElement('canvas');
+      c.width = w;
+      c.height = 1;
+      const ctx = c.getContext('2d', { willReadFrequently: true })!;
+      const row = (img: ImageBitmap) => {
+        ctx.clearRect(0, 0, w, 1);
+        ctx.drawImage(img, X0, Y, w, 1, 0, 0, w, 1);
+        return ctx.getImageData(0, 0, w, 1).data;
+      };
+      const da = row(ia);
+      const db = row(ib);
+      ia.close();
+      ib.close();
+      const out: number[] = [];
+      for (let i = 0; i < w; i++) {
+        const j = i * 4;
+        out.push(0.2126 * (da[j] - db[j]) + 0.7152 * (da[j + 1] - db[j + 1]) + 0.0722 * (da[j + 2] - db[j + 2]));
+      }
+      return out;
+    }, { yFrac, x0Frac, x1Frac, urlA, urlB });
+  } finally {
+    await page.unroute(urlA);
+    await page.unroute(urlB);
+  }
+}
+
+/** 10%–90% width of the single step in a profile, either direction. */
+function rampWidth(profile: number[]): { ramp: number; low: number; high: number } {
+  const low = Math.min(...profile);
+  const high = Math.max(...profile);
+  const span = high - low;
+  const t10 = low + 0.1 * span;
+  const t90 = low + 0.9 * span;
+  const rising = profile[profile.length - 1] >= profile[0];
+  const start = rising ? profile.findIndex((v) => v > t10) : profile.findIndex((v) => v < t90);
+  if (start < 0) return { ramp: -1, low, high };
+  const end = rising
+    ? profile.findIndex((v, i) => i >= start && v >= t90)
+    : profile.findIndex((v, i) => i >= start && v <= t10);
+  return { ramp: end < 0 ? -1 : end - start + 1, low, high };
 }
 
 /** Downscale the stage canvas or a decoded export to a 128 px frame. */
@@ -373,6 +442,40 @@ test.describe('selection brush (issue #3)', () => {
       brush_longtasks_over_50ms: maxLongTasks.filter((v) => v > 50).length,
     });
     expect(maxLongTasks.filter((v) => v > 50), 'a brush stroke produced a main-thread long task > 50 ms').toEqual([]);
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  test('the largest soft brush stays under the long-task bar', async ({ page }, testInfo) => {
+    test.setTimeout(180_000);
+    const errors = trackErrors(page);
+    await openApp(page);
+    await importFiles(page, [PNG_SMALL]);
+    await waitSmall(page);
+
+    await selectBrush(page);
+    await setRange(page, /^Size:/, 0.3);
+    await setRange(page, /^Softness:/, 0.5);
+    await parkPointer(page);
+    await settle(page);
+    const baseline = await readCanvas(page);
+    await installLongTaskProbe(page);
+    await clearLongTasks(page);
+
+    // 30% / 50% is the QA worst case: long tasks grew along the stroke there.
+    await stroke(page, [[0.15, 0.25], [0.85, 0.25], [0.85, 0.7], [0.2, 0.7], [0.2, 0.45]], 12);
+    const tasks = await readLongTasks(page);
+    await parkPointer(page);
+    await settle(page);
+    const after = await readCanvas(page);
+    // The stroke must actually have painted (a no-op would trivially pass).
+    expect(meanDiff(baseline.bytes, after.bytes), 'the large soft stroke did not tint the canvas').toBeGreaterThan(2);
+
+    const maxLong = tasks.reduce((m, v) => Math.max(m, v), 0);
+    recordMetrics(testInfo, {
+      brush_30pct_longtask_max_ms: Math.round(maxLong * 10) / 10,
+      brush_30pct_longtasks_over_50ms: tasks.filter((v) => v > 50).length,
+    });
+    expect(tasks.filter((v) => v > 50), 'a 30%/50% brush stroke produced a main-thread long task > 50 ms').toEqual([]);
     expect(errors, errors.join('\n')).toEqual([]);
   });
 
@@ -556,6 +659,67 @@ test.describe('selection brush (issue #3)', () => {
     expect(onDelta, 'the brushed mask had no visible effect').toBeGreaterThan(2);
     expect(outsideDelta, 'the brushed mask leaked outside the stroke').toBeLessThanOrEqual(1);
     expect(db, `brushed preview vs export PSNR ${db.toFixed(2)} dB at 128 px < 30 dB`).toBeGreaterThanOrEqual(30);
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  // QA finding 4: one stroke used to bake a vector layer mask into a 1024 px
+  // raster, so the untouched far edge of the same mask softened to a ~4.9 px
+  // ramp in a 6000 px export. The committed raster is now capped at 3200 px,
+  // which keeps the export ramp near the source resolution.
+  test('a 24 MP brush stroke keeps a vector mask edge sharp in the export', async ({ page }, testInfo) => {
+    test.setTimeout(300_000);
+    const errors = trackErrors(page);
+    await openApp(page);
+    await importFiles(page, [JPEG_A]);
+    await expect.poll(() => canvasSize(page).then((s) => s.w), { timeout: 60_000 }).toBeGreaterThan(0);
+    await settle(page, 800);
+
+    // A vector lasso with a vertical right edge at x = 0.72, over the flat
+    // backdrop at y = 0.5, moved into an adjustment layer.
+    await clickTab(page, 'Select');
+    await selectChip(page, 'Lasso').click();
+    await stroke(page, [[0.2, 0.15], [0.72, 0.15], [0.72, 0.8], [0.2, 0.8]], 10);
+    await parkPointer(page);
+    await clickTab(page, 'Layers');
+    await expect(addAdjustFromSel(page)).toBeEnabled({ timeout: 10_000 });
+    await addAdjustFromSel(page).click();
+    await setRange(page, /^Brightness/, 0.3);
+    await settle(page, 800);
+
+    // A small Remove stroke inside the mask is enough to commit it; the far
+    // edge must keep the vector's sharpness through that rasterization.
+    await selectBrush(page);
+    await setRange(page, /^Size:/, 0.05);
+    await setRange(page, /^Softness:/, 0);
+    await selectChip(page, 'Remove').click();
+    await parkPointer(page);
+    await settle(page, 500);
+    await installLongTaskProbe(page);
+    await clearLongTasks(page);
+    await stroke(page, [[0.32, 0.32], [0.4, 0.37]], 6);
+    const longTasks = await readLongTasks(page);
+    await parkPointer(page);
+    await settle(page, 800);
+
+    const masked = await exportPng(page);
+    await clickTab(page, 'Layers');
+    await page.locator('.layer-row').first().locator('.icon-btn').first().click();
+    await settle(page, 600);
+    const plain = await exportPng(page);
+
+    const profile = await stripDelta(page, masked, plain, 0.5, 0.7, 0.74);
+    const { ramp, low, high } = rampWidth(profile);
+    recordMetrics(testInfo, {
+      brush_edge_ramp_px: ramp,
+      brush_edge_delta: Math.round((high - low) * 10) / 10,
+      brush_edge_longtask_max_ms:
+        Math.round(longTasks.reduce((m, v) => Math.max(m, v), 0) * 10) / 10,
+    });
+
+    expect(high - low, 'the masked layer had no visible step at the sampled edge').toBeGreaterThan(20);
+    // The 3200 px raster measures 3 px here; the old 1024 px one measured ~9.
+    expect(ramp, `export mask edge ramp ${ramp} px at 6000 px wide`).toBeLessThanOrEqual(4);
+    expect(longTasks.filter((v) => v > 50), 'the 24 MP stroke produced a main-thread long task > 50 ms').toEqual([]);
     expect(errors, errors.join('\n')).toEqual([]);
   });
 

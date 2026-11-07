@@ -123,6 +123,7 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
                         class="chip"
                         on:click=move |_| {
                             state.subject_photo.set(None);
+                            clear_subject_brush_ops(state);
                             state.update_current(|e| {
                                 e.selection = None;
                                 e.selection_rev += 1;
@@ -236,6 +237,7 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
                     class="btn"
                     on:click=move |_| {
                         state.subject_photo.set(None);
+                        clear_subject_brush_ops(state);
                         state.update_current(|e| {
                             e.selection = None;
                             e.selection_rev += 1;

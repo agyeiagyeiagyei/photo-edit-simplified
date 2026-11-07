@@ -214,9 +214,10 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         }
         let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop)).flatten() else { return };
         brush_hover.set(Some((nx, ny)));
-        let Some(Some(mut drag)) = brush_drag.try_get() else { return };
-        if drag.points.last().map(|last| dist2(*last, (nx, ny)) > 0.00005).unwrap_or(true) {
-            drag.points.push((nx, ny));
+        let Some(Some(drag)) = brush_drag.try_get() else { return };
+        let added = drag.live.borrow_mut().push_point(nx * drag.w as f32, ny * drag.h as f32);
+        drag.view_live.borrow_mut().push_point(nx * drag.view_w as f32, ny * drag.view_h as f32);
+        if added {
             brush_drag.set(Some(drag));
         }
     });
@@ -264,6 +265,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 }
             }
         };
+        clear_subject_brush_ops(state);
         state.update_current_item(|m| {
             m.edit.selection = new_sel;
             m.edit.selection_rev += 1;

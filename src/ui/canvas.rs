@@ -28,19 +28,23 @@ pub(crate) enum SelectDrag {
 }
 
 /// In-flight selection-brush stroke: the target's mask captured at
-/// pointerdown plus the pointer path in normalized working coords.
-#[derive(Clone, PartialEq, Debug)]
+/// pointerdown plus incrementally rasterized stroke state. `w`/`h` is the
+/// committed mask space (up to the 3200 px raster cap); `view_*` is the
+/// preview-resolution copy that paints the live tint, so the drag never pays
+/// for a full-resolution canvas blit.
+#[derive(Clone)]
 pub(crate) struct BrushDrag {
     pub item_id: usize,
     pub target: BrushTarget,
     pub w: usize,
     pub h: usize,
     pub base: Rc<Vec<u8>>,
-    pub points: Vec<(f32, f32)>,
-    /// Stroke radius in mask pixels.
-    pub radius: f32,
-    pub softness: f32,
-    pub add: bool,
+    pub live: Rc<RefCell<brush::LiveStroke>>,
+    pub view_w: usize,
+    pub view_h: usize,
+    pub view_base: Rc<Vec<u8>>,
+    pub view_live: Rc<RefCell<brush::LiveStroke>>,
+    pub tint: Rc<RefCell<Option<BrushTint>>>,
 }
 
 pub(crate) fn crop_is_full(c: &state::CropRect) -> bool {
@@ -240,14 +244,64 @@ pub(crate) fn draw_select_drag(ctx: &web_sys::CanvasRenderingContext2d, drag: &S
     ctx.restore();
 }
 
+/// Cached tint canvas for an in-flight stroke: the base mask is painted once,
+/// then each frame only the stroke's dirty rect is repainted.
+pub(crate) struct BrushTint {
+    canvas: web_sys::HtmlCanvasElement,
+    ctx: web_sys::CanvasRenderingContext2d,
+    rgb: [u8; 3],
+    ready: bool,
+}
+
+impl BrushTint {
+    fn new(w: usize, h: usize, rgb: [u8; 3]) -> Self {
+        let canvas = web::create_canvas(w as u32, h as u32);
+        let ctx = web::ctx2d(&canvas);
+        Self { canvas, ctx, rgb, ready: false }
+    }
+
+    /// Paint a w×h mask at (x, y) in canvas pixels.
+    fn paint_mask(&self, mask: &[u8], x: usize, y: usize, w: usize, h: usize) {
+        let mut rgba = vec![0u8; w * h * 4];
+        for (i, &m) in mask.iter().enumerate() {
+            if m == 0 {
+                continue;
+            }
+            rgba[i * 4] = self.rgb[0];
+            rgba[i * 4 + 1] = self.rgb[1];
+            rgba[i * 4 + 2] = self.rgb[2];
+            rgba[i * 4 + 3] = m / 3;
+        }
+        let arr = js_sys::Uint8ClampedArray::from(&rgba[..]);
+        if let Ok(data) = web_sys::ImageData::new_with_js_u8_clamped_array_and_sh(
+            &arr,
+            w as u32,
+            h as u32,
+        ) {
+            let _ = self.ctx.put_image_data(&data, x as f64, y as f64);
+        }
+    }
+}
+
 /// Live selection-brush tint: the captured mask plus the in-progress stroke.
 pub(crate) fn draw_brush_drag(ctx: &web_sys::CanvasRenderingContext2d, drag: &BrushDrag) {
-    let mask = brush_live_mask(drag);
     let rgb = match drag.target {
         BrushTarget::Global => [10, 132, 255],
         BrushTarget::Layer(_) => [255, 59, 48],
     };
-    paint_mask_tint(ctx, &mask, drag.w, drag.h, rgb);
+    let mut slot = drag.tint.borrow_mut();
+    let tint = slot.get_or_insert_with(|| BrushTint::new(drag.view_w, drag.view_h, rgb));
+    if !tint.ready {
+        tint.paint_mask(&drag.view_base, 0, 0, drag.view_w, drag.view_h);
+        tint.ready = true;
+    }
+    let mut live = drag.view_live.borrow_mut();
+    if let Some(r) = live.take_dirty() {
+        let mut vals = vec![0u8; r.w * r.h];
+        live.fill_live_rect(r, &mut vals);
+        tint.paint_mask(&vals, r.x, r.y, r.w, r.h);
+    }
+    let _ = ctx.draw_image_with_html_canvas_element(&tint.canvas, 0.0, 0.0);
 }
 
 /// Brush outline: a white ring with a dark backing so it reads on any photo.

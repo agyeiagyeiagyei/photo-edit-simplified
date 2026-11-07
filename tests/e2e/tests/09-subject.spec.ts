@@ -1,5 +1,7 @@
-import { test, expect } from '@playwright/test';
-import { openApp, importFiles, canvas, recordMetrics, trackErrors, JPEG_A } from './helpers';
+import { test, expect, Page } from '@playwright/test';
+import {
+  openApp, importFiles, canvas, recordMetrics, trackErrors, clickTab, setRange, JPEG_A,
+} from './helpers';
 
 // Bars (approved scope, issue #3 comment 6681440642): encode <= 6 s,
 // refine decode <= 0.5 s, worker peak <= 400 MB, tab within +50 MB of
@@ -155,5 +157,88 @@ test('subject tool segments, refines, and releases the worker', async ({ page },
   expect(peakMb, 'worker wasm peak over the 400 MB bar').toBeLessThanOrEqual(400);
   expect(deltaMb, 'tab grew more than 50 MB after closing the subject worker').toBeLessThanOrEqual(50);
   expect([...thirdParty], 'subject tool made third-party requests').toEqual([]);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+// QA finding 2: a refinement tap rebuilt the selection from the SAM mask alone
+// and silently discarded every brush stroke made on top of it.
+test('subject refinement taps keep brush strokes', async ({ page }) => {
+  test.setTimeout(300_000);
+  const errors = trackErrors(page);
+  const logs: string[] = [];
+  page.on('console', (m) => logs.push(m.text()));
+
+  await openApp(page);
+  await importFiles(page, [JPEG_A]);
+
+  const region = (x0: number, y0: number, x1: number, y1: number) =>
+    canvas(page).evaluate((c: HTMLCanvasElement, r) => {
+      const ctx = c.getContext('2d')!;
+      const d = ctx.getImageData(
+        Math.floor(c.width * r.x0),
+        Math.floor(c.height * r.y0),
+        Math.max(1, Math.floor(c.width * (r.x1 - r.x0))),
+        Math.max(1, Math.floor(c.height * (r.y1 - r.y0))),
+      ).data;
+      return Array.from(d);
+    }, { x0, y0, x1, y1 });
+  const meanDiff = (a: number[], b: number[]) => {
+    let sum = 0;
+    let n = 0;
+    for (let i = 0; i < a.length; i += 4) {
+      for (let k = 0; k < 3; k++) {
+        sum += Math.abs(a[i + k] - b[i + k]);
+        n++;
+      }
+    }
+    return sum / n;
+  };
+  // A band across the tapped subject.
+  const box: [number, number, number, number] = [0.54, 0.52, 0.64, 0.6];
+
+  await clickTab(page, 'Select');
+  await page.locator('.select-tab .chip', { hasText: /^Subject$/ }).click();
+  await page.waitForTimeout(2500);
+
+  const click = async (nx: number, ny: number) => {
+    const b = await canvas(page).boundingBox();
+    await canvas(page).click({ position: { x: b!.width * nx, y: b!.height * ny } });
+  };
+  const maskCount = () => logs.filter((l) => l.includes('subject mask')).length;
+
+  await click(0.57, 0.55);
+  await expect.poll(maskCount, { timeout: 240_000 }).toBeGreaterThan(0);
+  await expect(page.locator('.overlay')).toHaveCount(0, { timeout: 240_000 });
+  await page.waitForTimeout(1200);
+  const tinted = await region(...box);
+
+  // Carve a hard-edged hole through the subject with the selection brush.
+  await page.locator('.select-tab .chip', { hasText: /^Brush$/ }).click();
+  await setRange(page, /^Size:/, 0.15);
+  await setRange(page, /^Softness:/, 0);
+  await page.locator('.select-tab .chip', { hasText: /^Remove$/ }).click();
+  const b = await page.locator('.canvas-wrap').boundingBox();
+  await page.mouse.move(b!.x + b!.width * 0.5, b!.y + b!.height * 0.55);
+  await page.mouse.down();
+  await page.mouse.move(b!.x + b!.width * 0.66, b!.y + b!.height * 0.55, { steps: 8 });
+  await page.mouse.up();
+  await page.mouse.move(2, 2);
+  await page.waitForTimeout(600);
+  const carved = await region(...box);
+  expect(meanDiff(tinted, carved), 'Remove stroke did not clear the selection').toBeGreaterThan(2);
+
+  // A refinement tap decodes a fresh mask; the stroke must be replayed on top.
+  await page.locator('.select-tab .chip', { hasText: /^Subject$/ }).click();
+  const before = maskCount();
+  await click(0.6, 0.58);
+  await expect.poll(maskCount, { timeout: 120_000 }).toBeGreaterThan(before);
+  await expect(page.locator('.overlay')).toHaveCount(0, { timeout: 120_000 });
+  await page.mouse.move(2, 2);
+  await page.waitForTimeout(1200);
+  expect(
+    meanDiff(carved, await region(...box)),
+    'subject tap re-tinted the area the brush had removed',
+  ).toBeLessThan(2);
+
   expect(errors, errors.join('\n')).toEqual([]);
 });
