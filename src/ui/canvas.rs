@@ -237,6 +237,10 @@ struct RingBackup {
     y: f64,
 }
 
+/// How far `draw_brush_outline`'s dark backing stroke reaches past the radius:
+/// stroked at radius + 1 with a line width of 2.
+const BRUSH_RING_OVERHANG: f64 = 2.0;
+
 thread_local! {
     static RING_BACKUP: RefCell<Option<(RingBackup, web_sys::HtmlCanvasElement)>> =
         const { RefCell::new(None) };
@@ -261,11 +265,15 @@ pub(crate) fn backup_brush_ring(
     let cy = m.b() * px + m.d() * py + m.f();
     let cw = canvas.width() as f64;
     let ch = canvas.height() as f64;
-    // +4 px: ring radius is the outer stroke edge plus antialiasing.
-    let x0 = (cx - radius * sx - 4.0).floor().max(0.0);
-    let y0 = (cy - radius * sy - 4.0).floor().max(0.0);
-    let x1 = (cx + radius * sx + 4.0).ceil().min(cw);
-    let y1 = (cy + radius * sy + 4.0).ceil().min(ch);
+    // The ring's outer edge overhangs `radius` in overlay units, which scale
+    // with the transform; a fixed device margin clips it on a hi-res frame and
+    // leaves its extremes behind as ticks. +2 px: antialiasing.
+    let rx = (radius + BRUSH_RING_OVERHANG) * sx + 2.0;
+    let ry = (radius + BRUSH_RING_OVERHANG) * sy + 2.0;
+    let x0 = (cx - rx).floor().max(0.0);
+    let y0 = (cy - ry).floor().max(0.0);
+    let x1 = (cx + rx).ceil().min(cw);
+    let y1 = (cy + ry).ceil().min(ch);
     if x1 - x0 < 1.0 || y1 - y0 < 1.0 {
         RING_BACKUP.with(|b| *b.borrow_mut() = None);
         return;
@@ -377,6 +385,9 @@ pub(crate) fn draw_brush_hover_incremental(
         viewport_gen,
     );
     draw_brush_outline(&ctx, nx, ny, radius, w, h);
+    // A full paint can reuse this context without resizing the canvas (the GPU
+    // path does), and it draws the photo assuming the identity transform.
+    let _ = ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
     true
 }
 
@@ -464,10 +475,13 @@ pub(crate) fn draw_brush_drag_incremental(
     let [a, b, c, d, e, f] = frame.xf;
     if !tint.base_blitted {
         if drag.base_blit {
-            // The committed selection was a vector outline; bake its mask in
-            // now, bounded to its coverage.
+            // The committed selection was a vector outline. It is on the canvas
+            // but not in the mask, and the commit skips its repaint, so take it
+            // off here; then bake the mask in, bounded to its coverage.
+            let _s = perf::Span::new("brush.drag.base_blit");
+            let _ = ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+            let _ = ctx.draw_image_with_html_canvas_element(&base, 0.0, 0.0);
             if let Some((x, y, w, h)) = drag.base_bbox {
-                let _s = perf::Span::new("brush.drag.base_blit");
                 let _ = ctx.set_transform(a, b, c, d, e, f);
                 let _ = ctx.draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
                     &tint.canvas,
