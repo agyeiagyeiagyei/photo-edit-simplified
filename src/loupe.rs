@@ -753,7 +753,7 @@ pub(crate) fn CanvasLoupe(
                 if let Ok(r) = reply {
                     let hi_canvas = web::create_canvas(r.w, r.h);
                     web::put_pixels_view(&hi_canvas, &r.pixels, r.w, r.h);
-                    composite_layers(&hi_canvas, &item_cb.layers, r.w as usize, r.h as usize);
+                    composite_layers(&hi_canvas, id, &item_cb.layers, r.w as usize, r.h as usize);
                     CANVAS_LOUPE_HI.with(|c| {
                         *c.borrow_mut() = Some(HiCache {
                             item_id: id,

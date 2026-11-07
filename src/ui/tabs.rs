@@ -197,9 +197,24 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
                 <p class="dim">
                     {move || {
                         state.selected_layer.track();
-                        match state.current().map(|m| brush_target(state, &m)) {
-                            Some(BrushTarget::Layer(_)) => "Brush edits the selected adjustment layer's mask (red tint).",
-                            _ => "Brush edits the global selection (blue tint).",
+                        state.mask_target.track();
+                        let Some(item) = state.current() else {
+                            return "Brush edits the global selection (blue tint).";
+                        };
+                        match brush_target(state, &item) {
+                            BrushTarget::Layer(id) => {
+                                let adjust = item
+                                    .layers
+                                    .iter()
+                                    .find(|l| l.id == id)
+                                    .is_some_and(|l| matches!(l.kind, LayerKind::Adjust(_)));
+                                if adjust {
+                                    "Brush edits the selected adjustment layer's mask (red tint)."
+                                } else {
+                                    "Brush edits the selected layer's mask (red tint)."
+                                }
+                            }
+                            BrushTarget::Global => "Brush edits the global selection (blue tint).",
                         }
                     }}
                 </p>
