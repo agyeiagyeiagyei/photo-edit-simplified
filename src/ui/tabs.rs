@@ -312,6 +312,22 @@ pub(crate) fn RotateTab(state: AppState) -> impl IntoView {
 
 #[component]
 pub(crate) fn ColorTab(state: AppState) -> impl IntoView {
+    // With an adjustment layer selected the tab edits that layer. The memo
+    // changes only when the selection does, so a slider drag never remounts
+    // the controls under the pointer.
+    let adjust_id = selected_adjust_memo(state);
+    move || match adjust_id.get() {
+        Some(id) => view! {
+            <AdjustColorControls state=state layer_id=id/>
+            <p class="dim">"Blur and grain apply to the photo only. This layer's mask is on the Layers tab."</p>
+        }
+        .into_view(),
+        None => view! { <PhotoColorControls state=state/> }.into_view(),
+    }
+}
+
+#[component]
+fn PhotoColorControls(state: AppState) -> impl IntoView {
     let channel = create_rw_signal(0usize); // 0=RGB, 1=R, 2=G, 3=B, shared by Levels + Curves
     let slider = move |label: &'static str,
                        get: fn(&EditParams) -> f32,

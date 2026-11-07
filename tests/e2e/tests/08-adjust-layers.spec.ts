@@ -610,7 +610,18 @@ test.describe('adjustment layers (issue #26)', () => {
     await rectDrag(page, 0.2, 0.2, 0.6, 0.6);
     await clickTab(page, 'Layers');
     await addAdjustFromSel(page).click();
-    expect(await labels()).toEqual(['Adjust 3 · masked', 'Adjust 1', 'Adjust 2']);
+    expect(await labels()).toEqual(['Adjust 3', 'Adjust 1', 'Adjust 2']);
+    // The masked row shows its mask: white inside the rect, black outside.
+    const thumb = page.locator('.layer-row').first().locator('canvas.mask-thumb');
+    await expect(thumb).toHaveCount(1);
+    await expect(page.locator('.layer-row').nth(1).locator('canvas.mask-thumb')).toHaveCount(0);
+    const lum = await thumb.evaluate((c: HTMLCanvasElement) => {
+      const x = c.getContext('2d')!;
+      const at = (fx: number, fy: number) => x.getImageData(Math.floor(c.width * fx), Math.floor(c.height * fy), 1, 1).data[0];
+      return { inside: at(0.4, 0.4), outside: at(0.9, 0.9) };
+    });
+    expect(lum.inside, 'mask thumbnail inside the rect').toBeGreaterThan(200);
+    expect(lum.outside, 'mask thumbnail outside the rect').toBeLessThan(50);
     expect(errors, errors.join('\n')).toEqual([]);
   });
 });

@@ -379,7 +379,7 @@ h1 { font-size: 17px; font-weight: 600; }
 .icon-btn:disabled { opacity: 0.3; cursor: default; }
 
 .layer-row input[type="range"] {
-  width: 60px;
+  width: 48px;
   accent-color: var(--accent);
 }
 
@@ -805,3 +805,48 @@ button:disabled {
 }
 .loupe-star.on { color: #f5c542; border-color: #f5c542; }
 .loupe-preload { display: none; }
+
+/* The photo is the bottom row of the layer list (issue #36, phase A). */
+.photo-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 6px 10px;
+  cursor: pointer;
+  user-select: none;
+  touch-action: manipulation;
+}
+.photo-row.selected { border-color: var(--accent); }
+.layer-thumb {
+  width: 28px;
+  height: 28px;
+  object-fit: cover;
+  border-radius: 4px;
+  flex: none;
+}
+.mask-thumb {
+  height: 20px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  flex: none;
+}
+.editing-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+.link-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  font-size: 13px;
+  cursor: pointer;
+  text-decoration: underline;
+}

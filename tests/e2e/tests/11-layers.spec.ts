@@ -176,3 +176,68 @@ test('arrows disable at the overlay/adjustment group boundary', async ({ page })
 
   expect(errors, errors.join('\n')).toEqual([]);
 });
+
+// Issue #36 phase A: the photo is a row, and the editing tabs say what they
+// edit. With an adjustment layer selected, Color edits that layer.
+test('the photo is the bottom row, and Color edits a selected adjustment layer', async ({ page }) => {
+  test.setTimeout(180_000);
+  const errors = trackErrors(page);
+  await openApp(page);
+  await importFiles(page, [PNG_SMALL]);
+  await page.waitForTimeout(1500);
+  const photoRow = page.locator('.layers-tab .photo-row');
+  const editing = page.locator('.editing-line');
+  const sliderSpan = (re: RegExp) => page.locator('label.slider', { hasText: re }).locator('span').first();
+
+  await clickTab(page, 'Layers');
+  await expect(photoRow).toHaveCount(1);
+  await expect(photoRow).toHaveClass(/selected/);
+  await expect(photoRow.locator('button')).toHaveCount(0);
+  await clickTab(page, 'Color');
+  await expect(editing).toHaveText('Editing: Photo');
+
+  await clickTab(page, 'Layers');
+  await addText(page, 'X', '#ff0000');
+  await page.getByRole('button', { name: /＋ Adjust\s*$/ }).click();
+  await expect(page.locator('.layer-list + .photo-row'), 'the photo must stay the bottom row').toHaveCount(1);
+  await expect(photoRow, 'the photo row must stay in view').toBeInViewport();
+  await expect(photoRow).not.toHaveClass(/selected/);
+  await expect(page.locator('.layer-row.selected .mask-thumb'), 'an unmasked layer has no mask thumbnail').toHaveCount(0);
+
+  // Color now edits the adjustment layer, by a real drag, and not the photo.
+  await clickTab(page, 'Color');
+  await expect(editing).toContainText('Editing: Adjust');
+  await snapshot(page);
+  const input = page.locator('label.slider', { hasText: /^Saturation/ }).locator('input');
+  const b = (await input.boundingBox())!;
+  await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(b.x - 10, b.y + b.height / 2, { steps: 15 });
+  await page.mouse.up();
+  await expect(sliderSpan(/^Saturation/)).toHaveText('Saturation: -100%');
+  await page.waitForTimeout(1200);
+  expect(await diffSinceSnapshot(page), 'the layer edit did not change the picture').toBeGreaterThan(50);
+  await clickTab(page, 'Layers');
+  await expect(page.locator('.adjust-editor').locator('label.slider', { hasText: /^Saturation/ }).locator('span').first())
+    .toHaveText('Saturation: -100%');
+
+  await clickTab(page, 'Color');
+  await page.locator('.editing-line button', { hasText: 'Edit the photo instead' }).click();
+  await expect(editing).toHaveText('Editing: Photo');
+  await expect(sliderSpan(/^Saturation/), 'the photo\'s own saturation must be untouched').toHaveText('Saturation: +0%');
+  await expect(page.locator('label.slider', { hasText: /^Blur/ })).toHaveCount(1);
+
+  // A tab that only edits the photo says so when a layer is selected.
+  await clickTab(page, 'Layers');
+  await page.locator('.layer-row .layer-label', { hasText: 'T: X' }).click();
+  await clickTab(page, 'Heal');
+  await expect(editing).toContainText('Editing: Photo');
+  await expect(editing).toContainText('T: X is selected, but healing works on the photo only for now.');
+
+  // Selecting the photo row clears the layer selection.
+  await clickTab(page, 'Layers');
+  await photoRow.click();
+  await expect(photoRow).toHaveClass(/selected/);
+  await expect(page.locator('.layer-row.selected')).toHaveCount(0);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
