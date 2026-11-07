@@ -6,6 +6,7 @@ export const FIX = path.resolve(__dirname, '..', 'fixtures');
 export const JPEG_A = path.join(FIX, 'bird-a-24mp.jpg');
 export const JPEG_B = path.join(FIX, 'bird-b-24mp.jpg');
 export const PNG_SMALL = path.join(FIX, 'small.png');
+export const RING = path.join(FIX, 'ring.jpg');
 export const RAW_DIR = path.resolve(__dirname, '..', '..', '..', 'dl-raw');
 export function rawFixtures(): string[] {
   if (!fs.existsSync(RAW_DIR)) return [];

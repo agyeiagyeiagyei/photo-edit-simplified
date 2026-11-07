@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline subject-segmentation QA: mirrors public/mobilesam/worker.js.
 
-Run with the QA venv (onnxruntime + pillow + numpy + scipy):
+Run with the QA venv (onnxruntime + pillow + numpy):
 
     /workspace/agent/.venv-birds/bin/python tests/e2e/subject_qa.py
 
@@ -25,7 +25,7 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 MODEL_DIR = os.path.join(ROOT, "public/models/mobilesam/v1-56663f87")
 SAM_SIZE = 1024
 MASK_MAX_EDGE = 3200
-MASK_LOGIT_THRESHOLD = 2.0
+MASK_LOGIT_THRESHOLD = 0.0  # SAM mask_threshold; mirrors worker.js
 PIXEL_MEAN = np.array([123.675, 116.28, 103.53], np.float32)
 PIXEL_STD = np.array([58.395, 57.12, 57.375], np.float32)
 
@@ -50,26 +50,6 @@ def preprocess(img, region):
     a = np.asarray(canvas, np.float32)
     a = (a - PIXEL_MEAN) / PIXEL_STD
     return np.ascontiguousarray(np.transpose(a, (2, 0, 1))[None])
-
-
-def clean_mask(mask, points, region, out_scale):
-    from scipy import ndimage
-
-    cross = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], bool)
-    mask = ndimage.binary_fill_holes(mask, structure=cross)
-    labels, _ = ndimage.label(mask, structure=cross)
-    h, w = mask.shape
-    keep = set()
-    for p in points:
-        if p["label"] != 1:
-            continue
-        x = min(w - 1, max(0, round((p["x"] - region[0]) * out_scale)))
-        y = min(h - 1, max(0, round((p["y"] - region[1]) * out_scale)))
-        if mask[y, x]:
-            keep.add(int(labels[y, x]))
-    if keep:
-        mask = np.isin(labels, list(keep))
-    return mask
 
 
 def decode(session, embedding, points, region, frame_w, frame_h):
@@ -100,8 +80,8 @@ def decode(session, embedding, points, region, frame_w, frame_h):
     plane = region_w * region_h
     logits = masks.reshape(-1)[best * plane:(best + 1) * plane]
     logits = logits.reshape(region_h, region_w)
-    cleaned = clean_mask(logits > MASK_LOGIT_THRESHOLD, points, region, out_scale)
-    region_mask = Image.fromarray((cleaned * 255).astype(np.uint8))
+    binary = logits > MASK_LOGIT_THRESHOLD
+    region_mask = Image.fromarray((binary * 255).astype(np.uint8))
     full = Image.new("L", (out_w, out_h), 0)
     full.paste(region_mask, (round(region[0] * out_scale), round(region[1] * out_scale)))
     return np.asarray(full) > 0, float(ious[0][best]), best
