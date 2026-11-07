@@ -1059,6 +1059,11 @@ pub(crate) struct GlobalBrushOp {
 thread_local! {
     static SUBJECT_BRUSH_OPS: RefCell<HashMap<usize, Vec<GlobalBrushOp>>> =
         RefCell::new(HashMap::new());
+    /// The latest decoded subject mask per photo, before any strokes. Undo and
+    /// redo rebuild from it once a refinement tap has replaced the mask their
+    /// patches were taken from.
+    static SUBJECT_DECODE: RefCell<HashMap<usize, (Vec<u8>, usize, usize)>> =
+        RefCell::new(HashMap::new());
 }
 
 fn subject_brush_ops(item_id: usize) -> Vec<GlobalBrushOp> {
@@ -1088,6 +1093,57 @@ pub(crate) fn clear_subject_brush_ops(state: AppState) {
 pub(crate) fn clear_subject_brush_ops_for(item_id: usize) {
     SUBJECT_BRUSH_OPS.with(|m| {
         m.borrow_mut().remove(&item_id);
+    });
+    SUBJECT_DECODE.with(|m| {
+        m.borrow_mut().remove(&item_id);
+    });
+}
+
+/// A tap that starts a new subject selection replaces the old one, so the
+/// strokes made on the old one go with it: no replay and no undo steps.
+fn start_new_subject_selection(state: AppState, item_id: usize) {
+    clear_subject_brush_ops_for(item_id);
+    state.brush_history.update(|h| {
+        let stale = |s: &BrushStep| s.item_id == item_id && s.target == BrushTarget::Global;
+        h.undo.retain(|s| !stale(s));
+        h.redo.retain(|s| !stale(s));
+        h.recount();
+    });
+}
+
+/// Undo or redo a subject stroke whose patches no longer match the mask because
+/// a refinement tap rebuilt it: change the replay list and rebuild from the
+/// latest decode. False when the step is not a stroke on the live subject.
+fn rederive_subject_step(state: AppState, step: &BrushStep, undo: bool) -> bool {
+    let Some(op) = &step.op else { return false };
+    if step.target != BrushTarget::Global
+        || state.subject_photo.get_untracked() != Some(step.item_id)
+    {
+        return false;
+    }
+    let Some((mut mask, w, h)) =
+        SUBJECT_DECODE.with(|m| m.borrow().get(&step.item_id).cloned())
+    else {
+        return false;
+    };
+    if undo {
+        pop_subject_brush_op(step.item_id);
+    } else {
+        push_subject_brush_op(step.item_id, op.clone());
+    }
+    replay_subject_brush_ops(step.item_id, &mut mask, w, h);
+    brush_store(state, step.item_id, BrushTarget::Global, mask, w, h)
+}
+
+fn advance_brush_history(state: AppState, undo: bool) {
+    state.brush_history.update(|h| {
+        if undo {
+            if let Some(s) = h.undo.pop() {
+                h.redo.push(s);
+            }
+        } else if let Some(s) = h.redo.pop() {
+            h.undo.push(s);
+        }
     });
 }
 
@@ -1521,6 +1577,10 @@ fn brush_history_step(state: AppState, undo: bool) -> bool {
         patch_region_matches(&current, w, p, if undo { &p.after } else { &p.before })
     });
     if !all_valid {
+        if rederive_subject_step(state, &step, undo) {
+            advance_brush_history(state, undo);
+            return true;
+        }
         invalidate_brush_history(state);
         return false;
     }
@@ -1539,15 +1599,7 @@ fn brush_history_step(state: AppState, undo: bool) -> bool {
         }
         _ => {}
     }
-    state.brush_history.update(|h| {
-        if undo {
-            if let Some(s) = h.undo.pop() {
-                h.redo.push(s);
-            }
-        } else if let Some(s) = h.redo.pop() {
-            h.undo.push(s);
-        }
-    });
+    advance_brush_history(state, undo);
     true
 }
 
@@ -1632,7 +1684,13 @@ fn subject_run(state: AppState, make_op: impl FnOnce(usize, usize) -> JsValue + 
         state.progress.set(0.0);
         match res {
             Ok(m) if m.width > 0 && m.height > 0 && m.mask.len() == m.width * m.height => {
+                if fresh {
+                    start_new_subject_selection(state, item.id);
+                }
                 let mut mask = m.mask;
+                SUBJECT_DECODE.with(|d| {
+                    d.borrow_mut().insert(item.id, (mask.clone(), m.width, m.height));
+                });
                 replay_subject_brush_ops(item.id, &mut mask, m.width, m.height);
                 let set = mask.iter().filter(|&&v| v > 0).count();
                 web::log(&format!(
