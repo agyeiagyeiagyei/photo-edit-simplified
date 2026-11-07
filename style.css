@@ -376,6 +376,7 @@ h1 { font-size: 17px; font-weight: 600; }
   touch-action: manipulation;
 }
 .icon-btn.delete { color: #ff453a; border-color: #ff453a; }
+.icon-btn:disabled { opacity: 0.3; cursor: default; }
 
 .layer-row input[type="range"] {
   width: 60px;

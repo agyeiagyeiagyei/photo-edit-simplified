@@ -246,6 +246,7 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
                                 />
                                 <button
                                     class="icon-btn"
+                                    disabled=move || !can_move_layer(&layers.get(), id, 1)
                                     on:click=move |ev| {
                                         ev.stop_propagation();
                                         move_layer(id, 1);
@@ -255,6 +256,7 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
                                 </button>
                                 <button
                                     class="icon-btn"
+                                    disabled=move || !can_move_layer(&layers.get(), id, -1)
                                     on:click=move |ev| {
                                         ev.stop_propagation();
                                         move_layer(id, -1);
@@ -302,6 +304,27 @@ fn display_layers(ls: Vec<Layer>) -> Vec<Layer> {
     let mut out: Vec<Layer> = ls[..first_adjust].iter().rev().cloned().collect();
     out.extend(ls[first_adjust..].iter().rev().cloned());
     out
+}
+
+/// Whether a layer can move `delta` slots without leaving its group. Overlays
+/// and adjustments never cross: adjustments always render under overlays, so
+/// a move across the boundary would have no visible effect.
+fn can_move_layer(ls: &[Layer], id: usize, delta: isize) -> bool {
+    let Some(i) = ls.iter().position(|l| l.id == id) else {
+        return false;
+    };
+    let is_adjust = matches!(ls[i].kind, LayerKind::Adjust(_));
+    let first_adjust = ls
+        .iter()
+        .position(|l| matches!(l.kind, LayerKind::Adjust(_)))
+        .unwrap_or(ls.len());
+    let (lo, hi) = if is_adjust {
+        (first_adjust, ls.len())
+    } else {
+        (0, first_adjust)
+    };
+    let j = i as isize + delta;
+    j >= lo as isize && j < hi as isize
 }
 
 /// Give Pen/Brush a layer to draw on: keep a compatible selection, else select

@@ -142,3 +142,37 @@ test('Pen and Brush select or create a layer and draw', async ({ page }) => {
 
   expect(errors, errors.join('\n')).toEqual([]);
 });
+
+test('arrows disable at the overlay/adjustment group boundary', async ({ page }) => {
+  test.setTimeout(120_000);
+  const errors = trackErrors(page);
+  await openApp(page);
+  await importFiles(page, [PNG_SMALL]);
+  await page.waitForTimeout(1500);
+  await clickTab(page, 'Layers');
+
+  // One text layer and one adjustment: each group has a single layer, so
+  // neither can move and both arrow pairs must look inert.
+  await addText(page, 'X', '#ff0000');
+  await page.getByRole('button', { name: '＋ Adjust', exact: true }).click();
+  await page.waitForTimeout(800);
+  const rows = page.locator('.layer-row');
+  await expect(rows).toHaveCount(2);
+  for (let i = 0; i < 2; i++) {
+    await expect(rows.nth(i).locator('button', { hasText: '↑' }), `row ${i} ↑`).toBeDisabled();
+    await expect(rows.nth(i).locator('button', { hasText: '↓' }), `row ${i} ↓`).toBeDisabled();
+  }
+
+  // A second text layer makes the overlay pair movable, but the adjustment
+  // still cannot cross the group boundary.
+  await addText(page, 'Y', '#0000ff');
+  await expect(rows).toHaveCount(3);
+  await expect(rows.nth(0).locator('button', { hasText: '↑' })).toBeDisabled();
+  await expect(rows.nth(0).locator('button', { hasText: '↓' })).toBeEnabled();
+  await expect(rows.nth(1).locator('button', { hasText: '↑' })).toBeEnabled();
+  await expect(rows.nth(1).locator('button', { hasText: '↓' })).toBeDisabled();
+  await expect(rows.nth(2).locator('button', { hasText: '↑' })).toBeDisabled();
+  await expect(rows.nth(2).locator('button', { hasText: '↓' })).toBeDisabled();
+
+  expect(errors, errors.join('\n')).toEqual([]);
+});
