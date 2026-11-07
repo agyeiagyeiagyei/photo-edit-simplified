@@ -78,7 +78,7 @@ test('the photo is the bottom row, and Color edits a selected adjustment layer',
   await expect(page.locator('.layer-list + .photo-row'), 'the photo must stay the bottom row').toHaveCount(1);
   await expect(photoRow, 'the photo row must stay in view').toBeInViewport();
   await expect(photoRow).not.toHaveClass(/selected/);
-  await expect(page.locator('.layer-row.selected .mask-thumb'), 'an unmasked layer has no mask thumbnail').toHaveCount(0);
+  await expect(page.locator('.layer-row.selected .mask-thumb.has-mask'), 'a new adjustment has no mask').toHaveCount(0);
 
   // Color now edits the adjustment layer, by a real drag, and not the photo.
   await clickTab(page, 'Color');
