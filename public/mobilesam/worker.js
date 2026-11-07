@@ -9,10 +9,10 @@ const MODEL_DIR = new URL(`../models/mobilesam/${MODEL_VERSION}/`, self.location
 const ORT_DIR = new URL('../vendor/ort/', self.location.href).href;
 const MASK_MAX_EDGE = 3200; // approved raster cap; the 1024 preview stores 1:1
 const SAM_SIZE = 1024;
-// Mask logits are post-upsampling scores, not probabilities. A 2.0 margin
-// (~0.88) drops low-confidence context (branches, perches) that the IoU head
-// still folds into the top candidate, while retaining thin subject features.
-const MASK_LOGIT_THRESHOLD = 2;
+// SAM's own mask threshold (logit 0): the approved rule (#3). A higher margin
+// trims thin features, and keeping only the tapped connected component cut
+// birds in two where a branch or wire crosses them (QA, owner photos).
+const MASK_LOGIT_THRESHOLD = 0;
 const PIXEL_MEAN = [123.675, 116.28, 103.53];
 const PIXEL_STD = [58.395, 57.12, 57.375];
 
@@ -169,67 +169,6 @@ async function encodeRegion(state, bitmap, region, report) {
   if (report) report({ phase: 'encode', loaded: 1, total: 1, ms: state.encodeMs });
 }
 
-// Fill enclosed holes (subject interiors the margin opened up) and drop
-// components no positive tap touches (branch speckles, background blobs).
-function cleanMask(mask, w, h, positives) {
-  const n = w * h;
-  const seen = new Uint8Array(n);
-  const stack = new Int32Array(n);
-  let sp = 0;
-  const push = (i) => {
-    if (!seen[i] && !mask[i]) {
-      seen[i] = 1;
-      stack[sp++] = i;
-    }
-  };
-  for (let x = 0; x < w; x++) {
-    push(x);
-    push((h - 1) * w + x);
-  }
-  for (let y = 0; y < h; y++) {
-    push(y * w);
-    push(y * w + w - 1);
-  }
-  while (sp) {
-    const i = stack[--sp];
-    const x = i % w;
-    if (x > 0) push(i - 1);
-    if (x + 1 < w) push(i + 1);
-    if (i >= w) push(i - w);
-    if (i + w < n) push(i + w);
-  }
-  for (let i = 0; i < n; i++) if (!mask[i] && !seen[i]) mask[i] = 255;
-
-  seen.fill(0);
-  let kept = 0;
-  for (const p of positives) {
-    const x = Math.min(w - 1, Math.max(0, Math.round(p.x)));
-    const y = Math.min(h - 1, Math.max(0, Math.round(p.y)));
-    const seed = y * w + x;
-    if (!mask[seed]) continue;
-    kept++;
-    sp = 0;
-    seen[seed] = 1;
-    stack[sp++] = seed;
-    while (sp) {
-      const i = stack[--sp];
-      const px = i % w;
-      const add = (j) => {
-        if (!seen[j] && mask[j]) {
-          seen[j] = 1;
-          stack[sp++] = j;
-        }
-      };
-      if (px > 0) add(i - 1);
-      if (px + 1 < w) add(i + 1);
-      if (i >= w) add(i - w);
-      if (i + w < n) add(i + w);
-    }
-  }
-  if (kept === 0) return;
-  for (let i = 0; i < n; i++) if (mask[i] && !seen[i]) mask[i] = 0;
-}
-
 async function decodePoints(state, points) {
   const t0 = performance.now();
   const { coords, labels } = mapPoints(state, points);
@@ -264,13 +203,6 @@ async function decodePoints(state, points) {
 
   const binary = new Uint8Array(plane);
   for (let i = 0; i < plane; i++) binary[i] = logits[i] > MASK_LOGIT_THRESHOLD ? 255 : 0;
-  const positives = points
-    .filter((p) => p.label === 1)
-    .map((p) => ({
-      x: (p.x - state.region.x) * outScale,
-      y: (p.y - state.region.y) * outScale,
-    }));
-  cleanMask(binary, regionW, regionH, positives);
 
   const regionMask = new Uint8ClampedArray(plane * 4);
   for (let i = 0; i < plane; i++) {

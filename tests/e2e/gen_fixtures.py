@@ -47,4 +47,25 @@ b = make(1500, 1000, 2, 90).resize((6000, 4000), Image.BICUBIC)
 b.save(f"{out}/bird-b-24mp.jpg", quality=92, subsampling=0, exif=exif_for("2026:05:01 06:13:30", "ILCE-6400"))
 c = make(400, 300, 3, 160).resize((800, 600), Image.BICUBIC)
 c.save(f"{out}/small.png")
+
+
+def ring(path):
+    """Subject-tool fixture: a textured orange ring on grey noise (1536x1024).
+    SAM selects the ring (or the whole disc); a negative tap in the middle must
+    leave the middle unselected, so enclosed holes cannot be refilled."""
+    from PIL import ImageChops, ImageFilter
+    random.seed(7)
+    w, h = 1536, 1024
+    noise = Image.frombytes("L", (w, h), random.randbytes(w * h))
+    bg = Image.blend(Image.new("L", (w, h), 120), noise, 0.15).convert("RGB")
+    fg = ImageChops.multiply(Image.new("RGB", (w, h), (215, 130, 45)),
+                             Image.blend(Image.new("L", (w, h), 235), noise, 0.2).convert("RGB"))
+    m = Image.new("L", (w, h), 0)
+    d = ImageDraw.Draw(m)
+    d.ellipse((768 - 330, 512 - 330, 768 + 330, 512 + 330), fill=255)
+    d.ellipse((768 - 170, 512 - 170, 768 + 170, 512 + 170), fill=0)
+    Image.composite(fg, bg, m).filter(ImageFilter.GaussianBlur(1.2)).save(path, quality=92)
+
+
+ring(f"{out}/ring.jpg")
 print("ok")
