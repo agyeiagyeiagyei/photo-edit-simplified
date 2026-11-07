@@ -570,22 +570,23 @@ pub fn layers_json(layers: &[Layer]) -> Option<String> {
                     ",\"t\":\"adjust\",\"adj\":{}",
                     pes_pixel::recipe::point_adjust_json(&a.adjust)
                 ));
-                if a.invert {
-                    out.push_str(",\"inv\":true");
-                }
-                if a.show_mask {
-                    out.push_str(",\"sm\":true");
-                }
-                if a.mask_version != 0 {
-                    out.push_str(&format!(",\"mv\":{}", a.mask_version));
-                }
-                if let Some(m) = &a.mask {
-                    out.push_str(&format!(
-                        ",\"mask\":{}",
-                        pes_pixel::recipe::selection_portable_json(m)
-                    ));
-                }
             }
+        }
+        // Mask fields are generic: every layer kind carries them.
+        if l.invert {
+            out.push_str(",\"inv\":true");
+        }
+        if l.show_mask {
+            out.push_str(",\"sm\":true");
+        }
+        if l.mask_version != 0 {
+            out.push_str(&format!(",\"mv\":{}", l.mask_version));
+        }
+        if let Some(m) = &l.mask {
+            out.push_str(&format!(
+                ",\"mask\":{}",
+                pes_pixel::recipe::selection_portable_json(m)
+            ));
         }
         out.push('}');
     }
@@ -714,15 +715,20 @@ pub fn layers_from_json(json: &str) -> Vec<Layer> {
                 adjust: crate::state::jget(&lv, "adj")
                     .map(|a| pes_pixel::recipe::point_adjust_from_json(&a))
                     .unwrap_or_default(),
-                mask: crate::state::jget(&lv, "mask")
-                    .and_then(|m| pes_pixel::recipe::selection_from_layer_value(&m)),
-                invert: crate::state::jbool(&lv, "inv").unwrap_or(false),
-                show_mask: crate::state::jbool(&lv, "sm").unwrap_or(false),
-                mask_version: crate::state::jnum(&lv, "mv").unwrap_or(0.0) as u64,
             }),
             _ => continue,
         };
-        out.push(Layer { id, visible, opacity, kind });
+        out.push(Layer {
+            id,
+            visible,
+            opacity,
+            mask: crate::state::jget(&lv, "mask")
+                .and_then(|m| pes_pixel::recipe::selection_from_layer_value(&m)),
+            invert: crate::state::jbool(&lv, "inv").unwrap_or(false),
+            show_mask: crate::state::jbool(&lv, "sm").unwrap_or(false),
+            mask_version: crate::state::jnum(&lv, "mv").unwrap_or(0.0) as u64,
+            kind,
+        });
     }
     out
 }

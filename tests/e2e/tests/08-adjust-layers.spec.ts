@@ -610,7 +610,7 @@ test.describe('adjustment layers (issue #26)', () => {
     await rectDrag(page, 0.2, 0.2, 0.6, 0.6);
     await clickTab(page, 'Layers');
     await addAdjustFromSel(page).click();
-    expect(await labels()).toEqual(['Adjust 3 · masked', 'Adjust 1', 'Adjust 2']);
+    expect(await labels()).toEqual(['Adjust 3', 'Adjust 1', 'Adjust 2']);
     expect(errors, errors.join('\n')).toEqual([]);
   });
 });
