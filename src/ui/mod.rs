@@ -346,7 +346,10 @@ pub(crate) fn ToolBar(state: AppState) -> impl IntoView {
                     <button
                         class="chip"
                         class:active=move || state.selected_tool.get() == t
-                        on:click=move |_| state.selected_tool.set(t)
+                        on:click=move |_| {
+                            ensure_tool_layer(state, t);
+                            state.selected_tool.set(t);
+                        }
                     >
                         {t.label()}
                     </button>

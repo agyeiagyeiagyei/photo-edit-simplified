@@ -352,10 +352,11 @@ test.describe('adjustment layers (issue #26)', () => {
     await clickTab(page, 'Layers');
     await expect(page.locator('.layer-row')).toHaveCount(2);
     // Click the label, not the row: the row's centre is its opacity slider.
+    // The panel lists the topmost layer first: the lasso layer was added last.
     await page.locator('.layer-row').first().locator('.layer-label').click();
-    expect(await layerSliderValue(page, 0), 'rect layer brightness lost on reload').toBeCloseTo(0.45, 2);
-    await page.locator('.layer-row').nth(1).locator('.layer-label').click();
     expect(await layerSliderValue(page, 2), 'lasso layer saturation lost on reload').toBeCloseTo(-0.8, 2);
+    await page.locator('.layer-row').nth(1).locator('.layer-label').click();
+    expect(await layerSliderValue(page, 0), 'rect layer brightness lost on reload').toBeCloseTo(0.45, 2);
 
     const reloadMean = meanDiff(masked.bytes, restored.bytes);
     recordMetrics(testInfo, {
@@ -412,7 +413,7 @@ test.describe('adjustment layers (issue #26)', () => {
     const editDelta = meanDiff(exportA.bytes, exportB.bytes);
     expect(editDelta, 'layer edit did not change the export').toBeGreaterThan(1);
 
-    // Move the bottom layer up one slot; the point ops do not commute.
+    // Move the top layer down one slot; the point ops do not commute.
     await clickTab(page, 'Layers');
     blits = await markCount(page, 'hi.blit');
     await page.locator('.layer-row').first().locator('button.icon-btn', { hasText: '↓' }).click();

@@ -111,6 +111,10 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
     };
 
     let layers = create_memo(move |_| state.current_layers());
+    // The stack is bottom-up, but a layers panel reads top-down: show the
+    // topmost layer first, within each group. Adjustments stay in their own
+    // group below the overlays.
+    let display = create_memo(move |_| display_layers(layers.get()));
     let is_photo = move || state.current().map(|m| m.kind == MediaKind::Photo).unwrap_or(false);
     let has_selection = move || state.current().map(|m| m.edit.selection.is_some()).unwrap_or(false);
 
@@ -177,7 +181,7 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
             </div>
             <div class="layer-list">
                 <For
-                    each=move || layers.get()
+                    each=move || display.get()
                     key=|l| l.id
                     children=move |l: Layer| {
                         let id = l.id;
@@ -186,7 +190,7 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
                         });
                         let is_selected = move || state.selected_layer.get() == Some(id);
                         let first_adjust = move || {
-                            let ls = layers.get();
+                            let ls = display.get();
                             let is_adjust = ls
                                 .iter()
                                 .find(|l| l.id == id)
@@ -244,7 +248,7 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
                                     class="icon-btn"
                                     on:click=move |ev| {
                                         ev.stop_propagation();
-                                        move_layer(id, -1);
+                                        move_layer(id, 1);
                                     }
                                 >
                                     "↑"
@@ -253,7 +257,7 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
                                     class="icon-btn"
                                     on:click=move |ev| {
                                         ev.stop_propagation();
-                                        move_layer(id, 1);
+                                        move_layer(id, -1);
                                     }
                                 >
                                     "↓"
@@ -285,6 +289,60 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
             <BrushLayerEditor state=state/>
             <RasterLayerEditor state=state/>
         </div>
+    }
+}
+
+/// Panel order: topmost first inside each group. The stack itself is bottom-up
+/// (index 0 composites first), so both groups are reversed for display.
+fn display_layers(ls: Vec<Layer>) -> Vec<Layer> {
+    let first_adjust = ls
+        .iter()
+        .position(|l| matches!(l.kind, LayerKind::Adjust(_)))
+        .unwrap_or(ls.len());
+    let mut out: Vec<Layer> = ls[..first_adjust].iter().rev().cloned().collect();
+    out.extend(ls[first_adjust..].iter().rev().cloned());
+    out
+}
+
+/// Give Pen/Brush a layer to draw on: keep a compatible selection, else select
+/// the topmost compatible layer, else create one on top of the overlay group.
+pub(crate) fn ensure_tool_layer(state: AppState, tool: Tool) {
+    if !matches!(tool, Tool::Pen | Tool::Brush) {
+        return;
+    }
+    let matching = |l: &Layer| {
+        matches!(
+            (tool, &l.kind),
+            (Tool::Pen, LayerKind::Path(_)) | (Tool::Brush, LayerKind::Brush(_))
+        )
+    };
+    let Some(item) = state.current() else { return };
+    let selected_matches = state
+        .selected_layer
+        .get_untracked()
+        .and_then(|id| item.layers.iter().find(|l| l.id == id))
+        .map(matching)
+        .unwrap_or(false);
+    if selected_matches {
+        return;
+    }
+    if let Some(id) = item.layers.iter().rev().find(|l| matching(l)).map(|l| l.id) {
+        state.selected_layer.set(Some(id));
+        return;
+    }
+    let mut new_id = None;
+    state.update_current_item(|m| {
+        let id = m.next_layer_id;
+        m.next_layer_id += 1;
+        let layer = match tool {
+            Tool::Pen => Layer::new_path(id),
+            _ => Layer::new_brush(id),
+        };
+        state::insert_overlay(&mut m.layers, layer);
+        new_id = Some(id);
+    });
+    if let Some(id) = new_id {
+        state.selected_layer.set(Some(id));
     }
 }
 
