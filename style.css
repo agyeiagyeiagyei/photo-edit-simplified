@@ -378,6 +378,22 @@ h1 { font-size: 17px; font-weight: 600; }
 .icon-btn.delete { color: #ff453a; border-color: #ff453a; }
 .icon-btn:disabled { opacity: 0.3; cursor: default; }
 
+.icon-btn.mask-thumb {
+  padding: 1px;
+  width: 28px;
+  height: 22px;
+  overflow: hidden;
+}
+.icon-btn.mask-thumb canvas {
+  display: block;
+  width: 24px;
+  height: 18px;
+  border-radius: 4px;
+  background: repeating-conic-gradient(#3a3a3c 0% 25%, #2c2c2e 0% 50%) 50% / 6px 6px;
+}
+.icon-btn.mask-thumb.has-mask { border-color: var(--accent); }
+.icon-btn.mask-thumb.targeted { box-shadow: 0 0 0 2px var(--accent); }
+
 .layer-row input[type="range"] {
   width: 48px;
   accent-color: var(--accent);
@@ -825,12 +841,6 @@ button:disabled {
   height: 28px;
   object-fit: cover;
   border-radius: 4px;
-  flex: none;
-}
-.mask-thumb {
-  height: 20px;
-  border: 1px solid var(--border);
-  border-radius: 3px;
   flex: none;
 }
 .editing-line {

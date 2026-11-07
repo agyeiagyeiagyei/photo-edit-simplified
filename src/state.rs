@@ -236,35 +236,16 @@ impl Default for BrushLayer {
     }
 }
 
-/// A non-destructive colour adjustment with its own mask, living in the layer
-/// stack. The mask selection is in working-image coordinates, the same frame
-/// the global selection uses.
+/// A non-destructive colour adjustment living in the layer stack. Its mask is
+/// stored on the `Layer` itself, shared with every other layer kind.
 #[derive(Clone, PartialEq, Debug)]
 pub struct AdjustLayerState {
     pub adjust: PointAdjust,
-    pub mask: Option<Selection>,
-    pub invert: bool,
-    /// Editor-only: paint the mask over the preview. Never rendered/exported.
-    pub show_mask: bool,
-    /// Bumped whenever mask bytes or feather change, so the worker's raster
-    /// cache for `(item, layer)` is replaced instead of reused.
-    pub mask_version: u64,
 }
 
 impl AdjustLayerState {
     pub fn new() -> Self {
-        AdjustLayerState {
-            adjust: PointAdjust::default(),
-            mask: None,
-            invert: false,
-            show_mask: false,
-            mask_version: 0,
-        }
-    }
-
-    pub fn set_mask(&mut self, mask: Option<Selection>) {
-        self.mask = mask;
-        self.mask_version += 1;
+        AdjustLayerState { adjust: PointAdjust::default() }
     }
 }
 
@@ -303,53 +284,62 @@ pub struct Layer {
     pub id: usize,
     pub visible: bool,
     pub opacity: f32,
+    /// Shared by every layer kind. Adjustment masks route to the worker;
+    /// overlay masks are applied when the layer is composited.
+    pub mask: Option<Selection>,
+    pub invert: bool,
+    pub show_mask: bool,
+    pub mask_version: u64,
     pub kind: LayerKind,
 }
 
 impl Layer {
-    pub fn new_text(id: usize) -> Self {
+    fn blank(id: usize, kind: LayerKind) -> Self {
         Layer {
             id,
             visible: true,
             opacity: 1.0,
-            kind: LayerKind::Text(TextLayer::default()),
+            mask: None,
+            invert: false,
+            show_mask: false,
+            mask_version: 0,
+            kind,
         }
+    }
+
+    pub fn new_text(id: usize) -> Self {
+        Layer::blank(id, LayerKind::Text(TextLayer::default()))
     }
 
     pub fn new_path(id: usize) -> Self {
-        Layer {
-            id,
-            visible: true,
-            opacity: 1.0,
-            kind: LayerKind::Path(PathLayer::default()),
-        }
+        Layer::blank(id, LayerKind::Path(PathLayer::default()))
     }
 
     pub fn new_brush(id: usize) -> Self {
-        Layer {
-            id,
-            visible: true,
-            opacity: 1.0,
-            kind: LayerKind::Brush(BrushLayer::default()),
-        }
+        Layer::blank(id, LayerKind::Brush(BrushLayer::default()))
     }
 
     pub fn new_raster(id: usize, pixels: Vec<u8>, width: usize, height: usize) -> Self {
-        Layer {
+        Layer::blank(
             id,
-            visible: true,
-            opacity: 1.0,
-            kind: LayerKind::Raster(RasterLayer { pixels: Rc::new(pixels), width, height, x: 0.5, y: 0.5, scale: 1.0 }),
-        }
+            LayerKind::Raster(RasterLayer {
+                pixels: Rc::new(pixels),
+                width,
+                height,
+                x: 0.5,
+                y: 0.5,
+                scale: 1.0,
+            }),
+        )
     }
 
     pub fn new_adjust(id: usize) -> Self {
-        Layer {
-            id,
-            visible: true,
-            opacity: 1.0,
-            kind: LayerKind::Adjust(AdjustLayerState::new()),
-        }
+        Layer::blank(id, LayerKind::Adjust(AdjustLayerState::new()))
+    }
+
+    pub fn set_mask(&mut self, mask: Option<Selection>) {
+        self.mask = mask;
+        self.mask_version += 1;
     }
 
     pub fn label(&self) -> String {
@@ -375,9 +365,9 @@ pub fn adjust_layers_from_stack(layers: &[Layer]) -> Vec<AdjustLayer> {
                 id: l.id as u64,
                 visible: l.visible,
                 opacity: l.opacity,
-                mask: a.mask.clone(),
-                invert: a.invert,
-                mask_version: a.mask_version,
+                mask: l.mask.clone(),
+                invert: l.invert,
+                mask_version: l.mask_version,
                 adjust: a.adjust.clone(),
             }),
             _ => None,
@@ -426,13 +416,11 @@ pub fn migrate_adjust_layers(
             id,
             visible: al.visible,
             opacity: al.opacity,
-            kind: LayerKind::Adjust(AdjustLayerState {
-                adjust: al.adjust,
-                mask: al.mask,
-                invert: al.invert,
-                show_mask: false,
-                mask_version: al.mask_version,
-            }),
+            mask: al.mask,
+            invert: al.invert,
+            show_mask: false,
+            mask_version: al.mask_version,
+            kind: LayerKind::Adjust(AdjustLayerState { adjust: al.adjust }),
         });
     }
     *next_layer_id = next;
@@ -499,6 +487,9 @@ pub struct AppState {
     pub list_gen: RwSignal<u32>,
     pub selected: RwSignal<Option<usize>>,
     pub selected_layer: RwSignal<Option<usize>>,
+    /// Layer whose mask is being edited (mask thumbnail clicked, or an
+    /// adjustment layer selected while the Brush tool is active).
+    pub mask_target: RwSignal<Option<(usize, usize)>>,
     pub selected_tool: RwSignal<Tool>,
     pub selected_select_tool: RwSignal<SelectTool>,
     pub busy: RwSignal<Option<String>>,
@@ -649,6 +640,7 @@ impl AppState {
             list_gen: create_rw_signal(0),
             selected: create_rw_signal(None),
             selected_layer: create_rw_signal(None),
+            mask_target: create_rw_signal(None),
             selected_tool: create_rw_signal(Tool::Select),
             selected_select_tool: create_rw_signal(SelectTool::Rect),
             busy: create_rw_signal(None),
