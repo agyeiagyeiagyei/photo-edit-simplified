@@ -1,5 +1,5 @@
 import { test, expect, Page } from '@playwright/test';
-import { openApp, importFiles, clickTab, canvas, trackErrors, PNG_SMALL } from './helpers';
+import { openApp, importFiles, clickTab, canvas, thumbs, trackErrors, PNG_SMALL, RING } from './helpers';
 
 const centerColors = (page: Page) =>
   canvas(page).evaluate((c: HTMLCanvasElement) => {
@@ -173,6 +173,70 @@ test('arrows disable at the overlay/adjustment group boundary', async ({ page })
   await expect(rows.nth(1).locator('button', { hasText: '↓' })).toBeDisabled();
   await expect(rows.nth(2).locator('button', { hasText: '↑' })).toBeDisabled();
   await expect(rows.nth(2).locator('button', { hasText: '↓' })).toBeDisabled();
+
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('Pen and Brush still draw after a photo switch, a deleted layer or another layer being selected', async ({ page }) => {
+  test.setTimeout(180_000);
+  const errors = trackErrors(page);
+  await openApp(page);
+  await importFiles(page, [PNG_SMALL, RING]);
+  await expect(thumbs(page)).toHaveCount(2, { timeout: 60_000 });
+  await page.waitForTimeout(1500);
+  await thumbs(page).nth(0).click();
+  await page.waitForTimeout(800);
+  await clickTab(page, 'Layers');
+
+  const labels = () => page.locator('.layer-row .layer-label').allTextContents();
+  const drag = async (y: number) => {
+    await page.mouse.move(2, 2);
+    await page.waitForTimeout(300);
+    const b = await canvas(page).boundingBox();
+    await snapshot(page);
+    await page.mouse.move(b!.x + b!.width * 0.2, b!.y + b!.height * y);
+    await page.mouse.down();
+    await page.mouse.move(b!.x + b!.width * 0.6, b!.y + b!.height * (y + 0.05), { steps: 8 });
+    await page.mouse.up();
+    await page.mouse.move(2, 2);
+    await page.waitForTimeout(900);
+    return diffSinceSnapshot(page);
+  };
+
+  await addText(page, 'X', '#ff0000');
+  await page.locator('.toolbar .chip', { hasText: 'Brush' }).click();
+  await page.waitForTimeout(400);
+  expect(await drag(0.2), 'Brush did not draw').toBeGreaterThan(50);
+
+  // Selecting another layer: the active tool decides what the press does.
+  await page.locator('.layer-row', { hasText: 'T: X' }).locator('.layer-label').click();
+  await page.waitForTimeout(300);
+  expect(await drag(0.4), 'Brush did nothing with the text layer selected').toBeGreaterThan(50);
+  await expect(page.locator('.layer-row.selected .layer-label')).toHaveText('Brush');
+  expect(await labels()).toEqual(['Brush', 'T: X']);
+
+  // Deleting the layer it was drawing on.
+  await page.locator('.layer-row', { hasText: 'Brush' }).locator('button.delete').click();
+  await page.waitForTimeout(300);
+  expect(await labels()).toEqual(['T: X']);
+  expect(await drag(0.6), 'Brush did nothing after its layer was deleted').toBeGreaterThan(50);
+  expect(await labels()).toEqual(['Brush', 'T: X']);
+
+  // A photo with no layers yet, and the tool still active.
+  await thumbs(page).nth(1).click();
+  await page.waitForTimeout(800);
+  expect(await labels()).toEqual([]);
+  expect(await drag(0.3), 'Brush did nothing on the next photo').toBeGreaterThan(50);
+  expect(await labels()).toEqual(['Brush']);
+
+  // A press with any other tool must not create a layer.
+  await page.locator('.toolbar .chip', { hasText: 'Select' }).click();
+  await page.waitForTimeout(300);
+  await thumbs(page).nth(0).click();
+  await page.waitForTimeout(800);
+  const before = await labels();
+  await drag(0.8);
+  expect(await labels()).toEqual(before);
 
   expect(errors, errors.join('\n')).toEqual([]);
 });
