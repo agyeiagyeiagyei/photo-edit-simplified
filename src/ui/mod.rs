@@ -18,15 +18,21 @@ thread_local! {
 
 // The bundled fonts only matter once a text layer exists, so don't fetch them
 // at startup.
-pub(crate) fn ensure_fonts() {
+pub(crate) fn ensure_fonts(state: AppState) {
     if FONTS_REQUESTED.with(|c| c.replace(true)) {
         return;
     }
-    spawn_local(async {
+    spawn_local(async move {
         let _ = web::load_font("Inter", "fonts/inter-400.woff2", "400").await;
         let _ = web::load_font("Inter", "fonts/inter-700.woff2", "700").await;
         let _ = web::load_font("Oswald", "fonts/oswald-400.woff2", "400").await;
         let _ = web::load_font("Oswald", "fonts/oswald-700.woff2", "700").await;
+        // A text layer added or restored before this finished was rasterized
+        // with the fallback face. Frames cached from it must not outlive the
+        // real font, so drop them and repaint.
+        crate::render::HI_CACHE.with(|c| *c.borrow_mut() = None);
+        crate::render::HI_WINDOW.with(|c| *c.borrow_mut() = None);
+        state.viewport_gen.update(|g| *g += 1);
     });
 }
 
@@ -34,6 +40,19 @@ pub(crate) fn ensure_fonts() {
 pub(crate) fn App() -> impl IntoView {
     let state = AppState::new();
     provide_context(state);
+
+    // A restored session can start with text layers whose font has never been
+    // fetched; they would otherwise stay in the fallback face.
+    create_effect(move |_| {
+        let has_text = state.items.with(|items| {
+            items
+                .iter()
+                .any(|m| m.layers.iter().any(|l| matches!(l.kind, state::LayerKind::Text(_))))
+        });
+        if has_text {
+            ensure_fonts(state);
+        }
+    });
 
     // Restore the previous session from IndexedDB (no-op on first run), then
     // mirror every later state change back — debounced, diffed per item.

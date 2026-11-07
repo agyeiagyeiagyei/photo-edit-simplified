@@ -548,7 +548,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                             .is_ok();
                         drop(blit_span);
                         if blitted {
-                            composite_layers(&canvas, &item.layers, gw as usize, gh as usize);
+                            composite_layers(&canvas, item.id, &item.layers, gw as usize, gh as usize);
                             sharp = Some(Sharp::Whole { w: gw as usize });
                             drawn_src = gpu::base_src().map(|(_, fp)| fp);
                         } else {
@@ -627,7 +627,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 let (cx, cy, cw, ch) = crop_px(&item.edit, w, h);
                 let off = web::create_canvas(w as u32, h as u32);
                 web::put_pixels(&off, &p, w as u32, h as u32);
-                composite_layers(&off, &item.layers, w, h);
+                composite_layers(&off, item.id, &item.layers, w, h);
                 canvas.set_width(cw as u32);
                 canvas.set_height(ch as u32);
                 web::ctx2d(&canvas)
@@ -638,7 +638,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     .unwrap();
             } else {
                 web::put_pixels(&canvas, &p, w as u32, h as u32);
-                composite_layers(&canvas, &item.layers, w, h);
+                composite_layers(&canvas, item.id, &item.layers, w, h);
             }
         }
         if want_hi
@@ -820,7 +820,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                     let sy = r.h as f64 / fch as f64;
                                     let _ = ctx.scale(sx, sy);
                                     let _ = ctx.translate(-(fcx as f64), -(fcy as f64));
-                                    composite_layers(&canvas, &item_cb.layers, fw2, fh2);
+                                    composite_layers(&canvas, item_cb.id, &item_cb.layers, fw2, fh2);
                                     let _ =
                                         ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
                                     HI_WINDOW.with(|c| {
@@ -883,6 +883,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                     web::put_pixels_view(&canvas, &r.pixels, r.w, r.h);
                                     composite_layers(
                                         &canvas,
+                                        item_cb.id,
                                         &item_cb.layers,
                                         r.w as usize,
                                         r.h as usize,
@@ -961,16 +962,14 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             }
         }
 
-        // Adjustment-layer mask tint: editor-only, drawn for every layer whose
-        // show_mask toggle is on (usually just the one being edited).
+        // Layer mask tint: editor-only, drawn for every layer whose show_mask
+        // toggle is on (usually just the one being edited).
         if tab.get() == Tab::Layers {
             let ctx = web::ctx2d(&canvas);
             for layer in item.layers.iter() {
-                if let LayerKind::Adjust(a) = &layer.kind {
-                    if a.show_mask {
-                        let key = overlay_key(item.id as u64, layer.id as u64, a.mask_version);
-                        draw_layer_mask_overlay(&ctx, a.mask.as_ref(), a.invert, w as f64, h as f64, key);
-                    }
+                if layer.show_mask && layer.mask.is_some() {
+                    let key = overlay_key(item.id as u64, layer.id as u64, layer.mask_version);
+                    draw_layer_mask_overlay(&ctx, layer.mask.as_ref(), layer.invert, w as f64, h as f64, key);
                 }
             }
         }
@@ -994,20 +993,19 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             } else if brush_tool {
                 let frame_key = match brush_target(state, &item) {
                     BrushTarget::Layer(id) => {
-                        let key = item
-                            .layers
-                            .iter()
-                            .find(|l| l.id == id)
-                            .map_or(overlay_key(item.id as u64, id as u64, 0), |l| match &l.kind {
-                                LayerKind::Adjust(a) => {
-                                    overlay_key(item.id as u64, id as u64, a.mask_version)
-                                }
-                                _ => overlay_key(item.id as u64, id as u64, 0),
-                            });
-                        if let Some(layer) = item.layers.iter().find(|l| l.id == id) {
-                            if let LayerKind::Adjust(a) = &layer.kind {
-                                draw_layer_mask_overlay(&ctx, a.mask.as_ref(), false, w as f64, h as f64, key);
-                            }
+                        let layer = item.layers.iter().find(|l| l.id == id);
+                        let key = layer.map_or(overlay_key(item.id as u64, id as u64, 0), |l| {
+                            overlay_key(item.id as u64, id as u64, l.mask_version)
+                        });
+                        if let Some(layer) = layer {
+                            draw_layer_mask_overlay(
+                                &ctx,
+                                layer.mask.as_ref(),
+                                false,
+                                w as f64,
+                                h as f64,
+                                key,
+                            );
                         }
                         key
                     }

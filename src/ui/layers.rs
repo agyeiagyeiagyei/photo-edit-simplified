@@ -8,7 +8,7 @@ use crate::*;
 pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
     let add_layer = move |kind: &str| {
         if kind == "text" {
-            ensure_fonts();
+            ensure_fonts(state);
         }
         let mut new_id = None;
         let mut took_selection = false;
@@ -33,8 +33,8 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
                 _ => Layer::new_text(id),
             };
             if kind == "adjust-sel" {
-                if let (LayerKind::Adjust(a), Some(sel)) = (&mut layer.kind, m.edit.selection.take()) {
-                    a.set_mask(Some(sel));
+                if let Some(sel) = m.edit.selection.take() {
+                    layer.set_mask(Some(sel));
                     took_selection = true;
                 }
             }
@@ -64,6 +64,9 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
         });
         if state.selected_layer.get() == Some(id) {
             state.selected_layer.set(None);
+        }
+        if state.mask_target.get().is_some_and(|(_, layer)| layer == id) {
+            state.mask_target.set(None);
         }
     };
 
@@ -108,6 +111,33 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
 
     let select_layer = move |id: usize| {
         state.selected_layer.set(Some(id));
+        // The mask brush target is explicit: only the row thumbnail arms it.
+        state.mask_target.set(None);
+    };
+
+    let click_mask = move |id: usize| {
+        let targeted = state
+            .mask_target
+            .get()
+            .is_some_and(|(_, layer)| layer == id);
+        if targeted {
+            state.mask_target.set(None);
+            return;
+        }
+        let has_mask = state
+            .current_layers()
+            .into_iter()
+            .find(|l| l.id == id)
+            .is_some_and(|l| l.mask.is_some());
+        if has_mask {
+            let item_id = state.current().map(|m| m.id);
+            state.selected_layer.set(Some(id));
+            if let Some(item_id) = item_id {
+                state.mask_target.set(Some((item_id, id)));
+            }
+        } else {
+            mask_from_selection(state, id);
+        }
     };
 
     let layers = create_memo(move |_| state.current_layers());
@@ -189,6 +219,15 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
                             layers.get().into_iter().find(|l| l.id == id)
                         });
                         let is_selected = move || state.selected_layer.get() == Some(id);
+                        let has_mask = move || layer.get().map(|l| l.mask.is_some()).unwrap_or(false);
+                        let mask_targeted =
+                            move || state.mask_target.get().is_some_and(|(_, lid)| lid == id);
+                        let mask_canvas_ref = create_node_ref::<html::Canvas>();
+                        create_effect(move |_| {
+                            if let (Some(canvas), Some(l)) = (mask_canvas_ref.get(), layer.get()) {
+                                draw_mask_thumb(&canvas, &l);
+                            }
+                        });
                         let first_adjust = move || {
                             let ls = display.get();
                             let is_adjust = ls
@@ -231,6 +270,18 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
                                 <span class="layer-label">
                                     {move || layer.get().map(|l| l.label()).unwrap_or_default()}
                                 </span>
+                                <button
+                                    class="icon-btn mask-thumb"
+                                    class:has-mask=has_mask
+                                    class:targeted=mask_targeted
+                                    title="Add or edit this layer's mask"
+                                    on:click=move |ev| {
+                                        ev.stop_propagation();
+                                        click_mask(id);
+                                    }
+                                >
+                                    <canvas node_ref=mask_canvas_ref width="24" height="18"></canvas>
+                                </button>
                                 <input
                                     type="range"
                                     min="0"
@@ -285,6 +336,9 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
                     .iter()
                     .any(|l| l.id == id && matches!(l.kind, LayerKind::Adjust(_)));
                 is_adjust.then(|| view! { <AdjustLayerEditor state=state layer_id=id/> })
+            })}
+            {move || state.selected_layer.get().map(|id| view! {
+                <MaskSection state=state layer_id=id/>
             })}
             <TextLayerEditor state=state/>
             <PathLayerEditor state=state/>
@@ -395,7 +449,6 @@ fn with_adjust(state: AppState, id: usize, f: impl FnOnce(&mut AdjustLayerState)
 pub(crate) fn AdjustLayerEditor(state: AppState, layer_id: usize) -> impl IntoView {
     let adjust = move || selected_adjust(state).map(|(_, a)| a);
     let channel = create_rw_signal(0usize);
-    let has_selection = move || state.current().map(|m| m.edit.selection.is_some()).unwrap_or(false);
 
     let slider = move |label: &'static str,
                        get: fn(&PointAdjust) -> f32,
@@ -418,29 +471,6 @@ pub(crate) fn AdjustLayerEditor(state: AppState, layer_id: usize) -> impl IntoVi
         }
     };
 
-    let take_selection = move |_| {
-        let mut took = false;
-        state.update_current_item(|m| {
-            let Some(l) = m.layers.iter_mut().find(|l| l.id == layer_id) else { return };
-            let Some(sel) = m.edit.selection.take() else { return };
-            if let LayerKind::Adjust(a) = &mut l.kind {
-                a.set_mask(Some(sel));
-                took = true;
-            }
-        });
-        if took {
-            state.subject_photo.set(None);
-            clear_subject_brush_ops(state);
-        }
-    };
-
-    let feather = move || {
-        adjust()
-            .and_then(|a| a.mask)
-            .map(|s| s.feather)
-            .unwrap_or(0.0)
-    };
-
     view! {
         <div class="adjust-editor">
             <div class="panel-title">"Adjustment layer"</div>
@@ -450,26 +480,119 @@ pub(crate) fn AdjustLayerEditor(state: AppState, layer_id: usize) -> impl IntoVi
             {slider("Warmth", |a| a.warmth, |a, v| a.warmth = v)}
             <LevelsPanel state=state channel=channel target=AdjustTarget::Layer(layer_id)/>
             <CurvesPanel state=state channel=channel target=AdjustTarget::Layer(layer_id)/>
+        </div>
+    }
+}
+
+/// Give a layer a mask from the global selection, or a reveal-all mask when
+/// there is none. Taking the selection clears it globally, exactly like the
+/// old adjustment-layer flow.
+fn mask_from_selection(state: AppState, layer_id: usize) -> bool {
+    let mut took = false;
+    let mut item_id = None;
+    state.update_current_item(|m| {
+        item_id = Some(m.id);
+        let Some(layer) = m.layers.iter_mut().find(|l| l.id == layer_id) else { return };
+        let mask = match m.edit.selection.take() {
+            Some(sel) => {
+                took = true;
+                sel
+            }
+            None => Selection {
+                kind: SelectionKind::Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 },
+                feather: 0.0,
+            },
+        };
+        layer.set_mask(Some(mask));
+    });
+    if took {
+        state.subject_photo.set(None);
+        clear_subject_brush_ops(state);
+    }
+    if let Some(item_id) = item_id {
+        state.selected_layer.set(Some(layer_id));
+        state.mask_target.set(Some((item_id, layer_id)));
+    }
+    item_id.is_some()
+}
+
+fn with_layer(state: AppState, layer_id: usize, f: impl FnOnce(&mut Layer)) {
+    state.update_current_item(|m| {
+        if let Some(l) = m.layers.iter_mut().find(|l| l.id == layer_id) {
+            f(l);
+        }
+    });
+}
+
+const MASK_THUMB_W: usize = 24;
+const MASK_THUMB_H: usize = 18;
+
+fn draw_mask_thumb(canvas: &web_sys::HtmlCanvasElement, layer: &Layer) {
+    let (w, h) = (MASK_THUMB_W, MASK_THUMB_H);
+    let mut mask = match &layer.mask {
+        Some(sel) => ops::selection_mask(sel, w, h),
+        None => {
+            web::put_pixels(canvas, &vec![0u8; w * h * 4], w as u32, h as u32);
+            return;
+        }
+    };
+    if layer.invert {
+        for v in &mut mask {
+            *v = 255 - *v;
+        }
+    }
+    let mut rgba = vec![0u8; w * h * 4];
+    for (m, px) in mask.iter().zip(rgba.as_chunks_mut::<4>().0) {
+        px[0] = *m;
+        px[1] = *m;
+        px[2] = *m;
+        px[3] = 255;
+    }
+    web::put_pixels(canvas, &rgba, w as u32, h as u32);
+}
+
+/// Mask controls shared by every layer kind: the mask itself, invert, the
+/// editor-only overlay and feather.
+#[component]
+pub(crate) fn MaskSection(state: AppState, layer_id: usize) -> impl IntoView {
+    let layer = create_memo(move |_| {
+        state.current_layers().into_iter().find(|l| l.id == layer_id)
+    });
+    let is_adjust = move || {
+        layer.get().map(|l| matches!(l.kind, LayerKind::Adjust(_))).unwrap_or(false)
+    };
+    let has_selection = move || state.current().map(|m| m.edit.selection.is_some()).unwrap_or(false);
+    let has_mask = move || layer.get().map(|l| l.mask.is_some()).unwrap_or(false);
+    let feather = move || layer.get().and_then(|l| l.mask).map(|s| s.feather).unwrap_or(0.0);
+    let targeted = move || state.mask_target.get().is_some_and(|(_, id)| id == layer_id);
+
+    view! {
+        <div class="mask-section">
             <div class="panel-title">"Mask"</div>
             <div class="row">
                 <button
                     class="btn"
-                    disabled=move || !has_selection()
-                    on:click=take_selection
-                >"New adjustment from selection"</button>
+                    on:click=move |_| {
+                        mask_from_selection(state, layer_id);
+                    }
+                >{move || if is_adjust() {
+                    "New adjustment from selection"
+                } else {
+                    "Add mask"
+                }}</button>
                 <button
                     class="btn"
-                    disabled=move || adjust().and_then(|a| a.mask).is_none()
-                    on:click=move |_| with_adjust(state, layer_id, |a| a.set_mask(None))
+                    disabled=move || !has_mask()
+                    on:click=move |_| with_layer(state, layer_id, |l| l.set_mask(None))
                 >"Clear mask"</button>
             </div>
             <label class="row" style="justify-content:flex-start;gap:0.5rem">
                 <input
                     type="checkbox"
-                    prop:checked=move || adjust().map(|a| a.invert).unwrap_or(false)
+                    prop:checked=move || layer.get().map(|l| l.invert).unwrap_or(false)
                     on:change=move |ev| {
                         let v = event_target_checked(&ev);
-                        with_adjust(state, layer_id, |a| a.invert = v);
+                        with_layer(state, layer_id, |l| l.invert = v);
                     }
                 />
                 "Invert"
@@ -477,10 +600,10 @@ pub(crate) fn AdjustLayerEditor(state: AppState, layer_id: usize) -> impl IntoVi
             <label class="row" style="justify-content:flex-start;gap:0.5rem">
                 <input
                     type="checkbox"
-                    prop:checked=move || adjust().map(|a| a.show_mask).unwrap_or(false)
+                    prop:checked=move || layer.get().map(|l| l.show_mask).unwrap_or(false)
                     on:change=move |ev| {
                         let v = event_target_checked(&ev);
-                        with_adjust(state, layer_id, |a| a.show_mask = v);
+                        with_layer(state, layer_id, |l| l.show_mask = v);
                     }
                 />
                 "Show mask"
@@ -492,18 +615,27 @@ pub(crate) fn AdjustLayerEditor(state: AppState, layer_id: usize) -> impl IntoVi
                     prop:value=move || feather().to_string()
                     on:input=move |ev| {
                         let v: f32 = event_target_value(&ev).parse().unwrap_or(0.0);
-                        with_adjust(state, layer_id, |a| {
-                            if let Some(ref mut s) = a.mask {
+                        with_layer(state, layer_id, |l| {
+                            if let Some(ref mut s) = l.mask {
                                 s.feather = v.clamp(0.0, 0.25);
-                                a.mask_version += 1;
+                                l.mask_version += 1;
                             }
                         });
                     }
                 />
             </label>
             <p class="dim">
-                "Masks come from the Select tab (rect, lasso or wand). Without a mask the \
-                 adjustment applies to the whole photo. Feather only applies to masked areas."
+                {move || if has_mask() {
+                    if targeted() {
+                        "Brush (Select tab) paints this mask: Add reveals, Remove hides."
+                    } else {
+                        "Click the row's mask thumbnail to paint it with the Select-tab Brush."
+                    }
+                } else if has_selection() {
+                    "The current selection becomes this layer's mask."
+                } else {
+                    "Add mask reveals the whole layer; the Select-tab Brush paints it."
+                }}
             </p>
         </div>
     }

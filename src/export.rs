@@ -78,7 +78,7 @@ pub(crate) async fn render_photo_export(
         .await?;
         let base = web::create_canvas(frame.w, frame.h);
         web::put_pixels_view(&base, &frame.pixels, frame.w, frame.h);
-        composite_layers(&base, &item.layers, frame.w as usize, frame.h as usize);
+        composite_layers(&base, item.id, &item.layers, frame.w as usize, frame.h as usize);
         let out = web::create_canvas(ew as u32, eh as u32);
         web::ctx2d(&out)
             .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
