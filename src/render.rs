@@ -478,8 +478,14 @@ pub(crate) fn edit_fingerprint(item: &MediaItem) -> u64 {
     }
     format!("{:?}", e.levels).hash(&mut h);
     format!("{:?}", e.curves).hash(&mut h);
-    hash_selection(&mut h, e.selection.as_ref());
-    h.write_u64(e.selection_rev);
+    // The render only consumes the global selection as an effect mask when a
+    // colour stage is active; painting one on an otherwise untouched photo
+    // must not invalidate the hi-res render (a full 3200 px re-render and blit
+    // per brush stroke).
+    if e.base_color_touched() {
+        hash_selection(&mut h, e.selection.as_ref());
+        h.write_u64(e.selection_rev);
+    }
     item.layers.len().hash(&mut h);
     for l in &item.layers {
         l.id.hash(&mut h);
@@ -1077,6 +1083,22 @@ pub(crate) fn brush_target(state: AppState, item: &MediaItem) -> BrushTarget {
     }
 }
 
+/// Overlay cache key of a brush target's committed mask.
+pub(crate) fn brush_overlay_key(item: &MediaItem, target: BrushTarget) -> u64 {
+    match target {
+        BrushTarget::Global => overlay_key(item.id as u64, 0, item.edit.selection_rev),
+        BrushTarget::Layer(id) => item
+            .layers
+            .iter()
+            .find(|l| l.id == id)
+            .map(|l| match &l.kind {
+                LayerKind::Adjust(a) => overlay_key(item.id as u64, id as u64, a.mask_version),
+                _ => overlay_key(item.id as u64, id as u64, 0),
+            })
+            .unwrap_or(0),
+    }
+}
+
 /// Preview-resolution mask space: the geometry-corrected preview, the frame
 /// the live tint paints in.
 fn brush_view_dims(item: &MediaItem) -> Option<(usize, usize)> {
@@ -1128,7 +1150,29 @@ fn brush_base_mask(item: &MediaItem, target: BrushTarget, w: usize, h: usize) ->
     }
 }
 
+/// Tight bounds of nonzero mask coverage, as (x, y, w, h).
+fn mask_bounds(mask: &[u8], w: usize, h: usize) -> Option<(usize, usize, usize, usize)> {
+    let mut min_x = w;
+    let mut min_y = h;
+    let mut max_x = 0;
+    let mut max_y = 0;
+    for y in 0..h {
+        let row = &mask[y * w..(y + 1) * w];
+        let Some(first) = row.iter().position(|&v| v != 0) else { continue };
+        let last = row.iter().rposition(|&v| v != 0).unwrap_or(first);
+        min_x = min_x.min(first);
+        max_x = max_x.max(last);
+        min_y = min_y.min(y);
+        max_y = y;
+    }
+    if max_x < min_x || max_y < min_y {
+        return None;
+    }
+    Some((min_x, min_y, max_x - min_x + 1, max_y - min_y + 1))
+}
+
 pub(crate) fn brush_begin(state: AppState, nx: f32, ny: f32) -> Option<BrushDrag> {
+    let mut begin = perf::Span::new("brush.begin");
     let item = state.current()?;
     if item.kind != MediaKind::Photo {
         return None;
@@ -1136,8 +1180,25 @@ pub(crate) fn brush_begin(state: AppState, nx: f32, ny: f32) -> Option<BrushDrag
     let (w, h) = brush_dims(&item)?;
     let (vw, vh) = brush_view_dims(&item)?;
     let target = brush_target(state, &item);
-    let base = Rc::new(brush_base_mask(&item, target, w, h));
-    let view_base = Rc::new(brush_base_mask(&item, target, vw, vh));
+    // No committed selection: keep the base masks virtual. An empty target is
+    // the common case (first stroke) and full-frame zero buffers here are tens
+    // of megabytes of pointerdown allocation.
+    let base_sel = brush_selection(&item, target);
+    let view_empty = base_sel.is_none();
+    let base = if view_empty { None } else { Some(Rc::new(brush_base_mask(&item, target, w, h))) };
+    let view_base =
+        if view_empty { None } else { Some(Rc::new(brush_base_mask(&item, target, vw, vh))) };
+    // A global vector selection is shown as an outline until the first stroke
+    // bakes it; only then does the canvas need the mask tint painted in.
+    let base_blit = matches!(
+        (target, base_sel),
+        (BrushTarget::Global, Some(sel)) if !matches!(&sel.kind, SelectionKind::Mask { .. })
+    );
+    let base_bbox = if base_blit {
+        view_base.as_ref().and_then(|b| mask_bounds(b, vw, vh))
+    } else {
+        None
+    };
     let size = state.brush_size.get_untracked();
     let diag = ((w * w + h * h) as f32).sqrt();
     let radius = (size * diag * 0.5).max(0.5);
@@ -1145,9 +1206,24 @@ pub(crate) fn brush_begin(state: AppState, nx: f32, ny: f32) -> Option<BrushDrag
     let view_radius = (size * view_diag * 0.5).max(0.5);
     let softness = state.brush_softness.get_untracked().clamp(0.0, 1.0);
     let add = !state.brush_remove.get_untracked();
-    let live = brush::LiveStroke::new(w, h, base.clone(), radius, softness, add, (nx * w as f32, ny * h as f32));
-    let view_live =
-        brush::LiveStroke::new(vw, vh, view_base.clone(), view_radius, softness, add, (nx * vw as f32, ny * vh as f32));
+    let tint_key = brush_overlay_key(&item, target);
+    let live = match &base {
+        Some(b) => brush::LiveStroke::new(w, h, b.clone(), radius, softness, add, (nx * w as f32, ny * h as f32))
+            .track_committed(),
+        // Empty base: coverage is the final mask, so there is nothing to merge.
+        None => brush::LiveStroke::new_empty(w, h, radius, softness, add, (nx * w as f32, ny * h as f32)),
+    };
+    let view_live = match &view_base {
+        Some(b) => brush::LiveStroke::new(vw, vh, b.clone(), view_radius, softness, add, (nx * vw as f32, ny * vh as f32)),
+        None => brush::LiveStroke::new_empty(vw, vh, view_radius, softness, add, (nx * vw as f32, ny * vh as f32)),
+    };
+    let frame = last_full_frame(
+        item.id,
+        tint_key,
+        state.hi_built.get_untracked(),
+        state.viewport_gen.get_untracked(),
+    );
+    begin.set_detail(if frame.is_some() { "frame" } else { "noframe" });
     Some(BrushDrag {
         item_id: item.id,
         target,
@@ -1160,6 +1236,11 @@ pub(crate) fn brush_begin(state: AppState, nx: f32, ny: f32) -> Option<BrushDrag
         view_base,
         view_live: Rc::new(RefCell::new(view_live)),
         tint: Rc::new(RefCell::new(None)),
+        tint_key,
+        frame: Rc::new(RefCell::new(frame)),
+        view_empty,
+        base_blit,
+        base_bbox,
     })
 }
 
@@ -1176,19 +1257,53 @@ pub(crate) fn brush_commit(state: AppState, drag: BrushDrag) {
     if item.id != drag.item_id || item.kind != MediaKind::Photo {
         return;
     }
-    let (after, changed) = { drag.live.borrow_mut().finish() };
-    let Some(b) = changed else { return };
-    let base: &[u8] = &drag.base;
-    let patch = MaskPatch {
-        x: b.x,
-        y: b.y,
-        w: b.w,
-        h: b.h,
-        before: copy_rect(base, drag.w, b.x, b.y, b.w, b.h),
-        after: copy_rect(&after, drag.w, b.x, b.y, b.w, b.h),
+    let (after, changed) = {
+        let _sp = perf::Span::new("brush.commit.finish");
+        drag.live.borrow_mut().finish()
     };
+    let Some(b) = changed else { return };
+    let patch = {
+        let _sp = perf::Span::new("brush.commit.snapshot");
+        MaskPatch {
+            x: b.x,
+            y: b.y,
+            w: b.w,
+            h: b.h,
+            before: match drag.base.as_deref() {
+                Some(base) => copy_rect(base, drag.w, b.x, b.y, b.w, b.h),
+                None => vec![0u8; b.w * b.h],
+            },
+            after: copy_rect(&after, drag.w, b.x, b.y, b.w, b.h),
+        }
+    };
+    // The live tint already shows this stroke. For a global selection with no
+    // colour stage reading it, the selection is pure overlay: adopt that tint
+    // for the new mask and skip the full-frame repaint the selection bump
+    // would trigger (the next pointer move paints as usual).
+    let overlay_only = drag.target == BrushTarget::Global
+        && state.current().is_some_and(|m| !m.edit.base_color_touched())
+        && drag.tint.borrow().is_some();
+    if overlay_only {
+        skip_next_preview_paint();
+    }
+    let _sp = perf::Span::new("brush.commit.store");
     if !brush_store(state, drag.item_id, drag.target, after, drag.w, drag.h) {
+        cancel_skipped_preview_paint();
         return;
+    }
+    if overlay_only {
+        flush_brush_tint(&drag);
+        let rgb = [10, 132, 255];
+        if let (Some(m), Some(tint)) = (state.current(), drag.tint.borrow().as_ref()) {
+            adopt_mask_tint(
+                overlay_key(m.id as u64, 0, m.edit.selection_rev),
+                drag.view_w,
+                drag.view_h,
+                rgb,
+                tint.canvas(),
+            );
+            retag_full_frame(overlay_key(m.id as u64, 0, m.edit.selection_rev));
+        }
     }
     let op = if drag.target == BrushTarget::Global
         && state.subject_photo.get_untracked() == Some(drag.item_id)

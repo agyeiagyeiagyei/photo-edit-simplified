@@ -3,6 +3,40 @@
 use crate::prelude::*;
 use crate::*;
 
+thread_local! {
+    /// Set when a change that is already on screen (the committed brush tint)
+    /// would otherwise schedule a redundant full-frame repaint.
+    static SKIP_NEXT_PAINT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn skip_next_preview_paint() {
+    SKIP_NEXT_PAINT.with(|s| s.set(true));
+    let cb = Closure::once(|| SKIP_NEXT_PAINT.with(|s| s.set(false)));
+    let _ = web::window().set_timeout_with_callback_and_timeout_and_arguments_0(
+        cb.as_ref().unchecked_ref(),
+        300,
+    );
+    cb.forget();
+}
+
+pub(crate) fn cancel_skipped_preview_paint() {
+    SKIP_NEXT_PAINT.with(|s| s.set(false));
+}
+
+/// Move the displayed pixels onto a replacement canvas node, 1:1. Returns
+/// false when the old node never had a backing store to copy.
+fn copy_canvas_pixels(from: &web_sys::HtmlCanvasElement, to: &web_sys::HtmlCanvasElement) -> bool {
+    let (w, h) = (from.width(), from.height());
+    if w == 0 || h == 0 {
+        return false;
+    }
+    to.set_width(w);
+    to.set_height(h);
+    web::ctx2d(to)
+        .draw_image_with_html_canvas_element(from, 0.0, 0.0)
+        .is_ok()
+}
+
 #[component]
 pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     let canvas_ref = create_node_ref::<html::Canvas>();
@@ -215,8 +249,12 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop)).flatten() else { return };
         brush_hover.set(Some((nx, ny)));
         let Some(Some(drag)) = brush_drag.try_get() else { return };
+        let _sp = perf::Span::new("brush.live.push.hi");
         let added = drag.live.borrow_mut().push_point(nx * drag.w as f32, ny * drag.h as f32);
+        drop(_sp);
+        let _sp = perf::Span::new("brush.live.push.view");
         drag.view_live.borrow_mut().push_point(nx * drag.view_w as f32, ny * drag.view_h as f32);
+        drop(_sp);
         if added {
             brush_drag.set(Some(drag));
         }
@@ -224,8 +262,17 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
 
     window_event_listener(leptos::ev::pointerup, move |_| {
         let Some(drag) = brush_drag.try_get().flatten() else { return };
+        // The canvas already shows the live tint; suppressing this repaint and
+        // solving the mask on a fresh task keeps pointerup short on 24 MP
+        // photos instead of a 50 ms+ finish-and-repaint combo.
+        skip_next_preview_paint();
         let _ = brush_drag.try_set(None);
-        brush_commit(state, drag);
+        let cb = Closure::once(move || brush_commit(state, drag));
+        let _ = web::window().set_timeout_with_callback_and_timeout_and_arguments_0(
+            cb.as_ref().unchecked_ref(),
+            0,
+        );
+        cb.forget();
     });
 
     window_event_listener(leptos::ev::pointerup, move |_| {
@@ -273,6 +320,30 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         state.subject_photo.set(None);
     });
 
+    // A reactive pass can replace the <canvas> node with a fresh, default-size
+    // one. The old node's pixels are authoritative: either the paint effect
+    // for this pass already drew them, or the pass skipped because they were
+    // already on screen (the committed brush tint). Carry them across; a full
+    // repaint here re-renders a 24 MP photo inside the commit task. With no
+    // backing store to copy (first mount, video node) force a real paint.
+    create_render_effect(move |prev: Option<Option<web_sys::HtmlCanvasElement>>| {
+        let node = canvas_ref.get().as_deref().cloned();
+        let old = prev.flatten();
+        if node.is_some() && node != old {
+            let copied = match (old.as_ref(), node.as_ref()) {
+                (Some(old), Some(new)) => {
+                    let _sp = perf::Span::new("preview.canvas.copy");
+                    copy_canvas_pixels(old, new)
+                }
+                _ => false,
+            };
+            if !copied {
+                state.viewport_gen.update(|g| *g += 1);
+            }
+        }
+        node
+    });
+
     create_effect(move |_| {
         perf::record("preview.effect", 0.0);
         state.items.track();
@@ -297,12 +368,58 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         // in it; a burst of further changes this frame coalesces into one
         // trailing rAF pass, so there is still at most one extra paint/frame.
         let render: Rc<dyn Fn()> = Rc::new(move || {
+            if SKIP_NEXT_PAINT.with(|s| s.replace(false)) {
+                return;
+            }
             let Some(item) = state.current() else { return };
             if item.kind != MediaKind::Photo {
                 return;
             }
-            let Some(photo) = get_photo(item.id) else { return };
             let Some(canvas) = canvas_ref.get() else { return };
+            // While a brush stroke is live, the base is already on the canvas
+            // and only the new tint pixels changed; repainting the 24 MP frame
+            // for every pointermove is the bulk of the drag's raster cost.
+            if let Some(drag) = brush_drag.get() {
+                if drag.item_id == item.id
+                    && tab.get() == Tab::Select
+                    && state.selected_select_tool.get() == SelectTool::Brush
+                    && draw_brush_drag_incremental(
+                        &canvas,
+                        &drag,
+                        state.hi_built.get(),
+                        state.viewport_gen.get(),
+                    )
+                {
+                    return;
+                }
+            } else if tab.get() == Tab::Select
+                && state.selected_select_tool.get() == SelectTool::Brush
+            {
+                // A hover only moves the cursor ring; the committed frame is
+                // already on the canvas, so repaint the ring, not the photo.
+                let (w, h) = working.get_untracked();
+                if w > 0 && h > 0 {
+                    let target = brush_target(state, &item);
+                    let key = brush_overlay_key(&item, target);
+                    let diag = ((w * w + h * h) as f64).sqrt();
+                    let radius = state.brush_size.get() as f64 * diag * 0.5;
+                    if draw_brush_hover_incremental(
+                        &canvas,
+                        item.id,
+                        key,
+                        brush_hover.get(),
+                        radius,
+                        w as f64,
+                        h as f64,
+                        state.hi_built.get(),
+                        state.viewport_gen.get(),
+                    ) {
+                        return;
+                    }
+                }
+            }
+            bump_paint_gen();
+            let Some(photo) = get_photo(item.id) else { return };
             let mut render_span = perf::Span::new("preview.render");
 
         // A lazily restored item has no preview until the selection effect's
@@ -851,10 +968,19 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             for layer in item.layers.iter() {
                 if let LayerKind::Adjust(a) = &layer.kind {
                     if a.show_mask {
-                        draw_layer_mask_overlay(&ctx, a.mask.as_ref(), a.invert, w as f64, h as f64);
+                        let key = overlay_key(item.id as u64, layer.id as u64, a.mask_version);
+                        draw_layer_mask_overlay(&ctx, a.mask.as_ref(), a.invert, w as f64, h as f64, key);
                     }
                 }
             }
+        }
+
+        // Incremental drag frames restore their dirty rect from the photo
+        // beneath the overlay, so capture that base in this same pass.
+        if tab.get() == Tab::Select && state.selected_select_tool.get() == SelectTool::Brush {
+            snapshot_frame_base(&canvas);
+        } else {
+            clear_frame_base();
         }
 
         // Draw selection overlay on the Select tab. The brush shows its target
@@ -864,33 +990,71 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             let brush_tool = state.selected_select_tool.get() == SelectTool::Brush;
             if let Some(drag) = brush_drag.get() {
                 draw_brush_drag(&ctx, &drag);
+                drag.record_frame(&ctx, &canvas, state.hi_built.get(), state.viewport_gen.get());
             } else if brush_tool {
-                match brush_target(state, &item) {
+                let frame_key = match brush_target(state, &item) {
                     BrushTarget::Layer(id) => {
+                        let key = item
+                            .layers
+                            .iter()
+                            .find(|l| l.id == id)
+                            .map_or(overlay_key(item.id as u64, id as u64, 0), |l| match &l.kind {
+                                LayerKind::Adjust(a) => {
+                                    overlay_key(item.id as u64, id as u64, a.mask_version)
+                                }
+                                _ => overlay_key(item.id as u64, id as u64, 0),
+                            });
                         if let Some(layer) = item.layers.iter().find(|l| l.id == id) {
                             if let LayerKind::Adjust(a) = &layer.kind {
-                                draw_layer_mask_overlay(&ctx, a.mask.as_ref(), false, w as f64, h as f64);
+                                draw_layer_mask_overlay(&ctx, a.mask.as_ref(), false, w as f64, h as f64, key);
                             }
                         }
+                        key
                     }
                     BrushTarget::Global => {
+                        let key = overlay_key(item.id as u64, 0, item.edit.selection_rev);
                         if let Some(sel) = &item.edit.selection {
-                            draw_selection_overlay(&ctx, sel, w as f64, h as f64);
+                            draw_selection_overlay(&ctx, sel, w as f64, h as f64, key);
                         }
+                        key
                     }
-                }
-            } else if let Some(sel) = &item.edit.selection {
-                draw_selection_overlay(&ctx, sel, w as f64, h as f64);
-            }
-            if let Some(drag) = select_drag.get() {
-                draw_select_drag(&ctx, &drag, w as f64, h as f64);
-            }
-            if brush_tool {
+                };
+                // The committed overlay is this frame's final state, so a drag
+                // starting here can paint its first dab without a full repaint.
+                remember_full_frame(
+                    item.id,
+                    frame_key,
+                    &ctx,
+                    &canvas,
+                    state.hi_built.get(),
+                    state.viewport_gen.get(),
+                );
+                // No ring while a stroke is live: incremental drag frames repaint
+                // only the dirty tint, so a moving ring would trail behind.
                 if let Some((nx, ny)) = brush_hover.get() {
                     let diag = ((w * w + h * h) as f64).sqrt();
                     let r = state.brush_size.get() as f64 * diag * 0.5;
+                    backup_brush_ring(
+                        item.id,
+                        frame_key,
+                        &ctx,
+                        &canvas,
+                        nx as f64 * w as f64,
+                        ny as f64 * h as f64,
+                        r,
+                        state.hi_built.get(),
+                        state.viewport_gen.get(),
+                    );
                     draw_brush_outline(&ctx, nx, ny, r, w as f64, h as f64);
+                } else {
+                    clear_brush_ring_backup();
                 }
+            } else if let Some(sel) = &item.edit.selection {
+                let key = overlay_key(item.id as u64, 0, item.edit.selection_rev);
+                draw_selection_overlay(&ctx, sel, w as f64, h as f64, key);
+            }
+            if let Some(drag) = select_drag.get() {
+                draw_select_drag(&ctx, &drag, w as f64, h as f64);
             }
         }
 

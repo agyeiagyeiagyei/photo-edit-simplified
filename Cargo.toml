@@ -33,7 +33,7 @@ web-sys = { version = "0.3", features = [
   "Performance", "Location",
   "WebGl2RenderingContext", "WebGlProgram", "WebGlShader", "WebGlBuffer",
   "WebGlTexture", "WebGlUniformLocation", "WebGlFramebuffer",
-  "WebGlVertexArrayObject",
+  "WebGlVertexArrayObject", "DomMatrix",
 ] }
 
 console_error_panic_hook = "0.1"

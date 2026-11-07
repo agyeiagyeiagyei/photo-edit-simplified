@@ -31,6 +31,32 @@ async function readCanvas(page: Page): Promise<Frame> {
   return { w: r.w, h: r.h, bytes: b64ToBytes(r.b64) };
 }
 
+/**
+ * Downscaled canvas read for large sources. A full 24 MP `getImageData` plus
+ * its base64 string allocates ~50 MB in the page; the resulting GC lands in
+ * the very pointerdown task a long-task gate is measuring. For gates whose
+ * assertion is mean delta, a 512 px sample is equivalent.
+ */
+async function readCanvasScaled(page: Page, maxW = 512): Promise<Frame> {
+  const r = await canvas(page).evaluate((c: HTMLCanvasElement, maxW: number) => {
+    const scale = Math.min(1, maxW / c.width);
+    const w = Math.max(1, Math.round(c.width * scale));
+    const h = Math.max(1, Math.round(c.height * scale));
+    const n = document.createElement('canvas');
+    n.width = w;
+    n.height = h;
+    const x = n.getContext('2d')!;
+    x.drawImage(c, 0, 0, w, h);
+    const d = x.getImageData(0, 0, w, h).data;
+    let s = '';
+    for (let i = 0; i < d.length; i += 0x8000) {
+      s += String.fromCharCode.apply(null, Array.from(d.subarray(i, i + 0x8000)) as number[]);
+    }
+    return { w, h, b64: btoa(s) };
+  }, maxW);
+  return { w: r.w, h: r.h, bytes: b64ToBytes(r.b64) };
+}
+
 async function decodePng(page: Page, bytes: Buffer): Promise<Frame> {
   const r = await page.evaluate(async (b64) => {
     const bin = atob(b64);
@@ -476,6 +502,42 @@ test.describe('selection brush (issue #3)', () => {
       brush_30pct_longtasks_over_50ms: tasks.filter((v) => v > 50).length,
     });
     expect(tasks.filter((v) => v > 50), 'a 30%/50% brush stroke produced a main-thread long task > 50 ms').toEqual([]);
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  test('a 30%/50% brush stroke on a 24 MP photo stays under the long-task bar', async ({ page }, testInfo) => {
+    test.setTimeout(240_000);
+    const errors = trackErrors(page);
+    await openApp(page);
+    await importFiles(page, [JPEG_A]);
+    await expect.poll(() => canvasSize(page).then((s) => s.w), { timeout: 60_000 }).toBeGreaterThan(0);
+    await settle(page, 800);
+
+    await selectBrush(page);
+    await setRange(page, /^Size:/, 0.3);
+    await setRange(page, /^Softness:/, 0.5);
+    await parkPointer(page);
+    await settle(page);
+    // Scaled baseline: the full-frame read's garbage is collected inside the
+    // pointerdown task being measured, which is not the app's cost.
+    const baseline = await readCanvasScaled(page);
+    await installLongTaskProbe(page);
+    await clearLongTasks(page);
+
+    // QA's worst case: the committed stroke now rasterizes at up to 3200 px,
+    // so a large soft brush on a 24 MP photo is the expensive combination.
+    await stroke(page, [[0.2, 0.3], [0.8, 0.3], [0.8, 0.6], [0.25, 0.6]], 12);
+    const tasks = await readLongTasks(page);
+    await parkPointer(page);
+    await settle(page, 800);
+    const after = await readCanvasScaled(page);
+    expect(meanDiff(baseline.bytes, after.bytes), 'the large soft stroke did not tint the canvas').toBeGreaterThan(2);
+
+    recordMetrics(testInfo, {
+      brush_24mp_soft_longtask_max_ms: Math.round(tasks.reduce((m, v) => Math.max(m, v), 0) * 10) / 10,
+      brush_24mp_soft_longtasks_over_50ms: tasks.filter((v) => v > 50).length,
+    });
+    expect(tasks.filter((v) => v > 50), 'a 30%/50% stroke on a 24 MP photo produced a main-thread long task > 50 ms').toEqual([]);
     expect(errors, errors.join('\n')).toEqual([]);
   });
 
