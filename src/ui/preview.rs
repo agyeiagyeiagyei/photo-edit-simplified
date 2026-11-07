@@ -1197,6 +1197,10 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                 return;
                             }
                             if tab.get() != Tab::Layers { return; }
+                            // Pen and Brush stay active across a photo switch, a
+                            // deleted layer or another layer being selected, so
+                            // give the press something to draw on here as well.
+                            ensure_tool_layer(state, state.selected_tool.get());
                             let Some(id) = state.selected_layer.get() else { return; };
                             let Some(item) = state.current() else { return; };
                             let Some(layer) = item.layers.iter().find(|l| l.id == id) else { return };
