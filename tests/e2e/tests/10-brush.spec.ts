@@ -57,6 +57,16 @@ async function readCanvasScaled(page: Page, maxW = 512): Promise<Frame> {
   return { w: r.w, h: r.h, bytes: b64ToBytes(r.b64) };
 }
 
+/** Pixels whose largest channel difference exceeds `threshold`. */
+function pixelsOver(a: Buffer, b: Buffer, threshold: number): number {
+  let n = 0;
+  for (let i = 0; i + 3 < a.length; i += 4) {
+    const d = Math.max(Math.abs(a[i] - b[i]), Math.abs(a[i + 1] - b[i + 1]), Math.abs(a[i + 2] - b[i + 2]));
+    if (d > threshold) n++;
+  }
+  return n;
+}
+
 async function decodePng(page: Page, bytes: Buffer): Promise<Frame> {
   const r = await page.evaluate(async (b64) => {
     const bin = atob(b64);
@@ -538,6 +548,118 @@ test.describe('selection brush (issue #3)', () => {
       brush_24mp_soft_longtasks_over_50ms: tasks.filter((v) => v > 50).length,
     });
     expect(tasks.filter((v) => v > 50), 'a 30%/50% stroke on a 24 MP photo produced a main-thread long task > 50 ms').toEqual([]);
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  test('moving the brush cursor leaves the frame untouched, through a window resize too', async ({ page }) => {
+    test.setTimeout(240_000);
+    const errors = trackErrors(page);
+    await openApp(page);
+    await importFiles(page, [JPEG_A]);
+    await expect.poll(() => canvasSize(page).then((s) => s.w), { timeout: 60_000 }).toBeGreaterThan(0);
+    await settle(page, 800);
+
+    await selectBrush(page);
+    await setRange(page, /^Size:/, 0.08);
+    await parkPointer(page);
+    await settle(page, 800);
+    const before = await readCanvas(page);
+
+    // A hi-res frame scales the ring's overlay units, which is where a backup
+    // rect sized in device pixels clips it.
+    const b = await wrapBox(page);
+    for (let i = 0; i < 40; i++) {
+      await page.mouse.move(b.x + b.width * (0.15 + 0.7 * i / 40), b.y + b.height * (0.2 + 0.6 * Math.abs(Math.sin(i / 5))));
+    }
+    await parkPointer(page);
+    await settle(page);
+    const hovered = await readCanvas(page);
+    expect([hovered.w, hovered.h]).toEqual([before.w, before.h]);
+    expect(pixelsOver(before.bytes, hovered.bytes, 8), 'the moving ring left marks on the photo').toBe(0);
+
+    // With the pointer off the photo a resize repaints without changing the
+    // backing size, so nothing else clears a transform left on the context.
+    const transform = await canvas(page).evaluate((c: HTMLCanvasElement) => {
+      const m = c.getContext('2d')!.getTransform();
+      return [m.a, m.b, m.c, m.d, m.e, m.f];
+    });
+    expect(transform, 'a cursor repaint left a transform on the canvas').toEqual([1, 0, 0, 1, 0, 0]);
+    await page.evaluate(() => window.dispatchEvent(new Event('resize')));
+    await page.waitForTimeout(300);
+    await settle(page, 800);
+    const resized = await readCanvas(page);
+    expect([resized.w, resized.h]).toEqual([before.w, before.h]);
+    expect(pixelsOver(before.bytes, resized.bytes, 8), 'a resize repainted a different frame').toBe(0);
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  test('Feather repaints the tint of a brushed selection', async ({ page }) => {
+    test.setTimeout(180_000);
+    const errors = trackErrors(page);
+    await openApp(page);
+    await importFiles(page, [PNG_SMALL]);
+    await waitSmall(page);
+
+    await selectBrush(page);
+    await setRange(page, /^Size:/, 0.15);
+    await setRange(page, /^Softness:/, 0);
+    await stroke(page, [[0.2, 0.3], [0.8, 0.3], [0.8, 0.7]]);
+    await parkPointer(page);
+    await settle(page);
+    const sharp = await readCanvas(page);
+
+    await setRange(page, /^Feather:/, 0.2);
+    await settle(page);
+    const brushTool = await readCanvas(page);
+    expect(meanDiff(sharp.bytes, brushTool.bytes), 'Feather did not change the tint with the Brush tool').toBeGreaterThan(0.2);
+
+    await selectRect(page);
+    await parkPointer(page);
+    await settle(page);
+    const rectTool = await readCanvas(page);
+    await setRange(page, /^Feather:/, 0);
+    await settle(page);
+    const unfeathered = await readCanvas(page);
+    expect(meanDiff(rectTool.bytes, unfeathered.bytes), 'Feather did not change the tint with another tool').toBeGreaterThan(0.2);
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  test('the first stroke takes a vector selection outline off the canvas', async ({ page }) => {
+    test.setTimeout(240_000);
+    const errors = trackErrors(page);
+    await openApp(page);
+    await importFiles(page, [JPEG_A]);
+    await expect.poll(() => canvasSize(page).then((s) => s.w), { timeout: 60_000 }).toBeGreaterThan(0);
+    await settle(page, 800);
+
+    await selectRect(page);
+    await rectDrag(page, 0.2, 0.2, 0.7, 0.7);
+    await settle(page, 800);
+    await selectBrush(page);
+    await setRange(page, /^Size:/, 0.05);
+    await setRange(page, /^Softness:/, 0);
+    await parkPointer(page);
+    await settle(page, 800);
+
+    await stroke(page, [[0.05, 0.45], [0.4, 0.45]]);
+    // Read before any pointer move: the commit skips its repaint, and a later
+    // full paint would clear whatever the drag left behind.
+    await page.waitForTimeout(200);
+    const drawn = await readCanvas(page);
+    await parkPointer(page);
+    await page.evaluate(() => window.dispatchEvent(new Event('resize')));
+    await page.waitForTimeout(300);
+    await settle(page, 800);
+    const repainted = await readCanvas(page);
+    expect([drawn.w, drawn.h]).toEqual([repainted.w, repainted.h]);
+    // The parked cursor ring is in the top rows, above the selection. The
+    // threshold clears the baked mask's resampled edge (under 40 levels); an
+    // opaque outline is far above it.
+    const skip = Math.floor(drawn.h * 0.15) * drawn.w * 4;
+    expect(
+      pixelsOver(drawn.bytes.subarray(skip), repainted.bytes.subarray(skip), 60),
+      'the old selection outline is still on the canvas',
+    ).toBe(0);
     expect(errors, errors.join('\n')).toEqual([]);
   });
 
