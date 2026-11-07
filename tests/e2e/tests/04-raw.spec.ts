@@ -2,7 +2,7 @@ import { test, expect } from '@playwright/test';
 import type { Page } from '@playwright/test';
 import * as fs from 'fs';
 import * as path from 'path';
-import { openApp, trackErrors, recordMetrics, importFiles, canvasSize, clickTab, imageDims, rawFixtures } from './helpers';
+import { openApp, trackErrors, recordMetrics, importFiles, canvasSize, clickTab, imageDims, rawFixtures, PNG_SMALL } from './helpers';
 
 // One test per RAW in dl-raw/: CI generates a synthetic DNG (small embedded JPEG, so the
 // proxy timing covers the sensor-develop path) and may also have a real ARW (camera-JPEG path).
@@ -95,8 +95,8 @@ test.describe('RAW (ARW/DNG) import → develop → export', () => {
       });
       expect(swap.first, 'saw a sharp backing width').toBeGreaterThanOrEqual(0);
       expect(swap.min, 'sharp backing fell back to the soft preview during the proxy swap').toBeGreaterThan(1200);
-      // The RAW develop panel lives inside the Color tab.
-      await clickTab(page, 'Color');
+      // RAW items get their own RAW tab for the develop controls.
+      await clickTab(page, 'RAW');
       await expect(page.locator('.raw-panel .panel-title', { hasText: 'RAW develop' })).toBeVisible();
       await page.locator('label.slider', { hasText: /^Exposure/ }).locator('input').evaluate((el: HTMLInputElement) => {
         el.value = '0.5'; el.dispatchEvent(new Event('input', { bubbles: true }));
@@ -187,4 +187,33 @@ test.describe('RAW (ARW/DNG) import → develop → export', () => {
       expect(errors.filter((e) => !/favicon/.test(e)), errors.join('\n')).toEqual([]);
     });
   }
+
+  // Owner report (8 Nov): no RAW options on the opened RAW. The controls sat
+  // at the top of Color while the editor opens on Crop.
+  test('a RAW gets its own RAW tab, a PNG does not', async ({ page }) => {
+    test.setTimeout(180_000);
+    const errors = trackErrors(page);
+    await openApp(page);
+    const raw = RAWS[0];
+    await importFiles(page, [raw, PNG_SMALL]);
+    const thumb = (p: string) => page.locator(`.filmstrip .thumb[title="${path.basename(p)}"]`);
+    const rawTab = page.locator('.tabs button', { hasText: /^RAW$/ });
+
+    await thumb(raw).click();
+    await expect(rawTab).toBeVisible();
+    await expect(page.locator('.tabs button').first(), 'RAW should be the first tab').toHaveText('RAW');
+    await rawTab.click();
+    await expect(page.locator('.raw-panel .panel-title', { hasText: 'RAW develop' })).toBeVisible();
+    await expect(page.locator('label.slider', { hasText: /^Exposure/ })).toBeVisible();
+    await clickTab(page, 'Color');
+    await expect(page.locator('.raw-panel'), 'RAW controls belong on the RAW tab only').toHaveCount(0);
+
+    // Switching to a PNG while on the RAW tab lands on Color.
+    await rawTab.click();
+    await thumb(PNG_SMALL).click();
+    await expect(rawTab).toHaveCount(0);
+    await expect(page.locator('.tabs button.active')).toHaveText('Color');
+    await expect(page.locator('label.slider', { hasText: /^Brightness/ })).toBeVisible();
+    expect(errors.filter((e) => !/favicon/.test(e)), errors.join('\n')).toEqual([]);
+  });
 });

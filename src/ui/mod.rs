@@ -262,7 +262,9 @@ pub(crate) fn FilmStrip(state: AppState) -> impl IntoView {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub(crate) enum Tab {    Crop,
+pub(crate) enum Tab {
+    Raw,
+    Crop,
     Rotate,
     Color,
     Select,
@@ -297,12 +299,23 @@ pub(crate) fn Editor(state: AppState) -> impl IntoView {
         web::segment_subject_close();
         state.subject_photo.set(None);
     });
+    let raw_item = move || state.current().map(|m| has_raw_controls(&m)).unwrap_or(false);
+    // The RAW tab only exists for RAW items: switching to a JPEG while it is
+    // open lands on Color, where the rest of the colour controls live.
+    create_effect(move |_| {
+        if tab.get() == Tab::Raw && state.current().is_some() && !raw_item() {
+            tab.set(Tab::Color);
+        }
+    });
     view! {
         <Show when=move || state.current().is_some() fallback=|| ()>
             <div class="editor">
                 <Preview state=state tab=tab/>
                 <div class="controls">
                     <div class="tabs">
+                    <Show when=raw_item fallback=|| ()>
+                        <TabBtn tab=tab t=Tab::Raw label="RAW"/>
+                    </Show>
                     <TabBtn tab=tab t=Tab::Crop label="Crop"/>
                     <TabBtn tab=tab t=Tab::Rotate label="Rotate"/>
                     <TabBtn tab=tab t=Tab::Color label="Color"/>
@@ -320,6 +333,7 @@ pub(crate) fn Editor(state: AppState) -> impl IntoView {
                     </div>
                     <div class="panel">
                     {move || match tab.get() {
+                        Tab::Raw => view! { <RawPanel state=state/> }.into_view(),
                         Tab::Crop => view! { <CropTab state=state tab=tab/> }.into_view(),
                         Tab::Rotate => view! { <RotateTab state=state/> }.into_view(),
                         Tab::Color => view! { <ColorTab state=state/> }.into_view(),
