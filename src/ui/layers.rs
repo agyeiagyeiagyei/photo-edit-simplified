@@ -115,6 +115,16 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
     // topmost layer first, within each group. Adjustments stay in their own
     // group below the overlays.
     let display = create_memo(move |_| display_layers(layers.get()));
+    // The adjustment editor mounts once per selected adjustment layer. Reading
+    // the whole layer list in the mount closure rebuilt the editor on every
+    // slider input, which swapped the <input> under the pointer and ended a
+    // real drag after its first step.
+    let selected_adjust_id = create_memo(move |_| {
+        let id = state.selected_layer.get()?;
+        layers
+            .with(|ls| ls.iter().any(|l| l.id == id && matches!(l.kind, LayerKind::Adjust(_))))
+            .then_some(id)
+    });
     let is_photo = move || state.current().map(|m| m.kind == MediaKind::Photo).unwrap_or(false);
     let has_selection = move || state.current().map(|m| m.edit.selection.is_some()).unwrap_or(false);
 
@@ -229,7 +239,7 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
                                     }}
                                 </button>
                                 <span class="layer-label">
-                                    {move || layer.get().map(|l| l.label()).unwrap_or_default()}
+                                    {move || layers.with(|ls| row_label(ls, id))}
                                 </span>
                                 <input
                                     type="range"
@@ -279,13 +289,9 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
                 />
             </div>
             <ToolBar state=state/>
-            {move || state.selected_layer.get().and_then(|id| {
-                let is_adjust = layers
-                    .get()
-                    .iter()
-                    .any(|l| l.id == id && matches!(l.kind, LayerKind::Adjust(_)));
-                is_adjust.then(|| view! { <AdjustLayerEditor state=state layer_id=id/> })
-            })}
+            {move || selected_adjust_id
+                .get()
+                .map(|id| view! { <AdjustLayerEditor state=state layer_id=id/> })}
             <TextLayerEditor state=state/>
             <PathLayerEditor state=state/>
             <BrushLayerEditor state=state/>
@@ -304,6 +310,29 @@ fn display_layers(ls: Vec<Layer>) -> Vec<Layer> {
     let mut out: Vec<Layer> = ls[..first_adjust].iter().rev().cloned().collect();
     out.extend(ls[first_adjust..].iter().rev().cloned());
     out
+}
+
+/// Row label. Layers of the same kind (other than text, which shows its own
+/// words) get a number in creation order, so two adjustments read "Adjust 1"
+/// and "Adjust 2" and a reorder is visible. A masked adjustment says so.
+fn row_label(ls: &[Layer], id: usize) -> String {
+    let Some(layer) = ls.iter().find(|l| l.id == id) else {
+        return String::new();
+    };
+    let mut label = layer.label();
+    if !matches!(layer.kind, LayerKind::Text(_)) {
+        let same = |l: &&Layer| std::mem::discriminant(&l.kind) == std::mem::discriminant(&layer.kind);
+        if ls.iter().filter(same).count() > 1 {
+            let n = ls.iter().filter(same).filter(|l| l.id <= id).count();
+            label = format!("{label} {n}");
+        }
+    }
+    if let LayerKind::Adjust(a) = &layer.kind {
+        if a.mask.is_some() {
+            label.push_str(" · masked");
+        }
+    }
+    label
 }
 
 /// Whether a layer can move `delta` slots without leaving its group. Overlays
