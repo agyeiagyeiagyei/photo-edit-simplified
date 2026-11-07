@@ -145,6 +145,12 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
     // topmost layer first, within each group. Adjustments stay in their own
     // group below the overlays.
     let display = create_memo(move |_| display_layers(layers.get()));
+    // The adjustment editor mounts once per selected adjustment layer. Reading
+    // the whole layer list in the mount closure rebuilt the editor on every
+    // slider input, which swapped the <input> under the pointer and ended a
+    // real drag after its first step.
+    let selected_adjust_id = selected_adjust_memo(state);
+    let thumb_url = create_memo(move |_| state.current().map(|m| m.thumb_url).unwrap_or_default());
     let is_photo = move || state.current().map(|m| m.kind == MediaKind::Photo).unwrap_or(false);
     let has_selection = move || state.current().map(|m| m.edit.selection.is_some()).unwrap_or(false);
 
@@ -268,7 +274,7 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
                                     }}
                                 </button>
                                 <span class="layer-label">
-                                    {move || layer.get().map(|l| l.label()).unwrap_or_default()}
+                                    {move || layers.with(|ls| row_label(ls, id, false))}
                                 </span>
                                 <button
                                     class="icon-btn mask-thumb"
@@ -329,14 +335,22 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
                     }
                 />
             </div>
+            // The photo is the bottom of the stack, pinned under the scrolling
+            // list so it is always in view. It can't be moved or deleted;
+            // selecting it means no layer is selected, so the editing tabs
+            // edit the photo.
+            <div
+                class="photo-row"
+                class:selected=move || state.selected_layer.get().is_none()
+                on:click=move |_| state.selected_layer.set(None)
+            >
+                <img class="layer-thumb" src=move || thumb_url.get() alt=""/>
+                <span class="layer-label">"Photo"</span>
+            </div>
             <ToolBar state=state/>
-            {move || state.selected_layer.get().and_then(|id| {
-                let is_adjust = layers
-                    .get()
-                    .iter()
-                    .any(|l| l.id == id && matches!(l.kind, LayerKind::Adjust(_)));
-                is_adjust.then(|| view! { <AdjustLayerEditor state=state layer_id=id/> })
-            })}
+            {move || selected_adjust_id
+                .get()
+                .map(|id| view! { <AdjustLayerEditor state=state layer_id=id/> })}
             {move || state.selected_layer.get().map(|id| view! {
                 <MaskSection state=state layer_id=id/>
             })}
@@ -358,6 +372,94 @@ fn display_layers(ls: Vec<Layer>) -> Vec<Layer> {
     let mut out: Vec<Layer> = ls[..first_adjust].iter().rev().cloned().collect();
     out.extend(ls[first_adjust..].iter().rev().cloned());
     out
+}
+
+/// The selected layer's id when it is an adjustment layer. Editors mount from
+/// this memo, which only changes when the selection does: reading the whole
+/// layer list in a mount closure rebuilt the editor on every slider input,
+/// which swapped the <input> under the pointer and ended a real drag after
+/// its first step.
+pub(crate) fn selected_adjust_memo(state: AppState) -> Memo<Option<usize>> {
+    create_memo(move |_| {
+        let id = state.selected_layer.get()?;
+        state
+            .current()?
+            .layers
+            .iter()
+            .any(|l| l.id == id && matches!(l.kind, LayerKind::Adjust(_)))
+            .then_some(id)
+    })
+}
+
+/// What the editing tabs act on: the photo, or the selected layer.
+#[derive(Clone, PartialEq)]
+pub(crate) enum EditTarget {
+    Photo,
+    Adjust { id: usize, label: String },
+    Other { label: String },
+}
+
+pub(crate) fn edit_target_memo(state: AppState) -> Memo<EditTarget> {
+    create_memo(move |_| {
+        let Some(id) = state.selected_layer.get() else { return EditTarget::Photo };
+        let Some(m) = state.current() else { return EditTarget::Photo };
+        let Some(l) = m.layers.iter().find(|l| l.id == id) else { return EditTarget::Photo };
+        let label = row_label(&m.layers, id, true);
+        match l.kind {
+            LayerKind::Adjust(_) => EditTarget::Adjust { id, label },
+            _ => EditTarget::Other { label },
+        }
+    })
+}
+
+/// "Editing: …" line at the top of the editing tabs, so a tab never edits the
+/// photo while a layer is selected without saying so. `photo_note` explains,
+/// for a tab that only works on the photo, why the selected layer isn't the
+/// target.
+#[component]
+pub(crate) fn EditingLine(state: AppState, photo_note: &'static str, #[prop(optional)] layers_ok: bool) -> impl IntoView {
+    let target = edit_target_memo(state);
+    view! {
+        <div class="editing-line">
+            {move || match target.get() {
+                EditTarget::Adjust { label, .. } if layers_ok => view! {
+                    <span>"Editing: " <b>{label}</b></span>
+                    <button class="link-btn" on:click=move |_| state.selected_layer.set(None)>
+                        "Edit the photo instead"
+                    </button>
+                }
+                .into_view(),
+                EditTarget::Photo => view! { <span>"Editing: " <b>"Photo"</b></span> }.into_view(),
+                EditTarget::Adjust { label, .. } | EditTarget::Other { label } => view! {
+                    <span>"Editing: " <b>"Photo"</b></span>
+                    <span class="dim">{format!("{label} is selected, but {photo_note}.")}</span>
+                }
+                .into_view(),
+            }}
+        </div>
+    }
+}
+
+/// Row label. Layers of the same kind (other than text, which shows its own
+/// words) get a number in creation order, so two adjustments read "Adjust 1"
+/// and "Adjust 2" and a reorder is visible. The row's mask thumbnail shows a
+/// mask; with `mask_note` (the Editing line) the label says so in words.
+fn row_label(ls: &[Layer], id: usize, mask_note: bool) -> String {
+    let Some(layer) = ls.iter().find(|l| l.id == id) else {
+        return String::new();
+    };
+    let mut label = layer.label();
+    if !matches!(layer.kind, LayerKind::Text(_)) {
+        let same = |l: &&Layer| std::mem::discriminant(&l.kind) == std::mem::discriminant(&layer.kind);
+        if ls.iter().filter(same).count() > 1 {
+            let n = ls.iter().filter(same).filter(|l| l.id <= id).count();
+            label = format!("{label} {n}");
+        }
+    }
+    if mask_note && layer.mask.is_some() {
+        label.push_str(" · masked");
+    }
+    label
 }
 
 /// Whether a layer can move `delta` slots without leaving its group. Overlays
@@ -423,18 +525,6 @@ pub(crate) fn ensure_tool_layer(state: AppState, tool: Tool) {
     }
 }
 
-/// Selected adjustment layer's state, if any.
-fn selected_adjust(state: AppState) -> Option<(usize, AdjustLayerState)> {
-    let id = state.selected_layer.get()?;
-    state
-        .current_layers()
-        .into_iter()
-        .find_map(|l| match l.kind {
-            LayerKind::Adjust(a) if l.id == id => Some((id, a)),
-            _ => None,
-        })
-}
-
 fn with_adjust(state: AppState, id: usize, f: impl FnOnce(&mut AdjustLayerState)) {
     state.update_current_item(|m| {
         if let Some(l) = m.layers.iter_mut().find(|l| l.id == id) {
@@ -445,11 +535,19 @@ fn with_adjust(state: AppState, id: usize, f: impl FnOnce(&mut AdjustLayerState)
     });
 }
 
-#[component]
-pub(crate) fn AdjustLayerEditor(state: AppState, layer_id: usize) -> impl IntoView {
-    let adjust = move || selected_adjust(state).map(|(_, a)| a);
-    let channel = create_rw_signal(0usize);
+fn adjust_of(state: AppState, id: usize) -> Option<AdjustLayerState> {
+    state.current_layers().into_iter().find_map(|l| match l.kind {
+        LayerKind::Adjust(a) if l.id == id => Some(a),
+        _ => None,
+    })
+}
 
+/// An adjustment layer's colour settings. The Layers tab's editor and the
+/// Color tab (with that layer selected) both show these.
+#[component]
+pub(crate) fn AdjustColorControls(state: AppState, layer_id: usize) -> impl IntoView {
+    let adjust = move || adjust_of(state, layer_id);
+    let channel = create_rw_signal(0usize);
     let slider = move |label: &'static str,
                        get: fn(&PointAdjust) -> f32,
                        set: fn(&mut PointAdjust, f32)| {
@@ -470,16 +568,22 @@ pub(crate) fn AdjustLayerEditor(state: AppState, layer_id: usize) -> impl IntoVi
             </label>
         }
     };
+    view! {
+        {slider("Brightness", |a| a.brightness, |a, v| a.brightness = v)}
+        {slider("Contrast", |a| a.contrast, |a, v| a.contrast = v)}
+        {slider("Saturation", |a| a.saturation, |a, v| a.saturation = v)}
+        {slider("Warmth", |a| a.warmth, |a, v| a.warmth = v)}
+        <LevelsPanel state=state channel=channel target=AdjustTarget::Layer(layer_id)/>
+        <CurvesPanel state=state channel=channel target=AdjustTarget::Layer(layer_id)/>
+    }
+}
 
+#[component]
+pub(crate) fn AdjustLayerEditor(state: AppState, layer_id: usize) -> impl IntoView {
     view! {
         <div class="adjust-editor">
             <div class="panel-title">"Adjustment layer"</div>
-            {slider("Brightness", |a| a.brightness, |a, v| a.brightness = v)}
-            {slider("Contrast", |a| a.contrast, |a, v| a.contrast = v)}
-            {slider("Saturation", |a| a.saturation, |a, v| a.saturation = v)}
-            {slider("Warmth", |a| a.warmth, |a, v| a.warmth = v)}
-            <LevelsPanel state=state channel=channel target=AdjustTarget::Layer(layer_id)/>
-            <CurvesPanel state=state channel=channel target=AdjustTarget::Layer(layer_id)/>
+            <AdjustColorControls state=state layer_id=layer_id/>
         </div>
     }
 }
