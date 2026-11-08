@@ -151,6 +151,10 @@ pub struct PathLayer {
     pub fill_color: String,
     pub stroke_color: String,
     pub stroke_width: f32,
+    /// Clockwise rotation in degrees about the points' bounding-box centre.
+    pub angle: f32,
+    /// Uniform scale about the points' bounding-box centre.
+    pub scale: f32,
     /// Per-path undo stack of point states.
     pub history: Vec<Vec<PathPoint>>,
 }
@@ -163,6 +167,8 @@ impl Default for PathLayer {
             fill_color: "#ff3b30".into(),
             stroke_color: "#000000".into(),
             stroke_width: 0.01,
+            angle: 0.0,
+            scale: 1.0,
             history: Vec::new(),
         }
     }
@@ -217,6 +223,10 @@ pub struct BrushLayer {
     pub spacing: f32,
     /// SVG path data for BrushShape::Custom (100x100 box).
     pub custom_path: String,
+    /// Clockwise rotation in degrees about the strokes' bounding-box centre.
+    pub angle: f32,
+    /// Uniform scale about the strokes' bounding-box centre.
+    pub scale: f32,
     /// Per-layer undo stack of stroke states.
     pub history: Vec<Vec<BrushStroke>>,
 }
@@ -231,6 +241,8 @@ impl Default for BrushLayer {
             spacing: 1.0,
             custom_path: "M50 5 L61 39 L98 39 L68 60 L79 95 L50 73 L21 95 L32 60 L2 39 L39 39 Z"
                 .into(),
+            angle: 0.0,
+            scale: 1.0,
             history: Vec::new(),
         }
     }
@@ -241,11 +253,14 @@ impl Default for BrushLayer {
 #[derive(Clone, PartialEq, Debug)]
 pub struct AdjustLayerState {
     pub adjust: PointAdjust,
+    /// When set, the adjustment only affects the pixels of this layer — an
+    /// adjustment clipped to the image layer below it.
+    pub clip_to: Option<usize>,
 }
 
 impl AdjustLayerState {
     pub fn new() -> Self {
-        AdjustLayerState { adjust: PointAdjust::default() }
+        AdjustLayerState { adjust: PointAdjust::default(), clip_to: None }
     }
 }
 
@@ -277,6 +292,12 @@ pub struct RasterLayer {
     /// Drawn width as a fraction of canvas width; height follows the
     /// buffer's aspect ratio. 1.0 = full-bleed.
     pub scale: f32,
+    /// Clockwise rotation in degrees about the (x, y) centre.
+    pub angle: f32,
+    /// Bumped by every in-place pixel edit (heal, clone) so the composited
+    /// segment cache does not keep serving the previous pixels — its
+    /// fingerprint only samples a few bytes.
+    pub rev: u64,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -329,6 +350,8 @@ impl Layer {
                 x: 0.5,
                 y: 0.5,
                 scale: 1.0,
+                angle: 0.0,
+                rev: 0,
             }),
         )
     }
@@ -353,6 +376,54 @@ impl Layer {
     }
 }
 
+impl PathLayer {
+    /// Control-point bounds in normalized image coords.
+    pub fn points_bbox(&self) -> Option<(f32, f32, f32, f32)> {
+        let first = self.points.first()?;
+        let (mut x0, mut y0, mut x1, mut y1) = (first.x, first.y, first.x, first.y);
+        for p in &self.points[1..] {
+            x0 = x0.min(p.x);
+            y0 = y0.min(p.y);
+            x1 = x1.max(p.x);
+            y1 = y1.max(p.y);
+        }
+        Some((x0, y0, x1, y1))
+    }
+}
+
+impl BrushLayer {
+    /// Stroke-point bounds in normalized image coords.
+    pub fn points_bbox(&self) -> Option<(f32, f32, f32, f32)> {
+        let mut it = self.strokes.iter().flat_map(|s| s.points.iter());
+        let (x, y) = *it.next()?;
+        let (mut x0, mut y0, mut x1, mut y1) = (x, y, x, y);
+        for &(x, y) in it {
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x);
+            y1 = y1.max(y);
+        }
+        Some((x0, y0, x1, y1))
+    }
+}
+
+impl LayerKind {
+    /// Rotation and uniform scale drawn around the layer's pivot. Only path
+    /// and brush layers scale this way; text scales through its font size and
+    /// an image through its drawn width.
+    pub fn pivot_transform(&self) -> (f32, f32) {
+        match self {
+            LayerKind::Path(p) => (p.angle, p.scale),
+            LayerKind::Brush(b) => (b.angle, b.scale),
+            _ => (0.0, 1.0),
+        }
+    }
+
+    pub fn has_transform(&self) -> bool {
+        !matches!(self, LayerKind::Adjust(_))
+    }
+}
+
 /// Stack order is application order: index 0 is the bottom. Adjustment layers
 /// below the first drawn overlay are part of the photo pipeline (they have
 /// only the photo beneath them); adjustments at or above it apply to the
@@ -372,7 +443,11 @@ pub fn adjust_layers_from_stack(layers: &[Layer]) -> Vec<AdjustLayer> {
     layers
         .iter()
         .filter_map(|l| match &l.kind {
-            LayerKind::Adjust(a) => Some(AdjustLayer {
+            // A clipped adjustment applies only where its target layer is
+            // drawn. The photo pipeline has no layer pixels to clip against,
+            // so baking one there would tint the whole picture — which is
+            // what the split does once the target is hidden.
+            LayerKind::Adjust(a) if a.clip_to.is_none() => Some(AdjustLayer {
                 id: l.id as u64,
                 visible: l.visible,
                 opacity: l.opacity,
@@ -433,7 +508,7 @@ pub fn migrate_adjust_layers(
             invert: al.invert,
             show_mask: false,
             mask_version: al.mask_version,
-            kind: LayerKind::Adjust(AdjustLayerState { adjust: al.adjust }),
+            kind: LayerKind::Adjust(AdjustLayerState { adjust: al.adjust, clip_to: None }),
         });
     }
     migrated.append(layers);

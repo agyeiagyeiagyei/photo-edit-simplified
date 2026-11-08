@@ -56,11 +56,39 @@ pub(crate) fn draw_text_layer(ctx: &web_sys::CanvasRenderingContext2d, layer: &s
     ctx.set_shadow_offset_y(0.0);
 }
 
+/// Pivot (bounding-box centre) of a path or brush layer, in device pixels.
+fn pivot_px(kind: &LayerKind, w: f64, h: f64) -> Option<(f64, f64)> {
+    let bbox = match kind {
+        LayerKind::Path(p) => p.points_bbox(),
+        LayerKind::Brush(b) => b.points_bbox(),
+        _ => None,
+    }?;
+    Some((((bbox.0 + bbox.2) / 2.0) as f64 * w, ((bbox.1 + bbox.3) / 2.0) as f64 * h))
+}
+
+fn apply_pivot_transform(ctx: &web_sys::CanvasRenderingContext2d, kind: &LayerKind, w: f64, h: f64) {
+    let (angle, scale) = kind.pivot_transform();
+    if angle == 0.0 && (scale - 1.0).abs() < 1e-4 {
+        return;
+    }
+    let Some((cx, cy)) = pivot_px(kind, w, h) else { return };
+    let _ = ctx.translate(cx, cy);
+    if angle != 0.0 {
+        let _ = ctx.rotate((angle as f64).to_radians());
+    }
+    if (scale - 1.0).abs() >= 1e-4 {
+        let _ = ctx.scale(scale as f64, scale as f64);
+    }
+    let _ = ctx.translate(-cx, -cy);
+}
+
 pub(crate) fn draw_path_layer(ctx: &web_sys::CanvasRenderingContext2d, layer: &state::Layer, w: f64, h: f64) {
     let LayerKind::Path(p) = &layer.kind else { return; };
     if p.points.len() < 2 {
         return;
     }
+    ctx.save();
+    apply_pivot_transform(ctx, &layer.kind, w, h);
     ctx.begin_path();
     let first = &p.points[0];
     ctx.move_to((first.x * w as f32) as f64, (first.y * h as f32) as f64);
@@ -99,10 +127,13 @@ pub(crate) fn draw_path_layer(ctx: &web_sys::CanvasRenderingContext2d, layer: &s
         ctx.set_line_join("round");
         ctx.stroke();
     }
+    ctx.restore();
 }
 
 pub(crate) fn draw_brush_layer(ctx: &web_sys::CanvasRenderingContext2d, layer: &state::Layer, w: f64, h: f64) {
     let LayerKind::Brush(b) = &layer.kind else { return; };
+    ctx.save();
+    apply_pivot_transform(ctx, &layer.kind, w, h);
     let size_px = (b.width * h as f32) as f64;
     if b.shape == state::BrushShape::Smooth {
         ctx.set_stroke_style_str(&b.color);
@@ -121,6 +152,7 @@ pub(crate) fn draw_brush_layer(ctx: &web_sys::CanvasRenderingContext2d, layer: &
             }
             ctx.stroke();
         }
+        ctx.restore();
         return;
     }
 
@@ -171,6 +203,7 @@ pub(crate) fn draw_brush_layer(ctx: &web_sys::CanvasRenderingContext2d, layer: &
             ctx.restore();
         }
     }
+    ctx.restore();
 }
 
 pub(crate) fn draw_raster_layer(ctx: &web_sys::CanvasRenderingContext2d, layer: &state::Layer, w: f64, h: f64) {
@@ -184,7 +217,15 @@ pub(crate) fn draw_raster_layer(ctx: &web_sys::CanvasRenderingContext2d, layer: 
     let dh = dw * r.height as f64 / r.width as f64;
     let dx = (r.x as f64 * w) - dw / 2.0;
     let dy = (r.y as f64 * h) - dh / 2.0;
+    ctx.save();
+    if r.angle != 0.0 {
+        let (cx, cy) = (r.x as f64 * w, r.y as f64 * h);
+        let _ = ctx.translate(cx, cy);
+        let _ = ctx.rotate((r.angle as f64).to_radians());
+        let _ = ctx.translate(-cx, -cy);
+    }
     let _ = ctx.draw_image_with_html_canvas_element_and_dw_and_dh(&canvas, dx, dy, dw, dh);
+    ctx.restore();
 }
 
 struct MaskBytes {
@@ -212,6 +253,18 @@ struct OverlaySegment {
     canvas: web_sys::HtmlCanvasElement,
 }
 
+/// Alpha of a layer that a clipped adjustment targets. Cleaned at the layer's
+/// own opacity, mask and transform, so a clipped colour edit changes exactly
+/// the pixels that layer contributes.
+struct ClipAlpha {
+    item_id: usize,
+    layer_id: usize,
+    w: usize,
+    h: usize,
+    fp: u64,
+    data: Vec<u8>,
+}
+
 /// Rasterised masks kept across frames. One entry per masked layer, so two
 /// masked overlays no longer evict each other every frame; below the cap a
 /// feather or brush stroke only rebuilds the mask that changed.
@@ -237,6 +290,12 @@ thread_local! {
         std::cell::RefCell::new(None);
     static OVERLAY_SEGMENTS: std::cell::RefCell<Vec<OverlaySegment>> =
         std::cell::RefCell::new(Vec::new());
+    static CLIP_ALPHA: std::cell::RefCell<Vec<ClipAlpha>> =
+        std::cell::RefCell::new(Vec::new());
+    /// Rasterising a clip target is separate from the overlay scratch: a masked
+    /// target draws through the overlay scratch inside this pass.
+    static CLIP_SCRATCH: std::cell::RefCell<Option<MaskScratch>> =
+        std::cell::RefCell::new(None);
 }
 
 fn mask_bytes(
@@ -424,23 +483,100 @@ fn segment_canvas(
     })
 }
 
+fn clip_alpha(item_id: usize, target: &state::Layer, w: usize, h: usize) -> Vec<u8> {
+    let fp = segment_fp(item_id, std::slice::from_ref(target), w, h);
+    let cacheable = w * h <= OVERLAY_CACHE_MAX_PX;
+    if cacheable {
+        let hit = CLIP_ALPHA.with(|c| {
+            let mut c = c.borrow_mut();
+            let i = c.iter().position(|a| {
+                a.item_id == item_id && a.layer_id == target.id && a.w == w && a.h == h && a.fp == fp
+            })?;
+            let hit = c.remove(i);
+            let data = hit.data.clone();
+            c.push(hit);
+            Some(data)
+        });
+        if let Some(data) = hit {
+            return data;
+        }
+    }
+    let _sp = perf::Span::new("stack.clip.build");
+    let canvas = CLIP_SCRATCH.with(|s| {
+        let mut s = s.borrow_mut();
+        if let Some(c) = s.as_ref() {
+            if c.w == w && c.h == h {
+                let ctx = web::ctx2d(&c.canvas);
+                ctx.set_global_composite_operation("source-over").ok();
+                ctx.set_global_alpha(1.0);
+                ctx.clear_rect(0.0, 0.0, w as f64, h as f64);
+                return c.canvas.clone();
+            }
+        }
+        let canvas = web::create_canvas(w as u32, h as u32);
+        *s = Some(MaskScratch { w, h, canvas: canvas.clone() });
+        canvas
+    });
+    let ctx = web::ctx2d(&canvas);
+    draw_overlay(&ctx, item_id, target, w, h);
+    let (data, _, _) = web::image_data_from_ctx(&ctx, w as u32, h as u32);
+    let alpha: Vec<u8> = data.chunks(4).map(|px| px[3]).collect();
+    if cacheable {
+        CLIP_ALPHA.with(|c| {
+            let mut c = c.borrow_mut();
+            c.push(ClipAlpha { item_id, layer_id: target.id, w, h, fp, data: alpha.clone() });
+            if c.len() > 2 {
+                c.remove(0);
+            }
+        });
+    }
+    alpha
+}
+
 fn apply_adjust_on_canvas(
     canvas: &web_sys::HtmlCanvasElement,
     ctx: &web_sys::CanvasRenderingContext2d,
     item_id: usize,
-    layer: &state::Layer,
+    layers: &[state::Layer],
+    li: usize,
     w: usize,
     h: usize,
 ) {
+    let layer = &layers[li];
     if !layer.visible || layer.opacity <= 0.01 || w == 0 || h == 0 {
         return;
     }
     let LayerKind::Adjust(a) = &layer.kind else { return };
     let _sp = perf::Span::new("stack.adjust.apply");
-    let (mut data, _, _) = web::image_data_from_ctx(ctx, w as u32, h as u32);
-    let mask = layer.mask.as_ref().map(|sel| {
+    let own_mask = layer.mask.as_ref().map(|sel| {
         mask_bytes(item_id, layer.id, layer.mask_version, sel, layer.invert, w, h)
     });
+    let clip = match a.clip_to {
+        Some(tid) => {
+            // A clipped adjustment only affects its target. If the target is
+            // gone or no longer below it, it affects nothing — never the
+            // whole picture.
+            let Some(ti) = layers[..li].iter().position(|l| l.id == tid) else { return };
+            let target = &layers[ti];
+            if !target.visible || target.opacity <= 0.01 {
+                return;
+            }
+            Some(clip_alpha(item_id, target, w, h))
+        }
+        None => None,
+    };
+    let mask = match (own_mask, clip) {
+        (None, None) => None,
+        (Some(m), None) => Some(m),
+        (None, Some(c)) => Some(c),
+        (Some(m), Some(c)) => Some(
+            m.iter()
+                .zip(c.iter())
+                .map(|(a, b)| ((*a as u16 * *b as u16) / 255) as u8)
+                .collect(),
+        ),
+    };
+    let (mut data, _, _) = web::image_data_from_ctx(ctx, w as u32, h as u32);
     pes_pixel::color::apply_point_adjust_u8(
         &mut data,
         &a.adjust,
@@ -477,7 +613,7 @@ pub(crate) fn composite_stack(
             ctx.draw_image_with_html_canvas_element(&seg, 0.0, 0.0).ok();
         }
         if i < layers.len() {
-            apply_adjust_on_canvas(canvas, &ctx, item_id, &layers[i], w, h);
+            apply_adjust_on_canvas(canvas, &ctx, item_id, layers, i, w, h);
             i += 1;
         }
     }
@@ -494,6 +630,8 @@ pub(crate) fn clear_overlay_caches() {
     MASK_BYTES.with(|c| c.borrow_mut().clear());
     MASK_ALPHA_CANVAS.with(|c| *c.borrow_mut() = None);
     MASK_SCRATCH.with(|c| *c.borrow_mut() = None);
+    CLIP_ALPHA.with(|c| c.borrow_mut().clear());
+    CLIP_SCRATCH.with(|c| *c.borrow_mut() = None);
 }
 
 pub(crate) async fn render_text_overlay(t: &state::TextLayer, w: usize, h: usize) -> Result<web_sys::Blob, JsValue> {
@@ -812,6 +950,8 @@ fn hash_layer(h: &mut std::collections::hash_map::DefaultHasher, l: &state::Laye
             p.fill_color.hash(h);
             p.stroke_color.hash(h);
             h.write_u32(p.stroke_width.to_bits());
+            h.write_u32(p.angle.to_bits());
+            h.write_u32(p.scale.to_bits());
             for pt in p.points.first().into_iter().chain(p.points.last()) {
                 h.write_u32(pt.x.to_bits());
                 h.write_u32(pt.y.to_bits());
@@ -825,6 +965,8 @@ fn hash_layer(h: &mut std::collections::hash_map::DefaultHasher, l: &state::Laye
             std::mem::discriminant(&b.shape).hash(h);
             h.write_u32(b.width.to_bits());
             h.write_u32(b.spacing.to_bits());
+            h.write_u32(b.angle.to_bits());
+            h.write_u32(b.scale.to_bits());
             if let Some(s) = b.strokes.last() {
                 s.points.len().hash(h);
                 if let Some(p) = s.points.last() {
@@ -840,6 +982,8 @@ fn hash_layer(h: &mut std::collections::hash_map::DefaultHasher, l: &state::Laye
             h.write_u32(r.x.to_bits());
             h.write_u32(r.y.to_bits());
             h.write_u32(r.scale.to_bits());
+            h.write_u32(r.angle.to_bits());
+            r.rev.hash(h);
             if !r.pixels.is_empty() {
                 r.pixels.len().hash(h);
                 for i in 0..8 {
@@ -854,6 +998,7 @@ fn hash_layer(h: &mut std::collections::hash_map::DefaultHasher, l: &state::Laye
             }
             format!("{:?}", a.adjust.levels).hash(h);
             format!("{:?}", a.adjust.curves).hash(h);
+            a.clip_to.hash(h);
         }
     }
 }
@@ -1159,6 +1304,131 @@ pub(crate) fn apply_clone(state: AppState, pts: &[(f32, f32)]) {
             })
         },
     );
+}
+
+/// Map a full-image normalized point into an image layer's own normalized
+/// pixel space, undoing its placement and rotation.
+pub(crate) fn raster_layer_point(
+    r: &state::RasterLayer,
+    nx: f32,
+    ny: f32,
+    w: usize,
+    h: usize,
+) -> Option<(f32, f32)> {
+    let dw = r.scale * w as f32;
+    if dw <= 0.0 || r.width == 0 || r.height == 0 {
+        return None;
+    }
+    let dh = dw * r.height as f32 / r.width as f32;
+    let dx = (nx - r.x) * w as f32;
+    let dy = (ny - r.y) * h as f32;
+    let (s, c) = r.angle.to_radians().sin_cos();
+    let lx = (dx * c + dy * s) / dw + 0.5;
+    let ly = (-dx * s + dy * c) / dh + 0.5;
+    Some((lx, ly))
+}
+
+/// Stroke coverage in an image layer's pixel space, limited to opaque layer
+/// pixels so healing and cloning never write into the transparent margin.
+fn layer_stroke_coverage(
+    r: &state::RasterLayer,
+    pts: &[(f32, f32)],
+    w: usize,
+    h: usize,
+    radius_frac: f32,
+) -> Option<Vec<u8>> {
+    let dw = r.scale * w as f32;
+    if dw <= 0.0 {
+        return None;
+    }
+    let mapped: Vec<(f32, f32)> = pts
+        .iter()
+        .filter_map(|&(nx, ny)| raster_layer_point(r, nx, ny, w, h))
+        .collect();
+    if mapped.is_empty() {
+        return None;
+    }
+    let diag = ((w * w + h * h) as f32).sqrt();
+    let r_px = (radius_frac * diag * (r.width as f32 / dw)).max(1.0);
+    let mut cov = vec![0u8; r.width * r.height];
+    pes_pixel::geo::stamp_stroke(&mut cov, r.width, r.height, &mapped, r_px);
+    for (i, px) in r.pixels.chunks(4).enumerate() {
+        if px[3] == 0 {
+            cov[i] = 0;
+        }
+    }
+    Some(cov)
+}
+
+fn swap_layer_pixels(state: AppState, layer_id: usize, px: Vec<u8>) {
+    state.update_current_item(|m| {
+        if let Some(l) = m.layers.iter_mut().find(|l| l.id == layer_id) {
+            if let LayerKind::Raster(r) = &mut l.kind {
+                r.pixels = Rc::new(px);
+                r.rev += 1;
+            }
+        }
+    });
+}
+
+/// Spot-heal an image layer's own pixels. The stroke arrives in full-image
+/// normalized coords and runs at the layer's native resolution — the photo
+/// underneath is untouched.
+pub(crate) fn apply_layer_heal(state: AppState, layer_id: usize, pts: &[(f32, f32)]) {
+    if pts.is_empty() {
+        return;
+    }
+    let Some(item) = state.current() else { return };
+    let Some(layer) = item.layers.iter().find(|l| l.id == layer_id) else { return };
+    let LayerKind::Raster(r) = &layer.kind else { return };
+    let (w, h) = working_dims(item.width, item.height, &item.edit);
+    let Some(cov) = layer_stroke_coverage(r, pts, w, h, state.heal_radius.get_untracked()) else {
+        return;
+    };
+    let mut px = (*r.pixels).clone();
+    let seed = (layer_id as u32).wrapping_mul(2654435761) ^ r.rev as u32;
+    if !heal::spot_heal(&mut px, &cov, r.width, r.height, 1.0, state.heal_mode.get_untracked(), seed) {
+        return;
+    }
+    swap_layer_pixels(state, layer_id, px);
+}
+
+/// Clone-stamp an image layer's own pixels from a source point on the canvas.
+pub(crate) fn apply_layer_clone(state: AppState, layer_id: usize, pts: &[(f32, f32)]) {
+    if pts.is_empty() {
+        return;
+    }
+    let Some(item) = state.current() else { return };
+    let Some(src) = state.clone_source.get_untracked() else { return };
+    let Some(layer) = item.layers.iter().find(|l| l.id == layer_id) else { return };
+    let LayerKind::Raster(r) = &layer.kind else { return };
+    let (w, h) = working_dims(item.width, item.height, &item.edit);
+    let aligned = state.clone_aligned.get_untracked();
+    let offset = if aligned {
+        match state.clone_offset.get_untracked() {
+            Some(off) => off,
+            None => {
+                let off = (src.0 - pts[0].0, src.1 - pts[0].1);
+                state.clone_offset.set(Some(off));
+                off
+            }
+        }
+    } else {
+        (src.0 - pts[0].0, src.1 - pts[0].1)
+    };
+    let Some(cov) = layer_stroke_coverage(r, pts, w, h, state.clone_radius.get_untracked()) else {
+        return;
+    };
+    let Some((lx, ly)) = raster_layer_point(r, pts[0].0, pts[0].1, w, h) else { return };
+    let Some((sx, sy)) = raster_layer_point(r, pts[0].0 + offset.0, pts[0].1 + offset.1, w, h)
+    else {
+        return;
+    };
+    let dx = ((sx - lx) * r.width as f32).round() as i32;
+    let dy = ((sy - ly) * r.height as f32).round() as i32;
+    let mut px = (*r.pixels).clone();
+    pes_pixel::clone::clone_stamp(&mut px, r.width, r.height, &cov, dx, dy);
+    swap_layer_pixels(state, layer_id, px);
 }
 
 /// Magic wand: flood-select pixels similar to the clicked one, sampled from

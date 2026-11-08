@@ -58,13 +58,26 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
     };
 
     let delete_layer = move |id: usize| {
+        let mut orphaned = Vec::new();
         state.update_current_item(|m| {
-            m.layers.retain(|l| l.id != id);
+            // An adjustment clipped to this layer has no target once it is
+            // gone; leaving it would silently widen its edits to the stack.
+            m.layers.retain(|l| {
+                let clipped = matches!(&l.kind, LayerKind::Adjust(a) if a.clip_to == Some(id));
+                if clipped {
+                    orphaned.push(l.id);
+                }
+                l.id != id && !clipped
+            });
         });
-        if state.selected_layer.get() == Some(id) {
+        if state.selected_layer.get().is_some_and(|sel| sel == id || orphaned.contains(&sel)) {
             state.selected_layer.set(None);
         }
-        if state.mask_target.get().is_some_and(|(_, layer)| layer == id) {
+        if state
+            .mask_target
+            .get()
+            .is_some_and(|(_, layer)| layer == id || orphaned.contains(&layer))
+        {
             state.mask_target.set(None);
         }
     };
@@ -355,12 +368,100 @@ pub(crate) fn selected_adjust_memo(state: AppState) -> Memo<Option<usize>> {
     })
 }
 
+/// Coarse layer class: enough to decide which editing tabs can act on a layer
+/// without copying its payload into the memo.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LayerClass {
+    Text,
+    Path,
+    Brush,
+    Raster,
+    Adjust,
+}
+
+impl LayerClass {
+    pub(crate) fn of(kind: &LayerKind) -> Self {
+        match kind {
+            LayerKind::Text(_) => LayerClass::Text,
+            LayerKind::Path(_) => LayerClass::Path,
+            LayerKind::Brush(_) => LayerClass::Brush,
+            LayerKind::Raster(_) => LayerClass::Raster,
+            LayerKind::Adjust(_) => LayerClass::Adjust,
+        }
+    }
+}
+
+/// The selected layer's id when the Rotate tab can transform it. Same
+/// selection-only memo rule as `selected_adjust_memo`: the controls read the
+/// layer's values reactively, and only a selection change remounts them.
+pub(crate) fn selected_transform_memo(state: AppState) -> Memo<Option<usize>> {
+    create_memo(move |_| {
+        let id = state.selected_layer.get()?;
+        state
+            .current()?
+            .layers
+            .iter()
+            .any(|l| l.id == id && l.kind.has_transform())
+            .then_some(id)
+    })
+}
+
+/// The selected layer's id when it is an image (raster) layer.
+pub(crate) fn selected_raster_memo(state: AppState) -> Memo<Option<usize>> {
+    create_memo(move |_| {
+        let id = state.selected_layer.get()?;
+        state
+            .current()?
+            .layers
+            .iter()
+            .any(|l| l.id == id && matches!(l.kind, LayerKind::Raster(_)))
+            .then_some(id)
+    })
+}
+
+/// The adjustment layer clipped to the selected image layer, if one exists.
+/// Stable while that layer's values change, so the Color sliders stay mounted
+/// through a drag.
+pub(crate) fn clip_adjust_memo(state: AppState) -> Memo<Option<usize>> {
+    create_memo(move |_| {
+        let rid = selected_raster_memo(state).get()?;
+        state.current_layers().into_iter().find_map(|l| match l.kind {
+            LayerKind::Adjust(a) if a.clip_to == Some(rid) => Some(l.id),
+            _ => None,
+        })
+    })
+}
+
+/// Colour on an image layer: make the adjustment clipped to it if it doesn't
+/// exist yet, so the Color tab has somewhere to write. Inserted directly above
+/// the image so it applies to that layer and nothing above it.
+pub(crate) fn ensure_clip_adjust(state: AppState, raster_id: usize) -> Option<usize> {
+    let mut made = None;
+    state.update_current_item(|m| {
+        if m.layers
+            .iter()
+            .any(|l| matches!(&l.kind, LayerKind::Adjust(a) if a.clip_to == Some(raster_id)))
+        {
+            return;
+        }
+        let Some(ri) = m.layers.iter().position(|l| l.id == raster_id) else { return };
+        let id = m.next_layer_id;
+        m.next_layer_id += 1;
+        let mut layer = Layer::new_adjust(id);
+        if let LayerKind::Adjust(a) = &mut layer.kind {
+            a.clip_to = Some(raster_id);
+        }
+        m.layers.insert(ri + 1, layer);
+        made = Some(id);
+    });
+    made
+}
+
 /// What the editing tabs act on: the photo, or the selected layer.
 #[derive(Clone, PartialEq)]
 pub(crate) enum EditTarget {
     Photo,
-    Adjust { id: usize, label: String },
-    Other { label: String },
+    Layer { id: usize, label: String, class: LayerClass },
 }
 
 pub(crate) fn edit_target_memo(state: AppState) -> Memo<EditTarget> {
@@ -369,24 +470,25 @@ pub(crate) fn edit_target_memo(state: AppState) -> Memo<EditTarget> {
         let Some(m) = state.current() else { return EditTarget::Photo };
         let Some(l) = m.layers.iter().find(|l| l.id == id) else { return EditTarget::Photo };
         let label = row_label(&m.layers, id, true);
-        match l.kind {
-            LayerKind::Adjust(_) => EditTarget::Adjust { id, label },
-            _ => EditTarget::Other { label },
-        }
+        EditTarget::Layer { id, label, class: LayerClass::of(&l.kind) }
     })
 }
 
 /// "Editing: …" line at the top of the editing tabs, so a tab never edits the
-/// photo while a layer is selected without saying so. `photo_note` explains,
-/// for a tab that only works on the photo, why the selected layer isn't the
-/// target.
+/// photo while a layer is selected without saying so. `supports` says which
+/// layer classes the tab can act on; `photo_note` completes "<layer> is
+/// selected, but …" for the classes it can't.
 #[component]
-pub(crate) fn EditingLine(state: AppState, photo_note: &'static str, #[prop(optional)] layers_ok: bool) -> impl IntoView {
+pub(crate) fn EditingLine(
+    state: AppState,
+    photo_note: &'static str,
+    supports: fn(LayerClass) -> bool,
+) -> impl IntoView {
     let target = edit_target_memo(state);
     view! {
         <div class="editing-line">
             {move || match target.get() {
-                EditTarget::Adjust { label, .. } if layers_ok => view! {
+                EditTarget::Layer { label, class, .. } if supports(class) => view! {
                     <span>"Editing: " <b>{label}</b></span>
                     <button class="link-btn" on:click=move |_| state.selected_layer.set(None)>
                         "Edit the photo instead"
@@ -394,7 +496,7 @@ pub(crate) fn EditingLine(state: AppState, photo_note: &'static str, #[prop(opti
                 }
                 .into_view(),
                 EditTarget::Photo => view! { <span>"Editing: " <b>"Photo"</b></span> }.into_view(),
-                EditTarget::Adjust { label, .. } | EditTarget::Other { label } => view! {
+                EditTarget::Layer { label, .. } => view! {
                     <span>"Editing: " <b>"Photo"</b></span>
                     <span class="dim">{format!("{label} is selected, but {photo_note}.")}</span>
                 }
@@ -572,7 +674,7 @@ fn mask_from_selection(state: AppState, layer_id: usize) -> bool {
     item_id.is_some()
 }
 
-fn with_layer(state: AppState, layer_id: usize, f: impl FnOnce(&mut Layer)) {
+pub(crate) fn with_layer(state: AppState, layer_id: usize, f: impl FnOnce(&mut Layer)) {
     state.update_current_item(|m| {
         if let Some(l) = m.layers.iter_mut().find(|l| l.id == layer_id) {
             f(l);

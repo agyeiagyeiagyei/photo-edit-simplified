@@ -564,6 +564,25 @@ pub(crate) fn layer_norm_pos(ev: &web_sys::MouseEvent, crop: state::CropRect) ->
     Some((crop.x + nx * crop.w, crop.y + ny * crop.h))
 }
 
+/// Displayed size of the preview in CSS pixels.
+pub(crate) fn canvas_css_size() -> Option<(f32, f32)> {
+    let el = web::document().query_selector(".canvas-wrap").ok().flatten()?;
+    let rect = el.get_bounding_client_rect();
+    Some((rect.width() as f32, rect.height() as f32))
+}
+
+/// Pointer position relative to `.canvas-wrap` in crop-relative units,
+/// unclamped: a rotate drag stays meaningful after the pointer leaves the
+/// canvas, where clamping would snap the bearing to an edge.
+pub(crate) fn layer_local_pos(ev: &web_sys::MouseEvent) -> Option<(f32, f32)> {
+    let el = web::document().query_selector(".canvas-wrap").ok().flatten()?;
+    let rect = el.get_bounding_client_rect();
+    Some((
+        (ev.client_x() as f32 - rect.left() as f32) / rect.width() as f32,
+        (ev.client_y() as f32 - rect.top() as f32) / rect.height() as f32,
+    ))
+}
+
 pub(crate) fn dist2(a: (f32, f32), b: (f32, f32)) -> f32 {
     let dx = a.0 - b.0;
     let dy = a.1 - b.1;
