@@ -408,7 +408,7 @@ pub(crate) fn source_window(
     if cw == 0 || ch == 0 || sx + cw > fw || sy + ch > fh {
         return None;
     }
-    let margin = (edit.blur / 100.0 * 8.0 * 3.0).ceil() as usize + 2;
+    let margin = (Place::whole(fw, fh).blur_sigma(edit.blur) * 3.0).ceil() as usize + 2;
     let x0 = sx.saturating_sub(margin);
     let y0 = sy.saturating_sub(margin);
     let x1 = (sx + cw + margin).min(fw);
@@ -419,7 +419,7 @@ pub(crate) fn source_window(
     // The loupe shows the whole window, not the selection. Layer masks are
     // full-frame, so crop them to the window or they would paint the whole crop.
     let rebased = pipeline::rebase_layer_masks(edit, fw, fh, (x0, y0, ew, eh), ew, eh);
-    pipeline::finish(&mut frame, &rebased, seed, None, 1.0);
+    pipeline::finish(&mut frame, &rebased, seed, None, 1.0, Place::window(fw, fh, (x0, y0, ew, eh), ew));
     let win = frame.pixels;
     let (ix, iy) = (sx - x0, sy - y0);
     let mut out = Vec::with_capacity(cw * ch * 4);

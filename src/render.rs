@@ -1559,7 +1559,7 @@ pub(crate) fn wand_select(state: AppState, nx: f32, ny: f32) {
     }
     let rendered = state::render_edit(&item.edit, &item.layers);
     if item.edit.base_color_touched() {
-        blur::blur_apply(p.to_mut(), w, h, item.edit.blur);
+        blur::blur_apply(p.to_mut(), w, h, item.edit.blur, Place::whole(w, h));
         color::apply_color(p.to_mut(), &item.edit);
     }
     if !rendered.adjust_layers.is_empty() {

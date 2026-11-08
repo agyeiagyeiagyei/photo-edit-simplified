@@ -20,6 +20,7 @@ use crate::levels::LevelsSettings;
 use crate::noise;
 #[cfg(test)]
 use crate::ops;
+use crate::place::Place;
 use crate::types::{EditParams, PointAdjust};
 use crate::wide;
 
@@ -508,10 +509,11 @@ pub fn apply_color_effects_wide(
     edit: &EditParams,
     seed: u32,
     mask: Option<&[u8]>,
+    place: Place,
 ) {
     match mask {
         Some(m) => {
-            blur::blur_apply_wide_masked(data, m, w, h, edit.blur);
+            blur::blur_apply_wide_masked(data, m, w, h, edit.blur, place);
             apply_color_wide_masked(data, m, edit);
             noise::noise_add_wide_masked(
                 data,
@@ -522,10 +524,11 @@ pub fn apply_color_effects_wide(
                 edit.grain_gaussian,
                 edit.grain_mono,
                 seed,
+                place,
             );
         }
         None => {
-            blur::blur_apply_wide(data, w, h, edit.blur);
+            blur::blur_apply_wide(data, w, h, edit.blur, place);
             apply_color_wide_unmasked(data, edit);
             noise::noise_add_wide(
                 data,
@@ -535,6 +538,7 @@ pub fn apply_color_effects_wide(
                 edit.grain_gaussian,
                 edit.grain_mono,
                 seed,
+                place,
             );
         }
     }
@@ -542,8 +546,8 @@ pub fn apply_color_effects_wide(
 
 /// The full colour stage used by previews and exports: blur, fused
 /// levels/curves/adjust, then grain.
-pub fn apply_color_effects(data: &mut [u8], w: usize, h: usize, edit: &EditParams, seed: u32) {
-    blur::blur_apply(data, w, h, edit.blur);
+pub fn apply_color_effects(data: &mut [u8], w: usize, h: usize, edit: &EditParams, seed: u32, place: Place) {
+    blur::blur_apply(data, w, h, edit.blur, place);
     apply_color(data, edit);
     noise::noise_add(
         data,
@@ -553,6 +557,7 @@ pub fn apply_color_effects(data: &mut [u8], w: usize, h: usize, edit: &EditParam
         edit.grain_gaussian,
         edit.grain_mono,
         seed,
+        place,
     );
 }
 
@@ -564,8 +569,9 @@ pub fn apply_color_effects_masked(
     h: usize,
     edit: &EditParams,
     seed: u32,
+    place: Place,
 ) {
-    blur::blur_apply_masked(data, mask, w, h, edit.blur);
+    blur::blur_apply_masked(data, mask, w, h, edit.blur, place);
     apply_color_masked(data, mask, edit);
     noise::noise_add_masked(
         data,
@@ -576,6 +582,7 @@ pub fn apply_color_effects_masked(
         edit.grain_gaussian,
         edit.grain_mono,
         seed,
+        place,
     );
 }
 
