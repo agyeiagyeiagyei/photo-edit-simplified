@@ -55,10 +55,10 @@ fn coverage_bounds(coverage: &[u8], width: usize, height: usize) -> Option<(usiz
 }
 
 /// True when the patch at (dx, dy) neither overlaps the spot nor leaves the
-/// image.
+/// image. Two same-size boxes are disjoint as soon as they are separated on
+/// either axis, so the displacement only has to clear one of them.
 fn source_fits(wx0: i64, wy0: i64, ww: i64, wh: i64, dx: i64, dy: i64, w: i64, h: i64) -> bool {
-    dx.abs() >= ww
-        && dy.abs() >= wh
+    (dx.abs() >= ww || dy.abs() >= wh)
         && wx0 + dx >= 0
         && wy0 + dy >= 0
         && wx0 + ww + dx <= w
@@ -456,6 +456,17 @@ mod tests {
             }
         }
         cov
+    }
+
+    #[test]
+    fn source_patch_may_sit_straight_beside_the_spot() {
+        // Same-size boxes are disjoint when separated on either axis: the
+        // straight-above/beside neighbours are valid, overlapping ones are not.
+        assert!(source_fits(20, 20, 10, 10, 10, 0, 100, 100));
+        assert!(source_fits(20, 20, 10, 10, 0, -10, 100, 100));
+        assert!(!source_fits(20, 20, 10, 10, 9, 9, 100, 100));
+        assert!(!source_fits(20, 20, 10, 10, -21, 0, 100, 100));
+        assert!(!source_fits(20, 20, 10, 10, 71, 0, 100, 100));
     }
 
     #[test]
