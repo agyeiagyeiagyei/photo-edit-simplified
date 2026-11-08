@@ -355,7 +355,7 @@ test.describe('RAW retouch (#42): non-destructive Heal/Clone', () => {
       const reload = await boxLuma(page, heal.x, heal.y, half);
       const reloadMad = mad(pre, reload);
 
-      await clickTab(page, 'Color');
+      await clickTab(page, 'RAW');
       await expect(page.locator('.raw-panel .panel-title', { hasText: 'RAW develop' })).toBeVisible();
 
       // A later RAW edit still applies on top of the recorded stroke, and the
@@ -417,8 +417,9 @@ test.describe('RAW retouch (#42): non-destructive Heal/Clone', () => {
       await clickNorm(page, dest.x, dest.y);
 
       // Sample off the Clone tab: its persistent source crosshair is about the
-      // size of the box and would skew the source mean.
-      await clickTab(page, 'Color');
+      // size of the box and would skew the source mean. The RAW tab holds the
+      // Exposure slider used below.
+      await clickTab(page, 'RAW');
 
       // Preview: the destination now renders the source content.
       await expect
