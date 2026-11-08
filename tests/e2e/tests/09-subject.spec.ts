@@ -286,3 +286,127 @@ test('subject refinement taps keep brush strokes', async ({ page }) => {
 
   expect(errors, errors.join('\n')).toEqual([]);
 });
+
+// One bird, the Subject tool and the selection brush, for the replay tests below.
+function subjectKit(page: Page) {
+  const logs: string[] = [];
+  page.on('console', (m) => logs.push(m.text()));
+  const maskCount = () => logs.filter((l) => l.includes('subject mask')).length;
+  const chip = (name: string) => page.locator('.select-tab .chip', { hasText: new RegExp(`^${name}$`) });
+  const region = (r: [number, number, number, number]) =>
+    canvas(page).evaluate((c: HTMLCanvasElement, r) => {
+      const d = c.getContext('2d')!.getImageData(
+        Math.floor(c.width * r[0]),
+        Math.floor(c.height * r[1]),
+        Math.max(1, Math.floor(c.width * (r[2] - r[0]))),
+        Math.max(1, Math.floor(c.height * (r[3] - r[1]))),
+      ).data;
+      return Array.from(d);
+    }, r);
+  const meanDiff = (a: number[], b: number[]) => {
+    let sum = 0;
+    let n = 0;
+    for (let i = 0; i < a.length; i += 4) {
+      for (let k = 0; k < 3; k++) {
+        sum += Math.abs(a[i + k] - b[i + k]);
+        n++;
+      }
+    }
+    return sum / n;
+  };
+  const tap = async (nx: number, ny: number) => {
+    const before = maskCount();
+    const b = await canvas(page).boundingBox();
+    await canvas(page).click({ position: { x: b!.width * nx, y: b!.height * ny } });
+    await expect.poll(maskCount, { timeout: 240_000 }).toBeGreaterThan(before);
+    await expect(page.locator('.overlay')).toHaveCount(0, { timeout: 240_000 });
+    await page.mouse.move(2, 2);
+    await page.waitForTimeout(1200);
+  };
+  const stroke = async (x0: number, y0: number, x1: number, y1: number) => {
+    const b = await page.locator('.canvas-wrap').boundingBox();
+    await page.mouse.move(b!.x + b!.width * x0, b!.y + b!.height * y0);
+    await page.mouse.down();
+    await page.mouse.move(b!.x + b!.width * x1, b!.y + b!.height * y1, { steps: 8 });
+    await page.mouse.up();
+    await page.mouse.move(2, 2);
+    await page.waitForTimeout(600);
+  };
+  return { chip, region, meanDiff, tap, stroke };
+}
+
+test('undo after a refinement tap takes the stroke out and redo puts it back', async ({ page }) => {
+  test.setTimeout(300_000);
+  const errors = trackErrors(page);
+  const { chip, region, meanDiff, tap, stroke } = subjectKit(page);
+  const box: [number, number, number, number] = [0.54, 0.52, 0.64, 0.6];
+
+  await openApp(page);
+  await importFiles(page, [JPEG_A]);
+  await clickTab(page, 'Select');
+  await chip('Subject').click();
+  await page.waitForTimeout(2500);
+  await tap(0.57, 0.55);
+  const tinted = await region(box);
+
+  await chip('Brush').click();
+  await setRange(page, /^Size:/, 0.15);
+  await setRange(page, /^Softness:/, 0);
+  await chip('Remove').click();
+  await stroke(0.5, 0.55, 0.66, 0.55);
+  const carved = await region(box);
+  expect(meanDiff(tinted, carved), 'Remove stroke did not clear the selection').toBeGreaterThan(2);
+
+  await chip('Add').click();
+  await chip('Subject').click();
+  await tap(0.6, 0.58);
+  expect(meanDiff(carved, await region(box)), 'the refinement tap lost the stroke').toBeLessThan(2);
+
+  await chip('Brush').click();
+  await chip('Undo').click();
+  await page.mouse.move(2, 2);
+  await page.waitForTimeout(600);
+  expect(meanDiff(tinted, await region(box)), 'undo did not take the stroke out').toBeLessThan(2);
+  await expect(chip('Undo')).toBeDisabled();
+  await expect(chip('Redo')).toBeEnabled();
+
+  await chip('Redo').click();
+  await page.mouse.move(2, 2);
+  await page.waitForTimeout(600);
+  expect(meanDiff(carved, await region(box)), 'redo did not put the stroke back').toBeLessThan(2);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('a new subject selection after leaving Select does not bring old strokes back', async ({ page }) => {
+  test.setTimeout(300_000);
+  const errors = trackErrors(page);
+  const { chip, region, meanDiff, tap, stroke } = subjectKit(page);
+  const patch: [number, number, number, number] = [0.1, 0.1, 0.2, 0.18];
+
+  await openApp(page);
+  await importFiles(page, [JPEG_A]);
+  await clickTab(page, 'Select');
+  await chip('Subject').click();
+  await page.waitForTimeout(2500);
+  await tap(0.57, 0.55);
+  const clean = await region(patch);
+
+  await chip('Brush').click();
+  await setRange(page, /^Size:/, 0.08);
+  await setRange(page, /^Softness:/, 0);
+  await chip('Add').click();
+  await stroke(0.1, 0.14, 0.2, 0.14);
+  expect(meanDiff(clean, await region(patch)), 'Add stroke did not select the patch').toBeGreaterThan(2);
+
+  await clickTab(page, 'Layers');
+  await clickTab(page, 'Select');
+  await chip('Subject').click();
+  await chip('Add').click();
+  await page.waitForTimeout(1000);
+  await tap(0.57, 0.55);
+  expect(meanDiff(clean, await region(patch)), 'the old stroke came back on a new selection').toBeLessThan(2);
+
+  await chip('Brush').click();
+  await expect(chip('Undo')).toBeDisabled();
+  expect(errors, errors.join('\n')).toEqual([]);
+});
