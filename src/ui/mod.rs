@@ -32,6 +32,7 @@ pub(crate) fn ensure_fonts(state: AppState) {
         // real font, so drop them and repaint.
         crate::render::HI_CACHE.with(|c| *c.borrow_mut() = None);
         crate::render::HI_WINDOW.with(|c| *c.borrow_mut() = None);
+        crate::render::clear_overlay_segments();
         state.viewport_gen.update(|g| *g += 1);
     });
 }

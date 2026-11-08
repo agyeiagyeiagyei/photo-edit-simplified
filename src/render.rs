@@ -187,8 +187,14 @@ pub(crate) fn draw_raster_layer(ctx: &web_sys::CanvasRenderingContext2d, layer: 
     let _ = ctx.draw_image_with_html_canvas_element_and_dw_and_dh(&canvas, dx, dy, dw, dh);
 }
 
-struct MaskAlphaCache {
+struct MaskBytes {
     key: (usize, usize, u64, usize, usize, bool),
+    data: Vec<u8>,
+}
+
+struct MaskAlphaCanvas {
+    w: usize,
+    h: usize,
     canvas: web_sys::HtmlCanvasElement,
 }
 
@@ -198,16 +204,75 @@ struct MaskScratch {
     canvas: web_sys::HtmlCanvasElement,
 }
 
+struct OverlaySegment {
+    item_id: usize,
+    w: usize,
+    h: usize,
+    fp: u64,
+    canvas: web_sys::HtmlCanvasElement,
+}
+
+/// Rasterised masks kept across frames. One entry per masked layer, so two
+/// masked overlays no longer evict each other every frame; below the cap a
+/// feather or brush stroke only rebuilds the mask that changed.
+const MASK_BYTES_MAX: usize = 3;
+/// Composited overlay runs. An adjustment above the overlays re-uses the run
+/// instead of rebuilding every overlay mask on each slider tick.
+const OVERLAY_SEGMENTS_MAX: usize = 2;
+/// Above this frame size masks and runs are not cached: a full-res export
+/// composites once, and keeping several 25 MP scratch frames alive costs more
+/// than rebuilding a mask for the single pass that reads it.
+const OVERLAY_CACHE_MAX_PX: usize = 4_000_000;
+
 thread_local! {
-    /// Full-frame alpha cut-out for the last overlay mask drawn. `destination-in`
-    /// needs the mask as a canvas, and rebuilding one at 3200 px per preview
-    /// frame would dominate a brush drag.
-    static MASK_ALPHA_CACHE: std::cell::RefCell<Option<MaskAlphaCache>> =
+    static MASK_BYTES: std::cell::RefCell<Vec<MaskBytes>> =
+        std::cell::RefCell::new(Vec::new());
+    /// One full-frame RGBA cut-out canvas, rebuilt from cached mask bytes only
+    /// when a masked overlay is actually drawn.
+    static MASK_ALPHA_CANVAS: std::cell::RefCell<Option<MaskAlphaCanvas>> =
         std::cell::RefCell::new(None);
     /// One reusable full-frame canvas for compositing a masked overlay before
     /// it is blitted, shared by every masked layer in a frame.
     static MASK_SCRATCH: std::cell::RefCell<Option<MaskScratch>> =
         std::cell::RefCell::new(None);
+    static OVERLAY_SEGMENTS: std::cell::RefCell<Vec<OverlaySegment>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+fn mask_bytes(
+    item_id: usize,
+    layer_id: usize,
+    version: u64,
+    sel: &Selection,
+    invert: bool,
+    w: usize,
+    h: usize,
+) -> Vec<u8> {
+    let key = (item_id, layer_id, version, w, h, invert);
+    let cacheable = w * h <= OVERLAY_CACHE_MAX_PX;
+    MASK_BYTES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(i) = cache.iter().position(|c| c.key == key) {
+            let hit = cache.remove(i);
+            let data = hit.data.clone();
+            cache.push(hit);
+            return data;
+        }
+        let _sp = perf::Span::new("overlay.mask.build");
+        let mut mask = ops::selection_mask(sel, w, h);
+        if invert {
+            for v in &mut mask {
+                *v = 255 - *v;
+            }
+        }
+        if cacheable {
+            cache.push(MaskBytes { key, data: mask.clone() });
+            if cache.len() > MASK_BYTES_MAX {
+                cache.remove(0);
+            }
+        }
+        mask
+    })
 }
 
 fn mask_alpha_canvas(
@@ -219,30 +284,25 @@ fn mask_alpha_canvas(
     w: usize,
     h: usize,
 ) -> web_sys::HtmlCanvasElement {
-    let key = (item_id, layer_id, version, w, h, invert);
-    MASK_ALPHA_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(c) = cache.as_ref() {
-            if c.key == key {
-                return c.canvas.clone();
+    let mask = mask_bytes(item_id, layer_id, version, sel, invert, w, h);
+    let _sp = perf::Span::new("overlay.mask.canvas");
+    let mut rgba = vec![0u8; w * h * 4];
+    for (m, px) in mask.iter().zip(rgba.as_chunks_mut::<4>().0) {
+        px[3] = *m;
+    }
+    let canvas = MASK_ALPHA_CANVAS.with(|c| {
+        let mut c = c.borrow_mut();
+        if let Some(a) = c.as_ref() {
+            if a.w == w && a.h == h {
+                return a.canvas.clone();
             }
-        }
-        let _sp = perf::Span::new("overlay.mask.build");
-        let mut mask = ops::selection_mask(sel, w, h);
-        if invert {
-            for v in &mut mask {
-                *v = 255 - *v;
-            }
-        }
-        let mut rgba = vec![0u8; w * h * 4];
-        for (m, px) in mask.iter().zip(rgba.as_chunks_mut::<4>().0) {
-            px[3] = *m;
         }
         let canvas = web::create_canvas(w as u32, h as u32);
-        web::put_pixels(&canvas, &rgba, w as u32, h as u32);
-        *cache = Some(MaskAlphaCache { key, canvas: canvas.clone() });
+        *c = Some(MaskAlphaCanvas { w, h, canvas: canvas.clone() });
         canvas
-    })
+    });
+    web::put_pixels(&canvas, &rgba, w as u32, h as u32);
+    canvas
 }
 
 fn mask_scratch(w: usize, h: usize) -> web_sys::HtmlCanvasElement {
@@ -263,52 +323,177 @@ fn mask_scratch(w: usize, h: usize) -> web_sys::HtmlCanvasElement {
     })
 }
 
-pub(crate) fn composite_layers(
+fn draw_overlay(
+    ctx: &web_sys::CanvasRenderingContext2d,
+    item_id: usize,
+    layer: &state::Layer,
+    w: usize,
+    h: usize,
+) {
+    if !layer.visible || layer.opacity <= 0.01 {
+        return;
+    }
+    let Some(mask) = &layer.mask else {
+        ctx.set_global_alpha(layer.opacity as f64);
+        match &layer.kind {
+            LayerKind::Text(_) => draw_text_layer(ctx, layer, w as f64, h as f64),
+            LayerKind::Path(_) => draw_path_layer(ctx, layer, w as f64, h as f64),
+            LayerKind::Brush(_) => draw_brush_layer(ctx, layer, w as f64, h as f64),
+            LayerKind::Raster(_) => draw_raster_layer(ctx, layer, w as f64, h as f64),
+            LayerKind::Adjust(_) => {}
+        }
+        ctx.set_global_alpha(1.0);
+        return;
+    };
+    if w == 0 || h == 0 {
+        return;
+    }
+    // A masked overlay must not erase what is below it, so destination-in
+    // runs on a scratch copy and only the cut-out is blitted.
+    let scratch = mask_scratch(w, h);
+    let sctx = web::ctx2d(&scratch);
+    match &layer.kind {
+        LayerKind::Text(_) => draw_text_layer(&sctx, layer, w as f64, h as f64),
+        LayerKind::Path(_) => draw_path_layer(&sctx, layer, w as f64, h as f64),
+        LayerKind::Brush(_) => draw_brush_layer(&sctx, layer, w as f64, h as f64),
+        LayerKind::Raster(_) => draw_raster_layer(&sctx, layer, w as f64, h as f64),
+        LayerKind::Adjust(_) => return,
+    }
+    let alpha = mask_alpha_canvas(item_id, layer.id, layer.mask_version, mask, layer.invert, w, h);
+    sctx.set_global_composite_operation("destination-in").ok();
+    sctx.draw_image_with_html_canvas_element(&alpha, 0.0, 0.0).ok();
+    sctx.set_global_composite_operation("source-over").ok();
+    ctx.set_global_alpha(layer.opacity as f64);
+    ctx.draw_image_with_html_canvas_element(&scratch, 0.0, 0.0).ok();
+    ctx.set_global_alpha(1.0);
+}
+
+fn segment_fp(item_id: usize, layers: &[state::Layer], w: usize, h: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hsh = std::collections::hash_map::DefaultHasher::new();
+    item_id.hash(&mut hsh);
+    w.hash(&mut hsh);
+    h.hash(&mut hsh);
+    for l in layers {
+        hash_layer(&mut hsh, l);
+    }
+    hsh.finish()
+}
+
+/// A run of overlay layers composited onto a transparent full-frame canvas,
+/// cached by its content fingerprint. Slider edits to an adjustment above the
+/// run (or to the base photo) reuse it without touching a single mask.
+fn segment_canvas(
+    item_id: usize,
+    layers: &[state::Layer],
+    w: usize,
+    h: usize,
+) -> web_sys::HtmlCanvasElement {
+    if w * h > OVERLAY_CACHE_MAX_PX {
+        let _sp = perf::Span::new("overlay.segment.build");
+        let canvas = web::create_canvas(w as u32, h as u32);
+        let ctx = web::ctx2d(&canvas);
+        for l in layers {
+            draw_overlay(&ctx, item_id, l, w, h);
+        }
+        return canvas;
+    }
+    let fp = segment_fp(item_id, layers, w, h);
+    OVERLAY_SEGMENTS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(i) = cache
+            .iter()
+            .position(|s| s.item_id == item_id && s.w == w && s.h == h && s.fp == fp)
+        {
+            let hit = cache.remove(i);
+            let canvas = hit.canvas.clone();
+            cache.push(hit);
+            return canvas;
+        }
+        let _sp = perf::Span::new("overlay.segment.build");
+        let canvas = web::create_canvas(w as u32, h as u32);
+        let ctx = web::ctx2d(&canvas);
+        for l in layers {
+            draw_overlay(&ctx, item_id, l, w, h);
+        }
+        cache.push(OverlaySegment { item_id, w, h, fp, canvas: canvas.clone() });
+        if cache.len() > OVERLAY_SEGMENTS_MAX {
+            cache.remove(0);
+        }
+        canvas
+    })
+}
+
+fn apply_adjust_on_canvas(
+    canvas: &web_sys::HtmlCanvasElement,
+    ctx: &web_sys::CanvasRenderingContext2d,
+    item_id: usize,
+    layer: &state::Layer,
+    w: usize,
+    h: usize,
+) {
+    if !layer.visible || layer.opacity <= 0.01 || w == 0 || h == 0 {
+        return;
+    }
+    let LayerKind::Adjust(a) = &layer.kind else { return };
+    let _sp = perf::Span::new("stack.adjust.apply");
+    let (mut data, _, _) = web::image_data_from_ctx(ctx, w as u32, h as u32);
+    let mask = layer.mask.as_ref().map(|sel| {
+        mask_bytes(item_id, layer.id, layer.mask_version, sel, layer.invert, w, h)
+    });
+    pes_pixel::color::apply_point_adjust_u8(
+        &mut data,
+        &a.adjust,
+        mask.as_deref(),
+        layer.opacity,
+    );
+    // put_pixels resets the canvas backing, so the caller re-uses `ctx` only
+    // for further whole-frame draws (alpha/transform state is set explicitly
+    // before each overlay).
+    web::put_pixels(canvas, &data, w as u32, h as u32);
+}
+
+/// Composite the layer stack above the photo: overlays and the adjustments
+/// that sit above them, bottom-up. Adjustments below the first drawn overlay
+/// are already in the worker/CPU pixels and are skipped here.
+pub(crate) fn composite_stack(
     canvas: &web_sys::HtmlCanvasElement,
     item_id: usize,
     layers: &[state::Layer],
     w: usize,
     h: usize,
 ) {
+    let split = state::stack_split(layers);
     let ctx = web::ctx2d(canvas);
-    for layer in layers {
-        if !layer.visible || layer.opacity <= 0.01 {
-            continue;
+    let mut i = split.min(layers.len());
+    while i < layers.len() {
+        let start = i;
+        while i < layers.len() && !matches!(layers[i].kind, LayerKind::Adjust(_)) {
+            i += 1;
         }
-        let Some(mask) = &layer.mask else {
-            ctx.set_global_alpha(layer.opacity as f64);
-            match &layer.kind {
-                LayerKind::Text(_) => draw_text_layer(&ctx, layer, w as f64, h as f64),
-                LayerKind::Path(_) => draw_path_layer(&ctx, layer, w as f64, h as f64),
-                LayerKind::Brush(_) => draw_brush_layer(&ctx, layer, w as f64, h as f64),
-                LayerKind::Raster(_) => draw_raster_layer(&ctx, layer, w as f64, h as f64),
-                LayerKind::Adjust(_) => {}
-            }
-            ctx.set_global_alpha(1.0);
-            continue;
-        };
-        if w == 0 || h == 0 {
-            continue;
+        let run = &layers[start..i];
+        if run.iter().any(|l| l.visible && l.opacity > 0.01) && w > 0 && h > 0 {
+            let seg = segment_canvas(item_id, run, w, h);
+            ctx.draw_image_with_html_canvas_element(&seg, 0.0, 0.0).ok();
         }
-        // A masked overlay must not erase what is below it, so destination-in
-        // runs on a scratch copy and only the cut-out is blitted.
-        let scratch = mask_scratch(w, h);
-        let sctx = web::ctx2d(&scratch);
-        match &layer.kind {
-            LayerKind::Text(_) => draw_text_layer(&sctx, layer, w as f64, h as f64),
-            LayerKind::Path(_) => draw_path_layer(&sctx, layer, w as f64, h as f64),
-            LayerKind::Brush(_) => draw_brush_layer(&sctx, layer, w as f64, h as f64),
-            LayerKind::Raster(_) => draw_raster_layer(&sctx, layer, w as f64, h as f64),
-            LayerKind::Adjust(_) => continue,
+        if i < layers.len() {
+            apply_adjust_on_canvas(canvas, &ctx, item_id, &layers[i], w, h);
+            i += 1;
         }
-        let alpha = mask_alpha_canvas(item_id, layer.id, layer.mask_version, mask, layer.invert, w, h);
-        sctx.set_global_composite_operation("destination-in").ok();
-        sctx.draw_image_with_html_canvas_element(&alpha, 0.0, 0.0).ok();
-        sctx.set_global_composite_operation("source-over").ok();
-        ctx.set_global_alpha(layer.opacity as f64);
-        ctx.draw_image_with_html_canvas_element(&scratch, 0.0, 0.0).ok();
-        ctx.set_global_alpha(1.0);
     }
+}
+
+pub(crate) fn clear_overlay_segments() {
+    OVERLAY_SEGMENTS.with(|c| c.borrow_mut().clear());
+}
+
+/// Drop every full-frame overlay scratch. Used after an export, where masks
+/// and segments would otherwise linger at native resolution.
+pub(crate) fn clear_overlay_caches() {
+    clear_overlay_segments();
+    MASK_BYTES.with(|c| c.borrow_mut().clear());
+    MASK_ALPHA_CANVAS.with(|c| *c.borrow_mut() = None);
+    MASK_SCRATCH.with(|c| *c.borrow_mut() = None);
 }
 
 pub(crate) async fn render_text_overlay(t: &state::TextLayer, w: usize, h: usize) -> Result<web_sys::Blob, JsValue> {
@@ -590,82 +775,87 @@ pub(crate) fn edit_fingerprint(item: &MediaItem) -> u64 {
     }
     item.layers.len().hash(&mut h);
     for l in &item.layers {
-        l.id.hash(&mut h);
-        l.visible.hash(&mut h);
-        h.write_u32(l.opacity.to_bits());
-        l.invert.hash(&mut h);
-        // Every mask change bumps the version; the selection hash only samples
-        // 8 bytes of a raster mask, so two wand masks of the same size can
-        // collide without it.
-        l.mask_version.hash(&mut h);
-        hash_selection(&mut h, l.mask.as_ref());
-        match &l.kind {
-            LayerKind::Text(t) => {
-                h.write_u8(1);
-                t.text.hash(&mut h);
-                t.font_family.hash(&mut h);
-                t.color.hash(&mut h);
-                t.stroke_color.hash(&mut h);
-                t.shadow_color.hash(&mut h);
-                t.font_weight.hash(&mut h);
-                std::mem::discriminant(&t.alignment).hash(&mut h);
-                for v in [t.x, t.y, t.font_size, t.angle, t.stroke_width, t.shadow_blur, t.shadow_offset_x, t.shadow_offset_y] {
-                    h.write_u32(v.to_bits());
-                }
-            }
-            LayerKind::Path(p) => {
-                h.write_u8(2);
-                p.points.len().hash(&mut h);
-                p.closed.hash(&mut h);
-                p.fill_color.hash(&mut h);
-                p.stroke_color.hash(&mut h);
-                h.write_u32(p.stroke_width.to_bits());
-                for pt in p.points.first().into_iter().chain(p.points.last()) {
-                    h.write_u32(pt.x.to_bits());
-                    h.write_u32(pt.y.to_bits());
-                }
-            }
-            LayerKind::Brush(b) => {
-                h.write_u8(3);
-                b.strokes.len().hash(&mut h);
-                b.color.hash(&mut h);
-                b.custom_path.hash(&mut h);
-                std::mem::discriminant(&b.shape).hash(&mut h);
-                h.write_u32(b.width.to_bits());
-                h.write_u32(b.spacing.to_bits());
-                if let Some(s) = b.strokes.last() {
-                    s.points.len().hash(&mut h);
-                    if let Some(p) = s.points.last() {
-                        h.write_u32(p.0.to_bits());
-                        h.write_u32(p.1.to_bits());
-                    }
-                }
-            }
-            LayerKind::Raster(r) => {
-                h.write_u8(4);
-                r.width.hash(&mut h);
-                r.height.hash(&mut h);
-                h.write_u32(r.x.to_bits());
-                h.write_u32(r.y.to_bits());
-                h.write_u32(r.scale.to_bits());
-                if !r.pixels.is_empty() {
-                    r.pixels.len().hash(&mut h);
-                    for i in 0..8 {
-                        h.write_u8(r.pixels[i * r.pixels.len() / 8]);
-                    }
-                }
-            }
-            LayerKind::Adjust(a) => {
-                h.write_u8(5);
-                for v in [a.adjust.brightness, a.adjust.contrast, a.adjust.saturation, a.adjust.warmth] {
-                    h.write_u32(v.to_bits());
-                }
-                format!("{:?}", a.adjust.levels).hash(&mut h);
-                format!("{:?}", a.adjust.curves).hash(&mut h);
-            }
-        }
+        hash_layer(&mut h, l);
     }
     h.finish()
+}
+
+fn hash_layer(h: &mut std::collections::hash_map::DefaultHasher, l: &state::Layer) {
+    use std::hash::{Hash, Hasher};
+    l.id.hash(h);
+    l.visible.hash(h);
+    h.write_u32(l.opacity.to_bits());
+    l.invert.hash(h);
+    // Every mask change bumps the version; the selection hash only samples
+    // 8 bytes of a raster mask, so two wand masks of the same size can
+    // collide without it.
+    l.mask_version.hash(h);
+    hash_selection(h, l.mask.as_ref());
+    match &l.kind {
+        LayerKind::Text(t) => {
+            h.write_u8(1);
+            t.text.hash(h);
+            t.font_family.hash(h);
+            t.color.hash(h);
+            t.stroke_color.hash(h);
+            t.shadow_color.hash(h);
+            t.font_weight.hash(h);
+            std::mem::discriminant(&t.alignment).hash(h);
+            for v in [t.x, t.y, t.font_size, t.angle, t.stroke_width, t.shadow_blur, t.shadow_offset_x, t.shadow_offset_y] {
+                h.write_u32(v.to_bits());
+            }
+        }
+        LayerKind::Path(p) => {
+            h.write_u8(2);
+            p.points.len().hash(h);
+            p.closed.hash(h);
+            p.fill_color.hash(h);
+            p.stroke_color.hash(h);
+            h.write_u32(p.stroke_width.to_bits());
+            for pt in p.points.first().into_iter().chain(p.points.last()) {
+                h.write_u32(pt.x.to_bits());
+                h.write_u32(pt.y.to_bits());
+            }
+        }
+        LayerKind::Brush(b) => {
+            h.write_u8(3);
+            b.strokes.len().hash(h);
+            b.color.hash(h);
+            b.custom_path.hash(h);
+            std::mem::discriminant(&b.shape).hash(h);
+            h.write_u32(b.width.to_bits());
+            h.write_u32(b.spacing.to_bits());
+            if let Some(s) = b.strokes.last() {
+                s.points.len().hash(h);
+                if let Some(p) = s.points.last() {
+                    h.write_u32(p.0.to_bits());
+                    h.write_u32(p.1.to_bits());
+                }
+            }
+        }
+        LayerKind::Raster(r) => {
+            h.write_u8(4);
+            r.width.hash(h);
+            r.height.hash(h);
+            h.write_u32(r.x.to_bits());
+            h.write_u32(r.y.to_bits());
+            h.write_u32(r.scale.to_bits());
+            if !r.pixels.is_empty() {
+                r.pixels.len().hash(h);
+                for i in 0..8 {
+                    h.write_u8(r.pixels[i * r.pixels.len() / 8]);
+                }
+            }
+        }
+        LayerKind::Adjust(a) => {
+            h.write_u8(5);
+            for v in [a.adjust.brightness, a.adjust.contrast, a.adjust.saturation, a.adjust.warmth] {
+                h.write_u32(v.to_bits());
+            }
+            format!("{:?}", a.adjust.levels).hash(h);
+            format!("{:?}", a.adjust.curves).hash(h);
+        }
+    }
 }
 
 /// Identity of the pixels a render was produced from: the preview generation
@@ -762,7 +952,7 @@ pub(crate) fn selection_to_layer(state: AppState, cut: bool) {
                             if let Some(m) = v.iter_mut().find(|m| m.id == item_id) {
                                 let nid = m.next_layer_id;
                                 m.next_layer_id += 1;
-                                state::insert_overlay(&mut m.layers, Layer::new_raster(nid, r.layer, r.lw, r.lh));
+                                m.layers.push(Layer::new_raster(nid, r.layer, r.lw, r.lh));
                             }
                         });
                         if let Some(c) = r.cut {
@@ -1790,8 +1980,8 @@ pub(crate) fn isolate_subject(state: AppState) {
                     m.next_layer_id += 1;
                     let id1 = m.next_layer_id;
                     m.next_layer_id += 1;
-                    state::insert_overlay(&mut m.layers, Layer::new_raster(id0, bg, pw, ph));
-                    state::insert_overlay(&mut m.layers, Layer::new_raster(id1, subject, pw, ph));
+                    m.layers.push(Layer::new_raster(id0, bg, pw, ph));
+                    m.layers.push(Layer::new_raster(id1, subject, pw, ph));
                     next_id = id1;
                 });
                 state.selected_layer.set(Some(next_id));
