@@ -613,4 +613,84 @@ test.describe('adjustment layers (issue #26)', () => {
     expect(await labels()).toEqual(['Adjust 3', 'Adjust 1', 'Adjust 2']);
     expect(errors, errors.join('\n')).toEqual([]);
   });
+
+  // Owner request (8 Nov): with an adjustment selected, the Select tab shows
+  // and edits its mask. Selections stay ordinary selections (so "+ Adjust from
+  // sel." keeps working) and are folded in with the mask panel's buttons.
+  // Exports carry no editor tint, so they show where the adjustment applies.
+  test('the Select tab\'s mask panel adds selections to and removes them from an adjustment mask', async ({ page }) => {
+    test.setTimeout(240_000);
+    const errors = trackErrors(page);
+    await openApp(page);
+    await importFiles(page, [PNG_SMALL]);
+    await waitSmall(page);
+    const base = await decodePng(page, await exportPng(page));
+    const lift = (f: { w: number; h: number; bytes: Buffer }, x0: number, y0: number, x1: number, y1: number) =>
+      regionDiff(base.bytes, f.bytes, f.w, f.h, x0, y0, x1, y1);
+    const A = [0.25, 0.25, 0.45, 0.45] as const; // inside the first rect
+    const B = [0.65, 0.65, 0.8, 0.8] as const; // added later
+    const C = [0.05, 0.75, 0.15, 0.9] as const; // never selected
+    const panel = page.locator('.select-tab .mask-panel');
+    const copyToLayer = page.locator('.select-row button', { hasText: /^Copy to layer$/ });
+
+    await selectTool(page, 'Rect');
+    await rectDrag(page, 0.2, 0.2, 0.5, 0.5);
+    await clickTab(page, 'Layers');
+    await addAdjustFromSel(page).click();
+    await setRange(page, /^Brightness/, 0.5);
+    await settle(page, 600);
+    // The Layers toolbar offers only Brush for an adjustment.
+    await expect(page.locator('.toolbar .chip', { hasText: /^Pen$/ })).toBeHidden();
+
+    await clickTab(page, 'Select');
+    await expect(panel.locator('.editing-line')).toContainText('Editing: Adjust mask');
+    await expect(panel.getByRole('button', { name: 'Add selection to mask' })).toBeDisabled();
+
+    // A new rect is an ordinary selection until it is added.
+    await rectDrag(page, 0.6, 0.6, 0.85, 0.85);
+    await expect(copyToLayer).toBeEnabled();
+    await panel.getByRole('button', { name: 'Add selection to mask' }).click();
+    await settle(page, 600);
+    await expect(copyToLayer, 'adding to the mask should use up the selection').toBeDisabled();
+    let e = await decodePng(page, await exportPng(page));
+    expect(lift(e, ...A), 'the first area lost the effect').toBeGreaterThan(3);
+    expect(lift(e, ...B), 'Add selection to mask did not extend the effect').toBeGreaterThan(3);
+    expect(lift(e, ...C), 'the effect leaked outside the mask').toBeLessThanOrEqual(1);
+
+    // Remove part of it, then undo that.
+    await clickTab(page, 'Select');
+    await rectDrag(page, 0.15, 0.15, 0.55, 0.55);
+    await panel.getByRole('button', { name: 'Remove selection from mask' }).click();
+    await settle(page, 600);
+    e = await decodePng(page, await exportPng(page));
+    expect(lift(e, ...A), 'Remove selection from mask did not take the effect away').toBeLessThanOrEqual(1);
+    expect(lift(e, ...B)).toBeGreaterThan(3);
+    await clickTab(page, 'Select');
+    await panel.getByRole('button', { name: 'Undo' }).click();
+    await settle(page, 600);
+    e = await decodePng(page, await exportPng(page));
+    expect(lift(e, ...A), 'Undo did not restore the removed area').toBeGreaterThan(3);
+
+    // Clear mask: the adjustment applies everywhere again.
+    await clickTab(page, 'Select');
+    await panel.getByRole('button', { name: 'Clear mask' }).click();
+    await settle(page, 600);
+    e = await decodePng(page, await exportPng(page));
+    expect(lift(e, ...C), 'after Clear mask the adjustment should apply everywhere').toBeGreaterThan(3);
+
+    // Back to the photo's own selection.
+    await clickTab(page, 'Select');
+    await panel.getByRole('button', { name: "Edit the photo's selection instead" }).click();
+    await expect(page.locator('.select-tab > .editing-line')).toHaveText("Editing: the photo's selection");
+    await expect(panel).toHaveCount(0);
+
+    // The Layers-tab Brush opens the Select tab's mask brush.
+    await clickTab(page, 'Layers');
+    await page.locator('.layer-row .layer-label', { hasText: /^Adjust/ }).click();
+    await page.locator('.toolbar .chip', { hasText: /^Brush$/ }).first().click();
+    await expect(page.locator('.tabs button.active')).toHaveText('Select');
+    await expect(page.locator('.select-tab .chip.active', { hasText: /^Brush$/ })).toHaveCount(1);
+    await expect(panel.locator('.editing-line')).toContainText('Editing: Adjust mask');
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
 });

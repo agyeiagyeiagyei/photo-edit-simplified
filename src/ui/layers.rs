@@ -5,7 +5,7 @@ use crate::state::{AdjustLayerState, PointAdjust};
 use crate::*;
 
 #[component]
-pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
+pub(crate) fn LayersTab(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     let add_layer = move |kind: &str| {
         if kind == "text" {
             ensure_fonts(state);
@@ -330,7 +330,7 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
                 <img class="layer-thumb" src=move || thumb_url.get() alt=""/>
                 <span class="layer-label">"Photo"</span>
             </div>
-            <ToolBar state=state/>
+            <ToolBar state=state tab=tab/>
             {move || selected_adjust_id
                 .get()
                 .map(|id| view! { <AdjustLayerEditor state=state layer_id=id/> })}
@@ -510,6 +510,11 @@ pub(crate) fn EditingLine(
 /// words) get a number in creation order, so two adjustments read "Adjust 1"
 /// and "Adjust 2" and a reorder is visible. The row's mask thumbnail shows a
 /// mask; with `mask_note` (the Editing line) the label says so in words.
+/// The row label without the mask note, for other tabs that name a layer.
+pub(crate) fn layer_row_label(ls: &[Layer], id: usize) -> String {
+    row_label(ls, id, false)
+}
+
 fn row_label(ls: &[Layer], id: usize, mask_note: bool) -> String {
     let Some(layer) = ls.iter().find(|l| l.id == id) else {
         return String::new();

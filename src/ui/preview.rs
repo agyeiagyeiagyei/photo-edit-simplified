@@ -1268,9 +1268,19 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 } else {
                     clear_brush_ring_backup();
                 }
-            } else if let Some(sel) = &item.edit.selection {
-                let key = overlay_key(item.id as u64, 0, item.edit.selection_rev);
-                draw_selection_overlay(&ctx, sel, w as f64, h as f64, key);
+            } else {
+                // With an adjustment's mask being edited, show it (red) under
+                // any photo selection, which "Add selection to mask" folds in.
+                if let Some(id) = mask_layer_for(state.mask_target.get(), state.selected_layer.get(), &item) {
+                    if let Some(layer) = item.layers.iter().find(|l| l.id == id) {
+                        let key = overlay_key(item.id as u64, id as u64, layer.mask_version);
+                        draw_layer_mask_overlay(&ctx, layer.mask.as_ref(), false, w as f64, h as f64, key);
+                    }
+                }
+                if let Some(sel) = &item.edit.selection {
+                    let key = overlay_key(item.id as u64, 0, item.edit.selection_rev);
+                    draw_selection_overlay(&ctx, sel, w as f64, h as f64, key);
+                }
             }
             if let Some(drag) = select_drag.get() {
                 draw_select_drag(&ctx, &drag, w as f64, h as f64);

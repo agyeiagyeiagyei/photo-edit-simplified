@@ -637,6 +637,35 @@ test.describe('selection brush (issue #3)', () => {
     expect(errors, errors.join('\n')).toEqual([]);
   });
 
+  // An unmasked adjustment applies everywhere, so a Remove stroke on it must
+  // hide it only where painted. It used to start from an empty mask and hide
+  // it everywhere.
+  test('a Remove stroke on an unmasked adjustment hides it only where painted', async ({ page }) => {
+    test.setTimeout(180_000);
+    const errors = trackErrors(page);
+    await openApp(page);
+    await importFiles(page, [PNG_SMALL]);
+    await waitSmall(page);
+    const base = await decodePng(page, await exportPng(page));
+    await clickTab(page, 'Layers');
+    await addAdjust(page).click();
+    await setRange(page, /^Brightness/, 0.5);
+    await settle(page, 600);
+    await selectBrush(page);
+    await setRange(page, /^Size:/, 0.1);
+    await setRange(page, /^Softness:/, 0);
+    await selectChip(page, 'Remove').click();
+    await stroke(page, [[0.2, 0.5], [0.4, 0.5]], 10);
+    await parkPointer(page);
+    await settle(page, 600);
+    const e = await decodePng(page, await exportPng(page));
+    const lift = (x0: number, y0: number, x1: number, y1: number) =>
+      regionDiff(base.bytes, e.bytes, e.w, e.h, x0, y0, x1, y1);
+    expect(lift(0.25, 0.47, 0.35, 0.53), 'the stroke did not remove the effect where painted').toBeLessThanOrEqual(1);
+    expect(lift(0.65, 0.2, 0.9, 0.4), 'the stroke removed the effect everywhere').toBeGreaterThan(3);
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
   test('Feather repaints the tint of a brushed selection', async ({ page }) => {
     test.setTimeout(180_000);
     const errors = trackErrors(page);
@@ -804,8 +833,17 @@ test.describe('selection brush (issue #3)', () => {
     const layerTint = regionDiff(beforeStroke.bytes, tinted.bytes, w, h, 0.5, 0.45, 0.84, 0.65);
     expect(layerTint, 'the brush did not tint the adjustment layer mask').toBeGreaterThan(3);
 
-    // With the brush closed, the Select tab shows the global selection again.
+    // With the adjustment still selected, the Select tab keeps showing its
+    // mask under the Rect tool too (owner request, 8 Nov).
     await selectRect(page);
+    await parkPointer(page);
+    await settle(page);
+    const rectWithMask = await readCanvas(page);
+    expect(regionDiff(withRect.bytes, rectWithMask.bytes, w, h, 0.5, 0.45, 0.84, 0.65), 'the mask is not shown under the Rect tool')
+      .toBeGreaterThan(3);
+
+    // The photo's own selection on its own must be exactly as it was.
+    await page.locator('.select-tab .mask-panel button', { hasText: "Edit the photo's selection instead" }).click();
     await parkPointer(page);
     await settle(page);
     const afterRect = await readCanvas(page);

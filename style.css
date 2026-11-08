@@ -917,3 +917,14 @@ button:disabled {
   margin-left: -1px;
   background: var(--accent);
 }
+
+/* Layers toolbar: hidden while an adjustment is selected (its Brush opens the
+   Select tab's mask brush instead). */
+.toolbar.hidden { display: none; }
+.toolbar .dim { align-self: center; }
+.mask-panel {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+}

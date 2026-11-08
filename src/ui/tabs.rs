@@ -51,6 +51,21 @@ pub(crate) fn CropTab(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
 pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
     let has_selection =
         move || state.current().map(|m| m.edit.selection.is_some()).unwrap_or(false);
+    // The layer whose mask the Brush and the mask panel edit: the selected
+    // adjustment, or a layer whose mask thumbnail is armed.
+    let mask_layer = create_memo(move |_| {
+        let m = state.current()?;
+        mask_layer_for(state.mask_target.get(), state.selected_layer.get(), &m)
+    });
+    let mask_label = create_memo(move |_| {
+        let id = mask_layer.get()?;
+        let m = state.current()?;
+        Some(layer_row_label(&m.layers, id))
+    });
+    let layer_has_mask = move || {
+        let Some(id) = mask_layer.get() else { return false };
+        state.current().is_some_and(|m| m.layers.iter().any(|l| l.id == id && l.mask.is_some()))
+    };
     let feather = move || {
         state
             .current()
@@ -60,6 +75,63 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
     };
     view! {
         <div class="select-tab">
+            <Show
+                when=move || mask_label.get().is_some()
+                fallback=|| view! {
+                    <div class="editing-line"><span>"Editing: " <b>"the photo's selection"</b></span></div>
+                }
+            >
+                <div class="mask-panel">
+                    <div class="editing-line">
+                        <span>"Editing: " <b>{move || format!("{} mask", mask_label.get().unwrap_or_default())}</b></span>
+                        <button
+                            class="link-btn"
+                            on:click=move |_| {
+                                state.mask_target.set(None);
+                                state.selected_layer.set(None);
+                            }
+                        >
+                            "Edit the photo's selection instead"
+                        </button>
+                    </div>
+                    <div class="row select-row">
+                        <button
+                            class="btn primary"
+                            disabled=move || !has_selection()
+                            on:click=move |_| commit_selection_to_mask(state, false)
+                        >
+                            "Add selection to mask"
+                        </button>
+                        <button
+                            class="btn"
+                            disabled=move || !has_selection()
+                            on:click=move |_| commit_selection_to_mask(state, true)
+                        >
+                            "Remove selection from mask"
+                        </button>
+                        <button class="btn" disabled=move || !layer_has_mask() on:click=move |_| invert_layer_mask(state)>
+                            "Invert mask"
+                        </button>
+                        <button class="btn" disabled=move || !layer_has_mask() on:click=move |_| clear_layer_mask(state)>
+                            "Clear mask"
+                        </button>
+                        <button
+                            class="btn"
+                            disabled=move || !state.brush_history.with(|h| h.can_undo())
+                            on:click=move |_| {
+                                brush_undo(state);
+                            }
+                        >
+                            "Undo"
+                        </button>
+                    </div>
+                    <p class="dim">
+                        "Red shows where the adjustment applies. Brush paints it directly; Rect, \
+                         Lasso, Wand and Subject make a selection to add or remove with the \
+                         buttons above."
+                    </p>
+                </div>
+            </Show>
             <div class="chips">
                 {SelectTool::ALL.map(|t| {
                     let active = move || state.selected_select_tool.get() == t;
@@ -297,6 +369,8 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
                  the model downloads ~15 MB on first use (photo-only). Brush paints into or out \
                  of the selection (or the selected adjustment layer's mask) with Size and \
                  Softness; each stroke is one undo step. \
+                 With an adjustment selected, its mask shows in red: Brush paints it, and any \
+                 selection can be added to it or removed from it. \
                  Cut/Copy lift the selection to a raster layer; Content fill synthesizes it from \
                  the surroundings; Invert selects everything outside the selection. \
                  Isolate person runs MediaPipe Selfie Segmentation."
