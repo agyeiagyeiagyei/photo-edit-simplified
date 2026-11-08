@@ -209,6 +209,10 @@ pub(crate) async fn persist_session(state: AppState) {
         let rec = session::jobj();
         let rec_v: &JsValue = rec.as_ref();
         session::jset(rec_v, "v", 1.0);
+        // Layer-stack semantics version: 2 = one stack, adjustments apply to
+        // whatever is below them. Records without it predate Phase C and get
+        // their adjustments moved to the bottom on restore.
+        session::jset(rec_v, "lv", 2.0);
         session::jset(rec_v, "name", item.name.as_str());
         session::jset(rec_v, "kind", if item.kind == MediaKind::Video { 1.0 } else { 0.0 });
         session::jset(rec_v, "w", item.width as f64);
@@ -435,6 +439,12 @@ pub(crate) fn restore_session(state: AppState) {
             let drive_baked = state::jbool(&v, "dbaked").unwrap_or(false);
             let mut next_layer_id = state::jnum(&v, "nlid").unwrap_or(0.0) as usize;
             state::migrate_adjust_layers(&mut edit, &mut layers, &mut next_layer_id);
+            // A stack saved before one-stack semantics had every adjustment
+            // below every overlay because that is where they were forced;
+            // moving them to the bottom keeps those pixels identical.
+            if state::jnum(&v, "lv").unwrap_or(0.0) < 2.0 {
+                state::normalize_legacy_stack(&mut layers);
+            }
             let taken = state::jnum(&v, "taken");
             // A stored thumbnail lets this item restore without decoding
             // anything; sessions written before the `thumbs` store fall back
