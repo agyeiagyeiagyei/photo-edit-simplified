@@ -1,5 +1,6 @@
-import { test, expect, Page, BrowserContext } from '@playwright/test';
+import { test, expect, Page } from '@playwright/test';
 import * as fs from 'fs';
+import * as zlib from 'zlib';
 import { openApp, importFiles, thumbs, clickTab, setRange, trackErrors, recordMetrics, JPEG_A } from './helpers';
 
 // Issue #47: Blur's radius and Grain's particle size were in output pixels, so
@@ -69,35 +70,81 @@ async function exportPng(page: Page): Promise<Buffer> {
   return fs.readFileSync((await dl.path())!);
 }
 
-/** Decode a full-size PNG in a fresh, empty page (a 24 MP noise PNG is too
- *  big to decode next to the app's own buffers) and measure it at `w` px. */
-async function exportDetail(context: BrowserContext, png: Buffer, w: number) {
-  const p = await context.newPage();
-  await p.route('http://qa.test/**', (r) =>
-    r.request().url().endsWith('.png')
-      ? r.fulfill({ body: png, contentType: 'image/png' })
-      : r.fulfill({ body: '<!doctype html><title>qa</title>', contentType: 'text/html' }),
-  );
-  await p.goto('http://qa.test/');
-  const out = await p.evaluate(
-    async ({ fn, w }) => {
-      const bmp = await createImageBitmap(await (await fetch('/export.png')).blob());
-      const detail = (0, eval)(fn);
-      const r = { detail: detail(bmp, w), dims: [bmp.width, bmp.height] };
-      bmp.close();
-      return r;
-    },
-    { fn: DETAIL_FN, w },
-  );
-  await p.close();
-  return out;
+/** Decode an 8-bit, non-interlaced RGB/RGBA PNG (what Export writes) in Node:
+ *  a 24 MP noise PNG is too big to decode in a page next to the app. */
+function decodePng(buf: Buffer): { w: number; h: number; ch: number; data: Buffer } {
+  let p = 8, w = 0, h = 0, depth = 0, type = 0, interlace = 0;
+  const idat: Buffer[] = [];
+  while (p < buf.length) {
+    const len = buf.readUInt32BE(p);
+    const kind = buf.toString('ascii', p + 4, p + 8);
+    const body = buf.subarray(p + 8, p + 8 + len);
+    if (kind === 'IHDR') {
+      w = body.readUInt32BE(0); h = body.readUInt32BE(4);
+      depth = body[8]; type = body[9]; interlace = body[12];
+    } else if (kind === 'IDAT') idat.push(body);
+    else if (kind === 'IEND') break;
+    p += 12 + len;
+  }
+  if (depth !== 8 || interlace !== 0 || (type !== 2 && type !== 6)) {
+    throw new Error(`unsupported PNG: depth ${depth} type ${type} interlace ${interlace}`);
+  }
+  const ch = type === 6 ? 4 : 3, stride = w * ch;
+  const raw = zlib.inflateSync(Buffer.concat(idat));
+  const out = Buffer.alloc(h * stride);
+  for (let y = 0; y < h; y++) {
+    const f = raw[y * (stride + 1)], src = y * (stride + 1) + 1, dst = y * stride, up = dst - stride;
+    for (let x = 0; x < stride; x++) {
+      const a = x >= ch ? out[dst + x - ch] : 0;
+      const b = y > 0 ? out[up + x] : 0;
+      const c = x >= ch && y > 0 ? out[up + x - ch] : 0;
+      let v = raw[src + x];
+      if (f === 1) v += a;
+      else if (f === 2) v += b;
+      else if (f === 3) v += (a + b) >> 1;
+      else if (f === 4) {
+        const q = a + b - c, pa = Math.abs(q - a), pb = Math.abs(q - b), pc = Math.abs(q - c);
+        v += pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+      }
+      out[dst + x] = v & 255;
+    }
+  }
+  return { w, h, ch, data: out };
+}
+
+/** Area-average the export's luma down to `w` px wide (what averaging its
+ *  pixels gives, the model the grain gain follows) and measure detail there,
+ *  the same mean |Laplacian| as the preview. */
+function exportDetail(png: Buffer, w: number) {
+  const img = decodePng(png);
+  const { w: sw, h: sh, ch, data: d } = img;
+  const W = w, H = Math.round((w * sh) / sw);
+  const sum = new Float64Array(W * H), cnt = new Uint32Array(W * H);
+  const fx = new Uint32Array(sw);
+  for (let i = 0; i < sw; i++) fx[i] = Math.min(W - 1, Math.floor((i * W) / sw));
+  for (let y = 0; y < sh; y++) {
+    const row = Math.min(H - 1, Math.floor((y * H) / sh)) * W;
+    for (let x = 0; x < sw; x++) {
+      const i = (y * sw + x) * ch;
+      sum[row + fx[x]] += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+      cnt[row + fx[x]]++;
+    }
+  }
+  const L = (i: number) => sum[i] / cnt[i];
+  let s = 0, k = 0;
+  for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) {
+    const i = y * W + x;
+    s += Math.abs(4 * L(i) - L(i - 1) - L(i + 1) - L(i - W) - L(i + W)); k++;
+  }
+  return { detail: s / k, dims: [sw, sh] };
 }
 
 for (const fx of [
+  // Before #47 these ratios were 4.6 (Blur) and about 0.17 (Grain).
   { name: 'Blur', re: /^Blur/, value: 60, lo: 0.8, hi: 1.25 },
   { name: 'Grain', re: /^Grain/, value: 50, lo: 0.75, hi: 1.33 },
 ]) {
-  test(`${fx.name} looks the same in the preview and the full-size export (#47)`, async ({ page, context }, testInfo) => {
+  test(`${fx.name} looks the same in the preview and the full-size export (#47)`, async ({ page }, testInfo) => {
     test.setTimeout(300_000);
     const errors = trackErrors(page);
     await openApp(page);
@@ -110,7 +157,7 @@ for (const fx of [
     await settle(page);
     const shown = await previewDetail(page);
     const png = await exportPng(page);
-    const exported = await exportDetail(context, png, shown.w);
+    const exported = exportDetail(png, shown.w);
     expect(exported.dims).toEqual([6000, 4000]);
     const ratio = exported.detail / shown.detail;
     recordMetrics(testInfo, {
