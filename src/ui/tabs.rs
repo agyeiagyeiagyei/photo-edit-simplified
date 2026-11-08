@@ -330,6 +330,22 @@ pub(crate) fn RotateTab(state: AppState) -> impl IntoView {
 
 #[component]
 pub(crate) fn ColorTab(state: AppState) -> impl IntoView {
+    // With an adjustment layer selected the tab edits that layer. The memo
+    // changes only when the selection does, so a slider drag never remounts
+    // the controls under the pointer.
+    let adjust_id = selected_adjust_memo(state);
+    move || match adjust_id.get() {
+        Some(id) => view! {
+            <AdjustColorControls state=state layer_id=id/>
+            <p class="dim">"Blur and grain apply to the photo only. This layer's mask is on the Layers tab."</p>
+        }
+        .into_view(),
+        None => view! { <PhotoColorControls state=state/> }.into_view(),
+    }
+}
+
+#[component]
+fn PhotoColorControls(state: AppState) -> impl IntoView {
     let channel = create_rw_signal(0usize); // 0=RGB, 1=R, 2=G, 3=B, shared by Levels + Curves
     let slider = move |label: &'static str,
                        get: fn(&EditParams) -> f32,
@@ -352,7 +368,6 @@ pub(crate) fn ColorTab(state: AppState) -> impl IntoView {
         }
     };
     view! {
-        <RawPanel state=state />
         {slider("Brightness", |e| e.brightness, |e, v| e.brightness = v)}
         {slider("Contrast", |e| e.contrast, |e, v| e.contrast = v)}
         {slider("Saturation", |e| e.saturation, |e, v| e.saturation = v)}
@@ -367,21 +382,18 @@ pub(crate) fn ColorTab(state: AppState) -> impl IntoView {
     }
 }
 
-/// Linear-light RAW develop controls. Shown for RAW sources and for any item
-/// carrying RAW edits (a healed RAW becomes a raster but keeps its recipe).
-/// JPEGs have no develop stage, so the panel stays hidden and their recipes
-/// never grow RAW fields.
+/// Whether an item gets the RAW tab: RAW sources, and any item carrying RAW
+/// edits (a healed RAW becomes a raster but keeps its recipe). JPEGs have no
+/// develop stage, so the tab stays hidden and their recipes never grow RAW
+/// fields.
+pub(crate) fn has_raw_controls(m: &MediaItem) -> bool {
+    !m.edit.raw.is_identity() || get_photo(m.id).map(|p| p.raw).unwrap_or(false)
+}
+
+/// Linear-light RAW develop controls: the RAW tab.
 #[component]
 pub(crate) fn RawPanel(state: AppState) -> impl IntoView {
-    let is_raw = move || {
-        state
-            .current()
-            .map(|m| {
-                !m.edit.raw.is_identity()
-                    || get_photo(m.id).map(|p| p.raw).unwrap_or(false)
-            })
-            .unwrap_or(false)
-    };
+    let is_raw = move || state.current().map(|m| has_raw_controls(&m)).unwrap_or(false);
     let rslider = move |label: &'static str,
                         min: f64,
                         max: f64,

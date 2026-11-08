@@ -565,4 +565,52 @@ test.describe('adjustment layers (issue #26)', () => {
     expect(db, `RAW wand layer preview vs export PSNR ${db.toFixed(2)} dB at 128 px < 30 dB`).toBeGreaterThanOrEqual(30);
     expect(errors, errors.join('\n')).toEqual([]);
   });
+
+  // setRange sets a value with one scripted event, so it can't see an editor
+  // that rebuilds itself mid-drag. This drags with the mouse like a person.
+  test('layer sliders follow a real mouse drag, and rows are told apart', async ({ page }) => {
+    test.setTimeout(180_000);
+    const errors = trackErrors(page);
+    await openApp(page);
+    await importFiles(page, [PNG_SMALL]);
+    await waitSmall(page);
+    const baseline = await readCanvas(page);
+
+    await clickTab(page, 'Layers');
+    const labels = () => page.locator('.layer-row .layer-label').allTextContents();
+    await addAdjust(page).click();
+    await addAdjust(page).click();
+    expect(await labels()).toEqual(['Adjust 2', 'Adjust 1']);
+    await page.locator('.layer-row').first().locator('button.icon-btn', { hasText: '↓' }).click();
+    expect(await labels(), 'moving a layer must show in the list').toEqual(['Adjust 1', 'Adjust 2']);
+    await expect(page.locator('.layer-row.selected .layer-label')).toHaveText('Adjust 2');
+
+    const input = page.locator('.adjust-editor label.slider', { hasText: /^Brightness/ }).locator('input');
+    await input.evaluate((el) => { (el as any).__dragTag = 1; });
+    const b = (await input.boundingBox())!;
+    const y = b.y + b.height / 2;
+    // Grab the thumb where a person would (value 0 sits mid-track) and drag
+    // past the right end.
+    await page.mouse.move(b.x + b.width / 2, y);
+    await page.mouse.down();
+    for (let i = 1; i <= 20; i++) {
+      await page.mouse.move(b.x + b.width / 2 + (b.width / 2 + 10) * (i / 20), y);
+      await page.waitForTimeout(16);
+    }
+    await page.mouse.up();
+    expect(await input.inputValue(), 'the drag stopped short of the right end').toBe('1');
+    await expect(page.locator('.adjust-editor label.slider', { hasText: /^Brightness/ }).locator('span').first())
+      .toHaveText('Brightness: +100%');
+    expect(await input.evaluate((el) => (el as any).__dragTag === 1), 'the slider was rebuilt mid-drag').toBe(true);
+    await settle(page, 600);
+    expect(meanDiff(baseline.bytes, (await readCanvas(page)).bytes), 'the drag did not change the photo')
+      .toBeGreaterThan(3);
+
+    await selectTool(page, 'Rect');
+    await rectDrag(page, 0.2, 0.2, 0.6, 0.6);
+    await clickTab(page, 'Layers');
+    await addAdjustFromSel(page).click();
+    expect(await labels()).toEqual(['Adjust 3', 'Adjust 1', 'Adjust 2']);
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
 });

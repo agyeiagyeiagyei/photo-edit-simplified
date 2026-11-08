@@ -229,7 +229,7 @@ test.describe('WebGL2 parametric preview (docs/GPU.md)', () => {
 
         // Let the tab switch (which may itself redraw) land before taking the
         // baseline, so the tick we wait for is the sliders' own.
-        await clickTab(page, 'Color');
+        await clickTab(page, 'RAW');
         await page.waitForTimeout(250);
         await waitStableSharpCanvas(page);
         // A non-identity RAW develop stays on the GPU through a developed base
@@ -245,6 +245,10 @@ test.describe('WebGL2 parametric preview (docs/GPU.md)', () => {
         await waitRenderTick(page, developTick, before, 1500);
         out.frames.develop = await downscaled(page, 512);
 
+        // Saturation is on the Color tab; let that switch settle first.
+        await clickTab(page, 'Color');
+        await page.waitForTimeout(250);
+        await waitStableSharpCanvas(page);
         before = (await markNames(page)).filter((n) => n === colourTick).length;
         await setRange(page, /^Saturation/, 0.4);
         await waitRenderTick(page, colourTick, before, 1500);
