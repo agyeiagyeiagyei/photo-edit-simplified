@@ -19,7 +19,9 @@ use js_sys::{Array, Object, Reflect, Uint16Array, Uint8Array};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
-use pes_pixel::geo::{crop_px, geometry, geometry_wide, hi_target, stamp_stroke, working_dims};
+use pes_pixel::geo::{
+    crop_px, geometry, geometry_wide, hi_target, replay_strokes, stamp_stroke, working_dims,
+};
 use pes_pixel::pipeline::{self, Frame, Target};
 use pes_pixel::rawops;
 use pes_pixel::recipe::{edit_params_from_recipe, selection_from_json};
@@ -99,6 +101,9 @@ struct BaseCache {
     id: u32,
     rot90: u8,
     fine_bits: u32,
+    /// Retouch strokes are baked into the cached pixels, so their fingerprint
+    /// is part of the key.
+    strokes_fp: u64,
     tw: usize,
     th: usize,
     /// Pre-develop, pre-colour: `rawops` runs on a copy every render so
@@ -110,6 +115,7 @@ struct WindowCache {
     id: u32,
     rot90: u8,
     fine_bits: u32,
+    strokes_fp: u64,
     /// Crop rect in working pixels.
     crop: (usize, usize, usize, usize),
     tw: usize,
@@ -435,6 +441,32 @@ fn resolve_adjust_masks(id: u32, edit: &mut EditParams) {
     }
 }
 
+/// Stable fingerprint of the retouch strokes, for the render cache keys.
+fn strokes_fingerprint(edit: &EditParams) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |v: u64| {
+        h ^= v;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    for s in &edit.strokes {
+        mix(s.mode as u64);
+        mix(s.radius.to_bits() as u64);
+        mix(s.seed as u64);
+        mix(s.pts.len() as u64);
+        for p in &s.pts {
+            mix(p.0.to_bits() as u64);
+            mix(p.1.to_bits() as u64);
+        }
+        let src = s.src;
+        mix(src.is_some() as u64);
+        if let Some((x, y)) = src {
+            mix(x.to_bits() as u64);
+            mix(y.to_bits() as u64);
+        }
+    }
+    h
+}
+
 /// Geometry + resample front half of the render pipeline, with the base
 /// cache. Returns pre-develop, pre-colour pixels.
 fn base_pipeline(
@@ -453,11 +485,13 @@ fn base_pipeline(
     let (ww, wh) = working_dims(fw, fh, edit);
     let (tw, th) = hi_target(req_w, req_h, ww, wh, max_edge);
     let fine_bits = edit.fine_angle.to_bits();
+    let strokes_fp = strokes_fingerprint(edit);
     let cached = BASE_CACHE.with(|c| {
         c.borrow().as_ref().is_some_and(|b| {
             b.id == id
                 && b.rot90 == edit.rot90
                 && b.fine_bits == fine_bits
+                && b.strokes_fp == strokes_fp
                 && b.tw == tw
                 && b.th == th
         })
@@ -473,6 +507,13 @@ fn base_pipeline(
     } else {
         let (p, gw, gh) = geometry(full, fw, fh, edit);
         let t = js_sys::Date::now();
+        let p = if edit.strokes.is_empty() {
+            p
+        } else {
+            let mut owned = p.into_owned();
+            replay_strokes(&mut owned, gw, gh, fw, fh, edit);
+            std::borrow::Cow::Owned(owned)
+        };
         let buf = pipeline::resize(&p, gw, gh, Target::new(tw, th)).pixels;
         // Store the pre-develop base: later renders re-run rawops on the
         // copy, so exposure edits never compound into the cached pixels.
@@ -481,6 +522,7 @@ fn base_pipeline(
                 id,
                 rot90: edit.rot90,
                 fine_bits,
+                strokes_fp,
                 tw,
                 th,
                 pixels: buf.clone(),
@@ -829,8 +871,9 @@ pub fn render_base(
     let edit = parse_edit(id, recipe);
     // A RAW with develop edits gets a developed base: the neutral develop,
     // camera tone and detail at the base size, without colour. The shader then
-    // applies only the colour edits, so colour drags stay on the GPU.
-    if !edit.raw.is_identity() {
+    // applies only the colour edits, so colour drags stay on the GPU. Strokes
+    // make the edit ineligible: they replay on the 8-bit base instead.
+    if pipeline::neutral_eligible(&edit) {
         let Some((fw, fh)) = neutral_dims(id, &edit) else {
             return Err(JsValue::from_str("developed base needs the neutral frame"));
         };
@@ -926,11 +969,13 @@ fn render_window_pipeline(
     let rebased = pipeline::rebase_layer_masks(edit, ww, wh, (cx, cy, cw, ch), tw, th);
     let edit = &rebased;
     let fine_bits = edit.fine_angle.to_bits();
+    let strokes_fp = strokes_fingerprint(edit);
     let cached = WINDOW_CACHE.with(|c| {
         c.borrow().as_ref().is_some_and(|w| {
             w.id == id
                 && w.rot90 == edit.rot90
                 && w.fine_bits == fine_bits
+                && w.strokes_fp == strokes_fp
                 && w.crop == (cx, cy, cw, ch)
                 && w.tw == tw
                 && w.th == th
@@ -945,6 +990,13 @@ fn render_window_pipeline(
     } else {
         let (p, gw, gh) = geometry(full, fw, fh, edit);
         let t = js_sys::Date::now();
+        let p = if edit.strokes.is_empty() {
+            p
+        } else {
+            let mut owned = p.into_owned();
+            replay_strokes(&mut owned, gw, gh, fw, fh, edit);
+            std::borrow::Cow::Owned(owned)
+        };
         // Identity geometry borrows the stored frame: copy only the window's
         // rows. A rotation has already produced a full working frame.
         let win = if (cx, cy, cw, ch) == (0, 0, gw, gh) {
@@ -958,6 +1010,7 @@ fn render_window_pipeline(
                 id,
                 rot90: edit.rot90,
                 fine_bits,
+                strokes_fp,
                 crop: (cx, cy, cw, ch),
                 tw,
                 th,
@@ -1082,6 +1135,7 @@ pub fn heal_stroke(
         let edit = parse_edit(id, recipe);
         let (base, w, h) = geometry(full, *fw, *fh, &edit);
         let mut base = base.into_owned();
+        replay_strokes(&mut base, w, h, *fw, *fh, &edit);
         let diag = ((w * w + h * h) as f32).sqrt();
         let r = (radius_frac * diag).max(1.0);
         let pts = parse_pts(pts);
@@ -1110,6 +1164,7 @@ pub fn clone_stamp(
         let edit = parse_edit(id, recipe);
         let (base, w, h) = geometry(full, *fw, *fh, &edit);
         let mut base = base.into_owned();
+        replay_strokes(&mut base, w, h, *fw, *fh, &edit);
         let diag = ((w * w + h * h) as f32).sqrt();
         let r = (radius_frac * diag).max(1.0);
         let pts = parse_pts(pts);
@@ -1140,6 +1195,7 @@ pub fn cut(
         let edit = parse_edit(id, recipe);
         let (base, w, h) = geometry(full, *fw, *fh, &edit);
         let mut base = base.into_owned();
+        replay_strokes(&mut base, w, h, *fw, *fh, &edit);
         let Some(sel) = selection_from_json(sel_json, sel_mask.map(|m| m.to_vec())) else {
             return JsValue::NULL;
         };
@@ -1162,6 +1218,7 @@ pub fn fill_selection(
         let edit = parse_edit(id, recipe);
         let (base, w, h) = geometry(full, *fw, *fh, &edit);
         let mut base = base.into_owned();
+        replay_strokes(&mut base, w, h, *fw, *fh, &edit);
         let Some(sel) = selection_from_json(sel_json, sel_mask.map(|m| m.to_vec())) else {
             return JsValue::NULL;
         };
@@ -1189,6 +1246,7 @@ pub fn extract(
         let edit = parse_edit(id, recipe);
         let (base, w, h) = geometry(full, *fw, *fh, &edit);
         let mut base = base.into_owned();
+        replay_strokes(&mut base, w, h, *fw, *fh, &edit);
         let Some(sel) = selection_from_json(sel_json, sel_mask.map(|m| m.to_vec())) else {
             return JsValue::NULL;
         };
@@ -1621,6 +1679,13 @@ fn export_pixels(
     }
     with_buffer(id, |(full, _, _)| {
         let (p, gw, gh) = geometry(full, fw, fh, edit);
+        let p = if edit.strokes.is_empty() {
+            p
+        } else {
+            let mut owned = p.into_owned();
+            replay_strokes(&mut owned, gw, gh, fw, fh, edit);
+            std::borrow::Cow::Owned(owned)
+        };
         let win = if (cx, cy, cw, ch) == (0, 0, gw, gh) {
             p.into_owned()
         } else {
@@ -1665,6 +1730,7 @@ pub fn export_photo(
     // 26 MP) that would otherwise raise this worker's wasm high-water for the
     // rest of the session.
     let untouched = edit.raw.is_identity()
+        && edit.strokes.is_empty()
         && !edit.is_color_touched()
         && edit.rot90.is_multiple_of(4)
         && edit.fine_angle.abs() <= 0.01

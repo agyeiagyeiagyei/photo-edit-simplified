@@ -113,7 +113,10 @@ pub fn neutral_eligible(edit: &EditParams) -> bool {
     // Denoise and capture sharpening run inside the neutral path (after the
     // camera tone, in `rawops::detail_toned_wide`), so they no longer push a
     // RAW back onto the legacy toned-then-develop rendering (#15).
-    !edit.raw.is_identity()
+    //
+    // Retouch strokes replay on the 8-bit working frame, so any stroke forces
+    // the legacy path — the same rendering a baked heal produced before #42.
+    !edit.raw.is_identity() && edit.strokes.is_empty()
 }
 
 /// Selection mask for an edit at `w`×`h`, when the edit is masked.

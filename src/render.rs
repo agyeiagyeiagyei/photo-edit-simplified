@@ -894,6 +894,25 @@ pub(crate) fn edit_fingerprint(item: &MediaItem) -> u64 {
     }
     h.write_u8(e.grain_gaussian as u8);
     h.write_u8(e.grain_mono as u8);
+    h.write_u64(e.strokes.len() as u64);
+    for s in &e.strokes {
+        h.write_u8(s.mode);
+        h.write_u32(s.radius.to_bits());
+        h.write_u32(s.seed);
+        h.write_u64(s.pts.len() as u64);
+        for p in &s.pts {
+            h.write_u32(p.0.to_bits());
+            h.write_u32(p.1.to_bits());
+        }
+        match s.src {
+            Some((x, y)) => {
+                h.write_u8(1);
+                h.write_u32(x.to_bits());
+                h.write_u32(y.to_bits());
+            }
+            None => h.write_u8(0),
+        }
+    }
     match e.aspect.ratio() {
         Some((a, b)) => {
             h.write_u32(a.to_bits());
@@ -1194,6 +1213,9 @@ pub(crate) fn destructive_apply(state: AppState, item_id: usize, r: pworker::Des
         if let Some(m) = v.iter_mut().find(|m| m.id == item_id) {
             m.edit.rot90 = 0;
             m.edit.fine_angle = 0.0;
+            // The worker replayed any recorded RAW strokes into the pixels it
+            // just committed, so keeping them would apply them twice.
+            m.edit.strokes.clear();
             m.edit.selection = None;
             m.edit.selection_rev += 1;
         }
@@ -1210,15 +1232,72 @@ pub(crate) fn heal_mode_u8(m: heal::HealMode) -> u8 {
     }
 }
 
+/// Dimensions of the current item when it still renders as a RAW, i.e. its
+/// pixels are parametric and Heal/Clone must stay non-destructive.
+fn live_raw_dims(id: usize) -> Option<(usize, usize)> {
+    get_photo(id).filter(|p| p.raw).map(|p| p.full_dims)
+}
+
+/// Per-stroke seed for Content-aware's texture search. Deterministic from the
+/// item and the stroke geometry, and persisted in the recipe, so a reload
+/// replays the identical result.
+fn stroke_seed(item_id: usize, mode: u8, pts: &[(f32, f32)]) -> u32 {
+    let mut h = (item_id as u32).wrapping_mul(0x9e37_79b1) ^ ((mode as u32) << 24);
+    for (x, y) in pts {
+        h = h.wrapping_mul(31).wrapping_add(x.to_bits());
+        h = h.wrapping_mul(31).wrapping_add(y.to_bits());
+    }
+    h
+}
+
+/// Record a Heal/Clone stroke on a RAW in the item's recipe, in
+/// original-image normalized coordinates, instead of writing pixels. The
+/// worker replays it after develop, so the item stays a RAW and later edits
+/// still apply (#42). Returns false when the item is not a live RAW (the
+/// caller falls back to the destructive path).
+fn record_retouch(
+    state: AppState,
+    mode: u8,
+    radius: f32,
+    pts: &[(f32, f32)],
+    src: Option<(f32, f32)>,
+) -> bool {
+    let Some(item) = state.current() else { return false };
+    let Some((fw, fh)) = live_raw_dims(item.id) else { return false };
+    if fw == 0 || fh == 0 {
+        return false;
+    }
+    let map = |p: (f32, f32)| pes_pixel::geo::orig_from_work_norm(p, fw, fh, &item.edit);
+    let orig_pts: Vec<(f32, f32)> = pts.iter().map(|&p| map(p)).collect();
+    let orig_src = src.map(map);
+    let seed = stroke_seed(item.id, mode, &orig_pts);
+    state.update_current_item(|m| {
+        m.edit.strokes.push(pes_pixel::types::RetouchStroke {
+            mode,
+            radius,
+            pts: orig_pts,
+            src: orig_src,
+            seed,
+        });
+    });
+    true
+}
+
 /// Spot heal: stamp soft discs along the stroke (normalized coords) into a
 /// coverage mask at full-res, run the patch-synthesis solver, and swap the
-/// cached pixels — destructive, mirroring delete_selection.
+/// cached pixels — destructive, mirroring delete_selection. On a RAW the
+/// stroke is recorded in the recipe instead and replays after develop.
 pub(crate) fn apply_heal(state: AppState, pts: &[(f32, f32)]) {
     if pts.is_empty() {
         return;
     }
     let Some(item) = state.current() else { return };
     if item.kind != MediaKind::Photo {
+        return;
+    }
+    let mode = heal_mode_u8(state.heal_mode.get_untracked());
+    let radius = state.heal_radius.get_untracked();
+    if record_retouch(state, mode, radius, pts, None) {
         return;
     }
     if !full_present(item.id) {
@@ -1259,7 +1338,27 @@ pub(crate) fn apply_clone(state: AppState, pts: &[(f32, f32)]) {
     if item.kind != MediaKind::Photo {
         return;
     }
-    if state.clone_source.get_untracked().is_none() {
+    let Some(src) = state.clone_source.get_untracked() else { return };
+    if live_raw_dims(item.id).is_some() {
+        let offset = if state.clone_aligned.get_untracked() {
+            match state.clone_offset.get_untracked() {
+                Some(off) => off,
+                None => {
+                    let off = (src.0 - pts[0].0, src.1 - pts[0].1);
+                    state.clone_offset.set(Some(off));
+                    off
+                }
+            }
+        } else {
+            (src.0 - pts[0].0, src.1 - pts[0].1)
+        };
+        record_retouch(
+            state,
+            pes_pixel::types::RetouchStroke::CLONE,
+            state.clone_radius.get_untracked(),
+            pts,
+            Some((pts[0].0 + offset.0, pts[0].1 + offset.1)),
+        );
         return;
     }
     if !full_present(item.id) {

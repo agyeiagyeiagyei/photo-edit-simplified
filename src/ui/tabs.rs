@@ -66,6 +66,12 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
         let Some(id) = mask_layer.get() else { return false };
         state.current().is_some_and(|m| m.layers.iter().any(|l| l.id == id && l.mask.is_some()))
     };
+    let is_raw = move || {
+        state
+            .current()
+            .map(|m| get_photo(m.id).map(|p| p.raw).unwrap_or(false))
+            .unwrap_or(false)
+    };
     let feather = move || {
         state
             .current()
@@ -375,6 +381,13 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
                  the surroundings; Invert selects everything outside the selection. \
                  Isolate person runs MediaPipe Selfie Segmentation."
             </p>
+            <Show when=is_raw fallback=|| ()>
+                <p class="dim">
+                    "This is a RAW photo. Cut, Delete and Content fill bake the pixels into an \
+                     8-bit image: a reload restores the baked result and the RAW develop \
+                     settings no longer apply. Heal and Clone stay non-destructive."
+                </p>
+            </Show>
         </div>
     }
 }
