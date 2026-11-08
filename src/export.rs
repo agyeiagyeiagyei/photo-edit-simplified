@@ -365,6 +365,7 @@ fn edit_unedited(e: &EditParams, item: &MediaItem) -> bool {
         && e.crop == state::CropRect::default()
         && e.rot90 == 0
         && e.fine_angle == 0.0
+        && e.strokes.is_empty()
         && !e.is_color_touched()
         && e.selection.is_none()
         && item.layers.iter().all(|l| !l.visible)

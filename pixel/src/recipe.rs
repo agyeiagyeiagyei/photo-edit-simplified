@@ -9,7 +9,8 @@ use wasm_bindgen::JsValue;
 use crate::curves::{CurvePoint, CurvesSettings};
 use crate::levels::{LevelRange, LevelsSettings};
 use crate::types::{
-    AdjustLayer, Aspect, CropRect, EditParams, PointAdjust, Selection, SelectionKind,
+    AdjustLayer, Aspect, CropRect, EditParams, PointAdjust, RetouchStroke, Selection,
+    SelectionKind,
 };
 
 pub fn jget(v: &JsValue, key: &str) -> Option<JsValue> {
@@ -234,6 +235,87 @@ fn adjust_layers_from_json(v: &JsValue) -> Vec<AdjustLayer> {
     out
 }
 
+fn strokes_json(e: &EditParams) -> Option<String> {
+    if e.strokes.is_empty() {
+        return None;
+    }
+    let out: Vec<String> = e
+        .strokes
+        .iter()
+        .map(|s| {
+            let pts: Vec<String> = s.pts.iter().map(|p| format!("[{},{}]", p.0, p.1)).collect();
+            let mut parts = vec![
+                format!("\"m\":{}", s.mode),
+                format!("\"r\":{}", s.radius),
+                format!("\"p\":[{}]", pts.join(",")),
+            ];
+            if let Some((x, y)) = s.src {
+                parts.push(format!("\"src\":[{},{}]", x, y));
+            }
+            if s.seed != 0 {
+                parts.push(format!("\"seed\":{}", s.seed));
+            }
+            format!("{{{}}}", parts.join(","))
+        })
+        .collect();
+    Some(format!("[{}]", out.join(",")))
+}
+
+fn strokes_from_json(v: &JsValue) -> Vec<RetouchStroke> {
+    if !js_sys::Array::is_array(v) {
+        return Vec::new();
+    }
+    let arr: js_sys::Array = v.clone().unchecked_into();
+    let mut out = Vec::new();
+    for item in arr.iter() {
+        let mode = jnum(&item, "m").unwrap_or(0.0) as u8;
+        if mode > RetouchStroke::CLONE {
+            continue;
+        }
+        let mut pts = Vec::new();
+        if let Some(pv) = jget(&item, "p") {
+            if js_sys::Array::is_array(&pv) {
+                let rows: js_sys::Array = pv.unchecked_into();
+                for p in rows.iter() {
+                    if !js_sys::Array::is_array(&p) {
+                        continue;
+                    }
+                    let pair: js_sys::Array = p.unchecked_into();
+                    if pair.length() == 2 {
+                        if let (Some(x), Some(y)) = (pair.get(0).as_f64(), pair.get(1).as_f64()) {
+                            pts.push((x as f32, y as f32));
+                        }
+                    }
+                }
+            }
+        }
+        if pts.is_empty() {
+            continue;
+        }
+        let src = jget(&item, "src").and_then(|s| {
+            if !js_sys::Array::is_array(&s) {
+                return None;
+            }
+            let pair: js_sys::Array = s.unchecked_into();
+            if pair.length() != 2 {
+                return None;
+            }
+            Some((pair.get(0).as_f64()? as f32, pair.get(1).as_f64()? as f32))
+        });
+        if mode == RetouchStroke::CLONE && src.is_none() {
+            continue;
+        }
+        out.push(RetouchStroke {
+            mode,
+            radius: (jnum(&item, "r").unwrap_or(0.02) as f32).clamp(0.001, 0.25),
+            pts,
+            src,
+            seed: jnum(&item, "seed").unwrap_or(0.0) as u32,
+        });
+    }
+    out
+}
+
 /// Parse a layer mask from its recipe form. `"ref"` masks parse as an
 /// unresolved raster (dims but no bytes) that the worker fills from its cache;
 /// a layer whose raster never arrives is skipped rather than applied globally.
@@ -351,6 +433,9 @@ fn recipe_json(e: &EditParams, portable_masks: bool) -> Option<String> {
     }
     if let Some(adj) = adjust_layers_json(e, portable_masks) {
         parts.push(format!("\"adj\":{}", adj));
+    }
+    if let Some(hs) = strokes_json(e) {
+        parts.push(format!("\"hs\":{}", hs));
     }
     if e.trim != d.trim {
         if let Some((a, b)) = e.trim {
@@ -472,6 +557,9 @@ pub fn edit_params_from_recipe(json: &str) -> Option<EditParams> {
     }
     if let Some(a) = jget(&v, "adj") {
         e.adjust_layers = adjust_layers_from_json(&a);
+    }
+    if let Some(hs) = jget(&v, "hs") {
+        e.strokes = strokes_from_json(&hs);
     }
     if let Some(t) = jget(&v, "trim") {
         if js_sys::Array::is_array(&t) {

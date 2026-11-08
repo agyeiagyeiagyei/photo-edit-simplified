@@ -198,6 +198,38 @@ impl RawAdjust {
     }
 }
 
+/// One non-destructive retouch stroke on a RAW photo. Points and clone source
+/// are original-image normalized (0..1), so a stroke survives geometry changes;
+/// the worker replays it right after `geometry()` on the working frame.
+#[derive(Clone, PartialEq, Debug)]
+pub struct RetouchStroke {
+    /// 0 = ContentAware, 1 = SmoothFill, 2 = ProximityMatch, 3 = Clone.
+    pub mode: u8,
+    /// Brush radius as a fraction of the working-frame diagonal.
+    pub radius: f32,
+    /// Stroke path, original-image normalized.
+    pub pts: Vec<(f32, f32)>,
+    /// Clone source point (original normalized). On Content-Aware and
+    /// Proximity-Match heals it is the chosen patch anchor in the same space,
+    /// so replays sample the same region at any resolution; None on legacy
+    /// heals (they search on replay) and Smooth Fill (no source).
+    pub src: Option<(f32, f32)>,
+    /// Deterministic seed for Content-aware's texture search.
+    pub seed: u32,
+}
+
+impl RetouchStroke {
+    pub const CONTENT_AWARE: u8 = 0;
+    pub const SMOOTH_FILL: u8 = 1;
+    pub const PROXIMITY_MATCH: u8 = 2;
+    pub const CLONE: u8 = 3;
+
+    /// True when this stroke samples from `src` rather than synthesising.
+    pub fn is_clone(&self) -> bool {
+        self.mode == Self::CLONE
+    }
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct EditParams {
     pub aspect: Aspect,
@@ -233,6 +265,9 @@ pub struct EditParams {
     /// Adjustment layers applied on top of the global colour stages, bottom
     /// first. Empty for a photo without adjustment layers.
     pub adjust_layers: Vec<AdjustLayer>,
+    /// Non-destructive Heal/Clone strokes on a RAW, replayed after develop.
+    /// Empty for every other image kind (and for baked/8-bit photos).
+    pub strokes: Vec<RetouchStroke>,
     /// Video trim (start_s, end_s); None = untrimmed.
     pub trim: Option<(f32, f32)>,
     /// Keep original audio track on export; if false, strip audio.
@@ -260,6 +295,7 @@ impl Default for EditParams {
             selection: None,
             selection_rev: 0,
             adjust_layers: Vec::new(),
+            strokes: Vec::new(),
             trim: None,
             keep_audio: true,
         }
