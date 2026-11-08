@@ -593,6 +593,50 @@ test.describe('selection brush (issue #3)', () => {
     expect(errors, errors.join('\n')).toEqual([]);
   });
 
+  // Owner request (8 Nov): invert a selection. The global selection masks the
+  // Color stage, so a brightness edit shows which side is selected; exports
+  // carry no editor tint.
+  test('Invert swaps the selected area, and inverting twice restores it', async ({ page }) => {
+    test.setTimeout(180_000);
+    const errors = trackErrors(page);
+    await openApp(page);
+    await importFiles(page, [PNG_SMALL]);
+    await waitSmall(page);
+    const base = await decodePng(page, await exportPng(page));
+    const inside = (f: Frame) => regionDiff(base.bytes, f.bytes, f.w, f.h, 0.25, 0.25, 0.45, 0.45);
+    const outside = (f: Frame) => regionDiff(base.bytes, f.bytes, f.w, f.h, 0.6, 0.6, 0.9, 0.9);
+
+    await selectRect(page);
+    await rectDrag(page, 0.2, 0.2, 0.5, 0.5);
+    await parkPointer(page);
+    await clickTab(page, 'Color');
+    await setRange(page, /^Brightness/, 0.5);
+    await settle(page, 600);
+    const once = await decodePng(page, await exportPng(page));
+    expect(inside(once), 'the rect selection did not take the edit').toBeGreaterThan(3);
+    expect(outside(once), 'the edit leaked outside the rect').toBeLessThanOrEqual(1);
+
+    const invert = page.locator('.select-row button', { hasText: /^Invert$/ });
+    await clickTab(page, 'Select');
+    await expect(invert).toBeEnabled();
+    await invert.click();
+    await settle(page, 600);
+    const inverted = await decodePng(page, await exportPng(page));
+    expect(inside(inverted), 'the rect is still selected after Invert').toBeLessThanOrEqual(1);
+    expect(outside(inverted), 'the outside was not selected by Invert').toBeGreaterThan(3);
+
+    await clickTab(page, 'Select');
+    await invert.click();
+    await settle(page, 600);
+    const twice = await decodePng(page, await exportPng(page));
+    expect(meanDiff(once.bytes, twice.bytes), 'inverting twice did not restore the selection').toBeLessThanOrEqual(0.5);
+
+    await clickTab(page, 'Select');
+    await page.locator('.select-row button', { hasText: /^Clear$/ }).click();
+    await expect(invert, 'Invert needs a selection').toBeDisabled();
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
   test('Feather repaints the tint of a brushed selection', async ({ page }) => {
     test.setTimeout(180_000);
     const errors = trackErrors(page);

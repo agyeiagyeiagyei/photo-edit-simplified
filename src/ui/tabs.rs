@@ -250,6 +250,14 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
                 </button>
                 <button
                     class="btn"
+                    disabled=move || !has_selection()
+                    title="Select everything outside the current selection"
+                    on:click=move |_| invert_selection(state)
+                >
+                    "Invert"
+                </button>
+                <button
+                    class="btn"
                     on:click=move |_| {
                         state.subject_photo.set(None);
                         clear_subject_brush_ops(state);
@@ -290,7 +298,8 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
                  of the selection (or the selected adjustment layer's mask) with Size and \
                  Softness; each stroke is one undo step. \
                  Cut/Copy lift the selection to a raster layer; Content fill synthesizes it from \
-                 the surroundings. Isolate person runs MediaPipe Selfie Segmentation."
+                 the surroundings; Invert selects everything outside the selection. \
+                 Isolate person runs MediaPipe Selfie Segmentation."
             </p>
         </div>
     }
