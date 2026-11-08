@@ -1475,6 +1475,38 @@ pub(crate) fn wand_select(state: AppState, nx: f32, ny: f32) {
     });
 }
 
+/// Select › Inverse: what was outside the selection becomes selected. A raster
+/// selection (wand, subject, brushed) inverts at its own size, so inverting
+/// twice gives back the same mask; a rect or lasso is rasterised hard-edged at
+/// the brush's mask size first. Feather carries over, so a soft edge stays
+/// soft. A tapped subject's refine state belongs to the old selection, so it
+/// is dropped, as Clear does.
+pub(crate) fn invert_selection(state: AppState) {
+    let Some(item) = state.current() else { return };
+    let Some(sel) = item.edit.selection.clone() else { return };
+    let (w, h) = match &sel.kind {
+        SelectionKind::Mask { width, height, .. } if *width > 0 && *height > 0 => (*width, *height),
+        _ => match brush_dims(&item) {
+            Some(d) => d,
+            None => return,
+        },
+    };
+    let hard = Selection { kind: sel.kind.clone(), feather: 0.0 };
+    let mut data = ops::selection_mask(&hard, w, h);
+    for v in &mut data {
+        *v = 255 - *v;
+    }
+    state.subject_photo.set(None);
+    clear_subject_brush_ops(state);
+    state.update_current(|e| {
+        e.selection = Some(Selection {
+            kind: SelectionKind::Mask { data: Rc::new(data), width: w, height: h },
+            feather: sel.feather,
+        });
+        e.selection_rev += 1;
+    });
+}
+
 // --- selection brush ---------------------------------------------------------
 
 /// One stroke's undo budget: dirty-tile patches, never full-mask snapshots.
