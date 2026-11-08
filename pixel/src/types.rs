@@ -209,7 +209,10 @@ pub struct RetouchStroke {
     pub radius: f32,
     /// Stroke path, original-image normalized.
     pub pts: Vec<(f32, f32)>,
-    /// Clone source point (original normalized); None for heal modes.
+    /// Clone source point (original normalized). On Content-Aware and
+    /// Proximity-Match heals it is the chosen patch anchor in the same space,
+    /// so replays sample the same region at any resolution; None on legacy
+    /// heals (they search on replay) and Smooth Fill (no source).
     pub src: Option<(f32, f32)>,
     /// Deterministic seed for Content-aware's texture search.
     pub seed: u32,

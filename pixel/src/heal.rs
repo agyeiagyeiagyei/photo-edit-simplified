@@ -54,14 +54,22 @@ fn coverage_bounds(coverage: &[u8], width: usize, height: usize) -> Option<(usiz
     Some((x0, y0, x1, y1))
 }
 
+/// True when the patch at (dx, dy) neither overlaps the spot nor leaves the
+/// image.
+fn source_fits(wx0: i64, wy0: i64, ww: i64, wh: i64, dx: i64, dy: i64, w: i64, h: i64) -> bool {
+    dx.abs() >= ww
+        && dy.abs() >= wh
+        && wx0 + dx >= 0
+        && wy0 + dy >= 0
+        && wx0 + ww + dx <= w
+        && wy0 + wh + dy <= h
+}
+
 /// Mean squared difference between the ring around the spot and the ring
 /// around the patch offset by (dx, dy). Infinite when the patch would overlap
 /// the spot or leave the image.
 fn heal_score(rgba: &[u8], role: &[u8], wx0: i64, wy0: i64, ww: i64, wh: i64, dx: i64, dy: i64, w: i64, h: i64) -> f64 {
-    if dx.abs() < ww && dy.abs() < wh {
-        return f64::INFINITY;
-    }
-    if wx0 + dx < 0 || wy0 + dy < 0 || wx0 + ww + dx > w || wy0 + wh + dy > h {
+    if !source_fits(wx0, wy0, ww, wh, dx, dy, w, h) {
         return f64::INFINITY;
     }
     let stride = w as usize * 4;
@@ -178,15 +186,20 @@ fn heal_solve(value: &mut [f32], role: &[u8], w: usize, h: usize, depth: u32) {
     }
 }
 
-/// Heal the pixels under `coverage` (w*h, 255 = full strength). Returns false
-/// when there was nothing to heal. `opacity` scales the blend. `seed` drives
-/// the detail grain on smooth fills.
-pub fn spot_heal(rgba: &mut [u8], coverage: &[u8], width: usize, height: usize, opacity: f32, mode: HealMode, seed: u32) -> bool {
+/// Coverage bounds, the spot's work box, and the RING/HOLE roles, shared by
+/// the heal and the source choice.
+struct SpotLayout {
+    wx0: i64,
+    wy0: i64,
+    ww: i64,
+    wh: i64,
+    role: Vec<u8>,
+    ring_count: usize,
+}
+
+fn spot_layout(coverage: &[u8], width: usize, height: usize) -> Option<SpotLayout> {
     let (w, h) = (width as i64, height as i64);
-    let Some((bx0, by0, bx1, by1)) = coverage_bounds(coverage, width, height) else {
-        return false;
-    };
-    let stride = width * 4;
+    let (bx0, by0, bx1, by1) = coverage_bounds(coverage, width, height)?;
     let (bw, bh) = ((bx1 - bx0) as i64, (by1 - by0) as i64);
     let size = bw.max(bh);
     let ring = (size / 8).clamp(2, 16);
@@ -201,7 +214,6 @@ pub fn spot_heal(rgba: &mut [u8], coverage: &[u8], width: usize, height: usize, 
     let mut role = vec![0u8; wn];
     let mut near = vec![0u8; wn];
     let mut prefix = vec![0i64; (ww.max(wh) + 1) as usize];
-    let mut value = vec![0f32; wn * 4];
     for y in 0..wh {
         for x in 0..ww {
             role[(y * ww + x) as usize] =
@@ -237,50 +249,108 @@ pub fn spot_heal(rgba: &mut [u8], coverage: &[u8], width: usize, height: usize, 
     }
     let ring_count = role.iter().filter(|&&r| r == RING).count();
     if ring_count == 0 {
-        return false;
+        return None;
     }
+    Some(SpotLayout { wx0, wy0, ww, wh, role, ring_count })
+}
+
+/// Search the 5 scales × 24 angles around the spot for the patch whose ring
+/// matches best, then refine by ±3 px so repeating texture lines up.
+fn search_source(rgba: &[u8], l: &SpotLayout, w: i64, h: i64, mode: HealMode) -> Option<(i64, i64)> {
+    const FACTORS: [f64; 5] = [1.05, 1.35, 1.75, 2.25, 2.8];
+    let count = if mode == HealMode::ProximityMatch { 2 } else { 5 };
+    let mut best = f64::INFINITY;
+    let (mut ox, mut oy) = (0i64, 0i64);
+    for (f, &factor) in FACTORS.iter().enumerate().take(count) {
+        for a in 0..24 {
+            let angle = a as f64 * std::f64::consts::PI / 12.0;
+            let dx = (angle.cos() * factor * l.ww as f64).round() as i64;
+            let dy = (angle.sin() * factor * l.wh as f64).round() as i64;
+            let score = heal_score(rgba, &l.role, l.wx0, l.wy0, l.ww, l.wh, dx, dy, w, h);
+            if !score.is_finite() {
+                continue;
+            }
+            // Nearer patches win ties.
+            let score = score * if mode == HealMode::ProximityMatch { 1.0 + 0.6 * f as f64 } else { 1.0 + 0.1 * f as f64 };
+            if score < best {
+                best = score;
+                ox = dx;
+                oy = dy;
+            }
+        }
+    }
+    if !best.is_finite() {
+        return None;
+    }
+    let (cx, cy) = (ox, oy);
+    let mut refined = heal_score(rgba, &l.role, l.wx0, l.wy0, l.ww, l.wh, cx, cy, w, h);
+    for j in -3..=3 {
+        for i in -3..=3 {
+            let score = heal_score(rgba, &l.role, l.wx0, l.wy0, l.ww, l.wh, cx + i, cy + j, w, h);
+            if score < refined {
+                refined = score;
+                ox = cx + i;
+                oy = cy + j;
+            }
+        }
+    }
+    Some((ox, oy))
+}
+
+/// Choose the Content-Aware / Proximity-Match source offset for `coverage`
+/// without healing: the returned (dx, dy) is added to every hole pixel to
+/// sample its patch. Persisting it with the stroke lets a replay at another
+/// resolution reuse the same source region instead of running a fresh search
+/// that could land elsewhere.
+pub fn find_source(rgba: &[u8], coverage: &[u8], width: usize, height: usize, mode: HealMode) -> Option<(i64, i64)> {
+    if mode == HealMode::SmoothFill {
+        return None;
+    }
+    let l = spot_layout(coverage, width, height)?;
+    search_source(rgba, &l, width as i64, height as i64, mode)
+}
+
+/// Heal the pixels under `coverage` (w*h, 255 = full strength). Returns false
+/// when there was nothing to heal. `opacity` scales the blend. `seed` drives
+/// the detail grain on smooth fills.
+pub fn spot_heal(rgba: &mut [u8], coverage: &[u8], width: usize, height: usize, opacity: f32, mode: HealMode, seed: u32) -> bool {
+    spot_heal_from(rgba, coverage, width, height, opacity, mode, seed, None)
+}
+
+/// [`spot_heal`] with an already-chosen source offset. An offset that no
+/// longer fits the frame at this resolution falls back to the search.
+#[allow(clippy::too_many_arguments)]
+pub fn spot_heal_from(
+    rgba: &mut [u8],
+    coverage: &[u8],
+    width: usize,
+    height: usize,
+    opacity: f32,
+    mode: HealMode,
+    seed: u32,
+    source: Option<(i64, i64)>,
+) -> bool {
+    let (w, h) = (width as i64, height as i64);
+    let Some(l) = spot_layout(coverage, width, height) else {
+        return false;
+    };
+    let stride = width * 4;
 
     // Source patch for Content-Aware and Proximity Match.
     let (mut ox, mut oy, mut have_source) = (0i64, 0i64, false);
     if mode != HealMode::SmoothFill {
-        const FACTORS: [f64; 5] = [1.05, 1.35, 1.75, 2.25, 2.8];
-        let count = if mode == HealMode::ProximityMatch { 2 } else { 5 };
-        let mut best = f64::INFINITY;
-        for (f, &factor) in FACTORS.iter().enumerate().take(count) {
-            for a in 0..24 {
-                let angle = a as f64 * std::f64::consts::PI / 12.0;
-                let dx = (angle.cos() * factor * ww as f64).round() as i64;
-                let dy = (angle.sin() * factor * wh as f64).round() as i64;
-                let score = heal_score(rgba, &role, wx0, wy0, ww, wh, dx, dy, w, h);
-                if !score.is_finite() {
-                    continue;
-                }
-                // Nearer patches win ties.
-                let score = score * if mode == HealMode::ProximityMatch { 1.0 + 0.6 * f as f64 } else { 1.0 + 0.1 * f as f64 };
-                if score < best {
-                    best = score;
-                    ox = dx;
-                    oy = dy;
-                }
-            }
-        }
-        if best.is_finite() {
-            // Fine-tune the alignment so repeating texture lines up.
-            let (cx, cy) = (ox, oy);
-            let mut refined = heal_score(rgba, &role, wx0, wy0, ww, wh, cx, cy, w, h);
-            for j in -3..=3 {
-                for i in -3..=3 {
-                    let score = heal_score(rgba, &role, wx0, wy0, ww, wh, cx + i, cy + j, w, h);
-                    if score < refined {
-                        refined = score;
-                        ox = cx + i;
-                        oy = cy + j;
-                    }
-                }
-            }
+        let chosen = source
+            .filter(|&(dx, dy)| source_fits(l.wx0, l.wy0, l.ww, l.wh, dx, dy, w, h))
+            .or_else(|| search_source(rgba, &l, w, h, mode));
+        if let Some((dx, dy)) = chosen {
+            ox = dx;
+            oy = dy;
             have_source = true;
         }
     }
+    let SpotLayout { wx0, wy0, ww, wh, role, ring_count } = l;
+    let wn = (ww * wh) as usize;
+    let mut value = vec![0f32; wn * 4];
 
     // Membrane: the edge difference between the original and the patch (or the
     // original itself for a smooth fill), spread across the spot.

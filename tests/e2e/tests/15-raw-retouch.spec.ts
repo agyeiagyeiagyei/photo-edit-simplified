@@ -81,6 +81,63 @@ const mad = (a: number[], b: number[]) => {
   return s / a.length;
 };
 
+/**
+ * PSNR (RGB) between the preview canvas and the export inside one normalized
+ * box, with both surfaces drawn down to 1024 px wide first. The two renders
+ * come from different source buffers (proxy vs sensor), so equality has to be
+ * judged at a common resolution.
+ */
+async function exportBoxPsnr(
+  page: Page,
+  bytes: Buffer,
+  mime: string,
+  at: { x: number; y: number },
+  half: number,
+): Promise<number> {
+  return page.evaluate(
+    async ({ b64, mime, at, half }) => {
+      const c = document.querySelector('.canvas-wrap canvas') as HTMLCanvasElement | null;
+      if (!c || !c.width || !c.height) return -1;
+      const bin = atob(b64);
+      const u8 = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+      const bmp = await createImageBitmap(new Blob([u8], { type: mime }));
+      const at1024 = (src: CanvasImageSource, sw: number, sh: number) => {
+        const w = 1024;
+        const h = Math.max(1, Math.round(sh * (w / sw)));
+        const o = document.createElement('canvas');
+        o.width = w;
+        o.height = h;
+        const ctx = o.getContext('2d')!;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(src, 0, 0, w, h);
+        return { ctx, w, h };
+      };
+      const a = at1024(c, c.width, c.height);
+      const b = at1024(bmp, bmp.width, bmp.height);
+      bmp.close();
+      const x0 = Math.max(0, Math.floor((at.x - half) * a.w));
+      const y0 = Math.max(0, Math.floor((at.y - half) * a.h));
+      const bw = Math.max(1, Math.min(a.w - x0, Math.round(half * 2 * a.w)));
+      const bh = Math.max(1, Math.min(a.h - y0, Math.round(half * 2 * a.h)));
+      const da = a.ctx.getImageData(x0, y0, bw, bh).data;
+      const db = b.ctx.getImageData(x0, y0, bw, bh).data;
+      let mse = 0;
+      let n = 0;
+      for (let i = 0; i < da.length; i += 4) {
+        for (let k = 0; k < 3; k++) {
+          const d = da[i + k] - db[i + k];
+          mse += d * d;
+          n++;
+        }
+      }
+      mse /= n;
+      return mse > 0 ? 10 * Math.log10((255 * 255) / mse) : 99;
+    },
+    { b64: bytes.toString('base64'), mime, at, half },
+  );
+}
+
 type Box = { x: number; y: number; m: number; sd: number };
 
 /** Grid of 3%-wide boxes over the middle of the canvas, with mean luma + std. */
@@ -503,6 +560,76 @@ test.describe('RAW retouch (#42): non-destructive Heal/Clone', () => {
 
       expect(exportDelta, 'export did not replay the clone stroke').toBeLessThan(8);
       expect(psnr, 'preview-vs-export PSNR').toBeGreaterThan(22);
+      expect(errors, errors.join('\n')).toEqual([]);
+    });
+
+    test(`RAW ${name} replays a content-aware heal identically in preview and export`, async ({ page }, testInfo) => {
+      test.setTimeout(420_000);
+      const errors = trackErrors(page);
+
+      await openApp(page);
+      await importFiles(page, [RAW]);
+      await waitDeveloped(page);
+
+      await clickTab(page, 'Heal');
+      await page.locator('.heal-panel .chip', { hasText: /^Content-aware$/ }).click();
+      await setRange(page, /^Brush size:/, 0.06);
+      await page.waitForTimeout(300);
+
+      const pick = await pickHealAndControl(page);
+      expect(pick, 'canvas had no pixels to sample').not.toBeNull();
+      const { heal } = pick!;
+      const half = 0.02;
+      const pre = await boxLuma(page, heal.x, heal.y, half);
+      const preSd = std(pre);
+      expect(preSd, 'picked heal spot has no texture to flatten').toBeGreaterThan(4);
+
+      await clickNorm(page, heal.x, heal.y);
+      await expect
+        .poll(async () => std(await boxLuma(page, heal.x, heal.y, half)) / preSd, { timeout: 120_000 })
+        .toBeLessThan(0.8);
+
+      // The chosen patch must be pinned in the recipe at stroke time: a
+      // replay that searches again would find different pixels at export.
+      await expect
+        .poll(async () => (await itemRecord(page))?.hs?.[0]?.src?.length ?? 0, { timeout: 30_000 })
+        .toBe(2);
+      const rec = await itemRecord(page);
+      expect(rec?.raw, 'raw flag dropped after a heal').toBe(true);
+      expect(rec?.raster, 'heal was baked into a raster').toBe(false);
+      const stroke = rec!.hs![0];
+      expect(stroke.m, 'mode').toBe(0); // Content-aware
+
+      // Off the Heal tab so no brush cursor sits over the sampled box.
+      await clickTab(page, 'RAW');
+      await page.waitForTimeout(400);
+      const previewSd = std(await boxLuma(page, heal.x, heal.y, half));
+
+      // Export: sensor-size decode. Inside the healed box the export must
+      // match the preview despite the 2888 px vs 6192 px replay resolution.
+      await clickTab(page, 'Export');
+      const [dl] = await Promise.all([
+        page.waitForEvent('download', { timeout: 240_000 }),
+        page.locator('button.btn.primary', { hasText: 'Download this' }).click(),
+      ]);
+      const bytes = fs.readFileSync((await dl.path())!);
+      const dims = await imageDims(page, bytes, 'image/jpeg');
+      expect(dims.w * dims.h, 'export is not at sensor resolution').toBeGreaterThan(4_000_000);
+      const boxPsnr = await exportBoxPsnr(page, bytes, 'image/jpeg', heal, half);
+      const psnr = await psnrCanvasVsExport(page, bytes, 'image/jpeg');
+
+      recordMetrics(testInfo, {
+        raw_fixture: name,
+        heal_ca_pre_sd: Math.round(preSd * 10) / 10,
+        heal_ca_preview_sd: Math.round(previewSd * 10) / 10,
+        heal_ca_anchor: `${stroke.src[0].toFixed(4)},${stroke.src[1].toFixed(4)}`,
+        heal_ca_box_psnr_db: Math.round(boxPsnr * 10) / 10,
+        heal_ca_export_psnr_db: Math.round(psnr * 10) / 10,
+        heal_ca_export_w: dims.w,
+        heal_ca_export_h: dims.h,
+      });
+
+      expect(boxPsnr, 'preview-vs-export PSNR inside the healed box').toBeGreaterThan(30);
       expect(errors, errors.join('\n')).toEqual([]);
     });
   }

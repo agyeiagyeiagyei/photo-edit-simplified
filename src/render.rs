@@ -1271,12 +1271,23 @@ fn record_retouch(
     let orig_pts: Vec<(f32, f32)> = pts.iter().map(|&p| map(p)).collect();
     let orig_src = src.map(map);
     let seed = stroke_seed(item.id, mode, &orig_pts);
+    // Pin the content-aware patch while the frame the user is looking at is
+    // loaded. Re-searching at the export resolution would land on another
+    // patch, so store the offset now and replay it at any resolution.
+    let anchor = if orig_src.is_none() && !full_present(item.id) {
+        proxy_data(item.id).and_then(|p| {
+            let px = p.pixels.as_cow();
+            pes_pixel::geo::heal_anchor(&px, p.w, p.h, &orig_pts, radius, mode, &item.edit)
+        })
+    } else {
+        None
+    };
     state.update_current_item(|m| {
         m.edit.strokes.push(pes_pixel::types::RetouchStroke {
             mode,
             radius,
             pts: orig_pts,
-            src: orig_src,
+            src: orig_src.or(anchor),
             seed,
         });
     });
