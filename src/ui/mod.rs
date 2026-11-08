@@ -296,16 +296,29 @@ pub(crate) enum Tab {
 }
 
 /// Tabs that edit pixels say what they edit. The text completes "<layer> is
-/// selected, but …" for a tab that can't act on the selected layer; the bool
-/// is whether the tab can edit an adjustment layer (only Color can).
-fn editing_note(t: Tab) -> Option<(&'static str, bool)> {
+/// selected, but …" for a layer class the tab can't act on; the fn says which
+/// classes it can (Color: adjustments and image layers; Rotate: every drawn
+/// layer; Heal/Clone: image layers).
+fn editing_note(t: Tab) -> Option<(&'static str, fn(LayerClass) -> bool)> {
     match t {
-        Tab::Raw => Some(("RAW develop applies to the photo", false)),
-        Tab::Crop => Some(("Crop covers the whole picture", false)),
-        Tab::Rotate => Some(("Rotate turns the whole picture", false)),
-        Tab::Color => Some(("only adjustment layers have colour settings so far", true)),
-        Tab::Heal => Some(("healing works on the photo only for now", false)),
-        Tab::Clone => Some(("cloning works on the photo only for now", false)),
+        Tab::Raw => Some(("RAW develop applies to the photo", |_| false)),
+        Tab::Crop => Some(("Crop covers the whole picture", |_| false)),
+        Tab::Rotate => Some((
+            "only text, path, brush and image layers can be turned",
+            |c| c != LayerClass::Adjust,
+        )),
+        Tab::Color => Some((
+            "only adjustment and image layers have colour settings",
+            |c| matches!(c, LayerClass::Adjust | LayerClass::Raster),
+        )),
+        Tab::Heal => Some((
+            "healing works on the photo or an image layer's pixels",
+            |c| c == LayerClass::Raster,
+        )),
+        Tab::Clone => Some((
+            "cloning works on the photo or an image layer's pixels",
+            |c| c == LayerClass::Raster,
+        )),
         Tab::Select | Tab::Layers | Tab::Trim | Tab::Export => None,
     }
 }
@@ -367,8 +380,8 @@ pub(crate) fn Editor(state: AppState) -> impl IntoView {
                         <TabBtn tab=tab t=Tab::Export label="Export"/>
                     </div>
                     <div class="panel">
-                    {move || editing_note(tab.get()).map(|(note, layers_ok)| view! {
-                        <EditingLine state=state photo_note=note layers_ok=layers_ok/>
+                    {move || editing_note(tab.get()).map(|(note, supports)| view! {
+                        <EditingLine state=state photo_note=note supports=supports/>
                     })}
                     {move || match tab.get() {
                         Tab::Raw => view! { <RawPanel state=state/> }.into_view(),

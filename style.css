@@ -207,6 +207,11 @@ h1 { font-size: 17px; font-weight: 600; }
   width: fit-content;
   max-width: 100%;
   margin: 0 auto;
+  /* Layer overlays can be wider than the photo (a long text box, a scaled
+     path). Clip them to the canvas so their hit area never covers the
+     side panel. */
+  overflow: hidden;
+  border-radius: 10px;
 }
 /* Width is the largest value that fits both the viewport width and the
    viewport height given the image aspect ratio (--ar, set from Rust). */
@@ -232,8 +237,6 @@ h1 { font-size: 17px; font-weight: 600; }
   line-height: 1.4;
   pointer-events: none;
 }
-/* Cropped view: clip layer overlays that fall outside the crop region. */
-.canvas-wrap.cropped { overflow: hidden; border-radius: 10px; }
 
 .crop-overlay { position: absolute; inset: 0; touch-action: none; }
 
@@ -859,4 +862,58 @@ button:disabled {
   font-size: 13px;
   cursor: pointer;
   text-decoration: underline;
+}
+
+/* Transform handles for the selected layer (Layers tab, Select tool). */
+.layer-box {
+  position: absolute;
+  pointer-events: auto;
+  touch-action: none;
+  cursor: move;
+  user-select: none;
+  z-index: 10;
+  outline: 2px dashed rgba(10, 132, 255, 0.85);
+  outline-offset: 2px;
+  min-width: 6px;
+  min-height: 6px;
+}
+.text-box .xform-text {
+  visibility: hidden;
+  white-space: nowrap;
+  line-height: 1.2;
+}
+.xform-handle {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--accent);
+  border-radius: 3px;
+  background: #fff;
+  transform: translate(-50%, -50%);
+}
+.xform-handle.nw { left: 0; top: 0; cursor: nwse-resize; }
+.xform-handle.ne { left: 100%; top: 0; cursor: nesw-resize; }
+.xform-handle.sw { left: 0; top: 100%; cursor: nesw-resize; }
+.xform-handle.se { left: 100%; top: 100%; cursor: nwse-resize; }
+.xform-rotate {
+  position: absolute;
+  left: 50%;
+  top: -26px;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--accent);
+  border-radius: 50%;
+  background: #fff;
+  transform: translate(-50%, -50%);
+  cursor: grab;
+}
+.xform-rotate::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 100%;
+  width: 2px;
+  height: 12px;
+  margin-left: -1px;
+  background: var(--accent);
 }

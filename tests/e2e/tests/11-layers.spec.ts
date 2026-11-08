@@ -108,7 +108,7 @@ test('the photo is the bottom row, and Color edits a selected adjustment layer',
   await page.locator('.layer-row .layer-label', { hasText: 'T: X' }).click();
   await clickTab(page, 'Heal');
   await expect(editing).toContainText('Editing: Photo');
-  await expect(editing).toContainText('T: X is selected, but healing works on the photo only for now.');
+  await expect(editing).toContainText("T: X is selected, but healing works on the photo or an image layer's pixels.");
 
   // Selecting the photo row clears the layer selection.
   await clickTab(page, 'Layers');

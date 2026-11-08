@@ -524,12 +524,15 @@ pub fn layers_json(layers: &[Layer]) -> Option<String> {
                     })
                     .collect();
                 out.push_str(&format!(
-                    ",\"t\":\"path\",\"pts\":[{}],\"closed\":{},\"fc\":\"{}\",\"sc\":\"{}\",\"sw\":{}",
+                    ",\"t\":\"path\",\"pts\":[{}],\"closed\":{},\"fc\":\"{}\",\"sc\":\"{}\",\"sw\":{},\
+                     \"ang\":{},\"scale\":{}",
                     pts.join(","),
                     p.closed,
                     esc(&p.fill_color),
                     esc(&p.stroke_color),
                     num(p.stroke_width),
+                    num(p.angle),
+                    num(p.scale),
                 ));
             }
             LayerKind::Brush(b) => {
@@ -546,23 +549,27 @@ pub fn layers_json(layers: &[Layer]) -> Option<String> {
                     })
                     .collect();
                 out.push_str(&format!(
-                    ",\"t\":\"brush\",\"strokes\":[{}],\"c\":\"{}\",\"w\":{},\"shape\":\"{}\",\"sp\":{},\"cp\":\"{}\"",
+                    ",\"t\":\"brush\",\"strokes\":[{}],\"c\":\"{}\",\"w\":{},\"shape\":\"{}\",\"sp\":{},\"cp\":\"{}\",\
+                     \"ang\":{},\"scale\":{}",
                     strokes.join(","),
                     esc(&b.color),
                     num(b.width),
                     shape_wire(b.shape),
                     num(b.spacing),
                     esc(&b.custom_path),
+                    num(b.angle),
+                    num(b.scale),
                 ));
             }
             LayerKind::Raster(r) => {
                 out.push_str(&format!(
-                    ",\"t\":\"raster\",\"w\":{},\"h\":{},\"x\":{},\"y\":{},\"scale\":{}",
+                    ",\"t\":\"raster\",\"w\":{},\"h\":{},\"x\":{},\"y\":{},\"scale\":{},\"ang\":{}",
                     r.width,
                     r.height,
                     num(r.x),
                     num(r.y),
                     num(r.scale),
+                    num(r.angle),
                 ));
             }
             LayerKind::Adjust(a) => {
@@ -570,6 +577,9 @@ pub fn layers_json(layers: &[Layer]) -> Option<String> {
                     ",\"t\":\"adjust\",\"adj\":{}",
                     pes_pixel::recipe::point_adjust_json(&a.adjust)
                 ));
+                if let Some(tid) = a.clip_to {
+                    out.push_str(&format!(",\"clip\":{}", tid));
+                }
             }
         }
         // Mask fields are generic: every layer kind carries them.
@@ -662,6 +672,8 @@ pub fn layers_from_json(json: &str) -> Vec<Layer> {
                     fill_color: jstr(&lv, "fc").unwrap_or_else(|| "#ff3b30".into()),
                     stroke_color: jstr(&lv, "sc").unwrap_or_else(|| "#000000".into()),
                     stroke_width: crate::state::jnum(&lv, "sw").unwrap_or(0.01) as f32,
+                    angle: crate::state::jnum(&lv, "ang").unwrap_or(0.0) as f32,
+                    scale: crate::state::jnum(&lv, "scale").unwrap_or(1.0) as f32,
                     history: Vec::new(),
                 })
             }
@@ -700,6 +712,8 @@ pub fn layers_from_json(json: &str) -> Vec<Layer> {
                     shape: shape_from(&jstr(&lv, "shape").unwrap_or_default()),
                     spacing: crate::state::jnum(&lv, "sp").unwrap_or(1.0) as f32,
                     custom_path: jstr(&lv, "cp").unwrap_or_default(),
+                    angle: crate::state::jnum(&lv, "ang").unwrap_or(0.0) as f32,
+                    scale: crate::state::jnum(&lv, "scale").unwrap_or(1.0) as f32,
                     history: Vec::new(),
                 })
             }
@@ -710,11 +724,14 @@ pub fn layers_from_json(json: &str) -> Vec<Layer> {
                 x: crate::state::jnum(&lv, "x").unwrap_or(0.5) as f32,
                 y: crate::state::jnum(&lv, "y").unwrap_or(0.5) as f32,
                 scale: crate::state::jnum(&lv, "scale").unwrap_or(1.0) as f32,
+                angle: crate::state::jnum(&lv, "ang").unwrap_or(0.0) as f32,
+                rev: 0,
             }),
             "adjust" => LayerKind::Adjust(AdjustLayerState {
                 adjust: crate::state::jget(&lv, "adj")
                     .map(|a| pes_pixel::recipe::point_adjust_from_json(&a))
                     .unwrap_or_default(),
+                clip_to: crate::state::jnum(&lv, "clip").map(|v| v as usize),
             }),
             _ => continue,
         };

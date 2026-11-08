@@ -9,6 +9,203 @@ thread_local! {
     static SKIP_NEXT_PAINT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum XformMode {
+    Move,
+    Scale,
+    Rotate,
+}
+
+/// Layer values captured when a transform gesture starts, in full-image
+/// normalized coords. Path and brush layers have no position field, so a move
+/// translates every point from this snapshot instead of accumulating deltas.
+#[derive(Clone)]
+pub(crate) enum XformStart {
+    Text { x: f32, y: f32 },
+    Raster { x: f32, y: f32 },
+    Path { points: Vec<state::PathPoint>, bbox: (f32, f32, f32, f32) },
+    Brush { strokes: Vec<state::BrushStroke>, bbox: (f32, f32, f32, f32) },
+}
+
+/// A live transform gesture. Positions are crop-relative units (0..1 inside
+/// the displayed preview); `origin` and `pivot` use the same space so every
+/// bearing and distance is computed in CSS pixels without re-querying the
+/// layer's geometry.
+#[derive(Clone)]
+pub(crate) struct XformDrag {
+    id: usize,
+    mode: XformMode,
+    origin: (f32, f32),
+    pivot: (f32, f32),
+    crop: state::CropRect,
+    start_angle: f32,
+    start_bearing: f32,
+    start_scale: f32,
+    start_dist: f32,
+    start: XformStart,
+}
+
+fn norm_deg(a: f32) -> f32 {
+    let mut a = a % 360.0;
+    if a > 180.0 {
+        a -= 360.0;
+    } else if a < -180.0 {
+        a += 360.0;
+    }
+    a
+}
+
+/// The selected image layer that Heal and Clone act on, if one is selected.
+pub(crate) fn raster_target(state: AppState) -> Option<usize> {
+    let id = state.selected_layer.get()?;
+    state
+        .current()?
+        .layers
+        .iter()
+        .find(|l| l.id == id && matches!(l.kind, LayerKind::Raster(_)))
+        .map(|l| l.id)
+}
+
+/// Pivot a layer turns or scales around, in full-image normalized coords.
+pub(crate) fn layer_pivot(kind: &state::LayerKind) -> (f32, f32) {
+    match kind {
+        state::LayerKind::Text(t) => (t.x, t.y),
+        state::LayerKind::Raster(r) => (r.x, r.y),
+        state::LayerKind::Path(p) => p
+            .points_bbox()
+            .map(|b| ((b.0 + b.2) / 2.0, (b.1 + b.3) / 2.0))
+            .unwrap_or((0.5, 0.5)),
+        state::LayerKind::Brush(b) => b
+            .points_bbox()
+            .map(|b| ((b.0 + b.2) / 2.0, (b.1 + b.3) / 2.0))
+            .unwrap_or((0.5, 0.5)),
+        state::LayerKind::Adjust(_) => (0.5, 0.5),
+    }
+}
+
+fn begin_xform(
+    state: AppState,
+    id: usize,
+    mode: XformMode,
+    ev: &web_sys::PointerEvent,
+    drag: RwSignal<Option<XformDrag>>,
+) {
+    ev.stop_propagation();
+    ev.prevent_default();
+    let Some(item) = state.current() else { return };
+    let Some(layer) = item.layers.iter().find(|l| l.id == id) else { return };
+    let Some((lx, ly)) = layer_local_pos(ev) else { return };
+    let Some((css_w, css_h)) = canvas_css_size() else { return };
+    let crop = item.edit.crop;
+    let (px, py) = layer_pivot(&layer.kind);
+    let pivot = ((px - crop.x) / crop.w, (py - crop.y) / crop.h);
+    let (start_angle, start_scale) = match &layer.kind {
+        state::LayerKind::Text(t) => (t.angle, t.font_size),
+        state::LayerKind::Path(p) => (p.angle, p.scale),
+        state::LayerKind::Brush(b) => (b.angle, b.scale),
+        state::LayerKind::Raster(r) => (r.angle, r.scale),
+        state::LayerKind::Adjust(_) => return,
+    };
+    let start = match &layer.kind {
+        state::LayerKind::Text(t) => XformStart::Text { x: t.x, y: t.y },
+        state::LayerKind::Raster(r) => XformStart::Raster { x: r.x, y: r.y },
+        state::LayerKind::Path(p) => XformStart::Path {
+            points: p.points.clone(),
+            bbox: p.points_bbox().unwrap_or((0.0, 0.0, 0.0, 0.0)),
+        },
+        state::LayerKind::Brush(b) => XformStart::Brush {
+            strokes: b.strokes.clone(),
+            bbox: b.points_bbox().unwrap_or((0.0, 0.0, 0.0, 0.0)),
+        },
+        state::LayerKind::Adjust(_) => return,
+    };
+    let dx = (lx - pivot.0) * css_w;
+    let dy = (ly - pivot.1) * css_h;
+    drag.set(Some(XformDrag {
+        id,
+        mode,
+        origin: (lx, ly),
+        pivot,
+        crop,
+        start_angle,
+        start_bearing: dy.atan2(dx),
+        start_scale,
+        start_dist: (dx * dx + dy * dy).sqrt().max(1.0),
+        start,
+    }));
+}
+
+fn update_xform(state: AppState, d: &XformDrag, lx: f32, ly: f32, css: (f32, f32)) {
+    match d.mode {
+        XformMode::Move => {
+            let dx = (lx - d.origin.0) * d.crop.w;
+            let dy = (ly - d.origin.1) * d.crop.h;
+            state.update_current_item(|m| {
+                let Some(l) = m.layers.iter_mut().find(|l| l.id == d.id) else { return };
+                match (&mut l.kind, &d.start) {
+                    (state::LayerKind::Text(t), XformStart::Text { x, y }) => {
+                        t.x = (x + dx).clamp(0.0, 1.0);
+                        t.y = (y + dy).clamp(0.0, 1.0);
+                    }
+                    (state::LayerKind::Raster(r), XformStart::Raster { x, y }) => {
+                        r.x = (x + dx).clamp(0.0, 1.0);
+                        r.y = (y + dy).clamp(0.0, 1.0);
+                    }
+                    (state::LayerKind::Path(p), XformStart::Path { points, bbox }) => {
+                        let dx = dx.clamp(-bbox.0, 1.0 - bbox.2);
+                        let dy = dy.clamp(-bbox.1, 1.0 - bbox.3);
+                        for (pt, orig) in p.points.iter_mut().zip(points) {
+                            pt.x = orig.x + dx;
+                            pt.y = orig.y + dy;
+                        }
+                    }
+                    (state::LayerKind::Brush(b), XformStart::Brush { strokes, bbox }) => {
+                        let dx = dx.clamp(-bbox.0, 1.0 - bbox.2);
+                        let dy = dy.clamp(-bbox.1, 1.0 - bbox.3);
+                        for (stroke, orig) in b.strokes.iter_mut().zip(strokes) {
+                            for (pt, o) in stroke.points.iter_mut().zip(&orig.points) {
+                                *pt = (o.0 + dx, o.1 + dy);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            });
+        }
+        XformMode::Scale => {
+            let dx = (lx - d.pivot.0) * css.0;
+            let dy = (ly - d.pivot.1) * css.1;
+            let factor = ((dx * dx + dy * dy).sqrt() / d.start_dist).clamp(0.05, 20.0);
+            state.update_current_item(|m| {
+                let Some(l) = m.layers.iter_mut().find(|l| l.id == d.id) else { return };
+                match &mut l.kind {
+                    state::LayerKind::Text(t) => t.font_size = (d.start_scale * factor).clamp(0.005, 0.5),
+                    state::LayerKind::Path(p) => p.scale = (d.start_scale * factor).clamp(0.02, 8.0),
+                    state::LayerKind::Brush(b) => b.scale = (d.start_scale * factor).clamp(0.02, 8.0),
+                    state::LayerKind::Raster(r) => r.scale = (d.start_scale * factor).clamp(0.02, 8.0),
+                    state::LayerKind::Adjust(_) => {}
+                }
+            });
+        }
+        XformMode::Rotate => {
+            let dx = (lx - d.pivot.0) * css.0;
+            let dy = (ly - d.pivot.1) * css.1;
+            let bearing = dy.atan2(dx);
+            let angle = norm_deg(d.start_angle + (bearing - d.start_bearing).to_degrees());
+            state.update_current_item(|m| {
+                let Some(l) = m.layers.iter_mut().find(|l| l.id == d.id) else { return };
+                match &mut l.kind {
+                    state::LayerKind::Text(t) => t.angle = angle,
+                    state::LayerKind::Path(p) => p.angle = angle,
+                    state::LayerKind::Brush(b) => b.angle = angle,
+                    state::LayerKind::Raster(r) => r.angle = angle,
+                    state::LayerKind::Adjust(_) => {}
+                }
+            });
+        }
+    }
+}
+
 pub(crate) fn skip_next_preview_paint() {
     SKIP_NEXT_PAINT.with(|s| s.set(true));
     let cb = Closure::once(|| SKIP_NEXT_PAINT.with(|s| s.set(false)));
@@ -42,13 +239,16 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     let canvas_ref = create_node_ref::<html::Canvas>();
     let working = create_rw_signal((1usize, 1usize));
     let layer_drag = create_rw_signal(None::<(usize, f32, f32, f32, f32)>);
+    let xform_drag = create_rw_signal(None::<XformDrag>);
     let pen_drag = create_rw_signal(None::<(usize, PenDrag, f32, f32)>);
     let brush_draw = create_rw_signal(None::<usize>);
     let select_drag = create_rw_signal(None::<SelectDrag>);
     let brush_drag = create_rw_signal(None::<BrushDrag>);
     let brush_hover = create_rw_signal(None::<(f32, f32)>);
-    let heal_drag = create_rw_signal(None::<Vec<(f32, f32)>>);
-    let clone_drag = create_rw_signal(None::<Vec<(f32, f32)>>);
+    // (target image layer, points): None heals/clones the photo, Some(id) the
+    // selected image layer's own pixels.
+    let heal_drag = create_rw_signal(None::<(Option<usize>, Vec<(f32, f32)>)>);
+    let clone_drag = create_rw_signal(None::<(Option<usize>, Vec<(f32, f32)>)>);
     // Hoisted out of CropOverlay: crop edits re-render the preview, which
     // remounts the overlay — a drag signal created inside it would be
     // disposed mid-gesture, killing the drag after one pointermove.
@@ -100,33 +300,39 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     }
 
     window_event_listener(leptos::ev::pointermove, move |ev| {
-        let Some(Some(mut pts)) = clone_drag.try_get() else { return };
+        let Some(Some((target, mut pts))) = clone_drag.try_get() else { return };
         let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop)).flatten() else { return };
         if pts.last().map(|last| dist2(*last, (nx, ny)) > 0.00005).unwrap_or(true) {
             pts.push((nx, ny));
-            clone_drag.set(Some(pts));
+            clone_drag.set(Some((target, pts)));
         }
     });
 
     window_event_listener(leptos::ev::pointerup, move |_| {
-        let Some(pts) = clone_drag.try_get().flatten() else { return };
+        let Some((target, pts)) = clone_drag.try_get().flatten() else { return };
         let _ = clone_drag.try_set(None);
-        apply_clone(state, &pts);
+        match target {
+            Some(id) => apply_layer_clone(state, id, &pts),
+            None => apply_clone(state, &pts),
+        }
     });
 
     window_event_listener(leptos::ev::pointermove, move |ev| {
-        let Some(Some(mut pts)) = heal_drag.try_get() else { return };
+        let Some(Some((target, mut pts))) = heal_drag.try_get() else { return };
         let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop)).flatten() else { return };
         if pts.last().map(|last| dist2(*last, (nx, ny)) > 0.00005).unwrap_or(true) {
             pts.push((nx, ny));
-            heal_drag.set(Some(pts));
+            heal_drag.set(Some((target, pts)));
         }
     });
 
     window_event_listener(leptos::ev::pointerup, move |_| {
-        let Some(pts) = heal_drag.try_get().flatten() else { return };
+        let Some((target, pts)) = heal_drag.try_get().flatten() else { return };
         let _ = heal_drag.try_set(None);
-        apply_heal(state, &pts);
+        match target {
+            Some(id) => apply_layer_heal(state, id, &pts),
+            None => apply_heal(state, &pts),
+        }
     });
 
     window_event_listener(leptos::ev::pointermove, move |ev| {
@@ -153,6 +359,17 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
 
     window_event_listener(leptos::ev::pointerup, move |_| {
         let _ = layer_drag.try_set(None);
+    });
+
+    window_event_listener(leptos::ev::pointermove, move |ev| {
+        let Some(Some(d)) = xform_drag.try_get() else { return };
+        let Some((lx, ly)) = layer_local_pos(&ev) else { return };
+        let Some(css) = canvas_css_size() else { return };
+        update_xform(state, &d, lx, ly, css);
+    });
+
+    window_event_listener(leptos::ev::pointerup, move |_| {
+        let _ = xform_drag.try_set(None);
     });
 
     window_event_listener(leptos::ev::pointermove, move |ev| {
@@ -1063,17 +1280,19 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         // Draw the heal stroke overlay on the Heal tab.
         if tab.get() == Tab::Heal {
             let ctx = web::ctx2d(&canvas);
-            draw_heal_overlay(&ctx, heal_drag.get().as_deref(), state.heal_radius.get(), w as f64, h as f64);
+            let pts = heal_drag.get().map(|(_, pts)| pts);
+            draw_heal_overlay(&ctx, pts.as_deref(), state.heal_radius.get(), w as f64, h as f64);
         }
 
         // Clone tab: stroke discs plus a crosshair at the active sample point.
         if tab.get() == Tab::Clone {
             let ctx = web::ctx2d(&canvas);
             let r = state.clone_radius.get();
-            draw_heal_overlay(&ctx, clone_drag.get().as_deref(), r, w as f64, h as f64);
+            let drag = clone_drag.get();
+            draw_heal_overlay(&ctx, drag.as_ref().map(|(_, pts)| pts.as_slice()), r, w as f64, h as f64);
             // Where the brush is currently sampling from: the source until an
             // aligned stroke fixes the offset, then source-follows-brush.
-            let sample = match (clone_drag.get(), state.clone_source.get()) {
+            let sample = match (drag.as_ref().map(|(_, pts)| pts), state.clone_source.get()) {
                 (Some(pts), Some(src)) => {
                     let start = pts[0];
                     let off = state.clone_offset.get().unwrap_or((src.0 - start.0, src.1 - start.1));
@@ -1159,7 +1378,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                             state.clone_offset.set(None);
                                             state.clone_pick.set(false);
                                         } else if state.clone_source.get().is_some() {
-                                            clone_drag.set(Some(vec![(nx, ny)]));
+                                            clone_drag.set(Some((raster_target(state), vec![(nx, ny)])));
                                         }
                                     }
                                 }
@@ -1168,7 +1387,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                             if tab.get() == Tab::Heal {
                                 if let Some(item) = state.current().filter(|m| m.kind == MediaKind::Photo) {
                                     if let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) {
-                                        heal_drag.set(Some(vec![(nx, ny)]));
+                                        heal_drag.set(Some((raster_target(state), vec![(nx, ny)])));
                                     }
                                 }
                                 return;
@@ -1209,17 +1428,9 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                             let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) else { return };
 
                             match state.selected_tool.get() {
-                                Tool::Select => {
-                                    match &layer.kind {
-                                        LayerKind::Text(t) => {
-                                            layer_drag.set(Some((id, nx, ny, t.x, t.y)));
-                                        }
-                                        LayerKind::Raster(r) => {
-                                            layer_drag.set(Some((id, nx, ny, r.x, r.y)));
-                                        }
-                                        _ => {}
-                                    }
-                                }
+                                // Move, scale and rotate are owned by the
+                                // transform handles, which sit above the canvas.
+                                Tool::Select => {}
                                 Tool::Pen => {
                                     let LayerKind::Path(ref p) = layer.kind else { return };
                                     if let Some((idx, handle)) = hit_test_path(&p.points, nx, ny) {
@@ -1297,7 +1508,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                         <Show when=move || tab.get() == Tab::Crop fallback=|| ()>
                             <CropOverlay state=state working=working drag=crop_drag pinch=crop_pinch/>
                         </Show>
-                        <SelectedTextOverlay state=state tab=tab layer_drag=layer_drag/>
+                        <LayerHandles state=state tab=tab drag=xform_drag/>
                     </div>
                 }.into_view(),
             }}
@@ -1359,6 +1570,167 @@ pub(crate) fn SelectedTextOverlay(
                         layer_drag.set(Some((id, nx, ny, t.x, t.y)));
                     }
                 >{t.text.clone()}</div>
+            })
+        }}
+    }
+}
+
+struct HandleGeom {
+    id: usize,
+    class: &'static str,
+    style: String,
+    /// Text to lay out inside the box (invisible; the canvas paints it).
+    text: Option<String>,
+}
+
+fn box_geom(
+    id: usize,
+    cx: f32,
+    cy: f32,
+    w_full: f32,
+    h_full: f32,
+    angle: f32,
+    crop: state::CropRect,
+) -> Option<HandleGeom> {
+    if crop.w <= 0.0 || crop.h <= 0.0 {
+        return None;
+    }
+    Some(HandleGeom {
+        id,
+        class: "layer-box",
+        style: format!(
+            "left:{:.3}%;top:{:.3}%;width:{:.3}%;height:{:.3}%;\
+             transform:translate(-50%,-50%) rotate({}deg);",
+            (cx - crop.x) / crop.w * 100.0,
+            (cy - crop.y) / crop.h * 100.0,
+            (w_full / crop.w * 100.0).max(0.5),
+            (h_full / crop.h * 100.0).max(0.5),
+            angle
+        ),
+        text: None,
+    })
+}
+
+fn handle_geom(kind: &state::LayerKind, m: &state::MediaItem, id: usize) -> Option<HandleGeom> {
+    let crop = m.edit.crop;
+    match kind {
+        state::LayerKind::Text(t) => {
+            let (_, css_h) = canvas_css_size()?;
+            // Text size is a fraction of image height; the displayed crop
+            // height maps that to CSS px.
+            let font_px = t.font_size * css_h / crop.h.max(1e-3);
+            let (translate, origin) = match t.alignment {
+                state::TextAlign::Left => ("translate(0,-50%)", "0% 50%"),
+                state::TextAlign::Center => ("translate(-50%,-50%)", "50% 50%"),
+                state::TextAlign::Right => ("translate(-100%,-50%)", "100% 50%"),
+            };
+            Some(HandleGeom {
+                id,
+                class: "layer-box text-box",
+                style: format!(
+                    "left:{:.3}%;top:{:.3}%;transform:{} rotate({}deg);transform-origin:{};\
+                     font-size:{:.2}px;font-family:'{}',sans-serif;font-weight:{};",
+                    (t.x - crop.x) / crop.w * 100.0,
+                    (t.y - crop.y) / crop.h * 100.0,
+                    translate,
+                    t.angle,
+                    origin,
+                    font_px,
+                    t.font_family,
+                    t.font_weight
+                ),
+                text: Some(t.text.clone()),
+            })
+        }
+        state::LayerKind::Raster(r) => {
+            if r.width == 0 || r.height == 0 {
+                return None;
+            }
+            let (w, h) = working_dims(m.width, m.height, &m.edit);
+            let dw = r.scale;
+            let dh = r.scale * (w as f32 / h as f32) * (r.height as f32 / r.width as f32);
+            box_geom(id, r.x, r.y, dw, dh, r.angle, crop)
+        }
+        state::LayerKind::Path(p) => {
+            let (x0, y0, x1, y1) = p.points_bbox()?;
+            box_geom(
+                id,
+                (x0 + x1) / 2.0,
+                (y0 + y1) / 2.0,
+                (x1 - x0) * p.scale,
+                (y1 - y0) * p.scale,
+                p.angle,
+                crop,
+            )
+        }
+        state::LayerKind::Brush(b) => {
+            let (x0, y0, x1, y1) = b.points_bbox()?;
+            box_geom(
+                id,
+                (x0 + x1) / 2.0,
+                (y0 + y1) / 2.0,
+                (x1 - x0) * b.scale,
+                (y1 - y0) * b.scale,
+                b.angle,
+                crop,
+            )
+        }
+        state::LayerKind::Adjust(_) => None,
+    }
+}
+
+/// Dashed box and transform handles around the selected layer in the Layers
+/// tab: drag inside to move, drag a corner to scale, drag the knob to rotate.
+#[component]
+pub(crate) fn LayerHandles(
+    state: AppState,
+    tab: RwSignal<Tab>,
+    drag: RwSignal<Option<XformDrag>>,
+) -> impl IntoView {
+    let geom = move || -> Option<HandleGeom> {
+        if state.selected_tool.get() != Tool::Select || tab.get() != Tab::Layers {
+            return None;
+        }
+        // Text box size in px depends on the displayed canvas height, which
+        // changes on resize and when a webfont finishes loading.
+        state.viewport_gen.get();
+        let m = state.current()?;
+        let id = state.selected_layer.get()?;
+        let layer = m.layers.iter().find(|l| l.id == id)?;
+        if !layer.visible || !layer.kind.has_transform() {
+            return None;
+        }
+        handle_geom(&layer.kind, &m, id)
+    };
+    view! {
+        {move || {
+            let g = geom()?;
+            let id = g.id;
+            let text = g.text;
+            Some(view! {
+                <div
+                    class=g.class
+                    style=g.style
+                    on:pointerdown=move |ev: web_sys::PointerEvent| {
+                        begin_xform(state, id, XformMode::Move, &ev, drag);
+                    }
+                >
+                    {text.map(|t| view! { <span class="xform-text">{t}</span> })}
+                    {["nw", "ne", "sw", "se"].map(|corner| view! {
+                        <div
+                            class=format!("xform-handle {corner}")
+                            on:pointerdown=move |ev: web_sys::PointerEvent| {
+                                begin_xform(state, id, XformMode::Scale, &ev, drag);
+                            }
+                        ></div>
+                    }).collect_view()}
+                    <div
+                        class="xform-rotate"
+                        on:pointerdown=move |ev: web_sys::PointerEvent| {
+                            begin_xform(state, id, XformMode::Rotate, &ev, drag);
+                        }
+                    ></div>
+                </div>
             })
         }}
     }

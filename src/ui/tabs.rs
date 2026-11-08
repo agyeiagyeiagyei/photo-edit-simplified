@@ -307,6 +307,18 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
 
 #[component]
 pub(crate) fn RotateTab(state: AppState) -> impl IntoView {
+    // With a transformable layer selected the tab turns and scales that layer;
+    // otherwise it turns the photo. The memo changes only with the selection,
+    // so a slider drag never remounts the control under the pointer.
+    let layer_id = selected_transform_memo(state);
+    move || match layer_id.get() {
+        Some(id) => view! { <LayerRotateControls state=state layer_id=id/> }.into_view(),
+        None => view! { <PhotoRotateControls state=state/> }.into_view(),
+    }
+}
+
+#[component]
+fn PhotoRotateControls(state: AppState) -> impl IntoView {
     let fine = move || state.current().map(|m| m.edit.fine_angle).unwrap_or(0.0);
     view! {
         <div class="row">
@@ -337,19 +349,138 @@ pub(crate) fn RotateTab(state: AppState) -> impl IntoView {
     }
 }
 
+/// Values the layer Rotate tab reads and writes, whatever the layer kind.
+fn xform_of(kind: &LayerKind) -> Option<(f32, f32, bool)> {
+    match kind {
+        LayerKind::Text(t) => Some((t.angle, t.font_size, true)),
+        LayerKind::Path(p) => Some((p.angle, p.scale, false)),
+        LayerKind::Brush(b) => Some((b.angle, b.scale, false)),
+        LayerKind::Raster(r) => Some((r.angle, r.scale, false)),
+        LayerKind::Adjust(_) => None,
+    }
+}
+
+fn set_xform(layer: &mut Layer, angle: f32, size: f32) {
+    match &mut layer.kind {
+        LayerKind::Text(t) => {
+            t.angle = angle;
+            t.font_size = size;
+        }
+        LayerKind::Path(p) => {
+            p.angle = angle;
+            p.scale = size;
+        }
+        LayerKind::Brush(b) => {
+            b.angle = angle;
+            b.scale = size;
+        }
+        LayerKind::Raster(r) => {
+            r.angle = angle;
+            r.scale = size;
+        }
+        LayerKind::Adjust(_) => {}
+    }
+}
+
+#[component]
+fn LayerRotateControls(state: AppState, layer_id: usize) -> impl IntoView {
+    let kind = move || {
+        state
+            .current_layers()
+            .into_iter()
+            .find(|l| l.id == layer_id)
+            .and_then(|l| xform_of(&l.kind))
+    };
+    let is_text = move || kind().map(|(_, _, text)| text).unwrap_or(false);
+    let angle = move || kind().map(|(a, _, _)| a).unwrap_or(0.0);
+    let size = move || kind().map(|(_, s, _)| s).unwrap_or(1.0);
+    let size_range = move || if is_text() { ("0.01", "0.3", "0.005") } else { ("0.05", "5", "0.01") };
+    view! {
+        <label class="slider">
+            <span>"Angle: " {move || format!("{:.0}°", angle())}</span>
+            <input
+                type="range" min="-180" max="180" step="1"
+                prop:value=move || angle().to_string()
+                on:input=move |ev| {
+                    let v: f32 = event_target_value(&ev).parse().unwrap_or(0.0);
+                    with_layer(state, layer_id, move |l| {
+                        let s = size_of(l);
+                        set_xform(l, v, s);
+                    });
+                }
+            />
+        </label>
+        <label class="slider">
+            <span>{move || if is_text() { "Size: " } else { "Scale: " }}
+                {move || if is_text() { format!("{:.1}%", size() * 100.0) } else { format!("{:.0}%", size() * 100.0) }}</span>
+            <input
+                type="range"
+                min=move || size_range().0
+                max=move || size_range().1
+                step=move || size_range().2
+                prop:value=move || size().to_string()
+                on:input=move |ev| {
+                    let v: f32 = event_target_value(&ev).parse().unwrap_or(1.0);
+                    with_layer(state, layer_id, move |l| {
+                        let a = angle_of(l);
+                        set_xform(l, a, v);
+                    });
+                }
+            />
+        </label>
+        <button class="btn dim-btn" on:click=move |_| {
+            with_layer(state, layer_id, |l| {
+                let keep = if matches!(l.kind, LayerKind::Text(_)) { size_of(l) } else { 1.0 };
+                set_xform(l, 0.0, keep);
+            });
+        }>
+            {move || if is_text() { "Reset rotation" } else { "Reset transform" }}
+        </button>
+    }
+}
+
+fn angle_of(l: &Layer) -> f32 {
+    xform_of(&l.kind).map(|(a, _, _)| a).unwrap_or(0.0)
+}
+
+fn size_of(l: &Layer) -> f32 {
+    xform_of(&l.kind).map(|(_, s, _)| s).unwrap_or(1.0)
+}
+
 #[component]
 pub(crate) fn ColorTab(state: AppState) -> impl IntoView {
-    // With an adjustment layer selected the tab edits that layer. The memo
-    // changes only when the selection does, so a slider drag never remounts
-    // the controls under the pointer.
+    // With an adjustment layer selected the tab edits that layer. With an
+    // image layer selected it edits an adjustment clipped to it, created on
+    // arrival. The memos change only when the selection (or the clip layer
+    // existing) does, so a slider drag never remounts the controls under the
+    // pointer.
     let adjust_id = selected_adjust_memo(state);
+    let raster_id = selected_raster_memo(state);
+    let clip_id = clip_adjust_memo(state);
+    create_effect(move |_| {
+        if clip_id.get().is_none() {
+            if let Some(rid) = raster_id.get() {
+                ensure_clip_adjust(state, rid);
+            }
+        }
+    });
     move || match adjust_id.get() {
         Some(id) => view! {
             <AdjustColorControls state=state layer_id=id/>
             <p class="dim">"Blur and grain apply to the photo only. This layer's mask is on the Layers tab."</p>
         }
         .into_view(),
-        None => view! { <PhotoColorControls state=state/> }.into_view(),
+        None => match clip_id.get() {
+            Some(id) => view! {
+                <div class="adjust-editor">
+                    <div class="panel-title">"Clipped to this image layer"</div>
+                    <AdjustColorControls state=state layer_id=id/>
+                </div>
+                <p class="dim">"Changes only this image layer, through an adjustment clipped to it. Blur and grain apply to the photo only."</p>
+            }
+            .into_view(),
+            None => view! { <PhotoColorControls state=state/> }.into_view(),
+        },
     }
 }
 
