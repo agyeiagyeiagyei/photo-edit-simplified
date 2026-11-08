@@ -353,10 +353,21 @@ impl Layer {
     }
 }
 
-/// Stack order is application order for adjustment layers: index 0 is the
-/// bottom of the photo stack. Overlay layers are composited after the whole
-/// photo pipeline, so their position relative to adjustments only affects the
-/// panel grouping, not pixels.
+/// Stack order is application order: index 0 is the bottom. Adjustment layers
+/// below the first drawn overlay are part of the photo pipeline (they have
+/// only the photo beneath them); adjustments at or above it apply to the
+/// composited pixels, so they affect every layer below, overlays included.
+pub fn stack_split(layers: &[Layer]) -> usize {
+    layers
+        .iter()
+        .position(|l| {
+            !matches!(l.kind, LayerKind::Adjust(_)) && l.visible && l.opacity > 0.01
+        })
+        .unwrap_or(layers.len())
+}
+
+/// Adjustment layers for the worker/CPU recipe: only those below the first
+/// drawn overlay. Everything above is applied to the composited canvas.
 pub fn adjust_layers_from_stack(layers: &[Layer]) -> Vec<AdjustLayer> {
     layers
         .iter()
@@ -375,30 +386,31 @@ pub fn adjust_layers_from_stack(layers: &[Layer]) -> Vec<AdjustLayer> {
         .collect()
 }
 
-/// Edit params for a render: the global edit with the stack's adjustment
-/// layers lifted into it. `item.edit.adjust_layers` is always empty in app
-/// state (recipes are migrated into the stack on ingest).
+/// Edit params for a render: the global edit with the adjustments that sit
+/// below the overlay stack lifted into it. `item.edit.adjust_layers` is always
+/// empty in app state (recipes are migrated into the stack on ingest).
 pub fn render_edit(edit: &EditParams, layers: &[Layer]) -> EditParams {
     let mut out = edit.clone();
-    out.adjust_layers = adjust_layers_from_stack(layers);
+    let split = stack_split(layers);
+    out.adjust_layers = adjust_layers_from_stack(&layers[..split]);
     out
 }
 
-/// Insert an overlay layer at the top of the overlay group — below the
-/// adjustment group in vector order, since adjustments apply to the photo and
-/// overlays composite above it.
-pub fn insert_overlay(layers: &mut Vec<Layer>, layer: Layer) {
-    let at = layers
-        .iter()
-        .position(|l| matches!(l.kind, LayerKind::Adjust(_)))
-        .unwrap_or(layers.len());
-    layers.insert(at, layer);
+/// True when an adjustment sits above a drawn overlay in the stack, so the
+/// canvas composite has to apply it after those overlays are drawn.
+pub fn has_post_adjustments(layers: &[Layer]) -> bool {
+    let split = stack_split(layers);
+    layers[split..].iter().any(|l| {
+        l.visible && l.opacity > 0.01 && matches!(l.kind, LayerKind::Adjust(_))
+    })
 }
 
 /// Move adjustment layers parsed from a stored recipe (Drive manifest, or a
 /// session written before layers lived in the stack) into the layer stack.
-/// Ids are renumbered so a recipe's ids can never collide with the overlays
-/// this item already has; the edit is left with no adjust layers.
+/// Recipes describe adjustments that were applied to the photo alone, so they
+/// go at the bottom, beneath any overlays the item already has; that keeps
+/// their pixels identical under one-stack semantics. Ids are renumbered so a
+/// recipe's ids can never collide with existing layers.
 pub fn migrate_adjust_layers(
     edit: &mut EditParams,
     layers: &mut Vec<Layer>,
@@ -409,10 +421,11 @@ pub fn migrate_adjust_layers(
     }
     let mut next = (*next_layer_id)
         .max(layers.iter().map(|l| l.id + 1).max().unwrap_or(0));
+    let mut migrated = Vec::new();
     for al in std::mem::take(&mut edit.adjust_layers) {
         let id = next;
         next += 1;
-        layers.push(Layer {
+        migrated.push(Layer {
             id,
             visible: al.visible,
             opacity: al.opacity,
@@ -423,7 +436,30 @@ pub fn migrate_adjust_layers(
             kind: LayerKind::Adjust(AdjustLayerState { adjust: al.adjust }),
         });
     }
+    migrated.append(layers);
+    *layers = migrated;
     *next_layer_id = next;
+}
+
+/// Session stacks written before one-stack rendering kept every adjustment
+/// above every overlay, and applied all of them to the photo alone. Moving
+/// those adjustments to the bottom (order preserved) reproduces the old
+/// pixels exactly, without letting them tint the overlays.
+pub fn normalize_legacy_stack(layers: &mut Vec<Layer>) {
+    if !layers.iter().any(|l| matches!(l.kind, LayerKind::Adjust(_))) {
+        return;
+    }
+    let mut adjusts = Vec::new();
+    let mut overlays = Vec::new();
+    for l in std::mem::take(layers) {
+        if matches!(l.kind, LayerKind::Adjust(_)) {
+            adjusts.push(l);
+        } else {
+            overlays.push(l);
+        }
+    }
+    adjusts.append(&mut overlays);
+    *layers = adjusts;
 }
 
 /// True when any adjustment layer can change pixels (used to keep the GPU

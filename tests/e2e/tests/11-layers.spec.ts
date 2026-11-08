@@ -208,7 +208,7 @@ test('Pen and Brush select or create a layer and draw', async ({ page }) => {
   expect(errors, errors.join('\n')).toEqual([]);
 });
 
-test('arrows disable at the overlay/adjustment group boundary', async ({ page }) => {
+test('arrows reach both ends of the one stack', async ({ page }) => {
   test.setTimeout(120_000);
   const errors = trackErrors(page);
   await openApp(page);
@@ -216,28 +216,32 @@ test('arrows disable at the overlay/adjustment group boundary', async ({ page })
   await page.waitForTimeout(1500);
   await clickTab(page, 'Layers');
 
-  // One text layer and one adjustment: each group has a single layer, so
-  // neither can move and both arrow pairs must look inert.
+  // One text layer and one adjustment: with no group boundary the adjustment
+  // can move below the text and only the ends of the stack clamp.
   await addText(page, 'X', '#ff0000');
   await page.getByRole('button', { name: '＋ Adjust', exact: true }).click();
   await page.waitForTimeout(800);
   const rows = page.locator('.layer-row');
   await expect(rows).toHaveCount(2);
-  for (let i = 0; i < 2; i++) {
-    await expect(rows.nth(i).locator('button', { hasText: '↑' }), `row ${i} ↑`).toBeDisabled();
-    await expect(rows.nth(i).locator('button', { hasText: '↓' }), `row ${i} ↓`).toBeDisabled();
-  }
-
-  // A second text layer makes the overlay pair movable, but the adjustment
-  // still cannot cross the group boundary.
-  await addText(page, 'Y', '#0000ff');
-  await expect(rows).toHaveCount(3);
   await expect(rows.nth(0).locator('button', { hasText: '↑' })).toBeDisabled();
   await expect(rows.nth(0).locator('button', { hasText: '↓' })).toBeEnabled();
   await expect(rows.nth(1).locator('button', { hasText: '↑' })).toBeEnabled();
   await expect(rows.nth(1).locator('button', { hasText: '↓' })).toBeDisabled();
-  await expect(rows.nth(2).locator('button', { hasText: '↑' })).toBeDisabled();
-  await expect(rows.nth(2).locator('button', { hasText: '↓' })).toBeDisabled();
+
+  // The adjustment crosses the former boundary: the text comes out on top.
+  await rows.nth(0).locator('button', { hasText: '↓' }).click();
+  await page.waitForTimeout(500);
+  await expect(rows.nth(0).locator('.layer-label')).toHaveText('T: X');
+  await expect(rows.nth(1).locator('.layer-label')).toHaveText('Adjust');
+  await expect(rows.nth(0).locator('button', { hasText: '↓' })).toBeEnabled();
+  await expect(rows.nth(1).locator('button', { hasText: '↓' })).toBeDisabled();
+  await expect(rows.nth(1).locator('button', { hasText: '↑' })).toBeEnabled();
+
+  // A third layer leaves the middle movable in both directions.
+  await addText(page, 'Y', '#0000ff');
+  await expect(rows).toHaveCount(3);
+  await expect(rows.nth(1).locator('button', { hasText: '↑' })).toBeEnabled();
+  await expect(rows.nth(1).locator('button', { hasText: '↓' })).toBeEnabled();
 
   expect(errors, errors.join('\n')).toEqual([]);
 });

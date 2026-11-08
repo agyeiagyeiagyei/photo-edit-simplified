@@ -503,6 +503,10 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         let src_fp = source_fingerprint(photo.gen, proxy_gen(item.id));
         let (cx_px, cy_px, cw_p, _) = crop_px(&item.edit, w, h);
         let (cx_p, cy_p) = (cx_px as f64, cy_px as f64);
+        // A crop-window frame is scaled and translated in place, so an
+        // adjustment sitting above an overlay cannot be applied to it; those
+        // stacks use the whole-frame cache and blit the crop from it.
+        let post_adjust = state::has_post_adjustments(&item.layers);
         let mut sharp: Option<Sharp> = None;
         // A sharp frame from an older source stays on screen while the new
         // one renders, so a RAW proxy upgrade never flashes the soft preview.
@@ -548,7 +552,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                             .is_ok();
                         drop(blit_span);
                         if blitted {
-                            composite_layers(&canvas, item.id, &item.layers, gw as usize, gh as usize);
+                            composite_stack(&canvas, item.id, &item.layers, gw as usize, gh as usize);
                             sharp = Some(Sharp::Whole { w: gw as usize });
                             drawn_src = gpu::base_src().map(|(_, fp)| fp);
                         } else {
@@ -561,7 +565,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             }
         }
         if want_hi {
-            if cropped_view {
+            if cropped_view && !post_adjust {
                 let (_, _, fcw, fch) = crop_px(&item.edit, fw, fh);
                 let win_target = hi_target(need_w, need_h, fcw, fch, WINDOW_MAX_EDGE as u32);
                 let key = crop_key(&crop);
@@ -627,7 +631,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 let (cx, cy, cw, ch) = crop_px(&item.edit, w, h);
                 let off = web::create_canvas(w as u32, h as u32);
                 web::put_pixels(&off, &p, w as u32, h as u32);
-                composite_layers(&off, item.id, &item.layers, w, h);
+                composite_stack(&off, item.id, &item.layers, w, h);
                 canvas.set_width(cw as u32);
                 canvas.set_height(ch as u32);
                 web::ctx2d(&canvas)
@@ -638,7 +642,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     .unwrap();
             } else {
                 web::put_pixels(&canvas, &p, w as u32, h as u32);
-                composite_layers(&canvas, item.id, &item.layers, w, h);
+                composite_stack(&canvas, item.id, &item.layers, w, h);
             }
         }
         if want_hi
@@ -774,7 +778,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 let source_fp = source_fingerprint(photo.gen, proxy_gen(item.id));
                 // A direct-painted proxy may already cover this target; rendering
                 // again would swap it for a smaller worker copy of the same pixels.
-                if !cropped_view
+                if (!cropped_view || state::has_post_adjustments(&item.layers))
                     && HI_CACHE.with(|c| {
                         c.borrow().as_ref().is_some_and(|hi| {
                             hi.item_id == item.id
@@ -789,7 +793,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 }
                 let item_id = item.id;
                 let item_cb = item.clone();
-                if cropped_view {
+                if cropped_view && !state::has_post_adjustments(&item.layers) {
                     let (fcx, fcy, fcw, fch) = crop_px(&item.edit, fw2, fh2);
                     let win_target =
                         hi_target(need_w, need_h, fcw, fch, WINDOW_MAX_EDGE as u32);
@@ -820,7 +824,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                     let sy = r.h as f64 / fch as f64;
                                     let _ = ctx.scale(sx, sy);
                                     let _ = ctx.translate(-(fcx as f64), -(fcy as f64));
-                                    composite_layers(&canvas, item_cb.id, &item_cb.layers, fw2, fh2);
+                                    composite_stack(&canvas, item_cb.id, &item_cb.layers, fw2, fh2);
                                     let _ =
                                         ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
                                     HI_WINDOW.with(|c| {
@@ -881,7 +885,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                     let blit = perf::Span::new("hi.blit");
                                     let canvas = web::create_canvas(r.w, r.h);
                                     web::put_pixels_view(&canvas, &r.pixels, r.w, r.h);
-                                    composite_layers(
+                                    composite_stack(
                                         &canvas,
                                         item_cb.id,
                                         &item_cb.layers,

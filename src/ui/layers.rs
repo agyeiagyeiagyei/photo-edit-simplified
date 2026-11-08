@@ -38,10 +38,9 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
                     took_selection = true;
                 }
             }
-            match &layer.kind {
-                LayerKind::Adjust(_) => m.layers.push(layer),
-                _ => state::insert_overlay(&mut m.layers, layer),
-            }
+            // New layers land on top: an adjustment above them still applies,
+            // and one below doesn't — the same rule as dragging a row.
+            m.layers.push(layer);
             new_id = Some(id);
         });
         if took_selection {
@@ -73,20 +72,9 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
     let move_layer = move |id: usize, delta: isize| {
         state.update_current_item(|m| {
             let Some(i) = m.layers.iter().position(|l| l.id == id) else { return };
-            // Reordering stays inside its group: overlay layers never cross the
-            // adjustment group, which keeps the panel grouping meaningful.
-            let is_adjust = matches!(m.layers[i].kind, LayerKind::Adjust(_));
-            let first_adjust = m
-                .layers
-                .iter()
-                .position(|l| matches!(l.kind, LayerKind::Adjust(_)))
-                .unwrap_or(m.layers.len());
-            let (lo, hi) = if is_adjust {
-                (first_adjust, m.layers.len())
-            } else {
-                (0, first_adjust)
-            };
-            let new_i = (i as isize + delta).clamp(lo as isize, hi as isize - 1) as usize;
+            // One stack, so a row may land anywhere: an adjustment renders over
+            // whatever sits below it after the move.
+            let new_i = (i as isize + delta).clamp(0, m.layers.len() as isize - 1) as usize;
             if new_i != i {
                 m.layers.swap(i, new_i);
             }
@@ -142,8 +130,7 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
 
     let layers = create_memo(move |_| state.current_layers());
     // The stack is bottom-up, but a layers panel reads top-down: show the
-    // topmost layer first, within each group. Adjustments stay in their own
-    // group below the overlays.
+    // topmost layer first.
     let display = create_memo(move |_| display_layers(layers.get()));
     // The adjustment editor mounts once per selected adjustment layer. Reading
     // the whole layer list in the mount closure rebuilt the editor on every
@@ -169,7 +156,7 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
                 if let LayerKind::Raster(r) = &mut layer.kind {
                     r.scale = 0.5;
                 }
-                state::insert_overlay(&mut m.layers, layer);
+                m.layers.push(layer);
                 new_id = Some(id);
             });
             if let Some(id) = new_id {
@@ -234,24 +221,7 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
                                 draw_mask_thumb(&canvas, &l);
                             }
                         });
-                        let first_adjust = move || {
-                            let ls = display.get();
-                            let is_adjust = ls
-                                .iter()
-                                .find(|l| l.id == id)
-                                .map(|l| matches!(l.kind, LayerKind::Adjust(_)))
-                                .unwrap_or(false);
-                            is_adjust
-                                && ls
-                                    .iter()
-                                    .find(|l| matches!(l.kind, LayerKind::Adjust(_)))
-                                    .map(|l| l.id == id)
-                                    .unwrap_or(false)
-                        };
                         view! {
-                            <Show when=first_adjust fallback=|| ()>
-                                <div class="layer-group-label">"Adjustments"</div>
-                            </Show>
                             <div
                                 class="layer-row"
                                 class:selected=is_selected
@@ -362,16 +332,10 @@ pub(crate) fn LayersTab(state: AppState) -> impl IntoView {
     }
 }
 
-/// Panel order: topmost first inside each group. The stack itself is bottom-up
-/// (index 0 composites first), so both groups are reversed for display.
+/// Panel order: topmost first. The stack itself is bottom-up (index 0
+/// composites first), so the whole list is reversed for display.
 fn display_layers(ls: Vec<Layer>) -> Vec<Layer> {
-    let first_adjust = ls
-        .iter()
-        .position(|l| matches!(l.kind, LayerKind::Adjust(_)))
-        .unwrap_or(ls.len());
-    let mut out: Vec<Layer> = ls[..first_adjust].iter().rev().cloned().collect();
-    out.extend(ls[first_adjust..].iter().rev().cloned());
-    out
+    ls.into_iter().rev().collect()
 }
 
 /// The selected layer's id when it is an adjustment layer. Editors mount from
@@ -462,29 +426,17 @@ fn row_label(ls: &[Layer], id: usize, mask_note: bool) -> String {
     label
 }
 
-/// Whether a layer can move `delta` slots without leaving its group. Overlays
-/// and adjustments never cross: adjustments always render under overlays, so
-/// a move across the boundary would have no visible effect.
+/// Whether a layer can move `delta` slots: one stack, so only the ends stop it.
 fn can_move_layer(ls: &[Layer], id: usize, delta: isize) -> bool {
     let Some(i) = ls.iter().position(|l| l.id == id) else {
         return false;
     };
-    let is_adjust = matches!(ls[i].kind, LayerKind::Adjust(_));
-    let first_adjust = ls
-        .iter()
-        .position(|l| matches!(l.kind, LayerKind::Adjust(_)))
-        .unwrap_or(ls.len());
-    let (lo, hi) = if is_adjust {
-        (first_adjust, ls.len())
-    } else {
-        (0, first_adjust)
-    };
     let j = i as isize + delta;
-    j >= lo as isize && j < hi as isize
+    j >= 0 && j < ls.len() as isize
 }
 
 /// Give Pen/Brush a layer to draw on: keep a compatible selection, else select
-/// the topmost compatible layer, else create one on top of the overlay group.
+/// the topmost compatible layer, else create one on top of the stack.
 pub(crate) fn ensure_tool_layer(state: AppState, tool: Tool) {
     if !matches!(tool, Tool::Pen | Tool::Brush) {
         return;
@@ -517,7 +469,7 @@ pub(crate) fn ensure_tool_layer(state: AppState, tool: Tool) {
             Tool::Pen => Layer::new_path(id),
             _ => Layer::new_brush(id),
         };
-        state::insert_overlay(&mut m.layers, layer);
+        m.layers.push(layer);
         new_id = Some(id);
     });
     if let Some(id) = new_id {
