@@ -391,7 +391,7 @@ pub(crate) fn Editor(state: AppState) -> impl IntoView {
                         Tab::Select => view! { <SelectTab state=state/> }.into_view(),
                         Tab::Heal => view! { <HealTab state=state/> }.into_view(),
                         Tab::Clone => view! { <CloneTab state=state/> }.into_view(),
-                        Tab::Layers => view! { <LayersTab state=state/> }.into_view(),
+                        Tab::Layers => view! { <LayersTab state=state tab=tab/> }.into_view(),
                         Tab::Trim => view! { <TrimTab state=state/> }.into_view(),
                         Tab::Export => view! { <ExportTab state=state/> }.into_view(),
                     }}
@@ -403,9 +403,27 @@ pub(crate) fn Editor(state: AppState) -> impl IntoView {
 }
 
 #[component]
-pub(crate) fn ToolBar(state: AppState) -> impl IntoView {
+pub(crate) fn ToolBar(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
+    // An adjustment layer has nothing for Select or Pen to act on, and its
+    // only paintable part is its mask: Brush opens the Select tab's mask brush.
+    let adjust_selected = selected_adjust_memo(state);
     view! {
-        <div class="toolbar">
+        <Show when=move || adjust_selected.get().is_some() fallback=|| ()>
+            <div class="toolbar">
+                <button
+                    class="chip"
+                    title="Paint where this adjustment applies, on the Select tab"
+                    on:click=move |_| {
+                        state.selected_select_tool.set(SelectTool::Brush);
+                        tab.set(Tab::Select);
+                    }
+                >
+                    "Brush"
+                </button>
+                <span class="dim">"paints this adjustment's mask, on the Select tab"</span>
+            </div>
+        </Show>
+        <div class="toolbar" class:hidden=move || adjust_selected.get().is_some()>
             {Tool::ALL.map(|t| {
                 view! {
                     <button

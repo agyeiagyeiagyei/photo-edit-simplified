@@ -1718,25 +1718,139 @@ fn invalidate_brush_history(state: AppState) {
     });
 }
 
-/// The layer mask explicitly targeted by its thumbnail, else the selected
-/// adjustment layer's mask, else the global selection.
-pub(crate) fn brush_target(state: AppState, item: &MediaItem) -> BrushTarget {
-    if let Some((item_id, layer_id)) = state.mask_target.get_untracked() {
+/// The layer whose mask the Select tab's Brush and mask panel edit: the mask
+/// armed by its row thumbnail, else the selected adjustment layer. `None`
+/// means they edit the photo's own selection.
+pub(crate) fn mask_layer_for(
+    mask_target: Option<(usize, usize)>,
+    selected: Option<usize>,
+    item: &MediaItem,
+) -> Option<usize> {
+    if let Some((item_id, layer_id)) = mask_target {
         if item_id == item.id && item.layers.iter().any(|l| l.id == layer_id) {
-            return BrushTarget::Layer(layer_id);
+            return Some(layer_id);
         }
     }
-    match state.selected_layer.get_untracked() {
-        Some(id)
-            if item
-                .layers
-                .iter()
-                .any(|l| l.id == id && matches!(l.kind, LayerKind::Adjust(_))) =>
-        {
-            BrushTarget::Layer(id)
-        }
-        _ => BrushTarget::Global,
+    let id = selected?;
+    item.layers
+        .iter()
+        .any(|l| l.id == id && matches!(l.kind, LayerKind::Adjust(_)))
+        .then_some(id)
+}
+
+/// What the brush paints: the Select tab's mask layer, else the global selection.
+pub(crate) fn brush_target(state: AppState, item: &MediaItem) -> BrushTarget {
+    match mask_layer_for(state.mask_target.get_untracked(), state.selected_layer.get_untracked(), item) {
+        Some(id) => BrushTarget::Layer(id),
+        None => BrushTarget::Global,
     }
+}
+
+/// Add a selection (rect, lasso, wand or subject) to a layer's mask, or cut
+/// it out. A layer without a mask shows its effect everywhere, so Add
+/// starts from an empty mask (only the shape) and Remove from a full one.
+/// Stored like a brush stroke, so Undo/Redo in the Select tab cover it.
+pub(crate) fn combine_into_layer_mask(state: AppState, layer_id: usize, shape: &Selection, remove: bool) -> bool {
+    let Some(item) = state.current() else { return false };
+    let Some(layer) = item.layers.iter().find(|l| l.id == layer_id) else { return false };
+    let Some((w, h)) = brush_dims(&item) else { return false };
+    let base = match &layer.mask {
+        Some(sel) => ops::selection_mask(sel, w, h),
+        None => vec![if remove { 255u8 } else { 0u8 }; w * h],
+    };
+    let shape_px = ops::selection_mask(shape, w, h);
+    let mut next = base.clone();
+    for (n, &s) in next.iter_mut().zip(shape_px.iter()) {
+        *n = if remove { (*n).min(255 - s) } else { (*n).max(s) };
+    }
+    // One patch over the changed rows and columns, for undo.
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0usize, 0usize);
+    for y in 0..h {
+        let row = y * w;
+        for x in 0..w {
+            if base[row + x] != next[row + x] {
+                x0 = x0.min(x);
+                x1 = x1.max(x);
+                y0 = y0.min(y);
+                y1 = y1.max(y);
+            }
+        }
+    }
+    // A layer without a mask still gets one, even if the shape changed nothing.
+    if x1 < x0 || y1 < y0 {
+        if layer.mask.is_none() {
+            return brush_store(state, item.id, BrushTarget::Layer(layer_id), next, w, h);
+        }
+        return false;
+    }
+    let (pw, ph) = (x1 - x0 + 1, y1 - y0 + 1);
+    let mut before = Vec::with_capacity(pw * ph);
+    let mut after = Vec::with_capacity(pw * ph);
+    for y in y0..=y1 {
+        before.extend_from_slice(&base[y * w + x0..y * w + x1 + 1]);
+        after.extend_from_slice(&next[y * w + x0..y * w + x1 + 1]);
+    }
+    if !brush_store(state, item.id, BrushTarget::Layer(layer_id), next, w, h) {
+        return false;
+    }
+    push_brush_step(
+        state,
+        BrushStep {
+            item_id: item.id,
+            target: BrushTarget::Layer(layer_id),
+            w,
+            h,
+            patches: vec![MaskPatch { x: x0, y: y0, w: pw, h: ph, before, after }],
+            op: None,
+        },
+    );
+    true
+}
+
+/// "Add selection to mask" / "Remove selection from mask": fold the photo's
+/// selection (a subject tap and its refinements, or one made earlier) into
+/// the mask being edited, then clear it.
+pub(crate) fn commit_selection_to_mask(state: AppState, remove: bool) {
+    let Some(item) = state.current() else { return };
+    let Some(id) = mask_layer_for(state.mask_target.get_untracked(), state.selected_layer.get_untracked(), &item) else {
+        return;
+    };
+    let Some(sel) = item.edit.selection.clone() else { return };
+    combine_into_layer_mask(state, id, &sel, remove);
+    state.subject_photo.set(None);
+    clear_subject_brush_ops(state);
+    state.update_current(|e| {
+        e.selection = None;
+        e.selection_rev += 1;
+    });
+}
+
+/// "Invert mask": flip the edited mask's Invert setting, the same one as in
+/// the Layers tab's Mask section.
+pub(crate) fn invert_layer_mask(state: AppState) {
+    let Some(item) = state.current() else { return };
+    let Some(id) = mask_layer_for(state.mask_target.get_untracked(), state.selected_layer.get_untracked(), &item) else {
+        return;
+    };
+    state.update_current_item(|m| {
+        if let Some(l) = m.layers.iter_mut().find(|l| l.id == id) {
+            l.invert = !l.invert;
+            l.mask_version += 1;
+        }
+    });
+}
+
+/// "Clear mask": drop the edited mask, so the layer applies everywhere again.
+pub(crate) fn clear_layer_mask(state: AppState) {
+    let Some(item) = state.current() else { return };
+    let Some(id) = mask_layer_for(state.mask_target.get_untracked(), state.selected_layer.get_untracked(), &item) else {
+        return;
+    };
+    state.update_current_item(|m| {
+        if let Some(l) = m.layers.iter_mut().find(|l| l.id == id) {
+            l.set_mask(None);
+        }
+    });
 }
 
 /// Overlay cache key of a brush target's committed mask.
@@ -1834,10 +1948,17 @@ pub(crate) fn brush_begin(state: AppState, nx: f32, ny: f32) -> Option<BrushDrag
     // the common case (first stroke) and full-frame zero buffers here are tens
     // of megabytes of pointerdown allocation.
     let base_sel = brush_selection(&item, target);
-    let view_empty = base_sel.is_none();
-    let base = if view_empty { None } else { Some(Rc::new(brush_base_mask(&item, target, w, h))) };
-    let view_base =
-        if view_empty { None } else { Some(Rc::new(brush_base_mask(&item, target, vw, vh))) };
+    // An unmasked layer shows its effect everywhere, so a Remove stroke on it
+    // starts from a fully revealed mask; an Add stroke starts empty.
+    let reveal_all = matches!(target, BrushTarget::Layer(_))
+        && base_sel.is_none()
+        && state.brush_remove.get_untracked();
+    let view_empty = base_sel.is_none() && !reveal_all;
+    let base_at = |bw: usize, bh: usize| {
+        if reveal_all { vec![255u8; bw * bh] } else { brush_base_mask(&item, target, bw, bh) }
+    };
+    let base = if view_empty { None } else { Some(Rc::new(base_at(w, h))) };
+    let view_base = if view_empty { None } else { Some(Rc::new(base_at(vw, vh))) };
     // A global vector selection is shown as an outline until the first stroke
     // bakes it; only then does the canvas need the mask tint painted in.
     let base_blit = matches!(
