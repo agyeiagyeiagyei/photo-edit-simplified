@@ -272,6 +272,9 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
                         state.update_current(|e| {
                             if let Some(ref mut s) = e.selection {
                                 s.feather = v.clamp(0.0, 0.25);
+                                // Feather changes the mask, so the tint cached
+                                // for this revision no longer matches it.
+                                e.selection_rev += 1;
                             }
                         });
                     }
