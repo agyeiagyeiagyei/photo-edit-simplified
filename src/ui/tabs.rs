@@ -47,6 +47,84 @@ pub(crate) fn CropTab(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     }
 }
 
+/// Smallest brush the sliders offer: a 2 px diameter (1 px radius). The
+/// worker already clamps a stroke radius to 1 px, so anything lower would
+/// just be a label that lies.
+const BRUSH_MIN_PX: f64 = 2.0;
+
+/// Log position (0..=1) of a brush diameter in image pixels. A log curve is
+/// what makes a 2 px dust brush and a 2000 px soft brush share one slider
+/// without the small end hiding in the first pixel of travel.
+fn brush_log_pos(px: f64, min: f64, max: f64) -> f64 {
+    let hi = max.max(min * 1.001);
+    (px.max(min) / min).ln() / (hi / min).ln()
+}
+
+/// Inverse of [`brush_log_pos`].
+fn brush_log_size(t: f64, min: f64, max: f64) -> f64 {
+    let hi = max.max(min * 1.001);
+    min * (hi / min).powf(t.clamp(0.0, 1.0))
+}
+
+fn brush_px_label(px: f64) -> String {
+    if px >= 100.0 {
+        format!("{:.0} px", px)
+    } else if px >= 10.0 {
+        format!("{:.1} px", px)
+    } else {
+        format!("{:.2} px", px)
+    }
+}
+
+/// Brush size slider, logarithmic and labelled in image pixels for the photo
+/// on screen. `value` keeps the stored fraction of the working diagonal —
+/// a diameter for the selection brush, a radius for heal and clone — so the
+/// same size follows a photo of any resolution.
+#[component]
+fn BrushSizeSlider(
+    state: AppState,
+    value: RwSignal<f32>,
+    label: &'static str,
+    /// True when `value` is a diameter fraction; false when it is a radius.
+    diameter: bool,
+    /// Largest size the slider reaches, in the same fraction units as `value`.
+    max_frac: f32,
+) -> impl IntoView {
+    let scale = move || if diameter { 1.0 } else { 2.0 };
+    let diag = move || {
+        let Some(m) = state.current() else {
+            return 7211.0;
+        };
+        let (w, h) = working_dims(m.width, m.height, &m.edit);
+        ((w * w + h * h) as f64).sqrt().max(1.0)
+    };
+    let max_px = move || max_frac as f64 * scale() * diag();
+    let size_px = move || value.get() as f64 * scale() * diag();
+    view! {
+        <label class="slider">
+            <span>{label} {move || brush_px_label(size_px())}</span>
+            <input
+                type="range" min="0" max="1000" step="1"
+                attr:data-min-px=BRUSH_MIN_PX.to_string()
+                attr:data-max-px=move || max_px().to_string()
+                attr:data-diag-px=move || diag().to_string()
+                attr:data-scale=move || scale().to_string()
+                prop:value=move || {
+                    format!("{:.0}", brush_log_pos(size_px(), BRUSH_MIN_PX, max_px()) * 1000.0)
+                }
+                on:input=move |ev| {
+                    let t: f64 = event_target_value(&ev)
+                        .parse::<f64>()
+                        .unwrap_or(500.0)
+                        / 1000.0;
+                    let px = brush_log_size(t, BRUSH_MIN_PX, max_px());
+                    value.set(((px / (scale() * diag())) as f32).min(max_frac));
+                }
+            />
+        </label>
+    }
+}
+
 #[component]
 pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
     let has_selection =
@@ -250,17 +328,7 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
                         "Redo"
                     </button>
                 </div>
-                <label class="slider">
-                    <span>"Size: " {move || format!("{:.1}%", state.brush_size.get() * 100.0)}</span>
-                    <input
-                        type="range" min="0.005" max="0.3" step="0.005"
-                        prop:value=move || state.brush_size.get().to_string()
-                        on:input=move |ev| {
-                            let v: f32 = event_target_value(&ev).parse().unwrap_or(0.04);
-                            state.brush_size.set(v.clamp(0.005, 0.3));
-                        }
-                    />
-                </label>
+                <BrushSizeSlider state=state value=state.brush_size label="Size: " diameter=true max_frac=0.3/>
                 <label class="slider">
                     <span>"Softness: " {move || format!("{:.0}%", state.brush_softness.get() * 100.0)}</span>
                     <input
@@ -1286,7 +1354,6 @@ pub(crate) fn HealTab(state: AppState) -> impl IntoView {
         (heal::HealMode::SmoothFill, "Smooth fill"),
         (heal::HealMode::ProximityMatch, "Proximity match"),
     ];
-    let radius = move || state.heal_radius.get();
     view! {
         <div class="heal-panel">
             <div class="chips">
@@ -1303,17 +1370,7 @@ pub(crate) fn HealTab(state: AppState) -> impl IntoView {
                     }
                 })}
             </div>
-            <label class="slider">
-                <span>"Brush size: " {move || format!("{:.0}%", radius() * 100.0)}</span>
-                <input
-                    type="range" min="0.005" max="0.1" step="0.005"
-                    prop:value=move || radius().to_string()
-                    on:input=move |ev| {
-                        let v: f32 = event_target_value(&ev).parse().unwrap_or(0.02);
-                        state.heal_radius.set(v.clamp(0.005, 0.1));
-                    }
-                />
-            </label>
+            <BrushSizeSlider state=state value=state.heal_radius label="Brush size: " diameter=false max_frac=0.1/>
             <p class="dim">
                 "Paint over a blemish to remove it. Content-aware clones a matching patch, \
                  smooth fill blends the surroundings, proximity match prefers nearby texture. \
@@ -1327,7 +1384,6 @@ pub(crate) fn HealTab(state: AppState) -> impl IntoView {
 pub(crate) fn CloneTab(state: AppState) -> impl IntoView {
     let has_source = move || state.clone_source.get().is_some();
     let picking = move || state.clone_pick.get();
-    let radius = move || state.clone_radius.get();
     view! {
         <div class="clone-panel">
             <div class="row select-row">
@@ -1360,17 +1416,7 @@ pub(crate) fn CloneTab(state: AppState) -> impl IntoView {
                 />
                 "Aligned"
             </label>
-            <label class="slider">
-                <span>"Brush size: " {move || format!("{:.0}%", radius() * 100.0)}</span>
-                <input
-                    type="range" min="0.005" max="0.15" step="0.005"
-                    prop:value=move || radius().to_string()
-                    on:input=move |ev| {
-                        let v: f32 = event_target_value(&ev).parse().unwrap_or(0.03);
-                        state.clone_radius.set(v.clamp(0.005, 0.15));
-                    }
-                />
-            </label>
+            <BrushSizeSlider state=state value=state.clone_radius label="Brush size: " diameter=false max_frac=0.15/>
             <p class="dim">
                 {move || if picking() {
                     "Click the canvas to set the clone source."
@@ -1519,5 +1565,30 @@ pub(crate) fn ExportTab(state: AppState) -> impl IntoView {
             </Show>
         </Show>
         <p class="dim">"Exports match the selected aspect preset’s social-media dimensions."</p>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{brush_log_pos, brush_log_size};
+
+    #[test]
+    fn brush_slider_is_logarithmic() {
+        let (min, max) = (2.0, 2000.0);
+        assert_eq!(brush_log_pos(min, min, max), 0.0);
+        assert!((brush_log_pos(max, min, max) - 1.0).abs() < 1e-9);
+        // The point of the log curve: 20 px is a third of the travel, where a
+        // linear slider would bury it in the first percent.
+        let p = brush_log_pos(20.0, min, max);
+        assert!((0.2..0.4).contains(&p), "20 px sits at {p}");
+    }
+
+    #[test]
+    fn brush_slider_round_trips_every_size() {
+        let (min, max) = (2.0, 2000.0);
+        for px in [2.0, 3.5, 7.5, 20.0, 240.0, 1999.0, 2000.0] {
+            let back = brush_log_size(brush_log_pos(px, min, max), min, max);
+            assert!((back - px).abs() < 1e-6, "{px} -> {back}");
+        }
     }
 }

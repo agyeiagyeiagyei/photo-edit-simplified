@@ -237,9 +237,27 @@ struct RingBackup {
     y: f64,
 }
 
-/// How far `draw_brush_outline`'s dark backing stroke reaches past the radius:
-/// stroked at radius + 1 with a line width of 2.
+/// How far `draw_brush_outline`'s dark backing stroke reaches past the radius,
+/// in CSS px: stroked at radius + 1 with a line width of 2.
 const BRUSH_RING_OVERHANG: f64 = 2.0;
+
+/// Preview pixels per CSS pixel for cosmetic overlay sizes. Handles and
+/// strokes are authored in CSS px; a windowed view stretches a fraction of
+/// the preview across the canvas, so they must shrink by the same factor to
+/// stay screen-constant. `win_w` is the visible window width in crop units
+/// (1 at Fit).
+pub(crate) fn overlay_ui(
+    canvas: &web_sys::HtmlCanvasElement,
+    preview_w: usize,
+    win_w: f32,
+) -> f64 {
+    let css = canvas.client_width() as f64;
+    if css >= 1.0 {
+        preview_w as f64 * win_w as f64 / css
+    } else {
+        1.0
+    }
+}
 
 thread_local! {
     static RING_BACKUP: RefCell<Option<(RingBackup, web_sys::HtmlCanvasElement)>> =
@@ -255,6 +273,7 @@ pub(crate) fn backup_brush_ring(
     px: f64,
     py: f64,
     radius: f64,
+    ui: f64,
     hi_gen: u32,
     viewport_gen: u32,
 ) {
@@ -268,8 +287,8 @@ pub(crate) fn backup_brush_ring(
     // The ring's outer edge overhangs `radius` in overlay units, which scale
     // with the transform; a fixed device margin clips it on a hi-res frame and
     // leaves its extremes behind as ticks. +2 px: antialiasing.
-    let rx = (radius + BRUSH_RING_OVERHANG) * sx + 2.0;
-    let ry = (radius + BRUSH_RING_OVERHANG) * sy + 2.0;
+    let rx = (radius + BRUSH_RING_OVERHANG * ui) * sx + 2.0;
+    let ry = (radius + BRUSH_RING_OVERHANG * ui) * sy + 2.0;
     let x0 = (cx - rx).floor().max(0.0);
     let y0 = (cy - ry).floor().max(0.0);
     let x1 = (cx + rx).ceil().min(cw);
@@ -356,6 +375,7 @@ pub(crate) fn draw_brush_hover_incremental(
     radius: f64,
     w: f64,
     h: f64,
+    ui: f64,
     hi_gen: u32,
     viewport_gen: u32,
 ) -> bool {
@@ -381,10 +401,11 @@ pub(crate) fn draw_brush_hover_incremental(
         nx as f64 * w,
         ny as f64 * h,
         radius,
+        ui,
         hi_gen,
         viewport_gen,
     );
-    draw_brush_outline(&ctx, nx, ny, radius, w, h);
+    draw_brush_outline(&ctx, nx, ny, radius, w, h, ui);
     // A full paint can reuse this context without resizing the canvas (the GPU
     // path does), and it draws the photo assuming the identity transform.
     let _ = ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
@@ -553,15 +574,33 @@ pub(crate) fn crop_is_full(c: &state::CropRect) -> bool {
     c.x <= 0.0005 && c.y <= 0.0005 && c.w >= 0.999 && c.h >= 0.999
 }
 
-// Pointer position in full-image normalized coords. The preview canvas shows
-// only the crop region outside the Crop tab, so canvas-local coords map
-// through the crop rect (identity when uncropped).
-pub(crate) fn layer_norm_pos(ev: &web_sys::MouseEvent, crop: state::CropRect) -> Option<(f32, f32)> {
+// Pointer position in full-image normalized coords. Outside the Crop tab the
+// canvas shows only the crop region, and a zoomed view shows only its window,
+// so canvas-local coords map through the view window and then the crop rect
+// (identity when uncropped and at Fit).
+pub(crate) fn layer_norm_pos(
+    ev: &web_sys::MouseEvent,
+    crop: state::CropRect,
+    view: state::ViewZoom,
+) -> Option<(f32, f32)> {
     let el = web::document().query_selector(".canvas-wrap").ok().flatten()?;
     let rect = el.get_bounding_client_rect();
     let nx = ((ev.client_x() as f32 - rect.left() as f32) / rect.width() as f32).clamp(0.0, 1.0);
     let ny = ((ev.client_y() as f32 - rect.top() as f32) / rect.height() as f32).clamp(0.0, 1.0);
-    Some((crop.x + nx * crop.w, crop.y + ny * crop.h))
+    let win = view.window();
+    let cx = win.x + nx * win.w;
+    let cy = win.y + ny * win.h;
+    Some((crop.x + cx * crop.w, crop.y + cy * crop.h))
+}
+
+/// Rectangle in pixels for an image of (w, h) — the window counterpart of
+/// `crop_px`, used for the zoom view rect.
+pub(crate) fn rect_px(r: &state::CropRect, w: usize, h: usize) -> (usize, usize, usize, usize) {
+    let x = (r.x * w as f32).round() as usize;
+    let y = (r.y * h as f32).round() as usize;
+    let rw = ((r.w * w as f32).round() as usize).max(1).min(w - x);
+    let rh = ((r.h * h as f32).round() as usize).max(1).min(h - y);
+    (x, y, rw, rh)
 }
 
 /// Displayed size of the preview in CSS pixels.
@@ -589,9 +628,19 @@ pub(crate) fn dist2(a: (f32, f32), b: (f32, f32)) -> f32 {
     dx * dx + dy * dy
 }
 
-pub(crate) fn hit_test_path(points: &[PathPoint], nx: f32, ny: f32) -> Option<(usize, PenHandle)> {
-    let point_r2 = 0.03_f32 * 0.03;
-    let handle_r2 = 0.025_f32 * 0.025;
+/// `win_w` is the visible window width in full-image normalized units (the
+/// crop width at Fit); the hit radii shrink with it so a zoomed view keeps a
+/// constant screen tolerance.
+pub(crate) fn hit_test_path(
+    points: &[PathPoint],
+    nx: f32,
+    ny: f32,
+    win_w: f32,
+) -> Option<(usize, PenHandle)> {
+    let point_r = 0.03 * win_w;
+    let handle_r = 0.025 * win_w;
+    let point_r2 = point_r * point_r;
+    let handle_r2 = handle_r * handle_r;
     // Points take priority over handles.
     for (i, p) in points.iter().enumerate().rev() {
         if dist2((p.x, p.y), (nx, ny)) < point_r2 {
@@ -623,7 +672,7 @@ pub(crate) fn push_brush_history(layer: &mut state::BrushLayer) {
     layer.history.push(layer.strokes.clone());
 }
 
-pub(crate) fn draw_path_edit_handles(ctx: &web_sys::CanvasRenderingContext2d, layer: &state::Layer, w: f64, h: f64) {
+pub(crate) fn draw_path_edit_handles(ctx: &web_sys::CanvasRenderingContext2d, layer: &state::Layer, w: f64, h: f64, ui: f64) {
     let LayerKind::Path(p) = &layer.kind else { return };
     for pt in &p.points {
         let px = (pt.x * w as f32) as f64;
@@ -634,7 +683,7 @@ pub(crate) fn draw_path_edit_handles(ctx: &web_sys::CanvasRenderingContext2d, la
         let iy = ((pt.y + pt.in_y) * h as f32) as f64;
 
         ctx.set_stroke_style_str("rgba(255,255,255,0.6)");
-        ctx.set_line_width(1.0);
+        ctx.set_line_width(1.0 * ui);
         ctx.begin_path();
         ctx.move_to(px, py);
         ctx.line_to(ox, oy);
@@ -644,13 +693,13 @@ pub(crate) fn draw_path_edit_handles(ctx: &web_sys::CanvasRenderingContext2d, la
 
         ctx.set_fill_style_str(if pt.smooth { "#0a84ff" } else { "#ffcc00" });
         ctx.begin_path();
-        ctx.arc(px, py, 6.0, 0.0, std::f64::consts::PI * 2.0).unwrap();
+        ctx.arc(px, py, 6.0 * ui, 0.0, std::f64::consts::PI * 2.0).unwrap();
         ctx.fill();
 
         ctx.set_fill_style_str("#fff");
         for (hx, hy) in [(ox, oy), (ix, iy)] {
             ctx.begin_path();
-            ctx.arc(hx, hy, 4.0, 0.0, std::f64::consts::PI * 2.0).unwrap();
+            ctx.arc(hx, hy, 4.0 * ui, 0.0, std::f64::consts::PI * 2.0).unwrap();
             ctx.fill();
         }
     }
@@ -675,10 +724,11 @@ pub(crate) fn draw_selection_overlay(
     w: f64,
     h: f64,
     key: u64,
+    ui: f64,
 ) {
     ctx.save();
     ctx.set_stroke_style_str("#0a84ff");
-    ctx.set_line_width(2.0);
+    ctx.set_line_width(2.0 * ui);
     match &sel.kind {
         SelectionKind::Rect { x, y, w: rw, h: rh } => {
             ctx.stroke_rect(
@@ -811,10 +861,10 @@ pub(crate) fn draw_layer_mask_overlay(
     paint_mask_tint(ctx, &mask, wi, hi, [255, 59, 48], key ^ invert as u64);
 }
 
-pub(crate) fn draw_select_drag(ctx: &web_sys::CanvasRenderingContext2d, drag: &SelectDrag, w: f64, h: f64) {
+pub(crate) fn draw_select_drag(ctx: &web_sys::CanvasRenderingContext2d, drag: &SelectDrag, w: f64, h: f64, ui: f64) {
     ctx.save();
     ctx.set_stroke_style_str("rgba(10,132,255,0.8)");
-    ctx.set_line_width(2.0);
+    ctx.set_line_width(2.0 * ui);
     match drag {
         SelectDrag::Rect((x0, y0), (x1, y1)) | SelectDrag::Subject((x0, y0), (x1, y1)) => {
             let x = x0.min(*x1);
@@ -962,16 +1012,17 @@ pub(crate) fn draw_brush_outline(
     radius: f64,
     w: f64,
     h: f64,
+    ui: f64,
 ) {
     let px = nx as f64 * w;
     let py = ny as f64 * h;
     ctx.save();
-    ctx.set_line_width(2.0);
+    ctx.set_line_width(2.0 * ui);
     ctx.set_stroke_style_str("rgba(0,0,0,0.55)");
     ctx.begin_path();
-    let _ = ctx.arc(px, py, radius + 1.0, 0.0, std::f64::consts::PI * 2.0);
+    let _ = ctx.arc(px, py, radius + 1.0 * ui, 0.0, std::f64::consts::PI * 2.0);
     ctx.stroke();
-    ctx.set_line_width(1.5);
+    ctx.set_line_width(1.5 * ui);
     ctx.set_stroke_style_str("rgba(255,255,255,0.95)");
     ctx.begin_path();
     let _ = ctx.arc(px, py, radius, 0.0, std::f64::consts::PI * 2.0);
@@ -986,6 +1037,7 @@ pub(crate) fn draw_heal_overlay(
     radius_frac: f32,
     w: f64,
     h: f64,
+    ui: f64,
 ) {
     let Some(pts) = pts else { return };
     if pts.is_empty() {
@@ -995,7 +1047,7 @@ pub(crate) fn draw_heal_overlay(
     ctx.save();
     ctx.set_fill_style_str("rgba(255,255,255,0.35)");
     ctx.set_stroke_style_str("rgba(255,255,255,0.9)");
-    ctx.set_line_width(1.5);
+    ctx.set_line_width(1.5 * ui);
     for &(nx, ny) in pts {
         ctx.begin_path();
         let _ = ctx.arc(nx as f64 * w, ny as f64 * h, r, 0.0, std::f64::consts::TAU);
@@ -1005,18 +1057,19 @@ pub(crate) fn draw_heal_overlay(
     ctx.restore();
 }
 
-pub(crate) fn draw_crosshair(ctx: &web_sys::CanvasRenderingContext2d, x: f32, y: f32) {
+pub(crate) fn draw_crosshair(ctx: &web_sys::CanvasRenderingContext2d, x: f32, y: f32, ui: f64) {
+    let arm = 9.0 * ui;
     ctx.save();
     ctx.set_stroke_style_str("rgba(10,132,255,0.9)");
-    ctx.set_line_width(1.5);
+    ctx.set_line_width(1.5 * ui);
     ctx.begin_path();
-    ctx.move_to(x as f64 - 9.0, y as f64);
-    ctx.line_to(x as f64 + 9.0, y as f64);
-    ctx.move_to(x as f64, y as f64 - 9.0);
-    ctx.line_to(x as f64, y as f64 + 9.0);
+    ctx.move_to(x as f64 - arm, y as f64);
+    ctx.line_to(x as f64 + arm, y as f64);
+    ctx.move_to(x as f64, y as f64 - arm);
+    ctx.line_to(x as f64, y as f64 + arm);
     ctx.stroke();
     ctx.begin_path();
-    let _ = ctx.arc(x as f64, y as f64, 4.0, 0.0, std::f64::consts::TAU);
+    let _ = ctx.arc(x as f64, y as f64, 4.0 * ui, 0.0, std::f64::consts::TAU);
     ctx.stroke();
     ctx.restore();
 }
@@ -1050,10 +1103,22 @@ pub(crate) fn text_overlay_style(t: &state::TextLayer, opacity: f32, crop: &stat
     )
 }
 
-pub(crate) fn selected_text_overlay_style(t: &state::TextLayer, opacity: f32, crop: &state::CropRect) -> String {
-    let px = format!("{:.2}%", t.font_size * 100.0);
-    let left = format!("{:.2}%", (t.x - crop.x) / crop.w * 100.0);
-    let top = format!("{:.2}%", (t.y - crop.y) / crop.h * 100.0);
+pub(crate) fn selected_text_overlay_style(
+    t: &state::TextLayer,
+    opacity: f32,
+    crop: &state::CropRect,
+    view: state::ViewZoom,
+) -> String {
+    let win = view.window();
+    let px = format!("{:.2}%", t.font_size * 100.0 / win.h.max(1e-3));
+    let left = format!(
+        "{:.2}%",
+        ((t.x - crop.x) / crop.w - win.x) / win.w * 100.0
+    );
+    let top = format!(
+        "{:.2}%",
+        ((t.y - crop.y) / crop.h - win.y) / win.h * 100.0
+    );
     let align = t.alignment.canvas_value();
     let translate = match t.alignment {
         TextAlign::Left => "translate(0,-50%)",

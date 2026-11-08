@@ -1,7 +1,7 @@
 import { test, expect, Page } from '@playwright/test';
 import * as fs from 'fs';
 import {
-  openApp, trackErrors, recordMetrics, importFiles, canvas, canvasSize, clickTab, setRange,
+  openApp, trackErrors, recordMetrics, importFiles, canvas, canvasSize, clickTab, setRange, setBrushFrac,
   thumbs, PNG_SMALL, JPEG_A, rawFixtures,
 } from './helpers';
 
@@ -385,7 +385,7 @@ test.describe('selection brush (issue #3)', () => {
     await waitSmall(page);
 
     await selectBrush(page);
-    await setRange(page, /^Size:/, 0.2);
+    await setBrushFrac(page, /^Size:/, 0.2);
     await setRange(page, /^Softness:/, 0);
     await parkPointer(page);
     await settle(page);
@@ -489,7 +489,7 @@ test.describe('selection brush (issue #3)', () => {
     await waitSmall(page);
 
     await selectBrush(page);
-    await setRange(page, /^Size:/, 0.3);
+    await setBrushFrac(page, /^Size:/, 0.3);
     await setRange(page, /^Softness:/, 0.5);
     await parkPointer(page);
     await settle(page);
@@ -524,7 +524,7 @@ test.describe('selection brush (issue #3)', () => {
     await settle(page, 800);
 
     await selectBrush(page);
-    await setRange(page, /^Size:/, 0.3);
+    await setBrushFrac(page, /^Size:/, 0.3);
     await setRange(page, /^Softness:/, 0.5);
     await parkPointer(page);
     await settle(page);
@@ -560,7 +560,7 @@ test.describe('selection brush (issue #3)', () => {
     await settle(page, 800);
 
     await selectBrush(page);
-    await setRange(page, /^Size:/, 0.08);
+    await setBrushFrac(page, /^Size:/, 0.08);
     await parkPointer(page);
     await settle(page, 800);
     const before = await readCanvas(page);
@@ -652,7 +652,7 @@ test.describe('selection brush (issue #3)', () => {
     await setRange(page, /^Brightness/, 0.5);
     await settle(page, 600);
     await selectBrush(page);
-    await setRange(page, /^Size:/, 0.1);
+    await setBrushFrac(page, /^Size:/, 0.1);
     await setRange(page, /^Softness:/, 0);
     await selectChip(page, 'Remove').click();
     await stroke(page, [[0.2, 0.5], [0.4, 0.5]], 10);
@@ -674,7 +674,7 @@ test.describe('selection brush (issue #3)', () => {
     await waitSmall(page);
 
     await selectBrush(page);
-    await setRange(page, /^Size:/, 0.15);
+    await setBrushFrac(page, /^Size:/, 0.15);
     await setRange(page, /^Softness:/, 0);
     await stroke(page, [[0.2, 0.3], [0.8, 0.3], [0.8, 0.7]]);
     await parkPointer(page);
@@ -709,7 +709,7 @@ test.describe('selection brush (issue #3)', () => {
     await rectDrag(page, 0.2, 0.2, 0.7, 0.7);
     await settle(page, 800);
     await selectBrush(page);
-    await setRange(page, /^Size:/, 0.05);
+    await setBrushFrac(page, /^Size:/, 0.05);
     await setRange(page, /^Softness:/, 0);
     await parkPointer(page);
     await settle(page, 800);
@@ -751,7 +751,7 @@ test.describe('selection brush (issue #3)', () => {
     const { w, h } = vector;
 
     await selectBrush(page);
-    await setRange(page, /^Size:/, 0.15);
+    await setBrushFrac(page, /^Size:/, 0.15);
     await setRange(page, /^Softness:/, 0);
     await parkPointer(page);
     await settle(page);
@@ -819,7 +819,7 @@ test.describe('selection brush (issue #3)', () => {
     // Brush the layer mask; the target hint must say the layer, not global.
     await selectBrush(page);
     await expect(page.locator('.select-tab p.dim', { hasText: /^Brush edits the selected adjustment layer's mask/ })).toBeVisible();
-    await setRange(page, /^Size:/, 0.15);
+    await setBrushFrac(page, /^Size:/, 0.15);
     await setRange(page, /^Softness:/, 0);
     await parkPointer(page);
     await settle(page);
@@ -860,7 +860,7 @@ test.describe('selection brush (issue #3)', () => {
     await expect(page.locator('.layer-row')).toHaveCount(1);
     await page.locator('.layer-row').first().locator('.layer-label').click();
     await selectBrush(page);
-    await setRange(page, /^Size:/, 0.15);
+    await setBrushFrac(page, /^Size:/, 0.15);
     await setRange(page, /^Softness:/, 0);
     await parkPointer(page);
     await settle(page, 800);
@@ -891,7 +891,7 @@ test.describe('selection brush (issue #3)', () => {
     await settle(page, 600);
 
     await selectBrush(page);
-    await setRange(page, /^Size:/, 0.25);
+    await setBrushFrac(page, /^Size:/, 0.25);
     await setRange(page, /^Softness:/, 0.4);
     await parkPointer(page);
 
@@ -955,7 +955,7 @@ test.describe('selection brush (issue #3)', () => {
     // A small Remove stroke inside the mask is enough to commit it; the far
     // edge must keep the vector's sharpness through that rasterization.
     await selectBrush(page);
-    await setRange(page, /^Size:/, 0.05);
+    await setBrushFrac(page, /^Size:/, 0.05);
     await setRange(page, /^Softness:/, 0);
     await selectChip(page, 'Remove').click();
     await parkPointer(page);
@@ -1009,7 +1009,7 @@ test.describe('selection brush (issue #3)', () => {
     await settle(page, 800);
 
     await selectBrush(page);
-    await setRange(page, /^Size:/, 0.15);
+    await setBrushFrac(page, /^Size:/, 0.15);
     await setRange(page, /^Softness:/, 0.2);
     await parkPointer(page);
 

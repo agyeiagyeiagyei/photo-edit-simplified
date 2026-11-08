@@ -30,7 +30,8 @@ pub(crate) enum XformStart {
 /// A live transform gesture. Positions are crop-relative units (0..1 inside
 /// the displayed preview); `origin` and `pivot` use the same space so every
 /// bearing and distance is computed in CSS pixels without re-querying the
-/// layer's geometry.
+/// layer's geometry. `win` is the visible view window: pointer deltas are
+/// mapped through it before use, so a zoomed view transforms at screen scale.
 #[derive(Clone)]
 pub(crate) struct XformDrag {
     id: usize,
@@ -38,6 +39,7 @@ pub(crate) struct XformDrag {
     origin: (f32, f32),
     pivot: (f32, f32),
     crop: state::CropRect,
+    win: state::CropRect,
     start_angle: f32,
     start_bearing: f32,
     start_scale: f32,
@@ -97,6 +99,8 @@ fn begin_xform(
     let Some((lx, ly)) = layer_local_pos(ev) else { return };
     let Some((css_w, css_h)) = canvas_css_size() else { return };
     let crop = item.edit.crop;
+    let win = state.view_zoom.get_untracked().window();
+    let (cx, cy) = (win.x + lx * win.w, win.y + ly * win.h);
     let (px, py) = layer_pivot(&layer.kind);
     let pivot = ((px - crop.x) / crop.w, (py - crop.y) / crop.h);
     let (start_angle, start_scale) = match &layer.kind {
@@ -119,14 +123,15 @@ fn begin_xform(
         },
         state::LayerKind::Adjust(_) => return,
     };
-    let dx = (lx - pivot.0) * css_w;
-    let dy = (ly - pivot.1) * css_h;
+    let dx = (cx - pivot.0) * css_w / win.w;
+    let dy = (cy - pivot.1) * css_h / win.h;
     drag.set(Some(XformDrag {
         id,
         mode,
-        origin: (lx, ly),
+        origin: (cx, cy),
         pivot,
         crop,
+        win,
         start_angle,
         start_bearing: dy.atan2(dx),
         start_scale,
@@ -136,10 +141,12 @@ fn begin_xform(
 }
 
 fn update_xform(state: AppState, d: &XformDrag, lx: f32, ly: f32, css: (f32, f32)) {
+    let cx = d.win.x + lx * d.win.w;
+    let cy = d.win.y + ly * d.win.h;
     match d.mode {
         XformMode::Move => {
-            let dx = (lx - d.origin.0) * d.crop.w;
-            let dy = (ly - d.origin.1) * d.crop.h;
+            let dx = (cx - d.origin.0) * d.crop.w;
+            let dy = (cy - d.origin.1) * d.crop.h;
             state.update_current_item(|m| {
                 let Some(l) = m.layers.iter_mut().find(|l| l.id == d.id) else { return };
                 match (&mut l.kind, &d.start) {
@@ -173,8 +180,8 @@ fn update_xform(state: AppState, d: &XformDrag, lx: f32, ly: f32, css: (f32, f32
             });
         }
         XformMode::Scale => {
-            let dx = (lx - d.pivot.0) * css.0;
-            let dy = (ly - d.pivot.1) * css.1;
+            let dx = (cx - d.pivot.0) * css.0 / d.win.w;
+            let dy = (cy - d.pivot.1) * css.1 / d.win.h;
             let factor = ((dx * dx + dy * dy).sqrt() / d.start_dist).clamp(0.05, 20.0);
             state.update_current_item(|m| {
                 let Some(l) = m.layers.iter_mut().find(|l| l.id == d.id) else { return };
@@ -188,8 +195,8 @@ fn update_xform(state: AppState, d: &XformDrag, lx: f32, ly: f32, css: (f32, f32
             });
         }
         XformMode::Rotate => {
-            let dx = (lx - d.pivot.0) * css.0;
-            let dy = (ly - d.pivot.1) * css.1;
+            let dx = (cx - d.pivot.0) * css.0 / d.win.w;
+            let dy = (cy - d.pivot.1) * css.1 / d.win.h;
             let bearing = dy.atan2(dx);
             let angle = norm_deg(d.start_angle + (bearing - d.start_bearing).to_degrees());
             state.update_current_item(|m| {
@@ -262,6 +269,24 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         )>,
     );
 
+    // The editing viewport is ephemeral: Fit on a photo switch and whenever
+    // the Crop tab is entered (that tab keeps its own crop gesture).
+    let last_photo = std::cell::Cell::new(usize::MAX);
+    create_effect(move |_| {
+        let id = state.current().map(|m| m.id).unwrap_or(0);
+        if id != last_photo.get() {
+            last_photo.set(id);
+            state.view_zoom.set(state::ViewZoom::default());
+        }
+    });
+    create_effect(move |_| {
+        // Crop and Rotate show Fit-only views: their own gestures assume the
+        // whole crop is on screen. Export deliberately keeps the view.
+        if matches!(tab.get(), Tab::Crop | Tab::Rotate) {
+            state.view_zoom.set(state::ViewZoom::default());
+        }
+    });
+
     // Window resizes change the canvas display size; bump a signal so the
     // render effect re-checks whether the hi-res backing is still sufficient.
     let rsz = window_event_listener(leptos::ev::resize, move |_| {
@@ -301,7 +326,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
 
     window_event_listener(leptos::ev::pointermove, move |ev| {
         let Some(Some((target, mut pts))) = clone_drag.try_get() else { return };
-        let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop)).flatten() else { return };
+        let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop, state.view_zoom.get_untracked())).flatten() else { return };
         if pts.last().map(|last| dist2(*last, (nx, ny)) > 0.00005).unwrap_or(true) {
             pts.push((nx, ny));
             clone_drag.set(Some((target, pts)));
@@ -319,7 +344,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
 
     window_event_listener(leptos::ev::pointermove, move |ev| {
         let Some(Some((target, mut pts))) = heal_drag.try_get() else { return };
-        let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop)).flatten() else { return };
+        let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop, state.view_zoom.get_untracked())).flatten() else { return };
         if pts.last().map(|last| dist2(*last, (nx, ny)) > 0.00005).unwrap_or(true) {
             pts.push((nx, ny));
             heal_drag.set(Some((target, pts)));
@@ -337,7 +362,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
 
     window_event_listener(leptos::ev::pointermove, move |ev| {
         let Some(Some((id, nx0, ny0, x0, y0))) = layer_drag.try_get() else { return };
-        let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop)).flatten() else { return };
+        let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop, state.view_zoom.get_untracked())).flatten() else { return };
         let dx = nx - nx0;
         let dy = ny - ny0;
         state.update_current_item(|m| {
@@ -374,7 +399,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
 
     window_event_listener(leptos::ev::pointermove, move |ev| {
         let Some(Some((id, drag, nx0, ny0))) = pen_drag.try_get() else { return };
-        let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop)).flatten() else { return };
+        let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop, state.view_zoom.get_untracked())).flatten() else { return };
         let dx = nx - nx0;
         let dy = ny - ny0;
         state.update_current_item(|m| {
@@ -420,7 +445,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
 
     window_event_listener(leptos::ev::pointermove, move |ev| {
         let Some(id) = brush_draw.try_get().flatten() else { return };
-        let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop)).flatten() else { return };
+        let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop, state.view_zoom.get_untracked())).flatten() else { return };
         state.update_current_item(|m| {
             let Some(l) = m.layers.iter_mut().find(|l| l.id == id) else { return };
             let LayerKind::Brush(b) = &mut l.kind else { return };
@@ -436,7 +461,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
 
     window_event_listener(leptos::ev::pointermove, move |ev| {
         let Some(Some(drag)) = select_drag.try_get() else { return };
-        let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop)).flatten() else { return };
+        let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop, state.view_zoom.get_untracked())).flatten() else { return };
         match drag {
             SelectDrag::Rect(start, _) => {
                 select_drag.set(Some(SelectDrag::Rect(start, (nx, ny))));
@@ -463,7 +488,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             }
             return;
         }
-        let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop)).flatten() else { return };
+        let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop, state.view_zoom.get_untracked())).flatten() else { return };
         brush_hover.set(Some((nx, ny)));
         let Some(Some(drag)) = brush_drag.try_get() else { return };
         let _sp = perf::Span::new("brush.live.push.hi");
@@ -620,6 +645,12 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     let key = brush_overlay_key(&item, target);
                     let diag = ((w * w + h * h) as f64).sqrt();
                     let radius = state.brush_size.get() as f64 * diag * 0.5;
+                    let win_w = if tab.get() == Tab::Crop {
+                        1.0
+                    } else {
+                        state.view_zoom.get_untracked().window().w
+                    };
+                    let ui = overlay_ui(&canvas, w, win_w);
                     if draw_brush_hover_incremental(
                         &canvas,
                         item.id,
@@ -628,6 +659,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                         radius,
                         w as f64,
                         h as f64,
+                        ui,
                         state.hi_built.get(),
                         state.viewport_gen.get(),
                     ) {
@@ -657,7 +689,17 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         };
         working.set((w, h));
         let crop = item.edit.crop;
-        let cropped_view = tab.get() != Tab::Crop && !crop_is_full(&crop);
+        // The Crop tab always shows the fit view; its own gestures edit the
+        // crop. Tabs without a zoom tool (Rotate, Trim) do the same, so a zoom
+        // left behind on another tab cannot desync their overlays. Export is
+        // zoomable, so the view carries into it.
+        let view = if zoomable_tab(tab.get()) {
+            state.view_zoom.get()
+        } else {
+            state::ViewZoom::default()
+        };
+        let img_win = view.image_window(crop);
+        let windowed_view = tab.get() != Tab::Crop && (view.zoomed() || !crop_is_full(&crop));
 
         // Is the 1024px preview finer than what the screen is asking for?
         // During reactive remounts this effect fires while the fresh canvas
@@ -695,12 +737,12 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         }
 
         // Total-image render size needed for the cache: when the view is
-        // cropped, the crop region alone must cover the display, so the
-        // whole image must be proportionally larger.
-        let (req_w, req_h) = if cropped_view {
+        // windowed (cropped or zoomed), the view window alone must cover the
+        // display, so the whole image must be proportionally larger.
+        let (req_w, req_h) = if windowed_view {
             (
-                need_w / crop.w.max(0.01) as f64,
-                need_h / crop.h.max(0.01) as f64,
+                need_w / img_win.w.max(0.01) as f64,
+                need_h / img_win.h.max(0.01) as f64,
             )
         } else {
             (need_w, need_h)
@@ -718,8 +760,8 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         // window is not available (worker down → sync fallback).
         let edit_fp = edit_fingerprint(&item);
         let src_fp = source_fingerprint(photo.gen, proxy_gen(item.id));
-        let (cx_px, cy_px, cw_p, _) = crop_px(&item.edit, w, h);
-        let (cx_p, cy_p) = (cx_px as f64, cy_px as f64);
+        let (vx_px, vy_px, vw_p, _) = rect_px(&img_win, w, h);
+        let (cx_p, cy_p) = (vx_px as f64, vy_px as f64);
         // A crop-window frame is scaled and translated in place, so an
         // adjustment sitting above an overlay cannot be applied to it; those
         // stacks use the whole-frame cache and blit the crop from it.
@@ -739,7 +781,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         // the shader never approximates the develop; without the neutral frame
         // the CPU neutral path renders it.
         let mut gpu_ok = want_hi
-            && !cropped_view
+            && !windowed_view
             && gpu::eligible(&item.edit, &item.layers)
             && gpu::active()
             && !(photo.raw && !item.edit.raw.is_identity() && !source_has_neutral(item.id, &photo));
@@ -782,10 +824,10 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             }
         }
         if want_hi {
-            if cropped_view && !post_adjust {
-                let (_, _, fcw, fch) = crop_px(&item.edit, fw, fh);
+            if windowed_view && !post_adjust {
+                let (_, _, fcw, fch) = rect_px(&img_win, fw, fh);
                 let win_target = hi_target(need_w, need_h, fcw, fch, WINDOW_MAX_EDGE as u32);
-                let key = crop_key(&crop);
+                let key = crop_key(&img_win);
                 sharp = HI_WINDOW.with(|c| {
                     let b = c.borrow();
                     let win = b.as_ref()?;
@@ -802,7 +844,12 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                         .unwrap();
                     stale_source = win.source_fp != src_fp;
                     drawn_src = Some(win.source_fp);
-                    Some(Sharp::Window { w: win.w, cw: cw_p })
+                    Some(Sharp::Window {
+                        w: win.w,
+                        cw: vw_p,
+                        cx: vx_px,
+                        cy: vy_px,
+                    })
                 });
             }
             if sharp.is_none() {
@@ -818,8 +865,8 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     if hi.w < target.0 || hi.h < target.1 {
                         return None;
                     }
-                    if cropped_view {
-                        blit_hi_frame(hi, &canvas, Some(crop_px(&item.edit, hi.w, hi.h)));
+                    if windowed_view {
+                        blit_hi_frame(hi, &canvas, Some(rect_px(&img_win, hi.w, hi.h)));
                     } else {
                         blit_hi_frame(hi, &canvas, None);
                     }
@@ -829,6 +876,20 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 });
             }
         }
+        // A whole-frame cache capped at HI_MAX_EDGE is still softer than the
+        // screen inside a small view window. Keep it up (no flash) but ask the
+        // worker for the native-density window frame.
+        let window_short = windowed_view
+            && !post_adjust
+            && sharp
+                .as_ref()
+                .is_some_and(|s| matches!(s, Sharp::Whole { .. }))
+            && HI_CACHE.with(|c| {
+                c.borrow().as_ref().is_some_and(|hi| {
+                    (hi.w as f64 * img_win.w as f64) < need_w * 0.999
+                        || (hi.h as f64 * img_win.h as f64) < need_h * 0.999
+                })
+            });
         if let Some(fp) = drawn_src {
             if state.shown_src.get_untracked() != Some((item.id, fp)) {
                 state.shown_src.set(Some((item.id, fp)));
@@ -841,11 +902,11 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             let params = state::render_edit(&item.edit, &item.layers);
             pipeline::finish_edit(&mut frame, &params, item.id as u32, px_scale);
             let p = frame.pixels;
-            if cropped_view {
-                // Composite at full size offscreen, then blit the crop region —
+            if windowed_view {
+                // Composite at full size offscreen, then blit the view region —
                 // the same pipeline as export, so the preview matches the output.
                 // Crop stays a stored rect; the original is never touched.
-                let (cx, cy, cw, ch) = crop_px(&item.edit, w, h);
+                let (cx, cy, cw, ch) = rect_px(&img_win, w, h);
                 let off = web::create_canvas(w as u32, h as u32);
                 web::put_pixels(&off, &p, w as u32, h as u32);
                 composite_stack(&off, item.id, &item.layers, w, h);
@@ -961,7 +1022,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             );
             cb.forget();
         }
-        if want_hi && !gpu_ok && (sharp.is_none() || stale_source) {
+        if want_hi && !gpu_ok && (sharp.is_none() || stale_source || window_short) {
             // Sharp frame lands 60ms after edits settle; until then the
             // cheap preview render keeps drags responsive. The worker's
             // base cache makes the follow-up render cheap, so a short
@@ -989,13 +1050,12 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 let t2 = hi_target(req_w, req_h, fw2, fh2, HI_MAX_EDGE as u32);
                 HI_REQ_GEN.with(|d| d.set(d.get() + 1));
                 let rgen = HI_REQ_GEN.with(|d| d.get());
-                let recipe = pworker::render_recipe(&item, src_id);
                 let sel = item.edit.selection.clone();
                 let edit_fp = edit_fingerprint(&item);
                 let source_fp = source_fingerprint(photo.gen, proxy_gen(item.id));
                 // A direct-painted proxy may already cover this target; rendering
                 // again would swap it for a smaller worker copy of the same pixels.
-                if (!cropped_view || state::has_post_adjustments(&item.layers))
+                if (!windowed_view || state::has_post_adjustments(&item.layers))
                     && HI_CACHE.with(|c| {
                         c.borrow().as_ref().is_some_and(|hi| {
                             hi.item_id == item.id
@@ -1010,8 +1070,14 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 }
                 let item_id = item.id;
                 let item_cb = item.clone();
-                if cropped_view && !state::has_post_adjustments(&item.layers) {
-                    let (fcx, fcy, fcw, fch) = crop_px(&item.edit, fw2, fh2);
+                if windowed_view && !state::has_post_adjustments(&item.layers) {
+                    // The worker derives the window from the recipe's crop, so a
+                    // temporary recipe with the view window renders it without
+                    // any worker change. The stored edit keeps its crop.
+                    let mut win_item = item.clone();
+                    win_item.edit.crop = img_win;
+                    let recipe = pworker::render_recipe(&win_item, src_id);
+                    let (fcx, fcy, fcw, fch) = rect_px(&img_win, fw2, fh2);
                     let win_target =
                         hi_target(need_w, need_h, fcw, fch, WINDOW_MAX_EDGE as u32);
                     let request = perf::Span::new("hi.request")
@@ -1049,7 +1115,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                             item_id,
                                             edit_fp,
                                             source_fp,
-                                            crop: crop_key(&item_cb.edit.crop),
+                                            crop: crop_key(&img_win),
                                             canvas,
                                             w: r.w as usize,
                                             h: r.h as usize,
@@ -1067,6 +1133,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     drop(request);
 
                 } else {
+                    let recipe = pworker::render_recipe(&item, src_id);
                     let request =
                         perf::Span::new("hi.request").detail(format!("{}x{}", req_w, req_h));
                     let hi_t0 = perf::now();
@@ -1145,12 +1212,16 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         // Overlay draws below use full-image preview pixel coords; map them
         // onto the canvas backing (sharp-frame scale and/or the crop offset).
         let ctx = web::ctx2d(&canvas);
-        let overlay_open = match (&sharp, cropped_view) {
-            (Some(Sharp::Window { w: win_w, cw }), _) => {
+        // Cosmetic sizes are authored in CSS px; the visible window may be a
+        // fraction of the preview, so they shrink with it to stay constant
+        // on screen at any zoom level.
+        let ui = overlay_ui(&canvas, w, view.window().w);
+        let overlay_open = match (&sharp, windowed_view) {
+            (Some(Sharp::Window { w: win_w, cw, cx, cy }), _) => {
                 ctx.save();
                 let s = *win_w as f64 / *cw as f64;
                 let _ = ctx.scale(s, s);
-                let _ = ctx.translate(-cx_p, -cy_p);
+                let _ = ctx.translate(-(*cx as f64), -(*cy as f64));
                 true
             }
             (Some(Sharp::Whole { w: hw }), true) => {
@@ -1178,7 +1249,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         if tab.get() == Tab::Layers && state.selected_tool.get() == Tool::Pen {
             if let Some(sel) = state.selected_layer.get() {
                 if let Some(layer) = item.layers.iter().find(|l| l.id == sel) {
-                    draw_path_edit_handles(&web::ctx2d(&canvas), layer, w as f64, h as f64);
+                    draw_path_edit_handles(&web::ctx2d(&canvas), layer, w as f64, h as f64, ui);
                 }
             }
         }
@@ -1233,7 +1304,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     BrushTarget::Global => {
                         let key = overlay_key(item.id as u64, 0, item.edit.selection_rev);
                         if let Some(sel) = &item.edit.selection {
-                            draw_selection_overlay(&ctx, sel, w as f64, h as f64, key);
+                            draw_selection_overlay(&ctx, sel, w as f64, h as f64, key, ui);
                         }
                         key
                     }
@@ -1261,10 +1332,11 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                         nx as f64 * w as f64,
                         ny as f64 * h as f64,
                         r,
+                        ui,
                         state.hi_built.get(),
                         state.viewport_gen.get(),
                     );
-                    draw_brush_outline(&ctx, nx, ny, r, w as f64, h as f64);
+                    draw_brush_outline(&ctx, nx, ny, r, w as f64, h as f64, ui);
                 } else {
                     clear_brush_ring_backup();
                 }
@@ -1279,11 +1351,11 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 }
                 if let Some(sel) = &item.edit.selection {
                     let key = overlay_key(item.id as u64, 0, item.edit.selection_rev);
-                    draw_selection_overlay(&ctx, sel, w as f64, h as f64, key);
+                    draw_selection_overlay(&ctx, sel, w as f64, h as f64, key, ui);
                 }
             }
             if let Some(drag) = select_drag.get() {
-                draw_select_drag(&ctx, &drag, w as f64, h as f64);
+                draw_select_drag(&ctx, &drag, w as f64, h as f64, ui);
             }
         }
 
@@ -1291,7 +1363,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         if tab.get() == Tab::Heal {
             let ctx = web::ctx2d(&canvas);
             let pts = heal_drag.get().map(|(_, pts)| pts);
-            draw_heal_overlay(&ctx, pts.as_deref(), state.heal_radius.get(), w as f64, h as f64);
+            draw_heal_overlay(&ctx, pts.as_deref(), state.heal_radius.get(), w as f64, h as f64, ui);
         }
 
         // Clone tab: stroke discs plus a crosshair at the active sample point.
@@ -1299,7 +1371,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             let ctx = web::ctx2d(&canvas);
             let r = state.clone_radius.get();
             let drag = clone_drag.get();
-            draw_heal_overlay(&ctx, drag.as_ref().map(|(_, pts)| pts.as_slice()), r, w as f64, h as f64);
+            draw_heal_overlay(&ctx, drag.as_ref().map(|(_, pts)| pts.as_slice()), r, w as f64, h as f64, ui);
             // Where the brush is currently sampling from: the source until an
             // aligned stroke fixes the offset, then source-follows-brush.
             let sample = match (drag.as_ref().map(|(_, pts)| pts), state.clone_source.get()) {
@@ -1312,13 +1384,14 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 _ => None,
             };
             if let Some((sx, sy)) = sample {
-                draw_crosshair(&ctx, sx * w as f32, sy * h as f32);
+                draw_crosshair(&ctx, sx * w as f32, sy * h as f32, ui);
             }
         }
 
         if overlay_open {
             ctx.restore();
         }
+        sync_canvas_rendering(&canvas);
             render_span.set_detail(format!("{}x{}", canvas.width(), canvas.height()));
         });
         PREVIEW_DIRTY.with(|d| d.set(true));
@@ -1382,7 +1455,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                             canvas_loupe_clear(state);
                             if tab.get() == Tab::Clone {
                                 if let Some(item) = state.current().filter(|m| m.kind == MediaKind::Photo) {
-                                    if let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) {
+                                    if let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop, state.view_zoom.get_untracked()) {
                                         if state.clone_pick.get() || ev.alt_key() {
                                             state.clone_source.set(Some((nx, ny)));
                                             state.clone_offset.set(None);
@@ -1396,7 +1469,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                             }
                             if tab.get() == Tab::Heal {
                                 if let Some(item) = state.current().filter(|m| m.kind == MediaKind::Photo) {
-                                    if let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) {
+                                    if let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop, state.view_zoom.get_untracked()) {
                                         heal_drag.set(Some((raster_target(state), vec![(nx, ny)])));
                                     }
                                 }
@@ -1404,7 +1477,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                             }
                             if tab.get() == Tab::Select {
                                 let Some(item) = state.current() else { return };
-                                let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) else { return; };
+                                let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop, state.view_zoom.get_untracked()) else { return; };
                                 match state.selected_select_tool.get() {
                                     SelectTool::Rect => {
                                         select_drag.set(Some(SelectDrag::Rect((nx, ny), (nx, ny))));
@@ -1435,7 +1508,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                             let Some(id) = state.selected_layer.get() else { return; };
                             let Some(item) = state.current() else { return; };
                             let Some(layer) = item.layers.iter().find(|l| l.id == id) else { return };
-                            let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) else { return };
+                            let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop, state.view_zoom.get_untracked()) else { return };
 
                             match state.selected_tool.get() {
                                 // Move, scale and rotate are owned by the
@@ -1443,7 +1516,9 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                 Tool::Select => {}
                                 Tool::Pen => {
                                     let LayerKind::Path(ref p) = layer.kind else { return };
-                                    if let Some((idx, handle)) = hit_test_path(&p.points, nx, ny) {
+                                    let tol = state.view_zoom.get_untracked().window().w
+                                        * item.edit.crop.w;
+                                    if let Some((idx, handle)) = hit_test_path(&p.points, nx, ny, tol) {
                                         if handle == PenHandle::Point && idx == 0 && p.points.len() >= 3 && !p.closed {
                                             state.update_current_item(|m| {
                                                 if let Some(l) = m.layers.iter_mut().find(|l| l.id == id) {
@@ -1487,24 +1562,27 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                             }
                         }
                         on:dblclick=move |ev: web_sys::MouseEvent| {
-                            if tab.get() != Tab::Layers || state.selected_tool.get() != Tool::Pen { return; }
-                            let Some(id) = state.selected_layer.get() else { return; };
-                            let Some(item) = state.current() else { return; };
-                            let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) else { return; };
-                            state.update_current_item(|m| {
-                                if let Some(l) = m.layers.iter_mut().find(|l| l.id == id) {
-                                    if let LayerKind::Path(p) = &mut l.kind {
-                                        if let Some((idx, PenHandle::Point)) = hit_test_path(&p.points, nx, ny) {
-                                            push_path_history(p);
-                                            p.points[idx].smooth = !p.points[idx].smooth;
-                                            if p.points[idx].smooth {
-                                                p.points[idx].in_x = -p.points[idx].out_x;
-                                                p.points[idx].in_y = -p.points[idx].out_y;
+                            if tab.get() == Tab::Layers && state.selected_tool.get() == Tool::Pen {
+                                let Some(id) = state.selected_layer.get() else { return; };
+                                let Some(item) = state.current() else { return; };
+                                let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop, state.view_zoom.get_untracked()) else { return; };
+                                let tol = state.view_zoom.get_untracked().window().w
+                                    * item.edit.crop.w;
+                                state.update_current_item(|m| {
+                                    if let Some(l) = m.layers.iter_mut().find(|l| l.id == id) {
+                                        if let LayerKind::Path(p) = &mut l.kind {
+                                            if let Some((idx, PenHandle::Point)) = hit_test_path(&p.points, nx, ny, tol) {
+                                                push_path_history(p);
+                                                p.points[idx].smooth = !p.points[idx].smooth;
+                                                if p.points[idx].smooth {
+                                                    p.points[idx].in_x = -p.points[idx].out_x;
+                                                    p.points[idx].in_y = -p.points[idx].out_y;
+                                                }
                                             }
                                         }
                                     }
-                                }
-                            });
+                                });
+                            }
                         }
                         on:pointermove=move |ev: web_sys::PointerEvent| {
                             canvas_loupe_move(state, tab, &ev);
@@ -1519,6 +1597,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                             <CropOverlay state=state working=working drag=crop_drag pinch=crop_pinch/>
                         </Show>
                         <LayerHandles state=state tab=tab drag=xform_drag/>
+                        <ZoomControls state=state tab=tab/>
                     </div>
                 }.into_view(),
             }}
@@ -1565,7 +1644,7 @@ pub(crate) fn SelectedTextOverlay(
     view! {
         {move || {
             let (id, t, opacity, crop) = maybe_layer()?;
-            let style = selected_text_overlay_style(&t, opacity, &crop);
+            let style = selected_text_overlay_style(&t, opacity, &crop, state.view_zoom.get());
             Some(view! {
                 <div
                     class="text-overlay selected"
@@ -1575,7 +1654,7 @@ pub(crate) fn SelectedTextOverlay(
                         ev.stop_propagation();
                         ev.prevent_default();
                         let Some(item) = state.current() else { return };
-                        let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop) else { return };
+                        let Some((nx, ny)) = layer_norm_pos(&ev, item.edit.crop, state.view_zoom.get_untracked()) else { return };
                         state.selected_layer.set(Some(id));
                         layer_drag.set(Some((id, nx, ny, t.x, t.y)));
                     }
@@ -1601,34 +1680,42 @@ fn box_geom(
     h_full: f32,
     angle: f32,
     crop: state::CropRect,
+    view: state::ViewZoom,
 ) -> Option<HandleGeom> {
     if crop.w <= 0.0 || crop.h <= 0.0 {
         return None;
     }
+    let win = view.window();
     Some(HandleGeom {
         id,
         class: "layer-box",
         style: format!(
             "left:{:.3}%;top:{:.3}%;width:{:.3}%;height:{:.3}%;\
              transform:translate(-50%,-50%) rotate({}deg);",
-            (cx - crop.x) / crop.w * 100.0,
-            (cy - crop.y) / crop.h * 100.0,
-            (w_full / crop.w * 100.0).max(0.5),
-            (h_full / crop.h * 100.0).max(0.5),
+            ((cx - crop.x) / crop.w - win.x) / win.w * 100.0,
+            ((cy - crop.y) / crop.h - win.y) / win.h * 100.0,
+            (w_full / crop.w / win.w * 100.0).max(0.5),
+            (h_full / crop.h / win.h * 100.0).max(0.5),
             angle
         ),
         text: None,
     })
 }
 
-fn handle_geom(kind: &state::LayerKind, m: &state::MediaItem, id: usize) -> Option<HandleGeom> {
+fn handle_geom(
+    kind: &state::LayerKind,
+    m: &state::MediaItem,
+    id: usize,
+    view: state::ViewZoom,
+) -> Option<HandleGeom> {
     let crop = m.edit.crop;
+    let win = view.window();
     match kind {
         state::LayerKind::Text(t) => {
             let (_, css_h) = canvas_css_size()?;
-            // Text size is a fraction of image height; the displayed crop
-            // height maps that to CSS px.
-            let font_px = t.font_size * css_h / crop.h.max(1e-3);
+            // Text size is a fraction of image height; the displayed image
+            // height (crop × view window) maps that to CSS px.
+            let font_px = t.font_size * css_h / (crop.h * win.h).max(1e-3);
             let (translate, origin) = match t.alignment {
                 state::TextAlign::Left => ("translate(0,-50%)", "0% 50%"),
                 state::TextAlign::Center => ("translate(-50%,-50%)", "50% 50%"),
@@ -1640,8 +1727,8 @@ fn handle_geom(kind: &state::LayerKind, m: &state::MediaItem, id: usize) -> Opti
                 style: format!(
                     "left:{:.3}%;top:{:.3}%;transform:{} rotate({}deg);transform-origin:{};\
                      font-size:{:.2}px;font-family:'{}',sans-serif;font-weight:{};",
-                    (t.x - crop.x) / crop.w * 100.0,
-                    (t.y - crop.y) / crop.h * 100.0,
+                    ((t.x - crop.x) / crop.w - win.x) / win.w * 100.0,
+                    ((t.y - crop.y) / crop.h - win.y) / win.h * 100.0,
                     translate,
                     t.angle,
                     origin,
@@ -1659,7 +1746,7 @@ fn handle_geom(kind: &state::LayerKind, m: &state::MediaItem, id: usize) -> Opti
             let (w, h) = working_dims(m.width, m.height, &m.edit);
             let dw = r.scale;
             let dh = r.scale * (w as f32 / h as f32) * (r.height as f32 / r.width as f32);
-            box_geom(id, r.x, r.y, dw, dh, r.angle, crop)
+            box_geom(id, r.x, r.y, dw, dh, r.angle, crop, view)
         }
         state::LayerKind::Path(p) => {
             let (x0, y0, x1, y1) = p.points_bbox()?;
@@ -1671,6 +1758,7 @@ fn handle_geom(kind: &state::LayerKind, m: &state::MediaItem, id: usize) -> Opti
                 (y1 - y0) * p.scale,
                 p.angle,
                 crop,
+                view,
             )
         }
         state::LayerKind::Brush(b) => {
@@ -1683,6 +1771,7 @@ fn handle_geom(kind: &state::LayerKind, m: &state::MediaItem, id: usize) -> Opti
                 (y1 - y0) * b.scale,
                 b.angle,
                 crop,
+                view,
             )
         }
         state::LayerKind::Adjust(_) => None,
@@ -1710,7 +1799,7 @@ pub(crate) fn LayerHandles(
         if !layer.visible || !layer.kind.has_transform() {
             return None;
         }
-        handle_geom(&layer.kind, &m, id)
+        handle_geom(&layer.kind, &m, id, state.view_zoom.get())
     };
     view! {
         {move || {

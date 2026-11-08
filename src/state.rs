@@ -38,6 +38,89 @@ impl TextAlign {
     }
 }
 
+/// Per-photo editing viewport. View-only: it never enters `EditParams`, the
+/// worker recipe, the session signature or an export.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ViewZoom {
+    /// 1.0 = Fit (the whole crop fills the canvas).
+    pub zoom: f32,
+    /// Centre of the visible window, crop-normalized.
+    pub center: (f32, f32),
+}
+
+pub const MAX_VIEW_ZOOM: f32 = 16.0;
+
+impl Default for ViewZoom {
+    fn default() -> Self {
+        ViewZoom { zoom: 1.0, center: (0.5, 0.5) }
+    }
+}
+
+impl ViewZoom {
+    pub fn zoomed(&self) -> bool {
+        self.zoom > 1.001
+    }
+
+    /// Visible window in crop-normalized coordinates. The canvas matches the
+    /// crop aspect, so one zoom factor covers both axes.
+    pub fn window(&self) -> CropRect {
+        let z = self.zoom.clamp(1.0, MAX_VIEW_ZOOM);
+        let w = 1.0 / z;
+        CropRect { x: self.center.0 - w * 0.5, y: self.center.1 - w * 0.5, w, h: w }
+    }
+
+    /// Visible window in full-image normalized coordinates.
+    pub fn image_window(&self, crop: CropRect) -> CropRect {
+        let win = self.window();
+        CropRect {
+            x: crop.x + win.x * crop.w,
+            y: crop.y + win.y * crop.h,
+            w: win.w * crop.w,
+            h: win.h * crop.h,
+        }
+    }
+
+    /// Set the zoom while keeping the crop-normalized `anchor` under the same
+    /// screen point (cursor-anchored wheel/pinch).
+    pub fn set_zoom_at(&mut self, zoom: f32, anchor: (f32, f32)) {
+        let new = zoom.clamp(1.0, MAX_VIEW_ZOOM);
+        let old = self.zoom.clamp(1.0, MAX_VIEW_ZOOM);
+        let k = old / new;
+        self.center = (
+            anchor.0 - (anchor.0 - self.center.0) * k,
+            anchor.1 - (anchor.1 - self.center.1) * k,
+        );
+        self.zoom = new;
+        self.clamp_center();
+    }
+
+    /// Zoom about the viewport centre (buttons and keyboard).
+    pub fn set_zoom(&mut self, zoom: f32) {
+        self.set_zoom_at(zoom, self.center);
+    }
+
+    /// Pan by a delta in crop-normalized units.
+    pub fn pan_by(&mut self, dx: f32, dy: f32) {
+        self.center.0 += dx;
+        self.center.1 += dy;
+        self.clamp_center();
+    }
+
+    pub fn clamp_center(&mut self) {
+        if self.zoom <= 1.0 {
+            self.center = (0.5, 0.5);
+            return;
+        }
+        let half = 0.5 / self.zoom.clamp(1.0, MAX_VIEW_ZOOM);
+        self.center.0 = self.center.0.clamp(half, 1.0 - half);
+        self.center.1 = self.center.1.clamp(half, 1.0 - half);
+    }
+
+    pub fn reset(&mut self) {
+        *self = ViewZoom::default();
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Tool {
     Select,
@@ -683,6 +766,9 @@ pub struct AppState {
     pub shown_src: RwSignal<Option<(usize, u64)>>,
     /// Bumped on window resize so the canvas backing can track display size.
     pub viewport_gen: RwSignal<u32>,
+    /// Editing viewport (Fit/zoom/pan). Ephemeral per photo; reset on a photo
+    /// switch, on entering Crop, and on reload.
+    pub view_zoom: RwSignal<ViewZoom>,
     pub drive_filter: RwSignal<DriveFilter>,
     pub drive_sort: RwSignal<DriveSort>,
     /// Grid tile size in px.
@@ -791,6 +877,7 @@ impl AppState {
             hi_built: create_rw_signal(0),
             shown_src: create_rw_signal(None),
             viewport_gen: create_rw_signal(0),
+            view_zoom: create_rw_signal(ViewZoom::default()),
             drive_filter: create_rw_signal(DriveFilter::All),
             drive_sort: create_rw_signal(DriveSort::DateDesc),
             drive_thumb_px: create_rw_signal(88),
@@ -855,5 +942,61 @@ impl AppState {
 
     pub fn current_layers(self) -> Vec<Layer> {
         self.current().map(|m| m.layers).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn point_under(center: (f32, f32), zoom: f32, anchor: (f32, f32)) -> (f32, f32) {
+        // The crop-normalized point under the screen point that showed `anchor`
+        // before the zoom change.
+        let w = 1.0 / zoom;
+        let u = (anchor.0 - center.0) / w + 0.5;
+        let v = (anchor.1 - center.1) / w + 0.5;
+        (center.0 + (u - 0.5) * w, center.1 + (v - 0.5) * w)
+    }
+
+    #[test]
+    fn zoom_keeps_the_anchor_under_the_same_screen_point() {
+        let mut v = ViewZoom::default();
+        let anchor = (0.72, 0.31);
+        v.set_zoom_at(4.0, anchor);
+        let (x, y) = point_under(v.center, v.zoom, anchor);
+        assert!((x - anchor.0).abs() < 1e-5, "x {x} != {}", anchor.0);
+        assert!((y - anchor.1).abs() < 1e-5, "y {y} != {}", anchor.1);
+    }
+
+    #[test]
+    fn pan_stops_at_the_crop_edges_and_fit_centres() {
+        let mut v = ViewZoom::default();
+        v.pan_by(0.4, -0.4);
+        assert_eq!(v.center, (0.5, 0.5), "fit cannot pan");
+        v.set_zoom(4.0);
+        v.pan_by(10.0, -10.0);
+        assert_eq!(v.center, (0.875, 0.125));
+        let win = v.window();
+        assert!(win.x >= 0.0 && win.y >= 0.0);
+        assert!(win.x + win.w <= 1.0 + 1e-6 && win.y + win.h <= 1.0 + 1e-6);
+    }
+
+    #[test]
+    fn image_window_maps_through_the_crop() {
+        let crop = CropRect { x: 0.2, y: 0.1, w: 0.5, h: 0.6 };
+        let v = ViewZoom { zoom: 2.0, center: (0.5, 0.5) };
+        let win = v.image_window(crop);
+        assert!((win.x - 0.325).abs() < 1e-6);
+        assert!((win.y - 0.25).abs() < 1e-6);
+        assert!((win.w - 0.25).abs() < 1e-6);
+        assert!((win.h - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reset_returns_to_fit() {
+        let mut v = ViewZoom { zoom: 8.0, center: (0.2, 0.8) };
+        v.reset();
+        assert_eq!(v, ViewZoom::default());
+        assert!(!v.zoomed());
     }
 }

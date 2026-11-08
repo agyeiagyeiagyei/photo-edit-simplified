@@ -7,10 +7,12 @@ mod canvas;
 mod layers;
 mod preview;
 mod tabs;
+mod zoom;
 pub(crate) use canvas::*;
 pub(crate) use layers::*;
 pub(crate) use preview::*;
 pub(crate) use tabs::*;
+pub(crate) use zoom::*;
 
 thread_local! {
     pub(crate) static FONTS_REQUESTED: Cell<bool> = const { Cell::new(false) };

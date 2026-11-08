@@ -922,6 +922,39 @@ button:disabled {
    Select tab's mask brush instead). */
 .toolbar.hidden { display: none; }
 .toolbar .dim { align-self: center; }
+
+/* View-only zoom: floats over the preview and never touches the edit. */
+.zoom-cluster {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.62);
+  backdrop-filter: blur(8px);
+  z-index: 12;
+  user-select: none;
+  touch-action: none;
+}
+.zoom-cluster button {
+  background: transparent;
+  border: none;
+  color: #fff;
+  font-size: 13px;
+  line-height: 1;
+  min-width: 28px;
+  padding: 7px 8px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-variant-numeric: tabular-nums;
+}
+.zoom-cluster button:hover { background: rgba(255, 255, 255, 0.12); }
+.zoom-cluster button:active { background: rgba(255, 255, 255, 0.22); }
+.zoom-cluster .zoom-pct { min-width: 56px; }
+.zoom-cluster .zoom-fit.active { color: var(--accent); }
 .mask-panel {
   border: 1px solid var(--border);
   border-radius: 10px;

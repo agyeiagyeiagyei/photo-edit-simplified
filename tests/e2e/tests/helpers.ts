@@ -143,6 +143,31 @@ export async function setRange(page: Page, labelRe: RegExp, value: number) {
   }, value);
 }
 
+/**
+ * Set a brush-size slider from a fraction of the image diagonal — the unit the
+ * pre-#46 sliders used. Since #46 the control is logarithmic and labelled in
+ * image pixels, so convert through the min/max/diagonal the slider exposes.
+ * Works for the selection brush (diameter) and heal/clone (radius) alike.
+ */
+export async function setBrushFrac(page: Page, labelRe: RegExp, frac: number) {
+  const label = page.locator('label').filter({ hasText: labelRe }).first();
+  const input = label.locator('input[type=range]').first();
+  await expect(input).toBeVisible();
+  const value = await input.evaluate((el: HTMLInputElement, frac) => {
+    const min = Number(el.dataset.minPx);
+    const max = Number(el.dataset.maxPx);
+    const diag = Number(el.dataset.diagPx);
+    const px = frac * Number(el.dataset.scale) * diag;
+    const t = Math.log(px / min) / Math.log(max / min);
+    return String(Math.round(Math.min(1, Math.max(0, t)) * 1000));
+  }, frac);
+  await input.evaluate((el: HTMLInputElement, v) => {
+    el.value = v;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  }, value);
+}
+
 export async function imageDims(page: Page, bytes: Buffer, mime: string) {
   return page.evaluate(async ({ b64, mime }) => {
     const bin = atob(b64); const u8 = new Uint8Array(bin.length);

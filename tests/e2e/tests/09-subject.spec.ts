@@ -1,6 +1,6 @@
 import { test, expect, Page } from '@playwright/test';
 import {
-  openApp, importFiles, canvas, recordMetrics, trackErrors, clickTab, setRange, JPEG_A, RING,
+  openApp, importFiles, canvas, recordMetrics, trackErrors, clickTab, setRange, setBrushFrac, JPEG_A, RING,
 } from './helpers';
 
 // Bars (approved scope, issue #3 comment 6681440642): encode <= 6 s,
@@ -258,7 +258,7 @@ test('subject refinement taps keep brush strokes', async ({ page }) => {
 
   // Carve a hard-edged hole through the subject with the selection brush.
   await page.locator('.select-tab .chip', { hasText: /^Brush$/ }).click();
-  await setRange(page, /^Size:/, 0.15);
+  await setBrushFrac(page, /^Size:/, 0.15);
   await setRange(page, /^Softness:/, 0);
   await page.locator('.select-tab .chip', { hasText: /^Remove$/ }).click();
   const b = await page.locator('.canvas-wrap').boundingBox();
@@ -350,7 +350,7 @@ test('undo after a refinement tap takes the stroke out and redo puts it back', a
   const tinted = await region(box);
 
   await chip('Brush').click();
-  await setRange(page, /^Size:/, 0.15);
+  await setBrushFrac(page, /^Size:/, 0.15);
   await setRange(page, /^Softness:/, 0);
   await chip('Remove').click();
   await stroke(0.5, 0.55, 0.66, 0.55);
@@ -392,7 +392,7 @@ test('a new subject selection after leaving Select does not bring old strokes ba
   const clean = await region(patch);
 
   await chip('Brush').click();
-  await setRange(page, /^Size:/, 0.08);
+  await setBrushFrac(page, /^Size:/, 0.08);
   await setRange(page, /^Softness:/, 0);
   await chip('Add').click();
   await stroke(0.1, 0.14, 0.2, 0.14);
