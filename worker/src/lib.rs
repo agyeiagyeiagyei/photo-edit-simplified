@@ -22,7 +22,7 @@ use wasm_bindgen::JsCast;
 use pes_pixel::geo::{
     crop_px, geometry, geometry_wide, hi_target, replay_strokes, stamp_stroke, working_dims,
 };
-use pes_pixel::pipeline::{self, Frame, Target};
+use pes_pixel::pipeline::{self, Frame, Place, Target};
 use pes_pixel::rawops;
 use pes_pixel::recipe::{edit_params_from_recipe, selection_from_json};
 use pes_pixel::types::{EditParams, Selection, SelectionKind};
@@ -322,7 +322,7 @@ pub fn loupe_window(
         if cw == 0 || ch == 0 || sx + cw > *fw || sy + ch > *fh {
             return Err(JsValue::from_str("loupe window out of bounds"));
         }
-        let margin = (edit.blur / 100.0 * 8.0 * 3.0).ceil() as usize + 2;
+        let margin = (Place::whole(*fw, *fh).blur_sigma(edit.blur) * 3.0).ceil() as usize + 2;
         let x0 = sx.saturating_sub(margin);
         let y0 = sy.saturating_sub(margin);
         let x1 = (sx + cw + margin).min(*fw);
@@ -332,7 +332,7 @@ pub fn loupe_window(
         let mut frame = Frame::new(win, ew, eh);
         let rebased =
             pipeline::rebase_layer_masks(&edit, *fw, *fh, (x0, y0, ew, eh), ew, eh);
-        pipeline::finish(&mut frame, &rebased, seed, None, 1.0);
+        pipeline::finish(&mut frame, &rebased, seed, None, 1.0, Place::window(*fw, *fh, (x0, y0, ew, eh), ew));
         let win = frame.pixels;
         let (ix, iy) = (sx - x0, sy - y0);
         let mut out = Vec::with_capacity(cw * ch * 4);
@@ -563,7 +563,7 @@ fn render_pipeline(
     } else {
         None
     };
-    pipeline::colour(&mut frame, edit, seed, mask.as_deref(), wide_buf);
+    pipeline::colour(&mut frame, edit, seed, mask.as_deref(), wide_buf, Place::whole(tw, th));
     let t2 = js_sys::Date::now();
     (frame.pixels, tw, th, [geometry_ms, resample_ms, t1 - t0, t2 - t1, hit])
 }
@@ -714,6 +714,7 @@ fn neutral_finish(
     tone: Option<&[u8; 256]>,
     mask: Option<&[u8]>,
     px_scale: f32,
+    place: Place,
 ) -> (Vec<u8>, f64, f64) {
     let t0 = js_sys::Date::now();
     rawops::develop_neutral_wide(buf, w, h, &edit.raw, white);
@@ -724,7 +725,7 @@ fn neutral_finish(
     rawops::detail_toned_wide(buf, w, h, &edit.raw, px_scale);
     let t1 = js_sys::Date::now();
     if edit.base_color_touched() {
-        color::apply_color_effects_wide(buf, w, h, edit, seed, mask);
+        color::apply_color_effects_wide(buf, w, h, edit, seed, mask, place);
     }
     pipeline::apply_adjust_layers_wide(buf, w, h, edit);
     let t2 = js_sys::Date::now();
@@ -783,7 +784,7 @@ fn neutral_render(
     let (out, dev_ms, col_ms) = NEUTRAL.with(|n| {
         let n = n.borrow();
         let src = n.get(&id).expect("neutral frame missing");
-        neutral_finish(&mut buf, tw, th, edit, seed, src.white, src.tone.as_ref(), mask.as_deref(), px_scale)
+        neutral_finish(&mut buf, tw, th, edit, seed, src.white, src.tone.as_ref(), mask.as_deref(), px_scale, Place::whole(tw, th))
     });
     (out, tw, th, [t[0], t[1], dev_ms, col_ms, t[2]])
 }
@@ -803,6 +804,7 @@ fn neutral_window_render(
     let (mut buf, tw, th, t) = wide_window_pipeline(id, fw, fh, edit, req_w, req_h, max_edge);
     let (ww, wh) = working_dims(fw, fh, edit);
     let (cx, cy, cw, ch) = crop_px(edit, ww, wh);
+    let place = Place::window(ww, wh, (cx, cy, cw, ch), tw);
     let rebased = pipeline::rebase_layer_masks(edit, ww, wh, (cx, cy, cw, ch), tw, th);
     let edit = &rebased;
     let px_scale = pipeline::px_scale_for(fw, fh, Target::new(ww, wh))
@@ -825,7 +827,7 @@ fn neutral_window_render(
     let (out, dev_ms, col_ms) = NEUTRAL.with(|n| {
         let n = n.borrow();
         let src = n.get(&id).expect("neutral frame missing");
-        neutral_finish(&mut buf, tw, th, edit, seed, src.white, src.tone.as_ref(), mask.as_deref(), px_scale)
+        neutral_finish(&mut buf, tw, th, edit, seed, src.white, src.tone.as_ref(), mask.as_deref(), px_scale, place)
     });
     (out, tw, th, [t[0], t[1], dev_ms, col_ms, t[2]])
 }
@@ -1043,7 +1045,7 @@ fn render_window_pipeline(
     } else {
         None
     };
-    pipeline::colour(&mut frame, edit, seed, mask.as_deref(), wide_buf);
+    pipeline::colour(&mut frame, edit, seed, mask.as_deref(), wide_buf, Place::window(ww, wh, (cx, cy, cw, ch), tw));
     let t4 = js_sys::Date::now();
     (frame.pixels, tw, th, [t1 - t0, t2 - t1, t3 - t2, t4 - t3, hit])
 }
@@ -1673,6 +1675,7 @@ fn export_pixels(
                 src.tone.as_ref(),
                 mask.as_deref(),
                 px_scale,
+                Place::window(ww, wh, (cx, cy, cw, ch), out_w),
             ))
         })?;
         return Ok((out, out_w, out_h));
@@ -1697,7 +1700,8 @@ fn export_pixels(
             * pipeline::px_scale_for(cw, ch, Target::new(ew, eh));
         let wide_buf = pipeline::develop(&mut frame, edit, px_scale);
         let mask = export_mask(edit, ww, wh, rect, frame.w, frame.h, sel_json, sel_mask);
-        pipeline::colour(&mut frame, edit, id, mask.as_deref(), wide_buf);
+        let place = Place::window(ww, wh, (cx, cy, cw, ch), frame.w);
+        pipeline::colour(&mut frame, edit, id, mask.as_deref(), wide_buf, place);
         Ok::<_, JsValue>((frame.pixels, frame.w, frame.h))
     })?
 }
