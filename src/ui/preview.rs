@@ -742,6 +742,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             && !cropped_view
             && gpu::eligible(&item.edit, &item.layers)
             && gpu::blur_fits(&item.edit, target.0 as u32, target.1 as u32)
+            && gpu::grain_fits(&item.edit, target.0 as u32, target.1 as u32)
             && gpu::active()
             && !(photo.raw && !item.edit.raw.is_identity() && !source_has_neutral(item.id, &photo));
         let mut gkey: Option<gpu::BaseKey> = None;
