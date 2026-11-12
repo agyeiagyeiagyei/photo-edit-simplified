@@ -1193,11 +1193,14 @@ pub(crate) fn pump_previews() {
                 if tracked {
                     CACHE.with(|c| {
                         if let Some(pd) = c.borrow_mut().photos.get_mut(&id) {
-                            let pd = Rc::make_mut(pd);
-                            pd.preview = preview;
-                            pd.gen += 1;
+                            Rc::make_mut(pd).preview = preview;
                         }
                     });
+                    // The preview is display-only; photo.gen means "destructively
+                    // healed" (session persistence bakes pixels on it). Bump the
+                    // derived caches that read the old preview pixels instead.
+                    crate::render::PREVIEW_GEO.with(|g| *g.borrow_mut() = None);
+                    crate::loupe::LOUPE_SRC.with(|s| *s.borrow_mut() = None);
                     state.items.update(|_| {});
                 }
             }
