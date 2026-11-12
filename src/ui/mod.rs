@@ -176,6 +176,25 @@ pub(crate) fn DropZone(state: AppState) -> impl IntoView {
 /// True when an item carries any visible edit: adjusted params, crop/rotate,
 /// trim, annotation layers, an unsaved destructive op, or a Drive copy that
 /// already has edits baked in.
+/// The filmstrip's × button. An item with edits asks first, since removing it
+/// drops the edits; an untouched one goes at once. Drive items are unstarred
+/// too (`remove_from_editor`).
+fn confirm_remove(state: AppState, id: usize) {
+    let ask = state.items.with(|v| {
+        v.iter().find(|m| m.id == id).map(|m| (item_edited(m), m.name.clone()))
+    });
+    let Some((edited, name)) = ask else { return };
+    if edited {
+        let msg = format!(
+            "Remove \u{201c}{name}\u{201d} from the editor?\n\nIts edits will be lost \u{2014} export first to keep them. The original file is not changed."
+        );
+        if !web::window().confirm_with_message(&msg).unwrap_or(false) {
+            return;
+        }
+    }
+    remove_from_editor(state, id);
+}
+
 pub(crate) fn item_edited(m: &MediaItem) -> bool {
     let dirty = get_photo(m.id).map(|p| p.dirty).unwrap_or(false);
     m.drive_baked
@@ -260,18 +279,20 @@ pub(crate) fn FilmStrip(state: AppState) -> impl IntoView {
                                     return None;
                                 }
                                 Some(view! {
-                                    <button
-                                        class="thumb-star"
-                                        title="Starred on Drive — click to unstar (removes it here)"
-                                        on:click=move |ev| {
-                                            ev.stop_propagation();
-                                            toggle_star(state, did.clone());
-                                        }
-                                    >
-                                        "★"
-                                    </button>
+                                    <span class="thumb-star" title="Starred on Drive">"★"</span>
                                 })
                             }}
+                            <button
+                                class="thumb-remove"
+                                title="Remove from the editor"
+                                aria-label=format!("Remove {} from the editor", m.name)
+                                on:click=move |ev| {
+                                    ev.stop_propagation();
+                                    confirm_remove(state, id);
+                                }
+                            >
+                                "×"
+                            </button>
                         </div>
                     }
                 }

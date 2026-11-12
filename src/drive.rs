@@ -23,6 +23,9 @@ pub fn configured() -> bool {
 }
 
 const FOLDER_KEY: &str = "pes-drive-folder";
+/// Drive file ids removed from the editor before this session's manifest
+/// loaded (signed out, or still loading): unstarred on the next load.
+const UNSTAR_KEY: &str = "pes-drive-unstar";
 
 // --- Types -------------------------------------------------------------------
 
@@ -73,6 +76,47 @@ pub fn save_folder(id: &str, name: &str) {
     if let Ok(Some(s)) = crate::web::window().local_storage() {
         let _ = s.set_item(FOLDER_KEY, &format!("{id}\t{name}"));
     }
+}
+
+/// Ids waiting to be unstarred on the next manifest load.
+pub fn pending_unstars() -> std::collections::HashSet<String> {
+    let Some(storage) = crate::web::window().local_storage().ok().flatten() else {
+        return Default::default();
+    };
+    storage
+        .get_item(UNSTAR_KEY)
+        .ok()
+        .flatten()
+        .map(|v| v.split('\n').filter(|s| !s.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+pub fn add_pending_unstar(id: &str) {
+    let mut ids = pending_unstars();
+    if ids.insert(id.to_string()) {
+        if let Ok(Some(s)) = crate::web::window().local_storage() {
+            let mut v: Vec<String> = ids.into_iter().collect();
+            v.sort();
+            let _ = s.set_item(UNSTAR_KEY, &v.join("\n"));
+        }
+    }
+}
+
+pub fn clear_pending_unstars() {
+    if let Ok(Some(s)) = crate::web::window().local_storage() {
+        let _ = s.remove_item(UNSTAR_KEY);
+    }
+}
+
+/// Drop `pending` ids from a star set; true when a star was actually removed,
+/// so the manifest has to be written back.
+pub fn apply_pending_unstars(
+    starred: &mut std::collections::HashSet<String>,
+    pending: &std::collections::HashSet<String>,
+) -> bool {
+    let before = starred.len();
+    starred.retain(|id| !pending.contains(id));
+    starred.len() != before
 }
 
 // --- JS shims ------------------------------------------------------------------
@@ -474,4 +518,29 @@ pub async fn upload_file(
     let resp = drive_fetch(&url, token, method, Some(&blob), Some(&ct)).await?;
     let json = JsFuture::from(resp.json()?).await?;
     js_str(&json, "id").ok_or_else(|| JsValue::from_str("upload returned no file id"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn set(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn pending_unstars_leave_the_rest_of_the_star_set() {
+        let mut starred = set(&["a", "b", "c"]);
+        assert!(apply_pending_unstars(&mut starred, &set(&["b", "zz"])));
+        assert_eq!(starred, set(&["a", "c"]));
+    }
+
+    #[test]
+    fn nothing_to_write_when_no_pending_id_was_starred() {
+        let mut starred = set(&["a"]);
+        assert!(!apply_pending_unstars(&mut starred, &set(&["x"])));
+        assert!(!apply_pending_unstars(&mut starred, &HashSet::new()));
+        assert_eq!(starred, set(&["a"]));
+    }
 }
