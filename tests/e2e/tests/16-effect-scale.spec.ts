@@ -9,9 +9,11 @@ import { openApp, importFiles, thumbs, clickTab, setRange, trackErrors, recordMe
 // at Blur 60 on a 1024 px canvas; grain 7x stronger on screen). Both are now
 // defined in image units, so the export downscaled to the preview's size has
 // the same detail as the preview.
-
-// A laptop-sized window at dpr 1 gives the smallest preview, the worst case.
-test.use({ viewport: { width: 1280, height: 800 }, deviceScaleFactor: 1 });
+//
+// Issue #51: grain then still point-sampled its lattice, so a large hi-dpi
+// preview (cells wider than its pixels) showed crisper, stronger grain than
+// the export box-averaged to it: 0.67 by this measure on the owner's ARW. Each
+// pixel now takes the area sample of the cells under it.
 
 /** Mean |Laplacian| of luma after drawing `src` at `w` px wide: how much fine
  *  detail survives at that size. Runs in the page. */
@@ -139,36 +141,53 @@ function exportDetail(png: Buffer, w: number) {
   return { detail: s / k, dims: [sw, sh] };
 }
 
-for (const fx of [
+const EFFECTS = [
   // Before #47 these ratios were 4.6 (Blur) and about 0.17 (Grain).
   { name: 'Blur', re: /^Blur/, value: 60, lo: 0.8, hi: 1.25 },
-  { name: 'Grain', re: /^Grain/, value: 50, lo: 0.75, hi: 1.33 },
-]) {
-  test(`${fx.name} looks the same in the preview and the full-size export (#47)`, async ({ page }, testInfo) => {
-    test.setTimeout(300_000);
-    const errors = trackErrors(page);
-    await openApp(page);
-    await importFiles(page, [JPEG_A]);
-    await expect(thumbs(page)).toHaveCount(1);
-    await settle(page);
-    const base = await previewDetail(page);
-    await clickTab(page, 'Color');
-    await setRange(page, fx.re, fx.value);
-    await settle(page);
-    const shown = await previewDetail(page);
-    const png = await exportPng(page);
-    const exported = exportDetail(png, shown.w);
-    expect(exported.dims).toEqual([6000, 4000]);
-    const ratio = exported.detail / shown.detail;
-    recordMetrics(testInfo, {
-      [`${fx.name.toLowerCase()}_preview_px`]: shown.w,
-      [`${fx.name.toLowerCase()}_detail_base`]: Math.round(base.detail * 1000) / 1000,
-      [`${fx.name.toLowerCase()}_detail_preview`]: Math.round(shown.detail * 1000) / 1000,
-      [`${fx.name.toLowerCase()}_detail_export`]: Math.round(exported.detail * 1000) / 1000,
-      [`${fx.name.toLowerCase()}_export_over_preview`]: Math.round(ratio * 1000) / 1000,
-    });
-    expect(ratio, `export/preview detail ${ratio.toFixed(3)} at ${shown.w} px`).toBeGreaterThanOrEqual(fx.lo);
-    expect(ratio, `export/preview detail ${ratio.toFixed(3)} at ${shown.w} px`).toBeLessThanOrEqual(fx.hi);
-    expect(errors).toEqual([]);
+  { name: 'Grain', re: /^Grain/, value: 50, lo: 0.88, hi: 1.14 },
+];
+
+const SCREENS = [
+  // A laptop-sized window at dpr 1 gives the smallest preview: grain cells
+  // smaller than its pixels, and the widest blur kernel relative to it.
+  { name: 'laptop', viewport: { width: 1280, height: 800 }, dpr: 1, effects: ['Blur', 'Grain'] },
+  // A large hi-dpi preview, about 2900 px: grain cells wider than its pixels.
+  // Point-sampled grain measured 0.67 here (#51).
+  { name: 'hi-dpi', viewport: { width: 1600, height: 1000 }, dpr: 2, effects: ['Grain'] },
+];
+
+for (const screen of SCREENS) {
+  test.describe(`${screen.name} screen`, () => {
+    test.use({ viewport: screen.viewport, deviceScaleFactor: screen.dpr });
+    for (const fx of EFFECTS.filter((e) => screen.effects.includes(e.name))) {
+      test(`${fx.name} looks the same in the preview and the full-size export (#47, #51)`, async ({ page }, testInfo) => {
+        test.setTimeout(300_000);
+        const errors = trackErrors(page);
+        await openApp(page);
+        await importFiles(page, [JPEG_A]);
+        await expect(thumbs(page)).toHaveCount(1);
+        await settle(page);
+        const base = await previewDetail(page);
+        await clickTab(page, 'Color');
+        await setRange(page, fx.re, fx.value);
+        await settle(page);
+        const shown = await previewDetail(page);
+        const png = await exportPng(page);
+        const exported = exportDetail(png, shown.w);
+        expect(exported.dims).toEqual([6000, 4000]);
+        const ratio = exported.detail / shown.detail;
+        const key = `${screen.name}_${fx.name.toLowerCase()}`;
+        recordMetrics(testInfo, {
+          [`${key}_preview_px`]: shown.w,
+          [`${key}_detail_base`]: Math.round(base.detail * 1000) / 1000,
+          [`${key}_detail_preview`]: Math.round(shown.detail * 1000) / 1000,
+          [`${key}_detail_export`]: Math.round(exported.detail * 1000) / 1000,
+          [`${key}_export_over_preview`]: Math.round(ratio * 1000) / 1000,
+        });
+        expect(ratio, `export/preview detail ${ratio.toFixed(3)} at ${shown.w} px`).toBeGreaterThanOrEqual(fx.lo);
+        expect(ratio, `export/preview detail ${ratio.toFixed(3)} at ${shown.w} px`).toBeLessThanOrEqual(fx.hi);
+        expect(errors).toEqual([]);
+      });
+    }
   });
 }

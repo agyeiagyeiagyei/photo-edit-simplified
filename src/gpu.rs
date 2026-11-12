@@ -202,6 +202,13 @@ pub fn blur_fits(edit: &EditParams, w: u32, h: u32) -> bool {
     Place::whole(w as usize, h as usize).blur_sigma(edit.blur) <= blur::DIRECT_MAX_SIGMA
 }
 
+/// Whether Grain at a `w` x `h` whole-frame render fits the shader's tap
+/// loop: a preview under 683 px has more lattice cells per pixel than it
+/// averages, so that renders on the CPU (#51).
+pub fn grain_fits(edit: &EditParams, w: u32, h: u32) -> bool {
+    edit.grain <= 0.0 || Place::whole(w as usize, h as usize).grain_fits_gpu()
+}
+
 pub fn render(edit: &EditParams, seed: u32) -> Option<(HtmlCanvasElement, u32, u32)> {
     let _span = perf::Span::new("gpu.render");
     let res = STATE.with(|s| -> Result<(HtmlCanvasElement, u32, u32), String> {
@@ -379,6 +386,49 @@ float grain_at(uint idx, uint c) {
     return (punit(key) * 2.0 - 1.0) * spread;
 }
 
+// Grain footprint of whole-frame pixel x along one axis (pixel/src/place.rs
+// grain_axis): the interval x*2048/long plus a quarter cell (GRAIN_PHASE) to
+// (x+1)*2048/long plus a quarter, over the cells it touches, weighted by
+// overlap and scaled so the squares sum to one. Place::grain_fits_gpu keeps
+// the count within GTAPS.
+const int GTAPS = 4;
+int gspan(int x, out int c0, out float w[GTAPS]) {
+    int den = 4 * u_glong;
+    float a = float(x * 8192 + u_glong) / float(den);
+    float b = float((x + 1) * 8192 + u_glong) / float(den);
+    c0 = (x * 8192 + u_glong) / den;
+    int n = min(((x + 1) * 8192 + u_glong + den - 1) / den - c0, GTAPS);
+    float q = 0.0;
+    for (int k = 0; k < GTAPS; k++) {
+        float c = float(c0 + k);
+        w[k] = k < n ? min(b, c + 1.0) - max(a, c) : 0.0;
+        q += w[k] * w[k];
+    }
+    float r = inversesqrt(q);
+    for (int k = 0; k < GTAPS; k++) w[k] *= r;
+    return n;
+}
+
+vec3 grain(int x, int y) {
+    if (u_grain <= 0.0) return vec3(0.0);
+    int cx;
+    int cy;
+    float wx[GTAPS];
+    float wy[GTAPS];
+    int nx = gspan(x, cx, wx);
+    int ny = gspan(y, cy, wy);
+    vec3 g = vec3(0.0);
+    for (int j = 0; j < GTAPS; j++) {
+        if (j >= ny) break;
+        for (int i = 0; i < GTAPS; i++) {
+            if (i >= nx) break;
+            uint idx = uint(cy + j) * 4096u + uint(cx + i);
+            g += (wx[i] * wy[j]) * vec3(grain_at(idx, 0u), grain_at(idx, 1u), grain_at(idx, 2u));
+        }
+    }
+    return g;
+}
+
 vec3 sample_u8(sampler2D tex, vec2 uv) {
     return floor(texture(tex, uv).rgb * 255.0 + 0.5);
 }
@@ -423,13 +473,9 @@ void main() {
     }
 
     vec3 v = adjust(lut3(t));
-    // Grain lattice cell under this pixel (pixel/src/place.rs): integer
-    // ((2x+1)*1024)/long, which the CPU's f64 formula reproduces exactly.
-    int gy = int(u_size.y) - 1 - p.y;
-    uint ci = uint(((2 * p.x + 1) * 1024) / u_glong);
-    uint cj = uint(((2 * gy + 1) * 1024) / u_glong);
-    uint idx = cj * 4096u + ci;
-    vec3 g = vec3(grain_at(idx, 0u), grain_at(idx, 1u), grain_at(idx, 2u));
+    // Grain: the area sample of the image-space lattice under this pixel
+    // (pixel/src/noise.rs grain_rows). Canvas row 0 is the CPU's last row.
+    vec3 g = grain(p.x, int(u_size.y) - 1 - p.y);
     vec3 outv = floor(clamp(v + g, 0.0, 255.0) + 0.5);
     o_col = vec4(outv / 255.0, 1.0);
 }
