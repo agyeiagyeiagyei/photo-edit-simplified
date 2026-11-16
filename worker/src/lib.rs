@@ -62,6 +62,12 @@ thread_local! {
     /// 16-bit counterparts of the two caches above, for the neutral path.
     static WIDE_BASE_CACHE: RefCell<Option<WideBaseCache>> = const { RefCell::new(None) };
     static WIDE_WINDOW_CACHE: RefCell<Option<WideWindowCache>> = const { RefCell::new(None) };
+    /// Developed (develop, camera tone, Smart denoise, sharpening) 16-bit
+    /// pixels of the last preview render, neutral or legacy, keyed by its
+    /// base and every RAW develop field. Colour, brush and layer edits leave
+    /// the develop alone, so they start from this instead of denoising again
+    /// (#53). Cleared with the caches above.
+    static DEVELOPED_CACHE: RefCell<Option<DevelopedCache>> = const { RefCell::new(None) };
     /// Raster masks for adjustment layers, keyed by (item, layer id). The app
     /// sends one per mask version; render recipes carry a versioned reference
     /// so a slider drag never re-ships the bytes. A miss disables the layer.
@@ -143,11 +149,63 @@ struct WideWindowCache {
     pixels: Vec<u16>,
 }
 
+/// What a preview's develop stage depends on: the base pixels (item,
+/// geometry, retouch strokes, crop window, size), which path made them, the
+/// neutral frame's white level and tone curve, every RAW field, and the
+/// sensor scale Smart denoise works at.
+#[derive(Clone, PartialEq)]
+struct DevelopedKey {
+    id: u32,
+    legacy: bool,
+    rot90: u8,
+    fine_bits: u32,
+    strokes_fp: u64,
+    crop: Option<(usize, usize, usize, usize)>,
+    tw: usize,
+    th: usize,
+    raw: [u32; 8],
+    white: u32,
+    tone: bool,
+    px_scale: u32,
+}
+
+impl DevelopedKey {
+    #[allow(clippy::too_many_arguments)]
+    fn new(id: u32, edit: &EditParams, crop: Option<(usize, usize, usize, usize)>, tw: usize, th: usize, white: f32, tone: bool, px_scale: f32) -> Self {
+        let r = &edit.raw;
+        DevelopedKey {
+            id,
+            legacy: false,
+            rot90: edit.rot90,
+            fine_bits: edit.fine_angle.to_bits(),
+            strokes_fp: strokes_fingerprint(edit),
+            crop,
+            tw,
+            th,
+            raw: [r.temp, r.tint, r.exposure, r.highlights, r.shadows, r.noise, r.denoise, r.sharpen].map(f32::to_bits),
+            white: white.to_bits(),
+            tone,
+            px_scale: px_scale.to_bits(),
+        }
+    }
+
+    /// A key for the legacy u8 path, which has no neutral white or tone.
+    fn legacy(id: u32, edit: &EditParams, crop: Option<(usize, usize, usize, usize)>, tw: usize, th: usize, px_scale: f32) -> Self {
+        DevelopedKey { legacy: true, ..DevelopedKey::new(id, edit, crop, tw, th, 0.0, false, px_scale) }
+    }
+}
+
+struct DevelopedCache {
+    key: DevelopedKey,
+    pixels: Vec<u16>,
+}
+
 fn clear_render_caches() {
     BASE_CACHE.with(|c| *c.borrow_mut() = None);
     WINDOW_CACHE.with(|c| *c.borrow_mut() = None);
     WIDE_BASE_CACHE.with(|c| *c.borrow_mut() = None);
     WIDE_WINDOW_CACHE.with(|c| *c.borrow_mut() = None);
+    DEVELOPED_CACHE.with(|c| *c.borrow_mut() = None);
 }
 
 fn drop_neutral(id: u32) {
@@ -223,6 +281,7 @@ pub fn load_neutral(id: u32, pixels: Uint16Array, w: u32, h: u32, white: f32, to
     };
     WIDE_BASE_CACHE.with(|c| *c.borrow_mut() = None);
     WIDE_WINDOW_CACHE.with(|c| *c.borrow_mut() = None);
+    DEVELOPED_CACHE.with(|c| *c.borrow_mut() = None);
     NEUTRAL.with(|n| {
         n.borrow_mut().insert(
             id,
@@ -534,6 +593,28 @@ fn base_pipeline(
     (buf, tw, th, t1 - t0, t2 - t1, hit)
 }
 
+/// [`pipeline::develop`] for a legacy preview, through [`DEVELOPED_CACHE`]:
+/// a retouched RAW's develop and Smart denoise run once per base and RAW
+/// setting, not again on every colour or brush edit.
+fn develop_cached(frame: &mut Frame, edit: &EditParams, px_scale: f32, key: DevelopedKey) -> Option<Vec<u16>> {
+    if edit.raw.is_identity() {
+        return None;
+    }
+    let len = frame.pixels.len();
+    let hit = DEVELOPED_CACHE.with(|c| {
+        c.borrow()
+            .as_ref()
+            .filter(|d| d.key == key && d.pixels.len() == len)
+            .map(|d| d.pixels.clone())
+    });
+    if hit.is_some() {
+        return hit;
+    }
+    let wide = pipeline::develop(frame, edit, px_scale)?;
+    DEVELOPED_CACHE.with(|c| *c.borrow_mut() = Some(DevelopedCache { key, pixels: wide.clone() }));
+    Some(wide)
+}
+
 /// Parametric pipeline (geometry → resample → color ops), mirroring the app's
 /// render_hi. Selection comes as JSON + optional mask buffer.
 fn render_pipeline(
@@ -554,7 +635,8 @@ fn render_pipeline(
     let mut frame = Frame::new(buf, tw, th);
     let t0 = js_sys::Date::now();
     let px_scale = pipeline::px_scale_for(fw, fh, Target::new(tw, th));
-    let wide_buf = pipeline::develop(&mut frame, edit, px_scale);
+    let key = DevelopedKey::legacy(id, edit, None, tw, th, px_scale);
+    let wide_buf = develop_cached(&mut frame, edit, px_scale, key);
     let t1 = js_sys::Date::now();
     let mask = if edit.is_color_touched() {
         sel_json
@@ -704,6 +786,9 @@ fn wide_window_pipeline(
 
 /// Develop, camera tone and colour on a neutral frame, then the single 8-bit
 /// quantisation. Returns the u8 pixels and (develop+tone, colour) timings.
+/// With a `cache` key (preview renders), the developed pixels are kept, and a
+/// render whose develop inputs match starts from them.
+#[allow(clippy::too_many_arguments)]
 fn neutral_finish(
     buf: &mut [u16],
     w: usize,
@@ -715,14 +800,32 @@ fn neutral_finish(
     mask: Option<&[u8]>,
     px_scale: f32,
     place: Place,
+    cache: Option<DevelopedKey>,
 ) -> (Vec<u8>, f64, f64) {
     let t0 = js_sys::Date::now();
-    rawops::develop_neutral_wide(buf, w, h, &edit.raw, white);
-    if let Some(lut) = tone {
-        let table = rawops::tone_table_for(lut, edit.raw.highlights);
-        rawops::apply_tone_wide(buf, &table);
+    let hit = cache.as_ref().is_some_and(|k| {
+        DEVELOPED_CACHE.with(|c| {
+            let c = c.borrow();
+            match c.as_ref() {
+                Some(d) if &d.key == k && d.pixels.len() == buf.len() => {
+                    buf.copy_from_slice(&d.pixels);
+                    true
+                }
+                _ => false,
+            }
+        })
+    });
+    if !hit {
+        rawops::develop_neutral_wide(buf, w, h, &edit.raw, white);
+        if let Some(lut) = tone {
+            let table = rawops::tone_table_for(lut, edit.raw.highlights);
+            rawops::apply_tone_wide(buf, &table);
+        }
+        rawops::detail_toned_wide(buf, w, h, &edit.raw, px_scale);
+        if let Some(key) = cache {
+            DEVELOPED_CACHE.with(|c| *c.borrow_mut() = Some(DevelopedCache { key, pixels: buf.to_vec() }));
+        }
     }
-    rawops::detail_toned_wide(buf, w, h, &edit.raw, px_scale);
     let t1 = js_sys::Date::now();
     if edit.base_color_touched() {
         color::apply_color_effects_wide(buf, w, h, edit, seed, mask, place);
@@ -784,7 +887,8 @@ fn neutral_render(
     let (out, dev_ms, col_ms) = NEUTRAL.with(|n| {
         let n = n.borrow();
         let src = n.get(&id).expect("neutral frame missing");
-        neutral_finish(&mut buf, tw, th, edit, seed, src.white, src.tone.as_ref(), mask.as_deref(), px_scale, Place::whole(tw, th))
+        let key = DevelopedKey::new(id, edit, None, tw, th, src.white, src.tone.is_some(), px_scale);
+        neutral_finish(&mut buf, tw, th, edit, seed, src.white, src.tone.as_ref(), mask.as_deref(), px_scale, Place::whole(tw, th), Some(key))
     });
     (out, tw, th, [t[0], t[1], dev_ms, col_ms, t[2]])
 }
@@ -827,7 +931,8 @@ fn neutral_window_render(
     let (out, dev_ms, col_ms) = NEUTRAL.with(|n| {
         let n = n.borrow();
         let src = n.get(&id).expect("neutral frame missing");
-        neutral_finish(&mut buf, tw, th, edit, seed, src.white, src.tone.as_ref(), mask.as_deref(), px_scale, place)
+        let key = DevelopedKey::new(id, edit, Some((cx, cy, cw, ch)), tw, th, src.white, src.tone.is_some(), px_scale);
+        neutral_finish(&mut buf, tw, th, edit, seed, src.white, src.tone.as_ref(), mask.as_deref(), px_scale, place, Some(key))
     });
     (out, tw, th, [t[0], t[1], dev_ms, col_ms, t[2]])
 }
@@ -1024,7 +1129,8 @@ fn render_window_pipeline(
     let mut frame = Frame::new(buf, tw, th);
     let px_scale = pipeline::px_scale_for(fw, fh, Target::new(ww, wh))
         * pipeline::px_scale_for(cw, ch, Target::new(tw, th));
-    let wide_buf = pipeline::develop(&mut frame, edit, px_scale);
+    let key = DevelopedKey::legacy(id, edit, Some((cx, cy, cw, ch)), tw, th, px_scale);
+    let wide_buf = develop_cached(&mut frame, edit, px_scale, key);
     let t3 = js_sys::Date::now();
     let hit = if cached { 1.0 } else { 0.0 };
     let mask = if edit.base_color_touched() {
@@ -1676,6 +1782,8 @@ fn export_pixels(
                 mask.as_deref(),
                 px_scale,
                 Place::window(ww, wh, (cx, cy, cw, ch), out_w),
+                // A one-off full-size export: not worth holding its pixels.
+                None,
             ))
         })?;
         return Ok((out, out_w, out_h));
