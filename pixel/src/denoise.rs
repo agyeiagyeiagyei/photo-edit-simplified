@@ -118,9 +118,9 @@ fn sep_filter(src: &[f32], dst: &mut [f32], tmp: &mut [f32], w: usize, h: usize,
                 }
             }
         }
-        let slow: Box<dyn Iterator<Item = usize>> =
-            if w > 2 * reach { Box::new((0..reach).chain(w - reach..w)) } else { Box::new(0..w) };
-        for x in slow {
+        // The edge columns (or every column of a narrow plane) reflect.
+        let (a, b) = if w > 2 * reach { (reach, w - reach) } else { (w, w) };
+        for x in (0..a).chain(b..w) {
             let mut s = 0.0;
             for (i, &kv) in k.iter().enumerate() {
                 s += kv * row[refl(x as isize + (i as isize - r as isize) * d as isize, w as isize)];
@@ -194,34 +194,68 @@ fn energy(b: &[f32], out: &mut [f32], sq: &mut [f32], tmp: &mut [f32], w: usize,
     }
 }
 
+/// The `k`-th smallest value of `v`, reordering it: a three-way quickselect,
+/// so the worker carries no standard-library sort for two small selections.
+fn kth_smallest(v: &mut [f32], k: usize) -> f32 {
+    let (mut lo, mut hi) = (0, v.len());
+    loop {
+        if hi - lo <= 1 {
+            return v[lo];
+        }
+        let (a, b, c) = (v[lo], v[lo + (hi - lo) / 2], v[hi - 1]);
+        let p = a.min(b).max(a.max(b).min(c));
+        // v[lo..lt] < p, v[lt..gt] == p, v[gt..hi] > p.
+        let (mut lt, mut i, mut gt) = (lo, lo, hi);
+        while i < gt {
+            if v[i] < p {
+                v.swap(lt, i);
+                lt += 1;
+                i += 1;
+            } else if v[i] > p {
+                gt -= 1;
+                v.swap(i, gt);
+            } else {
+                i += 1;
+            }
+        }
+        if k < lt {
+            hi = lt;
+        } else if k >= gt {
+            lo = gt;
+        } else {
+            return p;
+        }
+    }
+}
+
 /// Noise deviation per band and channel, from the flattest blocks.
 fn estimate_noise(buf: &[u16], w: usize, h: usize, levels: usize) -> Vec<[f32; 3]> {
     let (bw, bh) = (w / BLOCK, h / BLOCK);
     // Flatness: variance of 4x4 means within the block (noise averaged down,
     // structure kept). Near-black and near-white blocks hide the noise.
     let mut blocks: Vec<(f32, usize, usize)> = Vec::new();
+    const CELLS: usize = BLOCK / 4;
     for by in 0..bh {
         for bx in 0..bw {
-            let (mut s, mut s2, mut n) = (0f64, 0f64, 0f64);
-            for cy in 0..BLOCK / 4 {
-                for cx in 0..BLOCK / 4 {
-                    let mut m = 0f64;
-                    for yy in 0..4 {
-                        let row = (by * BLOCK + cy * 4 + yy) * w + bx * BLOCK + cx * 4;
-                        for xx in 0..4 {
-                            let p = &buf[(row + xx) * 4..(row + xx) * 4 + 3];
-                            m += 0.299 * p[0] as f64 + 0.587 * p[1] as f64 + 0.114 * p[2] as f64;
-                        }
-                    }
-                    m /= 16.0 * 257.0;
-                    s += m;
-                    s2 += m * m;
-                    n += 1.0;
+            // Sums of the 4x4 cells, one block row at a time.
+            let mut cell = [0f32; CELLS * CELLS];
+            for yy in 0..BLOCK {
+                let start = ((by * BLOCK + yy) * w + bx * BLOCK) * 4;
+                let sums = &mut cell[yy / 4 * CELLS..(yy / 4 + 1) * CELLS];
+                for (xx, p) in buf[start..start + BLOCK * 4].chunks_exact(4).enumerate() {
+                    sums[xx / 4] += 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32;
                 }
             }
+            let (mut s, mut s2) = (0f32, 0f32);
+            for &c in &cell {
+                let m = c / (16.0 * 257.0);
+                s += m;
+                s2 += m * m;
+            }
+            let n = (CELLS * CELLS) as f32;
             let mean = s / n;
             if (12.0..=243.0).contains(&mean) {
-                blocks.push(((s2 / n - mean * mean) as f32, bx, by));
+                blocks.push((s2 / n - mean * mean, bx, by));
             }
         }
     }
@@ -229,8 +263,18 @@ fn estimate_noise(buf: &[u16], w: usize, h: usize, levels: usize) -> Vec<[f32; 3
     if blocks.is_empty() {
         return sig;
     }
-    blocks.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // The flattest share, kept in scan order so the sample spreads over the
+    // frame: everything below the share's threshold, then ties up to it.
     let flat = ((blocks.len() as f32 * FLAT_SHARE).ceil() as usize).clamp(1, blocks.len());
+    let thr = kth_smallest(&mut blocks.iter().map(|b| b.0).collect::<Vec<_>>(), flat - 1);
+    let mut ties = flat - blocks.iter().filter(|b| b.0 < thr).count();
+    blocks.retain(|b| {
+        b.0 < thr
+            || (b.0 == thr && ties > 0 && {
+                ties -= 1;
+                true
+            })
+    });
     let take = flat.min(MAX_SAMPLE_BLOCKS);
     let a = apron(levels);
     let mut coef: Vec<[Vec<f32>; 3]> = (0..levels).map(|_| [Vec::new(), Vec::new(), Vec::new()]).collect();
@@ -256,8 +300,7 @@ fn estimate_noise(buf: &[u16], w: usize, h: usize, levels: usize) -> Vec<[f32; 3
         for ch in 0..3 {
             let v = &mut per[ch];
             let mid = v.len() / 2;
-            let (_, m, _) = v.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
-            let measured = 1.4826 * *m;
+            let measured = 1.4826 * kth_smallest(v, mid);
             // A coarse band of a flat block still sees edges up to its support
             // away, so its MAD overstates the noise. Sensor noise falls about
             // 0.5-0.6x per band (measured on an ISO 3200 ARW); cap each band at
@@ -450,6 +493,20 @@ mod tests {
     }
 
     const GREY: fn(usize, usize) -> [f32; 3] = |_, _| [120.0, 130.0, 125.0];
+
+    #[test]
+    fn kth_smallest_matches_a_sort() {
+        let mut rng = Rng(7);
+        for n in [1usize, 2, 3, 10, 101, 1000] {
+            // A third of the values tie, as zero coefficients do.
+            let v: Vec<f32> = (0..n).map(|i| if i % 3 == 0 { 1.0 } else { rng.normal() }).collect();
+            let mut sorted = v.clone();
+            sorted.sort_by(f32::total_cmp);
+            for k in [0, n / 3, n / 2, n - 1] {
+                assert_eq!(kth_smallest(&mut v.clone(), k), sorted[k], "n {n}, k {k}");
+            }
+        }
+    }
 
     #[test]
     fn zero_strength_is_a_noop() {
