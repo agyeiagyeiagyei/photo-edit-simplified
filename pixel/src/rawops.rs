@@ -289,13 +289,16 @@ pub fn develop_wide(buf: &mut [u16], w: usize, h: usize, adj: &RawAdjust, px_sca
 /// filter leaves alone keep their full precision (no 8-bit banding is
 /// introduced into gradients the 16-bit pipeline carries).
 /// Starting Smart denoise for a newly imported RAW shot at `iso`, so a
-/// high-ISO file opens with its noise handled (owner decision on #15). Anchors
-/// on the slider's 0..100 scale: ISO <= 800 -> 0, 1600 -> 15, 3200 -> 25,
-/// 6400 -> 35, >= 12800 -> 50. Between anchors it is linear in stops, rounded
-/// to a whole slider step: ISO 1250 -> 10, ISO 1000 -> 5.
+/// high-ISO file opens with its noise handled (owner decision on #15). Smart
+/// denoise measures the photo's own noise (#53), so a slider value is a share
+/// of that noise whatever the ISO; the ISO says how much of it to take by
+/// default, rising with how visible the noise is. Anchors on the slider's
+/// 0..100 scale: ISO <= 400 -> 0, 800 -> 20 (colour noise fully cleaned from
+/// 20 up), 1600 -> 30, 3200 -> 40, 6400 -> 50, >= 12800 -> 60. Between anchors
+/// it is linear in stops, rounded to a whole slider step: ISO 1250 -> 26.
 pub fn denoise_start_for_iso(iso: u32) -> f32 {
-    const ANCHORS: [(f32, f32); 5] =
-        [(800.0, 0.0), (1600.0, 15.0), (3200.0, 25.0), (6400.0, 35.0), (12800.0, 50.0)];
+    const ANCHORS: [(f32, f32); 6] =
+        [(400.0, 0.0), (800.0, 20.0), (1600.0, 30.0), (3200.0, 40.0), (6400.0, 50.0), (12800.0, 60.0)];
     let iso = iso as f32;
     if iso <= ANCHORS[0].0 {
         return 0.0;
@@ -529,8 +532,8 @@ mod tests {
     #[test]
     fn denoise_start_follows_the_iso_table() {
         for (iso, want) in [
-            (100, 0.0), (800, 0.0), (1000, 5.0), (1250, 10.0), (1600, 15.0),
-            (2500, 21.0), (3200, 25.0), (6400, 35.0), (12800, 50.0), (51200, 50.0),
+            (100, 0.0), (400, 0.0), (640, 14.0), (800, 20.0), (1250, 26.0), (1600, 30.0),
+            (2500, 36.0), (3200, 40.0), (6400, 50.0), (12800, 60.0), (51200, 60.0),
         ] {
             assert_eq!(super::denoise_start_for_iso(iso), want, "ISO {iso}");
         }
