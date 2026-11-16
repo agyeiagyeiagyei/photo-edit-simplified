@@ -1964,7 +1964,8 @@ fn follow_geometry(
         Some(a) if a.stamp == stamp && same_selection(&a.out, cur) => (a.src, a.geo),
         _ => (cur.clone(), (old.rot90, old.fine_angle)),
     };
-    let from = EditParams { rot90: geo.0, fine_angle: geo.1, ..EditParams::default() };
+    let mut from = new.clone();
+    (from.rot90, from.fine_angle) = geo;
     let out = pes_pixel::geo::remap_selection(&src, fw, fh, &from, new);
     Anchored { src, geo, out, stamp: 0 }
 }
@@ -1975,13 +1976,15 @@ fn follow_geometry(
 /// place on the canvas, as before.
 pub(crate) fn set_photo_geometry(state: AppState, f: impl FnOnce(&mut EditParams)) {
     let Some(item) = state.current() else { return };
-    let old = item.edit.clone();
-    let mut new = old.clone();
+    let mut new = item.edit.clone();
     f(&mut new);
-    if pes_pixel::geo::same_geometry(&old, &new) {
-        state.update_current(|e| *e = new);
-        return;
-    }
+    // One copy of the body below, not one per caller's closure.
+    apply_photo_geometry(state, item, new);
+}
+
+fn apply_photo_geometry(state: AppState, item: MediaItem, new: EditParams) {
+    let old = &item.edit;
+    let turned = !pes_pixel::geo::same_geometry(old, &new);
     let dims = get_photo(item.id)
         .map(|p| if p.full_dims.0 > 0 { p.full_dims } else { (p.preview.1, p.preview.2) })
         .filter(|d| d.0 > 0 && d.1 > 0);
@@ -1991,6 +1994,9 @@ pub(crate) fn set_photo_geometry(state: AppState, f: impl FnOnce(&mut EditParams
         .unwrap_or(GeoAnchor { item_id: item.id, selection: None, layers: Vec::new() });
     state.update_current_item(|m| {
         m.edit = new;
+        if !turned {
+            return;
+        }
         let Some(dims) = dims else {
             // No pixels to measure the frame by (a video): drop a selection
             // rather than leave it on the wrong place.
@@ -2001,7 +2007,7 @@ pub(crate) fn set_photo_geometry(state: AppState, f: impl FnOnce(&mut EditParams
         };
         let prev = anchor.selection.take();
         if let Some(cur) = m.edit.selection.take() {
-            let mut a = follow_geometry(prev, &cur, m.edit.selection_rev, dims, &old, &m.edit);
+            let mut a = follow_geometry(prev, &cur, m.edit.selection_rev, dims, old, &m.edit);
             m.edit.selection_rev += 1;
             a.stamp = m.edit.selection_rev;
             m.edit.selection = Some(a.out.clone());
@@ -2011,7 +2017,7 @@ pub(crate) fn set_photo_geometry(state: AppState, f: impl FnOnce(&mut EditParams
         for l in &mut m.layers {
             let (LayerKind::Adjust(_), Some(cur)) = (&l.kind, &l.mask) else { continue };
             let prev = prev_layers.iter().position(|(id, _)| *id == l.id).map(|i| prev_layers.swap_remove(i).1);
-            let mut a = follow_geometry(prev, cur, l.mask_version, dims, &old, &m.edit);
+            let mut a = follow_geometry(prev, cur, l.mask_version, dims, old, &m.edit);
             l.mask_version += 1;
             a.stamp = l.mask_version;
             l.mask = Some(a.out.clone());
@@ -2019,6 +2025,9 @@ pub(crate) fn set_photo_geometry(state: AppState, f: impl FnOnce(&mut EditParams
         }
     });
     GEO_ANCHOR.with(|a| *a.borrow_mut() = Some(anchor));
+    if !turned {
+        return;
+    }
     // Brush undo steps and subject refinements were taken in the old frame.
     state.brush_history.update(|h| {
         h.undo.retain(|s| s.item_id != item.id);
