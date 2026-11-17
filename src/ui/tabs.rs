@@ -409,11 +409,11 @@ fn PhotoRotateControls(state: AppState) -> impl IntoView {
     let fine = move || state.current().map(|m| m.edit.fine_angle).unwrap_or(0.0);
     view! {
         <div class="row">
-            <button class="btn" on:click=move |_| state.update_current(|e| {
+            <button class="btn" on:click=move |_| set_photo_geometry(state, |e| {
                 e.rot90 = (e.rot90 + 3) % 4;
                 e.crop = state::CropRect::default();
             })>"⟲ 90°"</button>
-            <button class="btn" on:click=move |_| state.update_current(|e| {
+            <button class="btn" on:click=move |_| set_photo_geometry(state, |e| {
                 e.rot90 = (e.rot90 + 1) % 4;
                 e.crop = state::CropRect::default();
             })>"⟳ 90°"</button>
@@ -425,11 +425,11 @@ fn PhotoRotateControls(state: AppState) -> impl IntoView {
                 prop:value=move || fine().to_string()
                 on:input=move |ev| {
                     let v: f32 = event_target_value(&ev).parse().unwrap_or(0.0);
-                    state.update_current(|e| e.fine_angle = v);
+                    set_photo_geometry(state, |e| e.fine_angle = v);
                 }
             />
         </label>
-        <button class="btn dim-btn" on:click=move |_| state.update_current(|e| {
+        <button class="btn dim-btn" on:click=move |_| set_photo_geometry(state, |e| {
             e.fine_angle = 0.0;
             e.rot90 = 0;
         })>"Reset rotation"</button>

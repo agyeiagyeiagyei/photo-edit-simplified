@@ -3,9 +3,10 @@
 //! [`crate::resample`], driven by [`crate::pipeline`].
 
 use std::borrow::Cow;
+use std::rc::Rc;
 
 use crate::ops;
-use crate::types::EditParams;
+use crate::types::{EditParams, Selection, SelectionKind};
 
 /// Apply rotation (quarter-turns then fine angle with auto-crop) to a buffer.
 /// The identity case borrows the source instead of copying it; callers that
@@ -139,6 +140,138 @@ pub fn orig_from_work_norm(
         p
     };
     rot90_norm_inv((rx, ry), edit.rot90)
+}
+
+/// Straighten angle as [`geometry`] applies it: within ±0.01° counts as none.
+fn straighten_of(edit: &EditParams) -> f32 {
+    if edit.fine_angle.abs() > 0.01 {
+        edit.fine_angle
+    } else {
+        0.0
+    }
+}
+
+/// True when [`geometry`] turns and straightens both edits the same way.
+pub fn same_geometry(a: &EditParams, b: &EditParams) -> bool {
+    a.rot90 % 4 == b.rot90 % 4 && straighten_of(a) == straighten_of(b)
+}
+
+/// Carry a selection drawn in `from`'s working frame into `to`'s, so it stays
+/// on the same pixels of the photo when the photo is turned or straightened.
+/// `fw`×`fh` is the unturned photo's size; only its aspect matters.
+///
+/// A change of quarter turns alone is exact: corners map to corners and a
+/// mask turns pixel for pixel. A straighten change maps rect and lasso
+/// corners exactly (a rect becomes a four-point lasso) and resamples a mask
+/// once, bilinearly. What leaves the frame is dropped, so callers that apply
+/// several straighten changes should remap from the first selection each time.
+pub fn remap_selection(
+    sel: &Selection,
+    fw: usize,
+    fh: usize,
+    from: &EditParams,
+    to: &EditParams,
+) -> Selection {
+    if same_geometry(from, to) {
+        return sel.clone();
+    }
+    let turns = (to.rot90 % 4 + 4 - from.rot90 % 4) % 4;
+    let quarter = straighten_of(from) == straighten_of(to);
+    let fwd = |p| work_from_orig_norm(orig_from_work_norm(p, fw, fh, from), fw, fh, to);
+    let kind = match &sel.kind {
+        SelectionKind::Rect { x, y, w, h } if quarter => {
+            let (ax, ay) = fwd((*x, *y));
+            let (bx, by) = fwd((x + w, y + h));
+            SelectionKind::Rect {
+                x: ax.min(bx),
+                y: ay.min(by),
+                w: (bx - ax).abs(),
+                h: (by - ay).abs(),
+            }
+        }
+        SelectionKind::Rect { x, y, w, h } => SelectionKind::Lasso(
+            [(*x, *y), (x + w, *y), (x + w, y + h), (*x, y + h)].map(fwd).to_vec(),
+        ),
+        SelectionKind::Lasso(pts) => SelectionKind::Lasso(pts.iter().map(|&p| fwd(p)).collect()),
+        SelectionKind::Mask { data, width, height } => {
+            let (data, width, height) = if quarter {
+                rotate_plane(data, *width, *height, turns)
+            } else {
+                // Keep the mask's density relative to its frame.
+                let (sw, sh) = working_dims(fw, fh, from);
+                let (dw, dh) = working_dims(fw, fh, to);
+                let ow = ((dw * width) as f32 / sw as f32).round().max(1.0) as usize;
+                let oh = ((dh * height) as f32 / sh as f32).round().max(1.0) as usize;
+                let inv = |p| work_from_orig_norm(orig_from_work_norm(p, fw, fh, to), fw, fh, from);
+                (resample_affine(data, *width, *height, ow, oh, inv), ow, oh)
+            };
+            SelectionKind::Mask { data: Rc::new(data), width, height }
+        }
+    };
+    Selection { kind, feather: sel.feather }
+}
+
+/// Turn a one-byte-per-pixel plane clockwise by `turns` quarter turns, the
+/// same way [`ops::rotate_90`] turns RGBA.
+fn rotate_plane(src: &[u8], w: usize, h: usize, turns: u8) -> (Vec<u8>, usize, usize) {
+    let k = turns % 4;
+    let (ow, oh) = if k % 2 == 1 { (h, w) } else { (w, h) };
+    let mut out = vec![0u8; src.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let (nx, ny) = match k {
+                1 => (h - 1 - y, x),
+                2 => (w - 1 - x, h - 1 - y),
+                3 => (y, w - 1 - x),
+                _ => (x, y),
+            };
+            out[ny * ow + nx] = src[y * w + x];
+        }
+    }
+    (out, ow, oh)
+}
+
+/// Resample a `w`×`h` plane into `ow`×`oh` through `inv`, which maps an
+/// output-normalized point to a source-normalized one. The map between two
+/// working frames is affine, so three points fix it. Bilinear inside the
+/// source, edge-clamped for the outer half pixel, 0 beyond.
+fn resample_affine(
+    src: &[u8],
+    w: usize,
+    h: usize,
+    ow: usize,
+    oh: usize,
+    inv: impl Fn((f32, f32)) -> (f32, f32),
+) -> Vec<u8> {
+    let o = inv((0.0, 0.0));
+    let ex = inv((1.0, 0.0));
+    let ey = inv((0.0, 1.0));
+    let (wf, hf) = (w as f32, h as f32);
+    // Source-pixel steps per output pixel along x and y.
+    let (ax, ay) = ((ex.0 - o.0) * wf / ow as f32, (ex.1 - o.1) * hf / ow as f32);
+    let (bx, by) = ((ey.0 - o.0) * wf / oh as f32, (ey.1 - o.1) * hf / oh as f32);
+    let mut out = vec![0u8; ow * oh];
+    for y in 0..oh {
+        let fy = y as f32 + 0.5;
+        for x in 0..ow {
+            let fx = x as f32 + 0.5;
+            let sx = o.0 * wf + ax * fx + bx * fy - 0.5;
+            let sy = o.1 * hf + ay * fx + by * fy - 0.5;
+            if sx < -0.5 || sy < -0.5 || sx > wf - 0.5 || sy > hf - 0.5 {
+                continue;
+            }
+            let sx = sx.clamp(0.0, wf - 1.0);
+            let sy = sy.clamp(0.0, hf - 1.0);
+            let (x0, y0) = (sx as usize, sy as usize);
+            let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+            let (tx, ty) = (sx - x0 as f32, sy - y0 as f32);
+            let p = |x: usize, y: usize| src[y * w + x] as f32;
+            let top = p(x0, y0) + (p(x1, y0) - p(x0, y0)) * tx;
+            let bot = p(x0, y1) + (p(x1, y1) - p(x0, y1)) * tx;
+            out[y * ow + x] = (top + (bot - top) * ty).round() as u8;
+        }
+    }
+    out
 }
 
 /// Crop rect in pixels for an image of (w, h).
@@ -503,5 +636,144 @@ mod tests {
             let psnr = if mse > 0.0 { 10.0 * (255.0f64 * 255.0 / (mse / n as f64)).log10() } else { 99.0 };
             assert!(psnr > 30.0, "rot {rot}: 1x and 2x replays differ ({psnr:.1} dB)");
         }
+    }
+
+    /// A 300×200 RGBA photo with an off-centre bar and disc in red, well
+    /// inside the frame so a straighten crop never reaches them.
+    fn shapes_photo() -> (Vec<u8>, usize, usize) {
+        let (w, h) = (300usize, 200usize);
+        let mut px = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let bar = (60..140).contains(&x) && (50..110).contains(&y);
+                let disc = (x as i64 - 190).pow(2) + (y as i64 - 120).pow(2) <= 900;
+                let i = (y * w + x) * 4;
+                px[i] = if bar || disc { 255 } else { 0 };
+                px[i + 3] = 255;
+            }
+        }
+        (px, w, h)
+    }
+
+    /// The shapes as a mask in `edit`'s working frame, read off the turned photo.
+    fn shapes_mask(edit: &EditParams) -> (Vec<u8>, usize, usize) {
+        let (px, w, h) = shapes_photo();
+        let (g, gw, gh) = geometry(&px, w, h, edit);
+        (g.chunks_exact(4).map(|p| if p[0] > 127 { 255 } else { 0 }).collect(), gw, gh)
+    }
+
+    fn geo(rot90: u8, fine_angle: f32) -> EditParams {
+        EditParams { rot90, fine_angle, ..EditParams::default() }
+    }
+
+    fn mask_of(sel: &Selection) -> (Vec<u8>, usize, usize) {
+        match &sel.kind {
+            SelectionKind::Mask { data, width, height } => ((**data).clone(), *width, *height),
+            k => panic!("expected a mask, got {k:?}"),
+        }
+    }
+
+    fn iou(a: &[u8], b: &[u8]) -> f32 {
+        let (mut both, mut any) = (0u32, 0u32);
+        for (&p, &q) in a.iter().zip(b) {
+            both += (p > 127 && q > 127) as u32;
+            any += (p > 127 || q > 127) as u32;
+        }
+        both as f32 / any.max(1) as f32
+    }
+
+    #[test]
+    fn a_turned_mask_lands_on_the_same_pixels() {
+        let pairs = [(0u8, 1u8), (0, 2), (0, 3), (1, 2), (3, 1), (2, 0)];
+        for (a, b) in pairs {
+            let (from, to) = (geo(a, 0.0), geo(b, 0.0));
+            let (m, mw, mh) = shapes_mask(&from);
+            let sel = Selection {
+                kind: SelectionKind::Mask { data: Rc::new(m), width: mw, height: mh },
+                feather: 0.02,
+            };
+            let out = remap_selection(&sel, 300, 200, &from, &to);
+            assert_eq!(out.feather, 0.02);
+            let (got, gw, gh) = mask_of(&out);
+            let (want, ww, wh) = shapes_mask(&to);
+            assert_eq!((gw, gh), (ww, wh), "{a}->{b}: dims");
+            assert!(got == want, "{a}->{b}: a quarter turn must move the mask exactly");
+        }
+    }
+
+    #[test]
+    fn a_straightened_mask_lands_on_the_same_pixels() {
+        let cases = [
+            ((0u8, 0.0f32), (0u8, 6.0f32)),
+            ((0, 6.0), (0, -3.5)),
+            ((1, 0.0), (1, -5.0)),
+            ((0, 4.0), (1, 4.0)),
+            ((2, -7.0), (3, 2.0)),
+        ];
+        for ((ra, fa), (rb, fb)) in cases {
+            let (from, to) = (geo(ra, fa), geo(rb, fb));
+            let (m, mw, mh) = shapes_mask(&from);
+            let sel = Selection {
+                kind: SelectionKind::Mask { data: Rc::new(m), width: mw, height: mh },
+                feather: 0.0,
+            };
+            let (got, gw, gh) = mask_of(&remap_selection(&sel, 300, 200, &from, &to));
+            let (want, ww, wh) = shapes_mask(&to);
+            assert_eq!((gw, gh), (ww, wh), "{ra}/{fa} -> {rb}/{fb}: dims");
+            let score = iou(&got, &want);
+            assert!(score > 0.95, "{ra}/{fa} -> {rb}/{fb}: IoU {score:.3}");
+        }
+    }
+
+    #[test]
+    fn rects_and_lassos_follow_the_photo() {
+        // The bar, as a rect in the unturned frame.
+        let bar = Selection {
+            kind: SelectionKind::Rect { x: 0.2, y: 0.25, w: 80.0 / 300.0, h: 0.3 },
+            feather: 0.0,
+        };
+        for (rb, fb) in [(1u8, 0.0f32), (2, 0.0), (3, 0.0), (0, 5.0), (1, -6.0)] {
+            let to = geo(rb, fb);
+            let out = remap_selection(&bar, 300, 200, &geo(0, 0.0), &to);
+            match (&out.kind, fb == 0.0) {
+                (SelectionKind::Rect { .. }, true) | (SelectionKind::Lasso(_), false) => {}
+                (k, _) => panic!("{rb}/{fb}: unexpected kind {k:?}"),
+            }
+            let (want, ww, wh) = shapes_mask(&to);
+            let got = ops::selection_mask(&out, ww, wh);
+            // Only the bar is selected; the disc stays out.
+            let bar_px = got.iter().filter(|&&v| v > 127).count();
+            let hit = got.iter().zip(&want).filter(|(&g, &w)| g > 127 && w > 127).count();
+            assert!(hit as f32 > 0.97 * bar_px as f32, "{rb}/{fb}: the rect left the bar");
+            assert!((bar_px as f32 - 80.0 * 60.0).abs() < 0.08 * 4800.0, "{rb}/{fb}: area {bar_px}");
+        }
+        // A lasso maps point by point, and four turns bring it home.
+        let lasso = Selection {
+            kind: SelectionKind::Lasso(vec![(0.1, 0.2), (0.4, 0.15), (0.35, 0.6)]),
+            feather: 0.0,
+        };
+        let mut cur = lasso.clone();
+        for k in 0..4u8 {
+            cur = remap_selection(&cur, 300, 200, &geo(k, 0.0), &geo((k + 1) % 4, 0.0));
+        }
+        let SelectionKind::Lasso(pts) = &cur.kind else { panic!("lasso became {:?}", cur.kind) };
+        let SelectionKind::Lasso(orig) = &lasso.kind else { unreachable!() };
+        for (p, q) in pts.iter().zip(orig) {
+            assert!((p.0 - q.0).abs() < 1e-5 && (p.1 - q.1).abs() < 1e-5, "{p:?} vs {q:?}");
+        }
+    }
+
+    #[test]
+    fn same_geometry_keeps_the_selection() {
+        let sel = Selection {
+            kind: SelectionKind::Mask { data: Rc::new(vec![7u8; 6]), width: 3, height: 2 },
+            feather: 0.1,
+        };
+        let e = geo(1, 0.005); // under the straighten threshold: no change
+        let out = remap_selection(&sel, 300, 200, &geo(1, 0.0), &e);
+        let (SelectionKind::Mask { data: a, .. }, SelectionKind::Mask { data: b, .. }) = (&sel.kind, &out.kind) else {
+            panic!()
+        };
+        assert!(Rc::ptr_eq(a, b));
     }
 }
