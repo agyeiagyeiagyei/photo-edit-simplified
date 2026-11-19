@@ -82,6 +82,21 @@ pub(crate) fn LayersTab(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         }
     };
 
+    // One row at a time asks "Delete …?" or shows its name as a text field.
+    let confirming = create_rw_signal(None::<usize>);
+    let renaming = create_rw_signal(None::<usize>);
+    let rename_layer = move |id: usize, name: String| {
+        if renaming.get_untracked() != Some(id) {
+            return;
+        }
+        renaming.set(None);
+        state.update_current_item(|m| {
+            if let Some(l) = m.layers.iter_mut().find(|l| l.id == id) {
+                l.name = name.trim().to_string();
+            }
+        });
+    };
+
     let move_layer = move |id: usize, delta: isize| {
         state.update_current_item(|m| {
             let Some(i) = m.layers.iter().position(|l| l.id == id) else { return };
@@ -234,7 +249,22 @@ pub(crate) fn LayersTab(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                 draw_mask_thumb(&canvas, &l);
                             }
                         });
+                        let rename_ref = create_node_ref::<html::Input>();
+                        create_effect(move |_| {
+                            if renaming.get() == Some(id) {
+                                if let Some(el) = rename_ref.get() {
+                                    let _ = el.focus();
+                                    el.select();
+                                }
+                            }
+                        });
+                        let grouped = move || has_mask() || layers.with(|ls| clipped_count(ls, id) > 0);
                         view! {
+                            <div
+                                class="layer-group"
+                                class:grouped=grouped
+                                class:clipped=move || layers.with(|ls| is_clipped(ls, id))
+                            >
                             <div
                                 class="layer-row"
                                 class:selected=is_selected
@@ -256,9 +286,37 @@ pub(crate) fn LayersTab(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                         }
                                     }}
                                 </button>
-                                <span class="layer-label">
-                                    {move || layers.with(|ls| row_label(ls, id, false))}
-                                </span>
+                                {move || if renaming.get() == Some(id) {
+                                    view! {
+                                        <input
+                                            node_ref=rename_ref
+                                            type="text"
+                                            class="layer-rename"
+                                            maxlength="40"
+                                            prop:value=move || layers.with_untracked(|ls| row_label(ls, id, false))
+                                            on:click=move |ev| ev.stop_propagation()
+                                            on:keydown=move |ev| match ev.key().as_str() {
+                                                "Enter" => rename_layer(id, event_target_value(&ev)),
+                                                "Escape" => renaming.set(None),
+                                                _ => {}
+                                            }
+                                            on:blur=move |ev| rename_layer(id, event_target_value(&ev))
+                                        />
+                                    }.into_view()
+                                } else {
+                                    view! {
+                                        <span
+                                            class="layer-label"
+                                            title="Double-click to rename"
+                                            on:dblclick=move |ev| {
+                                                ev.stop_propagation();
+                                                renaming.set(Some(id));
+                                            }
+                                        >
+                                            {move || layers.with(|ls| row_label(ls, id, false))}
+                                        </span>
+                                    }.into_view()
+                                }}
                                 <button
                                     class="icon-btn mask-thumb"
                                     class:has-mask=has_mask
@@ -306,13 +364,30 @@ pub(crate) fn LayersTab(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                 </button>
                                 <button
                                     class="icon-btn delete"
+                                    title="Delete layer"
                                     on:click=move |ev| {
                                         ev.stop_propagation();
-                                        delete_layer(id);
+                                        confirming.set(Some(id));
                                     }
                                 >
                                     "✕"
                                 </button>
+                            </div>
+                            <Show when=has_mask fallback=|| ()>
+                                <div class="layer-sub" on:click=move |_| click_mask(id)>
+                                    "↳ Mask · part of this layer"
+                                </div>
+                            </Show>
+                            <Show when=move || confirming.get() == Some(id) fallback=|| ()>
+                                <div class="layer-confirm">
+                                    <span>{move || layers.with(|ls| delete_question(ls, id))}</span>
+                                    <button class="btn danger" on:click=move |_| {
+                                        confirming.set(None);
+                                        delete_layer(id);
+                                    }>"Delete"</button>
+                                    <button class="btn" on:click=move |_| confirming.set(None)>"Cancel"</button>
+                                </div>
+                            </Show>
                             </div>
                         }
                     }
@@ -520,7 +595,9 @@ fn row_label(ls: &[Layer], id: usize, mask_note: bool) -> String {
         return String::new();
     };
     let mut label = layer.label();
-    if !matches!(layer.kind, LayerKind::Text(_)) {
+    if !layer.name.is_empty() {
+        label = layer.name.clone();
+    } else if !matches!(layer.kind, LayerKind::Text(_)) {
         let same = |l: &&Layer| std::mem::discriminant(&l.kind) == std::mem::discriminant(&layer.kind);
         if ls.iter().filter(same).count() > 1 {
             let n = ls.iter().filter(same).filter(|l| l.id <= id).count();
@@ -531,6 +608,30 @@ fn row_label(ls: &[Layer], id: usize, mask_note: bool) -> String {
         label.push_str(" · masked");
     }
     label
+}
+
+/// What deleting a layer takes with it, as the question the row asks first.
+/// A mask and any adjustment clipped to the layer have no life of their own.
+fn delete_question(ls: &[Layer], id: usize) -> String {
+    let masked = ls.iter().any(|l| l.id == id && l.mask.is_some());
+    let clipped = clipped_count(ls, id);
+    let mut q = format!("Delete “{}”", row_label(ls, id, false));
+    if masked {
+        q.push_str(" and its mask");
+    }
+    if clipped > 0 {
+        q.push_str(&format!(" and {clipped} adjustment{} clipped to it", if clipped == 1 { "" } else { "s" }));
+    }
+    q.push('?');
+    q
+}
+
+fn clipped_count(ls: &[Layer], id: usize) -> usize {
+    ls.iter().filter(|l| matches!(&l.kind, LayerKind::Adjust(a) if a.clip_to == Some(id))).count()
+}
+
+fn is_clipped(ls: &[Layer], id: usize) -> bool {
+    ls.iter().any(|l| l.id == id && matches!(&l.kind, LayerKind::Adjust(a) if a.clip_to.is_some()))
 }
 
 /// Whether a layer can move `delta` slots: one stack, so only the ends stop it.

@@ -537,9 +537,21 @@ pub mod tiff {
         Entry { tag, typ: SRATIONAL, count: 1, data }
     }
 
+    /// IFD entries go in tag order. An insertion sort: a handful of entries,
+    /// and std's stable sort is several KB of wasm per element type.
+    fn sort_by_tag(v: &mut [Entry]) {
+        for i in 1..v.len() {
+            let mut j = i;
+            while j > 0 && v[j].tag < v[j - 1].tag {
+                v.swap(j, j - 1);
+                j -= 1;
+            }
+        }
+    }
+
     /// Serialize one IFD (little-endian) at the current end of `out`.
     pub fn write_ifd(out: &mut Vec<u8>, mut entries: Vec<Entry>) {
-        entries.sort_by_key(|e| e.tag);
+        sort_by_tag(&mut entries);
         let n = entries.len();
         out.extend_from_slice(&(n as u16).to_le_bytes());
         let data_base = out.len() + 12 * n + 4;
@@ -578,7 +590,7 @@ pub mod tiff {
         if !gps.is_empty() {
             ifd0.push(Entry { tag: 0x8825, typ: LONG, count: 1, data: vec![0; 4] });
         }
-        ifd0.sort_by_key(|e| e.tag);
+        sort_by_tag(&mut ifd0);
         let pos_of = |tag: u16| 8 + 2 + 12 * ifd0.iter().position(|e| e.tag == tag).unwrap() + 8;
         let exif_patch = (!exif.is_empty()).then(|| pos_of(0x8769));
         let gps_patch = (!gps.is_empty()).then(|| pos_of(0x8825));

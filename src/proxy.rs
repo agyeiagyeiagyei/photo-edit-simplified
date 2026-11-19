@@ -179,7 +179,7 @@ pub(crate) fn evict_proxy_lru(state: AppState, keep: usize) {
                 })
                 .collect()
         });
-        candidates.sort_by_key(|c| c.0);
+        ops::sort_small_by_key(&mut candidates, |c| c.0);
         let mut total = total;
         let mut victims = Vec::new();
         for (_, id, len) in candidates {

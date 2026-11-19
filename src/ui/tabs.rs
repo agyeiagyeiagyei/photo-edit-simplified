@@ -1188,7 +1188,7 @@ pub(crate) fn CurvesPanel(
         } else if pts.len() < 32 && x > 1.0 && x < 254.0 && pts.iter().all(|p| (p.x - x).abs() > 1.0) {
             let mut new_pts = pts.clone();
             new_pts.push(curves::CurvePoint { x, y });
-            new_pts.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap());
+            ops::sort_small_by_key(&mut new_pts, |p| p.x);
             let idx = new_pts.iter().position(|p| p.x == x).unwrap();
             with_curves(state, target, |c| c.channels[ch] = new_pts);
             dragging.set_value(Some(idx));
