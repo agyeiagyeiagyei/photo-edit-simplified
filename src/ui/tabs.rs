@@ -755,7 +755,7 @@ pub(crate) fn RawPanel(state: AppState) -> impl IntoView {
                     |v| format!("{v:.0}"),
                 )}
                 {rslider(
-                    "Demosaic sharpening", 0.0, 100.0, 1.0,
+                    "Sharpening", 0.0, 100.0, 1.0,
                     |r| r.sharpen, |r, v| r.sharpen = v,
                     |v| format!("{v:.0}"),
                 )}
