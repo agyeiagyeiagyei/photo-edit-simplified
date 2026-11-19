@@ -361,6 +361,66 @@ test.describe('WebGL2 parametric preview (docs/GPU.md)', () => {
     await cpuCtx.close();
   });
 
+  // #47: grain sits on an image-space lattice and Blur is sized in image
+  // units, on the GPU exactly as on the CPU. Compared 1:1 at full canvas
+  // resolution, where a lattice off by one cell re-rolls the grain (about
+  // 25 dB); a 512 px downscale would average that away.
+  test('blur and grain on the GPU match the CPU pixel for pixel (#47)', async ({ page, browser }, testInfo) => {
+    const effects = async (p: Page) => {
+      await applyColorEdit(p);
+      await setRange(p, /^Blur/, 30);
+      await setRange(p, /^Grain/, 40);
+    };
+    const crop = (p: Page) =>
+      p.evaluate(() => {
+        const c = document.querySelector('.canvas-wrap canvas') as HTMLCanvasElement;
+        const w = 640, h = 480;
+        const x = Math.floor((c.width - w) / 2), y = Math.floor((c.height - h) / 2);
+        const d = c.getContext('2d')!.getImageData(x, y, w, h).data;
+        let s = '';
+        for (let i = 0; i < d.length; i += 0x8000) {
+          s += String.fromCharCode.apply(null, Array.from(d.subarray(i, i + 0x8000)) as number[]);
+        }
+        return { b64: btoa(s), srcW: c.width, srcH: c.height };
+      });
+    const gpuPage = page;
+    const gpuErrors = trackErrors(gpuPage);
+    await openMode(gpuPage, '1');
+    await importFiles(gpuPage, [JPEG_A]);
+    await waitCanvasWidthAbove(gpuPage, 1200);
+    await waitMark(gpuPage, 'worker.render_base');
+    await waitMark(gpuPage, 'gpu.render');
+    const before = (await markNames(gpuPage)).filter((n) => n === 'gpu.render').length;
+    await effects(gpuPage);
+    await waitRenderTick(gpuPage, 'gpu.render', before, 500);
+
+    const cpuCtx = await browser.newContext({
+      viewport: { width: 1600, height: 1000 },
+      deviceScaleFactor: 2,
+      baseURL: process.env.PES_BASE_URL || 'http://127.0.0.1:8787/',
+    });
+    const cpuPage = await cpuCtx.newPage();
+    const cpuErrors = trackErrors(cpuPage);
+    await openMode(cpuPage, '0');
+    await importFiles(cpuPage, [JPEG_A]);
+    await waitCanvasWidthAbove(cpuPage, 1200);
+    await effects(cpuPage);
+    await waitStableSharpCanvas(cpuPage, 90_000, 500);
+
+    const g = await crop(gpuPage);
+    const c = await crop(cpuPage);
+    expect([c.srcW, c.srcH]).toEqual([g.srcW, g.srcH]);
+    const db = psnr(Buffer.from(g.b64, 'base64'), Buffer.from(c.b64, 'base64'));
+    const gpuNames = await markNames(gpuPage);
+    expect(gpuNames).toContain('gpu.render');
+    expect(await markNames(cpuPage)).not.toContain('gpu.render');
+    recordMetrics(testInfo, { effects_parity_psnr_db: Math.round(db * 100) / 100, effects_parity_canvas_w: g.srcW });
+    expect(gpuErrors, gpuErrors.join('\n')).toEqual([]);
+    expect(cpuErrors, cpuErrors.join('\n')).toEqual([]);
+    expect(db, `blur+grain parity ${db.toFixed(2)} dB < 40 dB at 1:1`).toBeGreaterThanOrEqual(40);
+    await cpuCtx.close();
+  });
+
   test('ten slider ticks run on the GPU with no worker round trip', async ({ page }, testInfo) => {
     const errors = trackErrors(page);
     await openMode(page, '1');

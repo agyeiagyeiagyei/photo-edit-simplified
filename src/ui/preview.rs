@@ -783,6 +783,8 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         let mut gpu_ok = want_hi
             && !windowed_view
             && gpu::eligible(&item.edit, &item.layers)
+            && gpu::blur_fits(&item.edit, target.0 as u32, target.1 as u32)
+            && gpu::grain_fits(&item.edit, target.0 as u32, target.1 as u32)
             && gpu::active()
             && !(photo.raw && !item.edit.raw.is_identity() && !source_has_neutral(item.id, &photo));
         let mut gkey: Option<gpu::BaseKey> = None;
@@ -900,7 +902,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             let mut frame = PipeFrame::new(p.into_owned(), w, h);
             let px_scale = pipeline::px_scale_for(sw, sh, PipeTarget::new(w, h));
             let params = state::render_edit(&item.edit, &item.layers);
-            pipeline::finish_edit(&mut frame, &params, item.id as u32, px_scale);
+            pipeline::finish_edit(&mut frame, &params, item.id as u32, px_scale, Place::whole(w, h));
             let p = frame.pixels;
             if windowed_view {
                 // Composite at full size offscreen, then blit the view region —

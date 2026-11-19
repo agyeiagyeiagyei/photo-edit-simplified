@@ -1,721 +1,664 @@
-//! Edge-aware denoiser: separable bilateral filter over a YCbCr split.
+//! Smart denoise: noise-adaptive, multi-scale (à-trous wavelet) shrinkage
+//! over a luma / colour-difference split (#53).
 //!
-//! Chroma first: the lower half of the slider mostly removes colour noise,
-//! the blotchy part of high-ISO noise. Luma is mixed in on a quadratic ramp
-//! that reaches the full filter at strength 0.5, because fine luminance
-//! grain is often real texture (feathers, foliage). Above 0.5 the behaviour
-//! is unchanged.
+//! High-ISO noise from a demosaiced sensor is not white: next to the
+//! pixel-level speckle it carries coarse mottle, luma blotches and above all
+//! colour blotches 4 to 32 px across. Those coarse bands are what show at the
+//! sizes a photo is viewed at. The frame is split into wavelet bands of 1, 2,
+//! 4, 8 and 16 px (a B3-spline à-trous transform, each band the difference of
+//! two successive smoothings), and each band is shrunk on its own.
 //!
-//! Chroma gets a wide window and its own range weight plus a luma-guided one,
-//! so colour blotches smooth out while real colour and luminance edges hold.
-//! Chroma is filtered at half resolution — the cheaper, standard split, and
-//! chroma noise is low-frequency anyway — and bilinearly upsampled. Luma uses
-//! a narrower window and a tighter range sigma so texture survives.
+//! **Noise is measured, not assumed.** Each band's noise deviation comes from
+//! the photo itself: the median absolute coefficient over its flattest blocks.
+//! So the thresholds follow the ISO, the exposure and the tone curve that made
+//! this frame, and a slider value means the same relative clean-up on an
+//! ISO 400 and an ISO 6400 file. The ISO sets only the starting value
+//! ([`crate::rawops::denoise_start_for_iso`]).
 //!
-//! Luma is the Rec.601 luma of the sRGB codes, the same value the YCbCr split
-//! carries, so filtering it leaves tone alone: an unfiltered pixel is returned
-//! exactly and a flat colour of any saturation does not move (#15).
+//! **Detail is kept by local energy.** A coefficient is scaled by
+//! `1 - (k * sigma)^2 / E`, with `E` the band's mean square over the 8 taps
+//! around it at that band's spacing (not itself, so a lone noise spike can't
+//! vouch for itself): an edge or a textured patch stands well
+//! above the noise and passes, a flat patch is noise and goes. Luma uses the
+//! slider's `k`. Colour uses a stronger `k` that is reached early on the
+//! slider, since colour noise is never wanted and colour detail is coarse;
+//! a clear luma edge at the same place lends its energy to the colour bands,
+//! so a thin white beak against a blue wall keeps its colour.
 //!
-//! Window and range parameters are defined in sensor pixels and sensor-referred
-//! noise, then scaled into the render: a proxy at 1/p the sensor's linear
-//! resolution carries ~1/p the noise, so its sigmas shrink by p and its radius
-//! is the sensor radius divided by p. Without that, the proxy would denoise
-//! relatively harder than the export and the two would not match.
+//! **Only the removed noise is subtracted.** The bands' removed parts are
+//! accumulated and taken off the 16-bit input, so a pixel the filter leaves
+//! alone comes back bit for bit and the tone is untouched.
+//!
+//! The frame is processed in tiles with an apron that covers every tap a
+//! tile's pixels depend on, so the result is the whole-frame result; band
+//! scales are in sensor pixels, so a preview at 1/p of the sensor resolution
+//! uses the bands the export's coarse bands land on.
 
-use std::sync::OnceLock;
+/// B3-spline smoothing taps.
+const B3: [f32; 5] = [1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0];
+/// Coarsest band, in sensor pixels: 16 px bands, on 32 px of support.
+const SENSOR_SCALE: f32 = 32.0;
+const MAX_LEVELS: usize = 5;
+/// Luma threshold multiplier at full strength; the slider is linear in it.
+const KY_MAX: f32 = 2.0;
+/// Colour threshold multiplier, reached at `KC_FULL_AT` of the slider.
+const KC: f32 = 2.5;
+const KC_FULL_AT: f32 = 0.2;
+/// A luma band counts as an edge for the colour bands above this multiple of
+/// its noise deviation.
+const EDGE_T: f32 = 2.0;
+/// Upper bound on a band's noise relative to the band below it.
+const NOISE_DECAY: f32 = 0.7;
+/// Noise is measured over blocks this size, the flattest `FLAT_SHARE` of them,
+/// at most `MAX_SAMPLE_BLOCKS` spread over that share.
+const BLOCK: usize = 32;
+const FLAT_SHARE: f32 = 0.2;
+const MAX_SAMPLE_BLOCKS: usize = 64;
+/// Output tile edge (the apron is added around it).
+const TILE: usize = 1024;
 
-const MAX_LUMA_R: usize = 6;
-const MAX_CHROMA_R: usize = 8;
-
-/// u16 luma (code x 257) back to an 8-bit code, rounded.
-fn luma_lut() -> &'static [u8; 65536] {
-    static LUT: OnceLock<[u8; 65536]> = OnceLock::new();
-    LUT.get_or_init(|| {
-        let mut t = [0u8; 65536];
-        for (v, out) in t.iter_mut().enumerate() {
-            *out = ((v as u32 + 128) / 257).min(255) as u8;
-        }
-        t
-    })
+#[derive(Clone, Copy, Debug)]
+struct Params {
+    ky: f32,
+    kc: f32,
+    levels: usize,
 }
 
-
-/// Normalised spatial Gaussian over the window offsets -r..=r.
-fn spatial(r: usize) -> Vec<f32> {
-    let sigma = (r as f32 / 2.0).max(0.7);
-    let mut w: Vec<f32> = (-(r as i32)..=(r as i32))
-        .map(|d| (-(d * d) as f32 / (2.0 * sigma * sigma)).exp())
-        .collect();
-    let sum: f32 = w.iter().sum();
-    for v in &mut w {
-        *v /= sum;
+fn params(strength: f32, px_scale: f32, w: usize, h: usize) -> Params {
+    let t = strength.clamp(0.0, 1.0);
+    let p = px_scale.max(1.0);
+    let by_scale = (SENSOR_SCALE / p).log2().round().max(1.0) as usize;
+    // Every dilated tap must stay inside the frame (half-sample reflection).
+    let by_size = ((w.min(h) as f32 / 4.0).log2().floor().max(0.0)) as usize;
+    Params {
+        ky: KY_MAX * t,
+        kc: KC * (t / KC_FULL_AT).min(1.0),
+        levels: by_scale.min(by_size).min(MAX_LEVELS),
     }
-    w
 }
 
-/// Range weights indexed by an absolute sample difference of 0..=255.
-fn range(sigma: f32) -> Vec<f32> {
-    (0..=255)
-        .map(|d| {
-            let d = d as f32;
-            (-(d * d) / (2.0 * sigma * sigma)).exp()
-        })
-        .collect()
-}
-
-fn luma_horizontal(
-    y: &[u8],
-    w: usize,
-    h: usize,
-    r: usize,
-    sw: &[f32],
-    lut: &[f32],
-) -> Vec<u16> {
-    let mut out = vec![0u16; w * h];
-    for yy in 0..h {
-        let row = &y[yy * w..(yy + 1) * w];
-        let orow = &mut out[yy * w..(yy + 1) * w];
-        for (x, o) in orow.iter_mut().enumerate() {
-            let c = row[x] as i32;
-            let x0 = x.saturating_sub(r);
-            let x1 = (x + r).min(w - 1);
-            // Same taps in the same order as the full window; at the edges the
-            // window is clipped and the spatial weights offset to match.
-            let win = &row[x0..=x1];
-            let swin = &sw[x0 + r - x..=x1 + r - x];
-            let mut acc = 0.0f32;
-            let mut wsum = 0.0f32;
-            for (&g, &s) in win.iter().zip(swin) {
-                let wt = s * lut[(g as i32 - c).unsigned_abs() as usize];
-                // The 16-bit luma (code x 257), computed inline: exact in f32.
-                acc += wt * (g as f32 * 257.0);
-                wsum += wt;
-            }
-            *o = (acc / wsum).round().clamp(0.0, 65535.0) as u16;
-        }
+/// Pixels a band-`levels` result depends on, on each side: the smoothing
+/// taps of every level plus the energy taps of the coarsest band.
+fn apron(levels: usize) -> usize {
+    if levels == 0 {
+        return 0;
     }
-    out
+    (2 << levels) - 2 + (1 << (levels - 1))
 }
 
-fn luma_vertical(
-    tmp: &[u16],
-    y: &[u8],
-    w: usize,
-    h: usize,
-    r: usize,
-    sw: &[f32],
-    lut: &[f32],
-    srgb: &[u8; 65536],
-) -> Vec<u8> {
-    let mut out = vec![0u8; w * h];
-    let mut acc = vec![0.0f32; w];
-    let mut wsum = vec![0.0f32; w];
-    for yy in 0..h {
-        let y0 = yy.saturating_sub(r);
-        let y1 = (yy + r).min(h - 1);
-        let centre = &y[yy * w..(yy + 1) * w];
-        acc.iter_mut().for_each(|v| *v = 0.0);
-        wsum.iter_mut().for_each(|v| *v = 0.0);
-        // Row-major: each tap row is read sequentially, and every pixel still
-        // accumulates its taps in ascending row order, so the sums are
-        // bit-identical to the column walk.
-        for yyy in y0..=y1 {
-            let s = sw[yyy + r - yy];
-            let grow = &y[yyy * w..(yyy + 1) * w];
-            let trow = &tmp[yyy * w..(yyy + 1) * w];
-            for x in 0..w {
-                let wt = s * lut[(grow[x] as i32 - centre[x] as i32).unsigned_abs() as usize];
-                acc[x] += wt * trow[x] as f32;
-                wsum[x] += wt;
-            }
-        }
-        for (x, o) in out[yy * w..(yy + 1) * w].iter_mut().enumerate() {
-            let v = (acc[x] / wsum[x]).round().clamp(0.0, 65535.0) as usize;
-            *o = srgb[v];
+/// Half-sample symmetric reflection into `0..n`.
+#[inline]
+fn refl(i: isize, n: isize) -> usize {
+    let mut i = i;
+    loop {
+        if i < 0 {
+            i = -i - 1;
+        } else if i >= n {
+            i = 2 * n - i - 1;
+        } else {
+            return i as usize;
         }
     }
-    out
 }
 
-/// Horizontal pass of the chroma bilateral, on Cb and Cr together: the
-/// spatial and luma-guide weights are the same for both planes, so each tap
-/// computes `spatial * guide` once and multiplies in each plane's own range
-/// weight, in the same order as filtering the planes separately (bit-exact).
-#[allow(clippy::too_many_arguments)]
-fn chroma_horizontal2(
-    cb: &[i16],
-    cr: &[i16],
-    guide: &[u8],
-    w: usize,
-    h: usize,
-    r: usize,
-    sw: &[f32],
-    guide_lut: &[f32],
-    chroma_lut: &[f32],
-) -> (Vec<i16>, Vec<i16>) {
-    let mut ob = vec![0i16; w * h];
-    let mut or = vec![0i16; w * h];
-    for yy in 0..h {
-        let rb = &cb[yy * w..(yy + 1) * w];
-        let rr = &cr[yy * w..(yy + 1) * w];
-        let grow = &guide[yy * w..(yy + 1) * w];
-        let (obr, orr) = (&mut ob[yy * w..(yy + 1) * w], &mut or[yy * w..(yy + 1) * w]);
-        for x in 0..w {
-            let g = grow[x] as i32;
-            let (vb, vr) = (rb[x] as i32, rr[x] as i32);
-            let x0 = x.saturating_sub(r);
-            let x1 = (x + r).min(w - 1);
-            let swin = &sw[x0 + r - x..=x1 + r - x];
-            let (mut ab, mut wb, mut ar, mut wr) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-            for (k, &sp) in swin.iter().enumerate() {
-                let xx = x0 + k;
-                let gw = sp * guide_lut[(grow[xx] as i32 - g).unsigned_abs() as usize];
-                let sb = rb[xx] as i32;
-                let sr = rr[xx] as i32;
-                let wtb = gw * chroma_lut[(sb - vb).unsigned_abs() as usize];
-                let wtr = gw * chroma_lut[(sr - vr).unsigned_abs() as usize];
-                ab += wtb * sb as f32;
-                wb += wtb;
-                ar += wtr * sr as f32;
-                wr += wtr;
-            }
-            obr[x] = (ab / wb).round().clamp(-1024.0, 1023.0) as i16;
-            orr[x] = (ar / wr).round().clamp(-1024.0, 1023.0) as i16;
-        }
-    }
-    (ob, or)
-}
-
-/// Vertical pass of the paired chroma bilateral, row-major: every pixel
-/// accumulates its taps in ascending row order (bit-exact).
-#[allow(clippy::too_many_arguments)]
-fn chroma_vertical2(
-    tb: &[i16],
-    tr: &[i16],
-    guide: &[u8],
-    w: usize,
-    h: usize,
-    r: usize,
-    sw: &[f32],
-    guide_lut: &[f32],
-    chroma_lut: &[f32],
-) -> (Vec<i16>, Vec<i16>) {
-    let mut ob = vec![0i16; w * h];
-    let mut or = vec![0i16; w * h];
-    let (mut ab, mut wb) = (vec![0.0f32; w], vec![0.0f32; w]);
-    let (mut ar, mut wr) = (vec![0.0f32; w], vec![0.0f32; w]);
+/// Separable filter with taps `k` at spacing `d` (centred), reflecting at the
+/// plane's edges. `tmp` holds the horizontal pass.
+fn sep_filter(src: &[f32], dst: &mut [f32], tmp: &mut [f32], w: usize, h: usize, k: &[f32], d: usize) {
+    let r = k.len() / 2;
+    let reach = r * d;
     for y in 0..h {
-        let y0 = y.saturating_sub(r);
-        let y1 = (y + r).min(h - 1);
-        let gc = &guide[y * w..(y + 1) * w];
-        let (cb, cr) = (&tb[y * w..(y + 1) * w], &tr[y * w..(y + 1) * w]);
-        for v in [&mut ab, &mut wb, &mut ar, &mut wr] {
-            v.iter_mut().for_each(|x| *x = 0.0);
-        }
-        for yy in y0..=y1 {
-            let sp = sw[yy + r - y];
-            let gr = &guide[yy * w..(yy + 1) * w];
-            let (rb, rr) = (&tb[yy * w..(yy + 1) * w], &tr[yy * w..(yy + 1) * w]);
-            for x in 0..w {
-                let gw = sp * guide_lut[(gr[x] as i32 - gc[x] as i32).unsigned_abs() as usize];
-                let sb = rb[x] as i32;
-                let sr = rr[x] as i32;
-                let wtb = gw * chroma_lut[(sb - cb[x] as i32).unsigned_abs() as usize];
-                let wtr = gw * chroma_lut[(sr - cr[x] as i32).unsigned_abs() as usize];
-                ab[x] += wtb * sb as f32;
-                wb[x] += wtb;
-                ar[x] += wtr * sr as f32;
-                wr[x] += wtr;
+        let row = &src[y * w..(y + 1) * w];
+        let out = &mut tmp[y * w..(y + 1) * w];
+        if w > 2 * reach {
+            out[reach..w - reach].fill(0.0);
+            for (i, &kv) in k.iter().enumerate() {
+                let off = i * d;
+                for (o, &v) in out[reach..w - reach].iter_mut().zip(&row[off..off + w - 2 * reach]) {
+                    *o += kv * v;
+                }
             }
         }
-        for x in 0..w {
-            ob[y * w + x] = (ab[x] / wb[x]).round().clamp(-1024.0, 1023.0) as i16;
-            or[y * w + x] = (ar[x] / wr[x]).round().clamp(-1024.0, 1023.0) as i16;
+        // The edge columns (or every column of a narrow plane) reflect.
+        let (a, b) = if w > 2 * reach { (reach, w - reach) } else { (w, w) };
+        for x in (0..a).chain(b..w) {
+            let mut s = 0.0;
+            for (i, &kv) in k.iter().enumerate() {
+                s += kv * row[refl(x as isize + (i as isize - r as isize) * d as isize, w as isize)];
+            }
+            out[x] = s;
         }
     }
-    (ob, or)
-}
-
-/// 2x2 box downsample of an i16 plane.
-fn half_down(src: &[i16], w: usize, h: usize) -> (Vec<i16>, usize, usize) {
-    let hw = w.div_ceil(2);
-    let hh = h.div_ceil(2);
-    let mut out = vec![0i16; hw * hh];
-    for y in 0..hh {
-        let y0 = y * 2;
-        let y1 = (y0 + 1).min(h - 1);
-        for x in 0..hw {
-            let x0 = x * 2;
-            let x1 = (x0 + 1).min(w - 1);
-            let s = src[y0 * w + x0] as i32
-                + src[y0 * w + x1] as i32
-                + src[y1 * w + x0] as i32
-                + src[y1 * w + x1] as i32;
-            // Round half up for both signs: `/` truncates toward zero, which
-            // nudged every negative chroma (all greens) one code toward zero.
-            out[y * hw + x] = ((s + 2) >> 2) as i16;
+    for y in 0..h {
+        let out = &mut dst[y * w..(y + 1) * w];
+        out.fill(0.0);
+        for (i, &kv) in k.iter().enumerate() {
+            let sy = refl(y as isize + (i as isize - r as isize) * d as isize, h as isize);
+            for (o, &v) in out.iter_mut().zip(&tmp[sy * w..(sy + 1) * w]) {
+                *o += kv * v;
+            }
         }
     }
-    (out, hw, hh)
 }
 
-/// Matching 2x2 box downsample for the u8 luma guide.
-fn half_down_luma(src: &[u8], w: usize, h: usize, hw: usize, hh: usize) -> Vec<u8> {
-    let mut out = vec![0u8; hw * hh];
-    for y in 0..hh {
-        let y0 = y * 2;
-        let y1 = (y0 + 1).min(h - 1);
-        for x in 0..hw {
-            let x0 = x * 2;
-            let x1 = (x0 + 1).min(w - 1);
-            let s = src[y0 * w + x0] as u32
-                + src[y0 * w + x1] as u32
-                + src[y1 * w + x0] as u32
-                + src[y1 * w + x1] as u32;
-            out[y * hw + x] = ((s + 2) / 4) as u8;
+/// Planes of a region: Rec.601 luma and the B-Y, R-Y differences, in 8-bit
+/// code units.
+fn load_region(buf: &[u16], w: usize, x0: usize, y0: usize, rw: usize, rh: usize) -> [Vec<f32>; 3] {
+    let n = rw * rh;
+    let (mut y, mut cb, mut cr) = (vec![0f32; n], vec![0f32; n], vec![0f32; n]);
+    for ry in 0..rh {
+        let src = &buf[((y0 + ry) * w + x0) * 4..((y0 + ry) * w + x0 + rw) * 4];
+        for (rx, px) in src.chunks_exact(4).enumerate() {
+            let (r, g, b) = (px[0] as f32 / 257.0, px[1] as f32 / 257.0, px[2] as f32 / 257.0);
+            let l = 0.299 * r + 0.587 * g + 0.114 * b;
+            let i = ry * rw + rx;
+            y[i] = l;
+            cb[i] = b - l;
+            cr[i] = r - l;
         }
     }
-    out
+    [y, cb, cr]
 }
 
-/// Denoise a 16-bit RGBA frame in place: narrow to 8 bits, filter, and add
-/// the 8-bit change back in steps of 257, so the 16-bit precision of
-/// unfiltered pixels is kept. The pre-filter 8-bit value is recomputed from
-/// the untouched u16 rather than kept in a second copy.
+/// Walk the bands of a region: `visit(level, band_planes)` sees the three
+/// channels' band `level`, and may shrink them. Returns nothing; the caller
+/// keeps what it needs from the visits.
+fn bands(mut c: [Vec<f32>; 3], w: usize, h: usize, levels: usize, mut visit: impl FnMut(usize, &mut [Vec<f32>; 3])) {
+    let n = w * h;
+    let mut s = [vec![0f32; n], vec![0f32; n], vec![0f32; n]];
+    let mut tmp = vec![0f32; n];
+    for j in 0..levels {
+        for ch in 0..3 {
+            sep_filter(&c[ch], &mut s[ch], &mut tmp, w, h, &B3, 1 << j);
+            // c becomes the band (c - s); s carries on as the next level.
+            for (cv, &sv) in c[ch].iter_mut().zip(&s[ch]) {
+                *cv -= sv;
+            }
+        }
+        visit(j, &mut c);
+        std::mem::swap(&mut c, &mut s);
+    }
+}
+
+/// Mean of `b`^2 over the 3x3 taps at spacing `d`.
+/// Mean of `b`^2 over the 8 taps around each coefficient at spacing `d`,
+/// leaving the coefficient itself out: an isolated noise spike then has only
+/// its quiet neighbours to vouch for it and goes, while an edge or texture is
+/// carried by its neighbours along it.
+fn energy(b: &[f32], out: &mut [f32], sq: &mut [f32], tmp: &mut [f32], w: usize, h: usize, d: usize) {
+    for (q, &v) in sq.iter_mut().zip(b) {
+        *q = v * v;
+    }
+    sep_filter(sq, out, tmp, w, h, &[1.0; 3], d);
+    for (o, &q) in out.iter_mut().zip(sq.iter()) {
+        *o = (*o - q) * (1.0 / 8.0);
+    }
+}
+
+/// The `k`-th smallest value of `v`, reordering it: a three-way quickselect,
+/// so the worker carries no standard-library sort for two small selections.
+fn kth_smallest(v: &mut [f32], k: usize) -> f32 {
+    let (mut lo, mut hi) = (0, v.len());
+    loop {
+        if hi - lo <= 1 {
+            return v[lo];
+        }
+        let (a, b, c) = (v[lo], v[lo + (hi - lo) / 2], v[hi - 1]);
+        let p = a.min(b).max(a.max(b).min(c));
+        // v[lo..lt] < p, v[lt..gt] == p, v[gt..hi] > p.
+        let (mut lt, mut i, mut gt) = (lo, lo, hi);
+        while i < gt {
+            if v[i] < p {
+                v.swap(lt, i);
+                lt += 1;
+                i += 1;
+            } else if v[i] > p {
+                gt -= 1;
+                v.swap(i, gt);
+            } else {
+                i += 1;
+            }
+        }
+        if k < lt {
+            hi = lt;
+        } else if k >= gt {
+            lo = gt;
+        } else {
+            return p;
+        }
+    }
+}
+
+/// Noise deviation per band and channel, from the flattest blocks.
+fn estimate_noise(buf: &[u16], w: usize, h: usize, levels: usize) -> Vec<[f32; 3]> {
+    let (bw, bh) = (w / BLOCK, h / BLOCK);
+    // Flatness: variance of 4x4 means within the block (noise averaged down,
+    // structure kept). Near-black and near-white blocks hide the noise.
+    let mut blocks: Vec<(f32, usize, usize)> = Vec::new();
+    const CELLS: usize = BLOCK / 4;
+    for by in 0..bh {
+        for bx in 0..bw {
+            // Sums of the 4x4 cells, one block row at a time.
+            let mut cell = [0f32; CELLS * CELLS];
+            for yy in 0..BLOCK {
+                let start = ((by * BLOCK + yy) * w + bx * BLOCK) * 4;
+                let sums = &mut cell[yy / 4 * CELLS..(yy / 4 + 1) * CELLS];
+                for (xx, p) in buf[start..start + BLOCK * 4].chunks_exact(4).enumerate() {
+                    sums[xx / 4] += 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32;
+                }
+            }
+            let (mut s, mut s2) = (0f32, 0f32);
+            for &c in &cell {
+                let m = c / (16.0 * 257.0);
+                s += m;
+                s2 += m * m;
+            }
+            let n = (CELLS * CELLS) as f32;
+            let mean = s / n;
+            if (12.0..=243.0).contains(&mean) {
+                blocks.push((s2 / n - mean * mean, bx, by));
+            }
+        }
+    }
+    let mut sig = vec![[0f32; 3]; levels];
+    if blocks.is_empty() {
+        return sig;
+    }
+    // The flattest share, kept in scan order so the sample spreads over the
+    // frame: everything below the share's threshold, then ties up to it.
+    let flat = ((blocks.len() as f32 * FLAT_SHARE).ceil() as usize).clamp(1, blocks.len());
+    let thr = kth_smallest(&mut blocks.iter().map(|b| b.0).collect::<Vec<_>>(), flat - 1);
+    let mut ties = flat - blocks.iter().filter(|b| b.0 < thr).count();
+    blocks.retain(|b| {
+        b.0 < thr
+            || (b.0 == thr && ties > 0 && {
+                ties -= 1;
+                true
+            })
+    });
+    let take = flat.min(MAX_SAMPLE_BLOCKS);
+    let a = apron(levels);
+    let mut coef: Vec<[Vec<f32>; 3]> = (0..levels).map(|_| [Vec::new(), Vec::new(), Vec::new()]).collect();
+    for i in 0..take {
+        let (_, bx, by) = blocks[i * flat / take];
+        let (cx0, cy0) = (bx * BLOCK, by * BLOCK);
+        let x0 = cx0.saturating_sub(a);
+        let y0 = cy0.saturating_sub(a);
+        let x1 = (cx0 + BLOCK + a).min(w);
+        let y1 = (cy0 + BLOCK + a).min(h);
+        let (rw, rh) = (x1 - x0, y1 - y0);
+        let planes = load_region(buf, w, x0, y0, rw, rh);
+        bands(planes, rw, rh, levels, |j, b| {
+            for ch in 0..3 {
+                for yy in cy0 - y0..cy0 - y0 + BLOCK {
+                    let row = &b[ch][yy * rw + cx0 - x0..yy * rw + cx0 - x0 + BLOCK];
+                    coef[j][ch].extend(row.iter().map(|v| v.abs()));
+                }
+            }
+        });
+    }
+    for (j, per) in coef.iter_mut().enumerate() {
+        for ch in 0..3 {
+            let v = &mut per[ch];
+            let mid = v.len() / 2;
+            let measured = 1.4826 * kth_smallest(v, mid);
+            // A coarse band of a flat block still sees edges up to its support
+            // away, so its MAD overstates the noise. Sensor noise falls about
+            // 0.5-0.6x per band (measured on an ISO 3200 ARW); cap each band at
+            // `NOISE_DECAY` of the band below.
+            sig[j][ch] = if j == 0 { measured } else { measured.min(NOISE_DECAY * sig[j - 1][ch]) };
+        }
+    }
+    sig
+}
+
+/// Shrink a region's bands and return the removed part per channel.
+fn removed(planes: [Vec<f32>; 3], w: usize, h: usize, p: Params, sig: &[[f32; 3]]) -> [Vec<f32>; 3] {
+    let n = w * h;
+    let mut rem = [vec![0f32; n], vec![0f32; n], vec![0f32; n]];
+    let (mut ey, mut ec, mut sq, mut tmp) = (vec![0f32; n], vec![0f32; n], vec![0f32; n], vec![0f32; n]);
+    bands(planes, w, h, p.levels, |j, b| {
+        let d = 1 << j;
+        let [sy, scb, scr] = sig[j];
+        energy(&b[0], &mut ey, &mut sq, &mut tmp, w, h, d);
+        let ty = (p.ky * sy) * (p.ky * sy);
+        for ((r, &bv), &e) in rem[0].iter_mut().zip(&b[0]).zip(&ey) {
+            *r += bv * (ty / e.max(1e-12)).min(1.0);
+        }
+        // Where luma has a clear edge, the colour bands keep at least the
+        // share an edge-only luma gain would keep there.
+        let te = (EDGE_T * sy) * (EDGE_T * sy);
+        for (ch, sc) in [(1usize, scb), (2, scr)] {
+            energy(&b[ch], &mut ec, &mut sq, &mut tmp, w, h, d);
+            let tc = (p.kc * sc) * (p.kc * sc);
+            for (((r, &bv), &e), &eyv) in rem[ch].iter_mut().zip(&b[ch]).zip(&ec).zip(&ey) {
+                let cut = (tc / e.max(1e-12)).min(1.0);
+                let edge_cut = (te / eyv.max(1e-12)).min(1.0);
+                let edge_cut = edge_cut * edge_cut;
+                *r += bv * cut.min(edge_cut);
+            }
+        }
+    });
+    rem
+}
+
+fn denoise_tiled(buf: &mut [u16], w: usize, h: usize, p: Params, tile: usize) {
+    let sig = estimate_noise(buf, w, h, p.levels);
+    if sig.iter().all(|s| s.iter().all(|&v| v <= 0.0)) {
+        return;
+    }
+    let a = apron(p.levels);
+    // Tiles read their apron from the frame as it was: each row of tiles
+    // takes its source rows from `src`, a copy holding rows `src_y0..`.
+    // Rows above the current tile row were written already, so they come
+    // from the previous copy, which still holds them unfiltered.
+    let row = w * 4;
+    let (mut src, mut src_y0): (Vec<u16>, usize) = (Vec::new(), 0);
+    let mut ty0 = 0;
+    while ty0 < h {
+        let ty1 = (ty0 + tile).min(h);
+        let (y0, y1) = (ty0.saturating_sub(a), (ty1 + a).min(h));
+        let mut band = Vec::with_capacity((y1 - y0) * row);
+        for yy in y0..y1 {
+            let line = if yy < ty0 { &src[(yy - src_y0) * row..(yy - src_y0 + 1) * row] } else { &buf[yy * row..(yy + 1) * row] };
+            band.extend_from_slice(line);
+        }
+        (src, src_y0) = (band, y0);
+        let mut tx0 = 0;
+        while tx0 < w {
+            let tx1 = (tx0 + tile).min(w);
+            let (x0, x1) = (tx0.saturating_sub(a), (tx1 + a).min(w));
+            let (rw, rh) = (x1 - x0, y1 - y0);
+            let planes = load_region(&src, w, x0, 0, rw, rh);
+            let [dy, dcb, dcr] = removed(planes, rw, rh, p, &sig);
+            for yy in ty0..ty1 {
+                for xx in tx0..tx1 {
+                    let i = (yy - y0) * rw + (xx - x0);
+                    // Removed Y/Cb/Cr back to RGB (the split is linear).
+                    let (ly, lb, lr) = (dy[i], dcb[i], dcr[i]);
+                    let r = lr + ly;
+                    let b = lb + ly;
+                    let g = (ly - 0.299 * r - 0.114 * b) / 0.587;
+                    let px = &mut buf[(yy * w + xx) * 4..(yy * w + xx) * 4 + 3];
+                    for (v, dv) in px.iter_mut().zip([r, g, b]) {
+                        let step = (dv * 257.0).round();
+                        if step != 0.0 {
+                            *v = (*v as f32 - step).clamp(0.0, 65535.0) as u16;
+                        }
+                    }
+                }
+            }
+            tx0 = tx1;
+        }
+        ty0 = ty1;
+    }
+}
+
+/// Denoise a 16-bit sRGB RGBA frame in place. `strength` 0..=1 (0 is a
+/// no-op); `px_scale` is sensor pixels per frame pixel (1 for a full-size
+/// export, larger for a downscaled preview).
 pub fn smart_denoise_wide(buf: &mut [u16], w: usize, h: usize, strength: f32, px_scale: f32) {
     if strength <= 0.0 || w == 0 || h == 0 || buf.len() < w * h * 4 {
         return;
     }
-    // Alpha is never filtered, so only the colour channels are narrowed and
-    // widened back.
-    let mut narrow = vec![255u8; w * h * 4];
-    for (n, v) in narrow.chunks_exact_mut(4).zip(buf.chunks_exact(4)) {
-        n[0] = to8(v[0]) as u8;
-        n[1] = to8(v[1]) as u8;
-        n[2] = to8(v[2]) as u8;
-    }
-    smart_denoise(&mut narrow, w, h, strength, px_scale);
-    for (dst, n) in buf.chunks_exact_mut(4).zip(narrow.chunks_exact(4)) {
-        for c in 0..3 {
-            let step = (n[c] as i32 - to8(dst[c])) * 257;
-            if step != 0 {
-                dst[c] = (dst[c] as i32 + step).clamp(0, 65535) as u16;
-            }
-        }
-    }
-}
-
-/// `(v + 128) / 257` without the division; exact for every u16 (checked
-/// exhaustively, and by `to8_matches_division`).
-#[inline]
-fn to8(v: u16) -> i32 {
-    ((v as u32 * 255 + 32895) >> 16) as i32
-}
-
-/// Taps for the 2x bilinear upsample of a half-resolution plane back to
-/// `w` x `h`: per output column (x0, x1, wx) and per output row (y0, y1, wy).
-struct UpTaps {
-    cols: Vec<(usize, usize, f32)>,
-    rows: Vec<(usize, usize, f32)>,
-}
-
-impl UpTaps {
-    fn new(sw: usize, sh: usize, w: usize, h: usize) -> Self {
-        let taps = |n: usize, sn: usize| -> Vec<(usize, usize, f32)> {
-            let s = sn as f32 / n as f32;
-            (0..n)
-                .map(|i| {
-                    let f = ((i as f32 + 0.5) * s - 0.5).clamp(0.0, (sn - 1) as f32);
-                    let i0 = f.floor() as usize;
-                    (i0, (i0 + 1).min(sn - 1), f - i0 as f32)
-                })
-                .collect()
-        };
-        UpTaps { cols: taps(w, sw), rows: taps(h, sh) }
-    }
-}
-
-#[inline]
-fn bilerp(a: i16, b: i16, c: i16, d: i16, wx: f32, wy: f32) -> i16 {
-    let (a, b, c, d) = (a as f32, b as f32, c as f32, d as f32);
-    let top = a + (b - a) * wx;
-    let bot = c + (d - c) * wx;
-    (top + (bot - top) * wy).round() as i16
-}
-
-/// Share of the luma filter applied at slider strength `t` (0..=1):
-/// `(t / LUMA_FULL_AT)²`, capped at 1. 0.1 → 0.04, 0.25 → 0.25, ≥0.5 → 1.
-const LUMA_FULL_AT: f32 = 0.5;
-/// Luma mixes below this are skipped outright (slider strength < ~0.11).
-const LUMA_SKIP_MIX: f32 = 0.05;
-fn luma_mix(t: f32) -> f32 {
-    let r = (t / LUMA_FULL_AT).clamp(0.0, 1.0);
-    r * r
-}
-
-/// Denoise `buf` (RGBA, `w`×`h`) in place. `strength` 0..=1; 0 is a no-op.
-/// `px_scale` is sensor pixels per buffer pixel — 1.0 for a full-res export,
-/// larger for a downscaled proxy or preview.
-pub fn smart_denoise(buf: &mut [u8], w: usize, h: usize, strength: f32, px_scale: f32) {
-    let t = strength.clamp(0.0, 1.0);
-    if t <= 0.0 || w == 0 || h == 0 || buf.len() < w * h * 4 {
+    let p = params(strength, px_scale, w, h);
+    if p.levels == 0 {
         return;
     }
-    let n = w * h;
-    let mut y = vec![0u8; n];
-    let mut cb = vec![0i16; n];
-    let mut cr = vec![0i16; n];
-    for i in 0..n {
-        let p = i * 4;
-        let r = buf[p] as i32;
-        let g = buf[p + 1] as i32;
-        let b = buf[p + 2] as i32;
-        let luma = (77 * r + 150 * g + 29 * b) >> 8;
-        y[i] = luma as u8;
-        cb[i] = ((-43 * r - 85 * g + 128 * b) >> 8) as i16;
-        cr[i] = ((128 * r - 107 * g - 21 * b) >> 8) as i16;
-    }
-
-    // Sensor-space long edge in kilopixels. Radii are chosen there, clamped
-    // there, then divided back into render pixels, so a high-MP sensor's cap
-    // does not shrink the preview's relative window.
-    let p = px_scale.max(1.0);
-    let sensor_kpx = w.max(h) as f32 / 1000.0 * p;
-    let r_y = (((0.9 * t * sensor_kpx).round().clamp(1.0, MAX_LUMA_R as f32)) / p)
-        .round()
-        .max(1.0) as usize;
-    // Chroma runs at half resolution, so its radius is in half-res pixels.
-    let r_c = (((1.0 * t * sensor_kpx)
-        .round()
-        .clamp(1.0, MAX_CHROMA_R as f32))
-        / p)
-        .round()
-        .max(1.0) as usize;
-    // Range sigmas are in 8-bit codes of this render, and the noise they must
-    // reject shrinks with the downscale factor.
-    let sy = (4.0 + 14.0 * t) / p;
-    let sg = (8.0 + 24.0 * t) / p;
-    let sc = (10.0 + 20.0 * t) / p;
-
-    let sw_y = spatial(r_y);
-    let lut_y = range(sy);
-    // Luma is filtered as the same Rec.601 luma of sRGB codes that the YCbCr
-    // split below carries. 189d5e5 filtered linear Rec.709 luminance instead
-    // and substituted it for this luma; the two agree only for greys, so every
-    // coloured pixel moved by a fixed amount whenever denoise was on (#15),
-    // and pure-chroma noise leaked into luma. The bilateral range gate keeps
-    // the averaged samples within a few codes of each other, so the sRGB-
-    // averaging bias is far below one code (measured: mean -0.6 codes at
-    // denoise 50 on the owner's ARW before 189d5e5).
-    // Below `LUMA_SKIP_MIX` the luma pass changes nothing measurable (Smart
-    // denoise 10 on the owner's ARW: luma detail +0.05 % at 100 %), so the
-    // low range pays for chroma only.
-    let luma_mix = luma_mix(t);
-    let filt_y: Option<Vec<u8>> = (luma_mix >= LUMA_SKIP_MIX).then(|| {
-        let tmp_y = luma_horizontal(&y, w, h, r_y, &sw_y, &lut_y);
-        luma_vertical(&tmp_y, &y, w, h, r_y, &sw_y, &lut_y, luma_lut())
-    });
-
-    let sw_c = spatial(r_c);
-    let lut_g = range(sg);
-    let lut_c = range(sc);
-    let (cb_h, hw, hh) = half_down(&cb, w, h);
-    let (cr_h, _, _) = half_down(&cr, w, h);
-    let y_h = half_down_luma(&y, w, h, hw, hh);
-    let (tmp_cb, tmp_cr) = chroma_horizontal2(&cb_h, &cr_h, &y_h, hw, hh, r_c, &sw_c, &lut_g, &lut_c);
-    let (v_cb, v_cr) = chroma_vertical2(&tmp_cb, &tmp_cr, &y_h, hw, hh, r_c, &sw_c, &lut_g, &lut_c);
-
-    // Radii and sigmas already carry the strength. Chroma uses the filtered
-    // result whole. Luma is mixed by `luma_mix`, which deliberately squares
-    // the slider over its lower half (see the module docs), so the low range
-    // leaves luminance texture nearly untouched.
-    // The bilinear upsample of the filtered chroma is folded into this pass
-    // (same arithmetic as a separate upsample, so bit-identical) instead of
-    // writing and re-reading two full-resolution planes.
-    let up = UpTaps::new(hw, hh, w, h);
-    for yy in 0..h {
-        let (y0, y1, wy) = up.rows[yy];
-        let (cb0, cb1) = (&v_cb[y0 * hw..(y0 + 1) * hw], &v_cb[y1 * hw..(y1 + 1) * hw]);
-        let (cr0, cr1) = (&v_cr[y0 * hw..(y0 + 1) * hw], &v_cr[y1 * hw..(y1 + 1) * hw]);
-        for (x, &(x0, x1, wx)) in up.cols.iter().enumerate() {
-            let i = yy * w + x;
-            // The integer forward split and this float inverse are not exact
-            // inverses (up to 2 codes on saturated blues), so apply only the
-            // change the filter made: an unfiltered pixel comes back exactly.
-            let to_rgb = |yy: f32, cb: f32, cr: f32| {
-                [yy + 1.402 * cr, yy - 0.344136 * cb - 0.714136 * cr, yy + 1.772 * cb]
-            };
-            let a = to_rgb(y[i] as f32, cb[i] as f32, cr[i] as f32);
-            let fy = match &filt_y {
-                Some(f) => y[i] as f32 + luma_mix * (f[i] as f32 - y[i] as f32),
-                None => y[i] as f32,
-            };
-            let fcb = bilerp(cb0[x0], cb0[x1], cb1[x0], cb1[x1], wx, wy) as f32;
-            let fcr = bilerp(cr0[x0], cr0[x1], cr1[x0], cr1[x1], wx, wy) as f32;
-            let b = to_rgb(fy, fcb, fcr);
-            let p = i * 4;
-            for c in 0..3 {
-                buf[p + c] = (buf[p + c] as f32 + (b[c] - a[c])).round().clamp(0.0, 255.0) as u8;
-            }
-        }
-    }
+    denoise_tiled(buf, w, h, p, TILE);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn colour_noisy(w: usize, h: usize, base: [u8; 3], amp: i32, seed: u32) -> Vec<u8> {
-        let mut v = vec![0u8; w * h * 4];
-        let mut s = seed;
-        for i in 0..w * h {
-            for c in 0..3 {
-                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
-                let d = if amp == 0 { 0 } else { ((s >> 16) as i32 % (2 * amp + 1)) - amp };
-                v[i * 4 + c] = (base[c] as i32 + d).clamp(0, 255) as u8;
-            }
-            v[i * 4 + 3] = 255;
+    /// Deterministic pseudo-random normal noise.
+    struct Rng(u64);
+    impl Rng {
+        fn unit(&mut self) -> f32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((self.0 >> 40) as f32 + 0.5) / (1u64 << 24) as f32
         }
-        v
-    }
-
-    fn channel_means(v: &[u8]) -> [f64; 3] {
-        let n = (v.len() / 4) as f64;
-        let mut m = [0f64; 3];
-        for p in v.chunks_exact(4) {
-            for c in 0..3 {
-                m[c] += p[c] as f64;
-            }
-        }
-        m.map(|x| x / n)
-    }
-
-    #[test]
-    fn flat_saturated_colour_is_unchanged() {
-        // #15: a flat foliage green came back ~+9 codes brighter at any
-        // strength because filtered luminance replaced Rec.601 luma.
-        for base in [[60u8, 140, 40], [200, 60, 50], [40, 70, 180], [128, 128, 128]] {
-            for strength in [0.1f32, 0.5, 1.0] {
-                let src = colour_noisy(48, 32, base, 0, 1);
-                let mut out = src.clone();
-                smart_denoise(&mut out, 48, 32, strength, 1.0);
-                let max = out.iter().zip(&src).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
-                assert!(max <= 1, "flat {base:?} at {strength} moved by {max}");
-            }
+        fn normal(&mut self) -> f32 {
+            let (a, b) = (self.unit(), self.unit());
+            (-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()
         }
     }
 
-    #[test]
-    fn noisy_saturated_colour_keeps_its_mean() {
-        for base in [[60u8, 140, 40], [200, 60, 50], [40, 70, 180]] {
-            for strength in [0.1f32, 0.5] {
-                let src = colour_noisy(96, 64, base, 8, 7);
-                let mut out = src.clone();
-                smart_denoise(&mut out, 96, 64, strength, 1.0);
-                let (a, b) = (channel_means(&src), channel_means(&out));
-                for c in 0..3 {
-                    assert!(
-                        (a[c] - b[c]).abs() <= 1.0,
-                        "{base:?} at {strength}: channel {c} mean {:.2} -> {:.2}",
-                        a[c],
-                        b[c]
-                    );
+    /// A frame from an 8-bit RGB function plus luma noise `sl` and colour
+    /// noise `sc` (in 8-bit codes), the colour noise box-blurred over `blot`
+    /// px like demosaiced colour mottle.
+    fn frame(w: usize, h: usize, f: impl Fn(usize, usize) -> [f32; 3], sl: f32, sc: f32, blot: usize, seed: u64) -> Vec<u16> {
+        let mut rng = Rng(seed);
+        let n = w * h;
+        let ln: Vec<f32> = (0..n).map(|_| rng.normal() * sl).collect();
+        let mut cn: [Vec<f32>; 2] = [(0..n).map(|_| rng.normal()).collect(), (0..n).map(|_| rng.normal()).collect()];
+        for c in cn.iter_mut() {
+            let src = c.clone();
+            let r = blot / 2;
+            for y in 0..h {
+                for x in 0..w {
+                    let (mut s, mut k) = (0.0, 0.0);
+                    for yy in y.saturating_sub(r)..(y + r + 1).min(h) {
+                        for xx in x.saturating_sub(r)..(x + r + 1).min(w) {
+                            s += src[yy * w + xx];
+                            k += 1.0;
+                        }
+                    }
+                    // Rescale so the blotchy noise keeps deviation sc.
+                    c[y * w + x] = s / k * sc * (k as f32).sqrt();
                 }
             }
         }
-    }
-
-    /// Standard deviation of Rec.601 luma and of the two chroma planes.
-    fn ycc_std(v: &[u8]) -> (f32, f32) {
-        let n = (v.len() / 4) as f32;
-        let mut sums = [0f32; 3];
-        let mut sq = [0f32; 3];
-        for p in v.chunks_exact(4) {
-            let (r, g, b) = (p[0] as f32, p[1] as f32, p[2] as f32);
-            let c = [
-                0.299 * r + 0.587 * g + 0.114 * b,
-                -0.168736 * r - 0.331264 * g + 0.5 * b,
-                0.5 * r - 0.418688 * g - 0.081312 * b,
-            ];
-            for k in 0..3 {
-                sums[k] += c[k];
-                sq[k] += c[k] * c[k];
-            }
-        }
-        let sd = |k: usize| (sq[k] / n - (sums[k] / n).powi(2)).max(0.0).sqrt();
-        (sd(0), (sd(1) + sd(2)) / 2.0)
-    }
-
-    #[test]
-    fn low_strength_is_chroma_first() {
-        // Independent per-channel noise carries both luma and chroma noise.
-        let src = colour_noisy(128, 96, [120, 110, 100], 10, 5);
-        let (y0, c0) = ycc_std(&src);
-        let mut low = src.clone();
-        smart_denoise(&mut low, 128, 96, 0.1, 1.0);
-        let (y1, c1) = ycc_std(&low);
-        assert!(c1 < c0 * 0.6, "chroma noise {c0:.2} -> {c1:.2} at 0.1 (want -40% or more)");
-        assert!(y1 > y0 * 0.95, "luma noise {y0:.2} -> {y1:.2} at 0.1 (want -5% at most)");
-        let mut full = src.clone();
-        smart_denoise(&mut full, 128, 96, 1.0, 1.0);
-        let (y2, _) = ycc_std(&full);
-        assert!(y2 < y0 * 0.8, "luma noise {y0:.2} -> {y2:.2} at 1.0 (want real smoothing)");
-    }
-
-    #[test]
-    fn luma_ramp_reaches_full_at_half() {
-        assert_eq!(luma_mix(0.0), 0.0);
-        assert!((luma_mix(0.1) - 0.04).abs() < 1e-6);
-        assert!((luma_mix(0.25) - 0.25).abs() < 1e-6);
-        assert_eq!(luma_mix(0.5), 1.0);
-        assert_eq!(luma_mix(1.0), 1.0);
-    }
-
-    fn gray_noisy(w: usize, h: usize, base: u8, amp: i32, seed: u32) -> Vec<u8> {
-        let mut v = vec![0u8; w * h * 4];
-        let mut s = seed;
-        for i in 0..w * h {
-            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
-            let d = ((s >> 16) as i32 % (2 * amp + 1)) - amp;
-            let val = (base as i32 + d).clamp(0, 255) as u8;
-            let p = i * 4;
-            v[p] = val;
-            v[p + 1] = val;
-            v[p + 2] = val;
-            v[p + 3] = 255;
-        }
-        v
-    }
-
-    fn luma_std(v: &[u8], w: usize, h: usize) -> f32 {
-        let vals: Vec<f32> = (0..w * h)
-            .map(|i| {
-                let p = i * 4;
-                (77.0 * v[p] as f32 + 150.0 * v[p + 1] as f32 + 29.0 * v[p + 2] as f32) / 256.0
-            })
-            .collect();
-        let m = vals.iter().sum::<f32>() / vals.len() as f32;
-        (vals.iter().map(|v| (v - m) * (v - m)).sum::<f32>() / vals.len() as f32).sqrt()
-    }
-
-    #[test]
-    fn to8_matches_division() {
-        for v in 0..=u16::MAX {
-            assert_eq!(to8(v), ((v as u32 + 128) / 257) as i32, "v = {v}");
-        }
-    }
-
-    #[test]
-    fn wide_matches_narrow_denoise_widen() {
-        // smart_denoise_wide must equal the old path: narrow to 8 bits,
-        // denoise, add the 8-bit change back in steps of 257.
-        let (w, h) = (96, 64);
-        let src8 = colour_noisy(w, h, [90, 140, 60], 9, 11);
-        let wide: Vec<u16> = src8
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| (v as u16 * 257).saturating_add(i as u16 % 200))
-            .collect();
-        for strength in [0.05f32, 0.3, 1.0] {
-            let mut expect = wide.clone();
-            let before: Vec<u8> = wide.iter().map(|&v| ((v as u32 + 128) / 257) as u8).collect();
-            let mut after = before.clone();
-            smart_denoise(&mut after, w, h, strength, 1.0);
-            for ((d, &a), &b) in expect.iter_mut().zip(&after).zip(&before) {
-                let step = (a as i32 - b as i32) * 257;
-                if step != 0 {
-                    *d = (*d as i32 + step).clamp(0, 65535) as u16;
+        let mut out = vec![65535u16; n * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                let [r, g, b] = f(x, y);
+                let (l, cb, cr) = (ln[i], cn[0][i], cn[1][i]);
+                let rr = r + l + cr;
+                let bb = b + l + cb;
+                let gg = g + l - (0.299 * cr + 0.114 * cb) / 0.587;
+                for (c, v) in [rr, gg, bb].into_iter().enumerate() {
+                    out[i * 4 + c] = (v * 257.0).round().clamp(0.0, 65535.0) as u16;
                 }
             }
-            let mut got = wide.clone();
-            smart_denoise_wide(&mut got, w, h, strength, 1.0);
-            assert_eq!(got, expect, "strength {strength}");
+        }
+        out
+    }
+
+    fn planes(buf: &[u16], w: usize, h: usize) -> [Vec<f32>; 3] {
+        load_region(buf, w, 0, 0, w, h)
+    }
+
+    /// Deviation of the k x k box means of `v` inside a window.
+    fn sd_at(v: &[f32], w: usize, (x0, y0, x1, y1): (usize, usize, usize, usize), k: usize) -> f32 {
+        let mut m = Vec::new();
+        let mut y = y0;
+        while y + k <= y1 {
+            let mut x = x0;
+            while x + k <= x1 {
+                let mut s = 0.0;
+                for yy in y..y + k {
+                    for xx in x..x + k {
+                        s += v[yy * w + xx];
+                    }
+                }
+                m.push(s / (k * k) as f32);
+                x += k;
+            }
+            y += k;
+        }
+        let mean = m.iter().sum::<f32>() / m.len() as f32;
+        (m.iter().map(|a| (a - mean) * (a - mean)).sum::<f32>() / m.len() as f32).sqrt()
+    }
+
+    const GREY: fn(usize, usize) -> [f32; 3] = |_, _| [120.0, 130.0, 125.0];
+
+    #[test]
+    fn kth_smallest_matches_a_sort() {
+        let mut rng = Rng(7);
+        for n in [1usize, 2, 3, 10, 101, 1000] {
+            // A third of the values tie, as zero coefficients do.
+            let v: Vec<f32> = (0..n).map(|i| if i % 3 == 0 { 1.0 } else { rng.normal() }).collect();
+            let mut sorted = v.clone();
+            sorted.sort_by(f32::total_cmp);
+            for k in [0, n / 3, n / 2, n - 1] {
+                assert_eq!(kth_smallest(&mut v.clone(), k), sorted[k], "n {n}, k {k}");
+            }
         }
     }
 
     #[test]
     fn zero_strength_is_a_noop() {
-        let orig = gray_noisy(64, 64, 120, 10, 7);
-        let mut v = orig.clone();
-        smart_denoise(&mut v, 64, 64, 0.0, 1.0);
-        assert_eq!(v, orig);
+        let mut a = frame(96, 64, GREY, 6.0, 8.0, 5, 1);
+        let b = a.clone();
+        smart_denoise_wide(&mut a, 96, 64, 0.0, 1.0);
+        assert_eq!(a, b);
     }
 
     #[test]
-    fn flat_noise_is_smoothed() {
-        let orig = gray_noisy(96, 96, 120, 12, 3);
-        let mut v = orig.clone();
-        // 96px image → tiny radii, so use a strong local check instead of
-        // absolute numbers: neighbour differences must shrink a lot.
-        smart_denoise(&mut v, 96, 96, 1.0, 1.0);
-        let noise_before = luma_std(&orig, 96, 96);
-        let noise_after = luma_std(&v, 96, 96);
-        assert!(
-            noise_after < noise_before * 0.7,
-            "before {noise_before}, after {noise_after}"
-        );
+    fn a_noise_free_frame_is_unchanged() {
+        // A smooth gradient of a saturated colour and a hard edge: no band
+        // stands above a noise of zero, so nothing is removed.
+        let f = |x: usize, y: usize| if x < 60 { [200.0, 40.0 + y as f32, 30.0] } else { [20.0, 90.0, 210.0 - x as f32 * 0.3] };
+        let mut a = frame(128, 96, f, 0.0, 0.0, 1, 2);
+        let b = a.clone();
+        smart_denoise_wide(&mut a, 128, 96, 1.0, 1.0);
+        assert_eq!(a, b);
     }
 
     #[test]
-    fn edges_are_preserved() {
-        let w = 80;
-        let h = 40;
-        let mut v = gray_noisy(w, h, 30, 4, 11);
-        // Right half becomes bright (edge at x=40).
-        for yy in 0..h {
-            for x in w / 2..w {
-                let p = (yy * w + x) * 4;
-                v[p] = 210;
-                v[p + 1] = 210;
-                v[p + 2] = 210;
+    fn colour_mottle_goes_at_every_scale() {
+        // ISO-3200-like: luma 6, colour 10 with 5 px blotches.
+        let (w, h) = (256, 192);
+        let mut a = frame(w, h, GREY, 6.0, 10.0, 5, 3);
+        let before = planes(&a, w, h);
+        smart_denoise_wide(&mut a, w, h, 0.25, 1.0);
+        let after = planes(&a, w, h);
+        let win = (24, 24, w - 24, h - 24);
+        for k in [1usize, 4, 8] {
+            for ch in 1..3 {
+                let (b, a) = (sd_at(&before[ch], w, win, k), sd_at(&after[ch], w, win, k));
+                assert!(a < 0.25 * b, "colour {ch} at {k} px: {a:.2} of {b:.2}");
             }
         }
-        let mut d = v.clone();
-        smart_denoise(&mut d, w, h, 1.0, 1.0);
-        let dark = |v: &[u8], x: usize| v[(20 * w + x) * 4] as i32;
-        let bright = |v: &[u8], x: usize| v[(20 * w + x) * 4] as i32;
-        // Just inside the edge, the step must survive.
-        let step_before = bright(&v, 41) - dark(&v, 38);
-        let step_after = bright(&d, 41) - dark(&d, 38);
-        assert!(
-            step_after as f32 > step_before as f32 * 0.8,
-            "before {step_before}, after {step_after}"
-        );
-        // Far from the edge the noise should be reduced.
-        let flat_before = luma_std(&v[..], 80, 40);
-        let flat_after = luma_std(&d[..], 80, 40);
-        assert!(flat_after < flat_before);
     }
 
     #[test]
-    fn chroma_blotches_are_suppressed() {
-        // Two colours with the same luma (128) but opposite Cr: pure chroma
-        // noise, no luminance signal for the filter to latch onto.
-        let (w, h) = (64, 64);
-        let mut v = vec![0u8; w * h * 4];
-        for i in 0..w * h {
-            let p = i * 4;
-            let (r, g, b) = if i % 2 == 0 {
-                (170u8, 107u8, 128u8)
-            } else {
-                (86u8, 149u8, 128u8)
-            };
-            v[p] = r;
-            v[p + 1] = g;
-            v[p + 2] = b;
-            v[p + 3] = 255;
+    fn luma_noise_falls_with_the_slider_at_fine_and_coarse_scales() {
+        let (w, h) = (256, 192);
+        let src = frame(w, h, GREY, 6.0, 4.0, 3, 4);
+        let base = planes(&src, w, h);
+        let win = (24, 24, w - 24, h - 24);
+        let mut last = [f32::MAX; 2];
+        for s in [0.25f32, 0.5, 1.0] {
+            let mut a = src.clone();
+            smart_denoise_wide(&mut a, w, h, s, 1.0);
+            let p = planes(&a, w, h);
+            let now = [sd_at(&p[0], w, win, 1), sd_at(&p[0], w, win, 4)];
+            assert!(now[0] < last[0] && now[1] < last[1], "strength {s}: {now:?} not below {last:?}");
+            last = now;
         }
-        let luma_before = luma_std(&v, w, h);
-        let mut d = v.clone();
-        smart_denoise(&mut d, w, h, 1.0, 1.0);
-        let spread = |v: &[u8]| -> f32 {
-            let vals: Vec<f32> = (0..w * h)
-                .map(|i| v[i * 4] as f32 - v[i * 4 + 2] as f32)
-                .collect();
-            let m = vals.iter().sum::<f32>() / vals.len() as f32;
-            (vals.iter().map(|x| (x - m) * (x - m)).sum::<f32>() / vals.len() as f32).sqrt()
+        assert!(last[0] < 0.4 * sd_at(&base[0], w, win, 1), "full strength fine luma {}", last[0]);
+        assert!(last[1] < 0.4 * sd_at(&base[0], w, win, 4), "full strength 4 px luma {}", last[1]);
+    }
+
+    #[test]
+    fn the_same_slider_cleans_any_noise_level_alike() {
+        // Thresholds come from the measured noise, so a quiet and a noisy
+        // frame lose the same share of it.
+        let (w, h) = (256, 192);
+        let win = (24, 24, w - 24, h - 24);
+        let mut share = Vec::new();
+        for sl in [2.0f32, 8.0] {
+            let mut a = frame(w, h, GREY, sl, sl, 3, 5);
+            let b = planes(&a, w, h)[0].clone();
+            smart_denoise_wide(&mut a, w, h, 0.5, 1.0);
+            share.push(sd_at(&planes(&a, w, h)[0], w, win, 1) / sd_at(&b, w, win, 1));
+        }
+        assert!((share[0] - share[1]).abs() < 0.08, "kept share {share:?}");
+    }
+
+    #[test]
+    fn edges_and_tone_are_kept() {
+        // A 60-code luma step under ISO-3200-like noise: both sides keep their
+        // level and the step stays as sharp.
+        let (w, h) = (192, 128);
+        let f = |x: usize, _| if x < 96 { [70.0, 80.0, 75.0] } else { [130.0, 140.0, 135.0] };
+        let mut a = frame(w, h, f, 6.0, 8.0, 3, 6);
+        let before = planes(&a, w, h);
+        smart_denoise_wide(&mut a, w, h, 0.5, 1.0);
+        let after = planes(&a, w, h);
+        let col = |p: &[f32], x: usize| (16..h - 16).map(|y| p[y * w + x]).sum::<f32>() / (h - 32) as f32;
+        // Against the noise-free level: one noisy column's mean is itself
+        // off by about 0.6 codes.
+        let truth = |c: [f32; 3]| 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
+        for x in [40usize, 150] {
+            let want = truth(f(x, 0));
+            assert!((col(&after[0], x) - want).abs() < 0.4, "level at {x}: {} vs {want}", col(&after[0], x));
+        }
+        let step = |p: &[f32]| col(p, 97) - col(p, 94);
+        assert!(step(&after[0]) > 0.9 * step(&before[0]), "step {} vs {}", step(&after[0]), step(&before[0]));
+    }
+
+    #[test]
+    fn a_thin_white_line_keeps_its_colour_on_a_coloured_ground() {
+        // The beak case: a 3 px neutral line on a cyan ground.
+        let (w, h) = (160, 120);
+        let f = |_, y: usize| if (58..61).contains(&y) { [215.0, 215.0, 215.0] } else { [110.0, 160.0, 165.0] };
+        let mut a = frame(w, h, f, 6.0, 8.0, 3, 7);
+        let before = planes(&a, w, h);
+        smart_denoise_wide(&mut a, w, h, 0.5, 1.0);
+        let after = planes(&a, w, h);
+        let mean = |p: &[f32]| (20..w - 20).flat_map(|x| (58..61).map(move |y| (x, y))).map(|(x, y)| p[y * w + x]).sum::<f32>() / ((w - 40) * 3) as f32;
+        for ch in 1..3 {
+            assert!((mean(&after[ch]) - mean(&before[ch])).abs() < 2.0, "colour {ch}: {} vs {}", mean(&after[ch]), mean(&before[ch]));
+        }
+    }
+
+    #[test]
+    fn tiles_give_the_whole_frame_result() {
+        let (w, h) = (300, 220);
+        let f = |x: usize, y: usize| [100.0 + (x % 37) as f32, 120.0 + (y % 23) as f32, 90.0];
+        let src = frame(w, h, f, 6.0, 8.0, 3, 8);
+        let p = params(0.6, 1.0, w, h);
+        let (mut whole, mut tiled) = (src.clone(), src.clone());
+        denoise_tiled(&mut whole, w, h, p, 4096);
+        denoise_tiled(&mut tiled, w, h, p, 70);
+        assert_eq!(whole, tiled);
+    }
+
+    #[test]
+    fn a_preview_cleans_as_the_export_does() {
+        // A 2x downscale halves white noise; measured noise and sensor-scaled
+        // bands make the preview lose the same share as the export.
+        let (w, h) = (384, 256);
+        let src = frame(w, h, GREY, 8.0, 10.0, 5, 9);
+        let down = |b: &[u16]| -> Vec<u16> {
+            let (hw, hh) = (w / 2, h / 2);
+            let mut o = vec![65535u16; hw * hh * 4];
+            for y in 0..hh {
+                for x in 0..hw {
+                    for c in 0..3 {
+                        let s: u32 = [(0, 0), (1, 0), (0, 1), (1, 1)].iter().map(|(dx, dy)| b[((2 * y + dy) * w + 2 * x + dx) * 4 + c] as u32).sum();
+                        o[(y * hw + x) * 4 + c] = ((s + 2) / 4) as u16;
+                    }
+                }
+            }
+            o
         };
-        assert!(spread(&d) < spread(&v) * 0.85, "chroma not smoothed");
-        assert!(luma_std(&d, w, h) < luma_before + 1.5, "luma disturbed");
+        let mut export = src.clone();
+        smart_denoise_wide(&mut export, w, h, 0.5, 1.0);
+        let export_small = down(&export);
+        let mut preview = down(&src);
+        smart_denoise_wide(&mut preview, w / 2, h / 2, 0.5, 2.0);
+        let (hw, hh) = (w / 2, h / 2);
+        let win = (12, 12, hw - 12, hh - 12);
+        let (e, p) = (planes(&export_small, hw, hh), planes(&preview, hw, hh));
+        for ch in 0..3 {
+            let (se, sp) = (sd_at(&e[ch], hw, win, 1), sd_at(&p[ch], hw, win, 1));
+            assert!(sp < se * 1.6 + 0.3 && se < sp * 1.6 + 0.3, "channel {ch}: export {se:.2} preview {sp:.2}");
+        }
     }
 }
+

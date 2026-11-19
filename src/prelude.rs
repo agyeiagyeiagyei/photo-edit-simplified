@@ -3,7 +3,7 @@
 //! references unqualified.
 
 pub(crate) use pes_pixel::geo::{crop_px, geometry, hi_target, working_dims};
-pub(crate) use pes_pixel::pipeline::{self, Frame as PipeFrame, Target as PipeTarget};
+pub(crate) use pes_pixel::pipeline::{self, Frame as PipeFrame, Place, Target as PipeTarget};
 pub(crate) use pes_pixel::types::RawAdjust;
 pub(crate) use pes_pixel::{blur, brush, color, curves, heal, levels, ops, rawops, resample, stroke, wand};
 

@@ -225,15 +225,28 @@ pub(crate) fn drive_refresh(state: AppState) {
             Ok(Some(mid)) => {
                 state.drive_manifest_id.set(Some(mid.clone()));
                 if let Ok(bytes) = drive::download_file(&token, &mid).await {
-                    let (starred, edits) = drive::parse_manifest(&bytes);
+                    let (mut starred, edits) = drive::parse_manifest(&bytes);
                     if !state.drive_manifest_loaded.get_untracked() {
-                        state.drive_shortlist.update(|s| s.extend(starred));
+                        // Photos removed from the editor before this load
+                        // (signed out, or still loading) are unstarred now.
+                        let pending = drive::pending_unstars();
+                        let dropped = drive::apply_pending_unstars(&mut starred, &pending);
+                        state.drive_shortlist.update(|s| {
+                            s.extend(starred);
+                            s.retain(|id| !pending.contains(id));
+                        });
                         state.drive_edits.update(|m| {
                             for (k, v) in edits {
                                 m.entry(k).or_insert(v);
                             }
                         });
                         state.drive_manifest_loaded.set(true);
+                        if !pending.is_empty() {
+                            drive::clear_pending_unstars();
+                        }
+                        if dropped {
+                            schedule_manifest_save(state);
+                        }
                     } else {
                         let fresh = !state.drive_save_pending.get_untracked()
                             && state.drive_save_gen.get_untracked() == gen_at_read;
@@ -248,7 +261,9 @@ pub(crate) fn drive_refresh(state: AppState) {
                 state.drive_manifest_id.set(None);
                 if !state.drive_manifest_loaded.get_untracked() {
                     // No manifest on Drive yet — local state (if any) becomes
-                    // the first manifest via the pending/next writer.
+                    // the first manifest via the pending/next writer. Nothing
+                    // on Drive is starred, so pending unstars are moot.
+                    drive::clear_pending_unstars();
                     state.drive_manifest_loaded.set(true);
                 } else {
                     let fresh = !state.drive_save_pending.get_untracked()
@@ -391,6 +406,40 @@ pub(crate) fn star_drive_file(state: AppState, id: &str) {
     state.drive_shortlist.update(|s| added = s.insert(id.to_string()));
     if added {
         schedule_manifest_save(state);
+    }
+}
+
+/// The filmstrip's remove button. Any item can be removed; the original file
+/// is never touched. A Drive-backed item is also unstarred, because the star
+/// means "keep this open" — left starred, "Import starred" would bring it
+/// back. Before this session's manifest has loaded (signed out after a
+/// reload, or the fetch still in flight) the unstar waits in localStorage and
+/// applies on the next load.
+pub(crate) fn remove_from_editor(state: AppState, item_id: usize) {
+    let (did, next) = state.items.with(|v| {
+        let pos = v.iter().position(|m| m.id == item_id);
+        let did = pos.and_then(|p| v[p].drive_file_id.clone());
+        // Keep an item on screen: the right-hand neighbour, else the left.
+        let next = pos.and_then(|p| v.get(p + 1).or_else(|| p.checked_sub(1).and_then(|q| v.get(q))));
+        (did, next.map(|m| m.id))
+    });
+    if state.selected.get_untracked() == Some(item_id) {
+        state.selected.set(next);
+    }
+    remove_item(state, item_id);
+    let Some(did) = did else { return };
+    // Another item opened from the same Drive file keeps the star.
+    if state.items.with(|v| v.iter().any(|m| m.drive_file_id.as_deref() == Some(did.as_str()))) {
+        return;
+    }
+    if state.drive_manifest_loaded.get_untracked() {
+        let mut removed = false;
+        state.drive_shortlist.update(|s| removed = s.remove(&did));
+        if removed {
+            schedule_manifest_save(state);
+        }
+    } else {
+        drive::add_pending_unstar(&did);
     }
 }
 

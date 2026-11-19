@@ -177,24 +177,49 @@ h1 { font-size: 17px; font-weight: 600; }
   color: var(--accent);
   pointer-events: none;
 }
+/* Drive star: an indicator. Removing is the × button, which also unstars. */
 .thumb-star {
   position: absolute;
-  top: 2px;
-  right: 2px;
+  left: 2px;
+  bottom: 2px;
   width: 18px;
   height: 18px;
-  border: none;
   border-radius: 4px;
   background: rgba(0,0,0,0.6);
   color: #f5c542;
   font-size: 11px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+.thumb-remove {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 20px;
+  height: 20px;
+  border: none;
+  border-radius: 4px;
+  background: rgba(0,0,0,0.7);
+  color: #fff;
+  font-size: 15px;
   line-height: 1;
   padding: 0;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
+  opacity: 0;
+  transition: opacity 0.12s;
 }
+.thumb:hover .thumb-remove,
+.thumb:focus-within .thumb-remove,
+.thumb.selected .thumb-remove { opacity: 1; }
+.thumb-remove:hover,
+.thumb-remove:focus-visible { background: #c0392b; opacity: 1; }
+@media (hover: none) { .thumb-remove { opacity: 1; } }
 
 .editor { display: flex; flex-direction: column; gap: 10px; }
 

@@ -18,8 +18,9 @@ use web_sys::{
     WebGlShader, WebGlTexture, WebGlUniformLocation, WebGlVertexArrayObject,
 };
 
+use pes_pixel::place::Place;
 use pes_pixel::types::EditParams;
-use pes_pixel::{color, rawops};
+use pes_pixel::{blur, color, rawops};
 
 use crate::perf;
 
@@ -194,6 +195,20 @@ pub fn upload_base(key: BaseKey, pixels: &[u8], w: u32, h: u32) -> bool {
 /// Draw the current edit from the uploaded base. Returns the offscreen canvas
 /// and its display dims, or None if the GPU path failed (it is then latched
 /// off for the session).
+/// Whether Blur at a `w` x `h` whole-frame render fits the shader's 49-tap
+/// kernel. Blur is sized in image units (#47), so a large preview of a strong
+/// blur needs a wider kernel than the shader holds; that renders on the CPU.
+pub fn blur_fits(edit: &EditParams, w: u32, h: u32) -> bool {
+    Place::whole(w as usize, h as usize).blur_sigma(edit.blur) <= blur::DIRECT_MAX_SIGMA
+}
+
+/// Whether Grain at a `w` x `h` whole-frame render fits the shader's tap
+/// loop: a preview under 683 px has more lattice cells per pixel than it
+/// averages, so that renders on the CPU (#51).
+pub fn grain_fits(edit: &EditParams, w: u32, h: u32) -> bool {
+    edit.grain <= 0.0 || Place::whole(w as usize, h as usize).grain_fits_gpu()
+}
+
 pub fn render(edit: &EditParams, seed: u32) -> Option<(HtmlCanvasElement, u32, u32)> {
     let _span = perf::Span::new("gpu.render");
     let res = STATE.with(|s| -> Result<(HtmlCanvasElement, u32, u32), String> {
@@ -269,6 +284,8 @@ uniform vec4  u_adj;
 uniform float u_grain;
 uniform float u_grain_gauss;
 uniform float u_grain_mono;
+uniform float u_gamp;
+uniform int   u_glong;
 uniform uint  u_seed;
 uniform vec2  u_size;
 uniform int   u_pass;
@@ -358,7 +375,7 @@ float punit(uint key) { return float(phash(key) >> 8u) * (1.0 / 16777216.0); }
 
 float grain_at(uint idx, uint c) {
     if (u_grain <= 0.0) return 0.0;
-    float spread = u_grain / 100.0 * 127.5;
+    float spread = u_grain / 100.0 * 127.5 * u_gamp;
     uint base = phash(u_seed ^ phash(idx));
     uint key = u_grain_mono > 0.5 ? base : base + c * 0x9e3779b9u;
     if (u_grain_gauss > 0.5) {
@@ -367,6 +384,49 @@ float grain_at(uint idx, uint c) {
         return sqrt(-2.0 * log(1.0 - u1)) * cos(TAU * u2) * spread * (2.0 / 3.0);
     }
     return (punit(key) * 2.0 - 1.0) * spread;
+}
+
+// Grain footprint of whole-frame pixel x along one axis (pixel/src/place.rs
+// grain_axis): the interval x*2048/long plus a quarter cell (GRAIN_PHASE) to
+// (x+1)*2048/long plus a quarter, over the cells it touches, weighted by
+// overlap and scaled so the squares sum to one. Place::grain_fits_gpu keeps
+// the count within GTAPS.
+const int GTAPS = 4;
+int gspan(int x, out int c0, out float w[GTAPS]) {
+    int den = 4 * u_glong;
+    float a = float(x * 8192 + u_glong) / float(den);
+    float b = float((x + 1) * 8192 + u_glong) / float(den);
+    c0 = (x * 8192 + u_glong) / den;
+    int n = min(((x + 1) * 8192 + u_glong + den - 1) / den - c0, GTAPS);
+    float q = 0.0;
+    for (int k = 0; k < GTAPS; k++) {
+        float c = float(c0 + k);
+        w[k] = k < n ? min(b, c + 1.0) - max(a, c) : 0.0;
+        q += w[k] * w[k];
+    }
+    float r = inversesqrt(q);
+    for (int k = 0; k < GTAPS; k++) w[k] *= r;
+    return n;
+}
+
+vec3 grain(int x, int y) {
+    if (u_grain <= 0.0) return vec3(0.0);
+    int cx;
+    int cy;
+    float wx[GTAPS];
+    float wy[GTAPS];
+    int nx = gspan(x, cx, wx);
+    int ny = gspan(y, cy, wy);
+    vec3 g = vec3(0.0);
+    for (int j = 0; j < GTAPS; j++) {
+        if (j >= ny) break;
+        for (int i = 0; i < GTAPS; i++) {
+            if (i >= nx) break;
+            uint idx = uint(cy + j) * 4096u + uint(cx + i);
+            g += (wx[i] * wy[j]) * vec3(grain_at(idx, 0u), grain_at(idx, 1u), grain_at(idx, 2u));
+        }
+    }
+    return g;
 }
 
 vec3 sample_u8(sampler2D tex, vec2 uv) {
@@ -413,8 +473,9 @@ void main() {
     }
 
     vec3 v = adjust(lut3(t));
-    uint idx = uint((int(u_size.y) - 1 - p.y) * int(u_size.x) + p.x);
-    vec3 g = vec3(grain_at(idx, 0u), grain_at(idx, 1u), grain_at(idx, 2u));
+    // Grain: the area sample of the image-space lattice under this pixel
+    // (pixel/src/noise.rs grain_rows). Canvas row 0 is the CPU's last row.
+    vec3 g = grain(p.x, int(u_size.y) - 1 - p.y);
     vec3 outv = floor(clamp(v + g, 0.0, 255.0) + 0.5);
     o_col = vec4(outv / 255.0, 1.0);
 }
@@ -532,7 +593,7 @@ impl Gpu {
         let mut map = HashMap::new();
         for name in [
             "u_tex", "u_lut", "u_gains", "u_exp", "u_hl", "u_sh", "u_nr", "u_adj",
-            "u_grain", "u_grain_gauss", "u_grain_mono", "u_seed", "u_size", "u_pass",
+            "u_grain", "u_grain_gauss", "u_grain_mono", "u_gamp", "u_glong", "u_seed", "u_size", "u_pass",
             "u_rad", "u_raw_identity", "u_k",
         ] {
             if let Some(l) = gl.get_uniform_location(&program, name) {
@@ -656,6 +717,9 @@ impl Gpu {
         u1f(gl, l("u_grain"), edit.grain);
         u1f(gl, l("u_grain_gauss"), if edit.grain_gaussian { 1.0 } else { 0.0 });
         u1f(gl, l("u_grain_mono"), if edit.grain_mono { 1.0 } else { 0.0 });
+        let place = Place::whole(w as usize, h as usize);
+        u1f(gl, l("u_gamp"), place.grain_gain());
+        u1i(gl, l("u_glong"), w.max(h).max(1) as i32);
         if let Some(loc) = l("u_seed") {
             gl.uniform1ui(Some(loc), seed);
         }
@@ -688,7 +752,7 @@ impl Gpu {
         let mut kbuf = [0f32; 49];
         let mut rad = 0i32;
         if blur_on {
-            let sigma = edit.blur / 100.0 * 8.0;
+            let sigma = place.blur_sigma(edit.blur);
             rad = ((sigma * 3.0).ceil() as i32).clamp(1, 24);
             let mut sum = 0.0f32;
             for i in -rad..=rad {

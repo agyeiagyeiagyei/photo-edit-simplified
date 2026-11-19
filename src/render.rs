@@ -1565,7 +1565,7 @@ pub(crate) fn wand_select(state: AppState, nx: f32, ny: f32) {
     }
     let rendered = state::render_edit(&item.edit, &item.layers);
     if item.edit.base_color_touched() {
-        blur::blur_apply(p.to_mut(), w, h, item.edit.blur);
+        blur::blur_apply(p.to_mut(), w, h, item.edit.blur, Place::whole(w, h));
         color::apply_color(p.to_mut(), &item.edit);
     }
     if !rendered.adjust_layers.is_empty() {
@@ -1921,6 +1921,129 @@ pub(crate) fn combine_into_layer_mask(state: AppState, layer_id: usize, shape: &
         },
     );
     true
+}
+
+// --- photo geometry ------------------------------------------------------------
+
+/// A selection as it was before a run of turns and straightens, and what the
+/// last of them made of it. `stamp` is the `selection_rev` (global selection)
+/// or `mask_version` (layer mask) written with `out`.
+struct Anchored {
+    src: Selection,
+    geo: (u8, f32),
+    out: Selection,
+    stamp: u64,
+}
+
+/// The current photo's anchors. While a remapped selection is still in place,
+/// the next change remaps from its anchor, so a straighten drag resamples a
+/// mask once rather than once per step, and turning back restores it exactly.
+struct GeoAnchor {
+    item_id: usize,
+    selection: Option<Anchored>,
+    layers: Vec<(usize, Anchored)>,
+}
+
+thread_local! {
+    static GEO_ANCHOR: RefCell<Option<GeoAnchor>> = const { RefCell::new(None) };
+}
+
+fn same_selection(a: &Selection, b: &Selection) -> bool {
+    a.feather == b.feather
+        && match (&a.kind, &b.kind) {
+            (SelectionKind::Mask { data: x, .. }, SelectionKind::Mask { data: y, .. }) => Rc::ptr_eq(x, y),
+            (x, y) => x == y,
+        }
+}
+
+/// Carry `cur` (written with `stamp`) from `old`'s geometry to `new`'s,
+/// starting from its anchor when the anchor's output is still what is there.
+fn follow_geometry(
+    prev: Option<Anchored>,
+    cur: &Selection,
+    stamp: u64,
+    (fw, fh): (usize, usize),
+    old: &EditParams,
+    new: &EditParams,
+) -> Anchored {
+    let (src, geo) = match prev {
+        Some(a) if a.stamp == stamp && same_selection(&a.out, cur) => (a.src, a.geo),
+        _ => (cur.clone(), (old.rot90, old.fine_angle)),
+    };
+    let mut from = new.clone();
+    (from.rot90, from.fine_angle) = geo;
+    let out = pes_pixel::geo::remap_selection(&src, fw, fh, &from, new);
+    Anchored { src, geo, out, stamp: 0 }
+}
+
+/// Turn or straighten the current photo. The selection and the adjustment-layer
+/// masks sit on the photo's pixels, so they turn with it: a bird selected
+/// before a turn is still the selection after it. Overlay layers keep their
+/// place on the canvas, as before.
+pub(crate) fn set_photo_geometry(state: AppState, f: impl FnOnce(&mut EditParams)) {
+    let Some(item) = state.current() else { return };
+    let mut new = item.edit.clone();
+    f(&mut new);
+    // One copy of the body below, not one per caller's closure.
+    apply_photo_geometry(state, item, new);
+}
+
+fn apply_photo_geometry(state: AppState, item: MediaItem, new: EditParams) {
+    let old = &item.edit;
+    let turned = !pes_pixel::geo::same_geometry(old, &new);
+    let dims = get_photo(item.id)
+        .map(|p| if p.full_dims.0 > 0 { p.full_dims } else { (p.preview.1, p.preview.2) })
+        .filter(|d| d.0 > 0 && d.1 > 0);
+    let mut anchor = GEO_ANCHOR
+        .with(|a| a.borrow_mut().take())
+        .filter(|a| a.item_id == item.id)
+        .unwrap_or(GeoAnchor { item_id: item.id, selection: None, layers: Vec::new() });
+    state.update_current_item(|m| {
+        m.edit = new;
+        if !turned {
+            return;
+        }
+        let Some(dims) = dims else {
+            // No pixels to measure the frame by (a video): drop a selection
+            // rather than leave it on the wrong place.
+            if m.edit.selection.take().is_some() {
+                m.edit.selection_rev += 1;
+            }
+            return;
+        };
+        let prev = anchor.selection.take();
+        if let Some(cur) = m.edit.selection.take() {
+            let mut a = follow_geometry(prev, &cur, m.edit.selection_rev, dims, old, &m.edit);
+            m.edit.selection_rev += 1;
+            a.stamp = m.edit.selection_rev;
+            m.edit.selection = Some(a.out.clone());
+            anchor.selection = Some(a);
+        }
+        let mut prev_layers = std::mem::take(&mut anchor.layers);
+        for l in &mut m.layers {
+            let (LayerKind::Adjust(_), Some(cur)) = (&l.kind, &l.mask) else { continue };
+            let prev = prev_layers.iter().position(|(id, _)| *id == l.id).map(|i| prev_layers.swap_remove(i).1);
+            let mut a = follow_geometry(prev, cur, l.mask_version, dims, old, &m.edit);
+            l.mask_version += 1;
+            a.stamp = l.mask_version;
+            l.mask = Some(a.out.clone());
+            anchor.layers.push((l.id, a));
+        }
+    });
+    GEO_ANCHOR.with(|a| *a.borrow_mut() = Some(anchor));
+    if !turned {
+        return;
+    }
+    // Brush undo steps and subject refinements were taken in the old frame.
+    state.brush_history.update(|h| {
+        h.undo.retain(|s| s.item_id != item.id);
+        h.redo.retain(|s| s.item_id != item.id);
+        h.recount();
+    });
+    clear_subject_brush_ops_for(item.id);
+    if state.subject_photo.get_untracked() == Some(item.id) {
+        state.subject_photo.set(None);
+    }
 }
 
 /// "Add selection to mask" / "Remove selection from mask": fold the photo's

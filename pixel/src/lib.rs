@@ -20,6 +20,7 @@ pub mod mask_png;
 pub mod noise;
 pub mod ops;
 pub mod pipeline;
+pub mod place;
 pub mod rawops;
 pub mod recipe;
 pub mod resample;

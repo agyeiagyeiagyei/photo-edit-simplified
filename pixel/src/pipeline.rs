@@ -12,6 +12,7 @@ use std::rc::Rc;
 use crate::color;
 use crate::geo::geometry;
 use crate::ops;
+pub use crate::place::Place;
 use crate::rawops;
 use crate::resample;
 use crate::types::{AdjustLayer, EditParams, Selection, SelectionKind};
@@ -150,16 +151,18 @@ pub fn develop(frame: &mut Frame, edit: &EditParams, px_scale: f32) -> Option<Ve
 /// selection mask at the frame's size, or `None` for a whole-frame edit.
 /// `wide_buf` is a developed 16-bit frame from [`develop`]; when present the
 /// result is narrowed to the frame's u8 pixels with the final dither.
+/// `place` puts the frame in the photo, for blur and grain sizes.
 pub fn colour(
     frame: &mut Frame,
     edit: &EditParams,
     seed: u32,
     mask: Option<&[u8]>,
     wide_buf: Option<Vec<u16>>,
+    place: Place,
 ) {
     if let Some(mut buf) = wide_buf {
         if edit.base_color_touched() {
-            color::apply_color_effects_wide(&mut buf, frame.w, frame.h, edit, seed, mask);
+            color::apply_color_effects_wide(&mut buf, frame.w, frame.h, edit, seed, mask, place);
         }
         apply_adjust_layers_wide(&mut buf, frame.w, frame.h, edit);
         wide::narrow_dithered(&buf, &mut frame.pixels, frame.w, frame.h);
@@ -177,8 +180,9 @@ pub fn colour(
                 frame.h,
                 edit,
                 seed,
+                place,
             ),
-            None => color::apply_color_effects(&mut frame.pixels, frame.w, frame.h, edit, seed),
+            None => color::apply_color_effects(&mut frame.pixels, frame.w, frame.h, edit, seed, place),
         }
     }
     apply_adjust_layers_u8(&mut frame.pixels, frame.w, frame.h, edit);
@@ -335,20 +339,21 @@ pub fn finish(
     seed: u32,
     mask: Option<&[u8]>,
     px_scale: f32,
+    place: Place,
 ) {
     let wide_buf = develop(frame, edit, px_scale);
-    colour(frame, edit, seed, mask, wide_buf);
+    colour(frame, edit, seed, mask, wide_buf, place);
 }
 
 /// `finish` with the mask taken from `edit.selection`.
-pub fn finish_edit(frame: &mut Frame, edit: &EditParams, seed: u32, px_scale: f32) {
+pub fn finish_edit(frame: &mut Frame, edit: &EditParams, seed: u32, px_scale: f32, place: Place) {
     let wide_buf = develop(frame, edit, px_scale);
     let mask = if edit.base_color_touched() {
         mask_for(frame, edit)
     } else {
         None
     };
-    colour(frame, edit, seed, mask.as_deref(), wide_buf);
+    colour(frame, edit, seed, mask.as_deref(), wide_buf, place);
 }
 
 /// The whole stage set on a 16-bit sRGB RGBA frame, for callers that own the
@@ -362,10 +367,11 @@ pub fn finish_wide(
     seed: u32,
     mask: Option<&[u8]>,
     px_scale: f32,
+    place: Place,
 ) {
     rawops::develop_wide(buf, w, h, &edit.raw, px_scale);
     if edit.base_color_touched() {
-        color::apply_color_effects_wide(buf, w, h, edit, seed, mask);
+        color::apply_color_effects_wide(buf, w, h, edit, seed, mask, place);
     }
     apply_adjust_layers_wide(buf, w, h, edit);
 }
@@ -382,6 +388,7 @@ pub fn finish_neutral_wide(
     white: f32,
     tone: Option<&[u16]>,
     px_scale: f32,
+    place: Place,
 ) {
     rawops::develop_neutral_wide(buf, w, h, &edit.raw, white);
     if let Some(table) = tone {
@@ -389,7 +396,7 @@ pub fn finish_neutral_wide(
     }
     rawops::detail_toned_wide(buf, w, h, &edit.raw, px_scale);
     if edit.base_color_touched() {
-        color::apply_color_effects_wide(buf, w, h, edit, seed, mask);
+        color::apply_color_effects_wide(buf, w, h, edit, seed, mask, place);
     }
     apply_adjust_layers_wide(buf, w, h, edit);
 }
@@ -402,6 +409,7 @@ pub fn finish_neutral(
     white: f32,
     tone: Option<&[u16]>,
     px_scale: f32,
+    place: Place,
 ) {
     let mask = if edit.base_color_touched() {
         mask_for_dims(frame.w, frame.h, edit)
@@ -418,6 +426,7 @@ pub fn finish_neutral(
         white,
         tone,
         px_scale,
+        place,
     );
 }
 
@@ -434,7 +443,8 @@ pub fn render_neutral(
 ) -> Frame16 {
     let px_scale = px_scale_for(w, h, target);
     let mut frame = prepare_neutral(src, w, h, edit, target);
-    finish_neutral(&mut frame, edit, seed, white, tone, px_scale);
+    let place = Place::whole(frame.w, frame.h);
+    finish_neutral(&mut frame, edit, seed, white, tone, px_scale, place);
     frame
 }
 
@@ -449,7 +459,8 @@ pub fn render(
 ) -> Frame {
     let mut frame = prepare(src, w, h, edit, target);
     let px_scale = px_scale_for(w, h, target);
-    finish_edit(&mut frame, edit, seed, px_scale);
+    let place = Place::whole(frame.w, frame.h);
+    finish_edit(&mut frame, edit, seed, px_scale, place);
     frame
 }
 
@@ -502,7 +513,7 @@ mod tests {
     fn identity_finish_leaves_pixels_untouched() {
         let px = fixture(16, 12);
         let mut frame = Frame::new(px.clone(), 16, 12);
-        finish_edit(&mut frame, &EditParams::default(), 7, 1.0);
+        finish_edit(&mut frame, &EditParams::default(), 7, 1.0, Place::whole(16, 12));
         assert_eq!(frame.pixels, px);
     }
 
@@ -512,7 +523,7 @@ mod tests {
         let edit = touched_edit();
         let out = render(&px, 32, 24, &edit, Target::new(16, 12), 42);
         let mut staged = prepare(&px, 32, 24, &edit, Target::new(16, 12));
-        finish(&mut staged, &edit, 42, None, 1.0);
+        finish(&mut staged, &edit, 42, None, 1.0, Place::whole(16, 12));
         assert_eq!(out.pixels, staged.pixels);
         assert_eq!((out.w, out.h), (16, 12));
     }
@@ -524,7 +535,7 @@ mod tests {
         edit.contrast = 0.2;
         let out = render(&px, 20, 10, &edit, Target::new(20, 10), 1);
         let mut direct = Frame::new(px.clone(), 20, 10);
-        finish_edit(&mut direct, &edit, 1, 1.0);
+        finish_edit(&mut direct, &edit, 1, 1.0, Place::whole(20, 10));
         assert_eq!(out.pixels, direct.pixels);
     }
 
@@ -563,7 +574,7 @@ mod tests {
 
     fn assert_dithered_ramp(w: usize, h: usize) {
         let mut buf = ramp16(w, h);
-        finish_wide(&mut buf, w, h, &banding_edit(), 1, None, 1.0);
+        finish_wide(&mut buf, w, h, &banding_edit(), 1, None, 1.0, Place::whole(w, h));
         let mut out = vec![0u8; w * h * 4];
         wide::narrow_dithered(&buf, &mut out, w, h);
         let row: Vec<u8> = out[..w * 4].chunks_exact(4).map(|p| p[0]).collect();
@@ -642,6 +653,7 @@ mod tests {
             1.0,
             Some(&table),
             1.0,
+            Place::whole(w, h),
         );
         let mut out = vec![0u8; w * h * 4];
         wide::narrow_dithered(&buf, &mut out, w, h);
@@ -990,9 +1002,9 @@ mod tests {
             ..EditParams::default()
         };
         let mut a: Vec<u16> = px.iter().map(|&v| v as u16 * 257).collect();
-        finish_wide(&mut a, w, h, &global, 4, None, 1.0);
+        finish_wide(&mut a, w, h, &global, 4, None, 1.0, Place::whole(w, h));
         let mut b: Vec<u16> = px.iter().map(|&v| v as u16 * 257).collect();
-        finish_wide(&mut b, w, h, &only_layer(adjust_layer(adj, None)), 4, None, 1.0);
+        finish_wide(&mut b, w, h, &only_layer(adjust_layer(adj, None)), 4, None, 1.0, Place::whole(w, h));
         assert_eq!(a, b);
     }
 
@@ -1033,7 +1045,24 @@ mod tests {
 
         let src = crop_pixels(&px, w, cx, cy, cw, ch);
         let mut win = Frame::new(src, cw, ch);
-        finish_edit(&mut win, &rebased, 2, 1.0);
+        finish_edit(&mut win, &rebased, 2, 1.0, Place::window(w, h, (cx, cy, cw, ch), cw));
+        assert_eq!(win.pixels, want);
+    }
+
+    #[test]
+    fn a_window_shows_the_whole_frames_grain() {
+        // What a zoomed or cropped view renders must be the export's grain at
+        // those pixels, not a fresh roll per window (#47, #46 R6).
+        let (w, h) = (48usize, 36usize);
+        let (cx, cy, cw, ch) = (13usize, 7usize, 20usize, 15usize);
+        let px = fixture(w, h);
+        let mut edit = EditParams::default();
+        edit.grain = 60.0;
+        edit.grain_gaussian = true;
+        let full = render(&px, w, h, &edit, Target::new(w, h), 9).pixels;
+        let want = crop_pixels(&full, w, cx, cy, cw, ch);
+        let mut win = Frame::new(crop_pixels(&px, w, cx, cy, cw, ch), cw, ch);
+        finish_edit(&mut win, &edit, 9, 1.0, Place::window(w, h, (cx, cy, cw, ch), cw));
         assert_eq!(win.pixels, want);
     }
 

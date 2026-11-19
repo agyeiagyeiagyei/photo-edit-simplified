@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test';
 import * as fs from 'fs';
 import * as path from 'path';
-import { openApp, trackErrors, recordMetrics, importFiles, thumbs, canvasSize, installRestoreProbe, readRestoreProbe, fileInput, JPEG_A, JPEG_B, PNG_SMALL } from './helpers';
+import { openApp, trackErrors, recordMetrics, importFiles, thumbs, canvasSize, installRestoreProbe, readRestoreProbe, fileInput, clickTab, setRange, rawFixtures, JPEG_A, JPEG_B, PNG_SMALL } from './helpers';
 
 test.describe('session persistence (IndexedDB)', () => {
   test('reload restores items and the editor, and measures restore time', async ({ page }, testInfo) => {
@@ -28,6 +28,48 @@ test.describe('session persistence (IndexedDB)', () => {
     expect(probe.thumbsMs).toBeGreaterThan(0);
     expect(probe.thumbsMs).toBeLessThanOrEqual(300);
     expect(probe.overlayGoneMs).toBeLessThanOrEqual(300);
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  // The preview pump bumped photo.gen whenever a decoded preview landed,
+  // which happens on every restore. Persistence reads gen > 0 on a RAW as
+  // "destructively healed", found no worker frame to bake, and skipped the
+  // item record, so every edit to a RAW after a reload was lost at the next
+  // reload. JPEGs were unaffected.
+  test('edits to a RAW after a reload survive the next reload', async ({ page }) => {
+    const raws = rawFixtures();
+    test.skip(raws.length === 0, 'no RAW fixture in dl-raw; run gen_dng.py to create one');
+    test.setTimeout(300_000);
+    const errors = trackErrors(page);
+    const slider = (re: RegExp) =>
+      page.locator('label.slider').filter({ hasText: re }).first().locator('input[type=range]');
+    const ready = async () => {
+      await expect(thumbs(page)).toHaveCount(1, { timeout: 120_000 });
+      await expect(page.locator('.developing-badge')).toHaveCount(0, { timeout: 120_000 });
+      await expect(page.locator('.overlay')).toHaveCount(0, { timeout: 60_000 });
+      // The restored preview decode is what bumped gen; let it land.
+      await page.waitForTimeout(3000);
+    };
+    await openApp(page);
+    await importFiles(page, [raws[0]]);
+    await ready();
+    await clickTab(page, 'Color');
+    await setRange(page, /^Brightness/, 0.2);
+    await page.waitForTimeout(4000); // debounced persist + the RAW's blob write
+
+    await page.reload();
+    await ready();
+    await clickTab(page, 'Color');
+    await expect(slider(/^Brightness/)).toHaveValue('0.2');
+    await setRange(page, /^Contrast/, 0.3);
+    await page.waitForTimeout(4000);
+
+    await page.reload();
+    await ready();
+    await clickTab(page, 'Color');
+    await expect(slider(/^Contrast/), 'an edit made after a reload was not saved').toHaveValue('0.3');
+    await expect(slider(/^Brightness/)).toHaveValue('0.2');
+    await expect(page.locator('.tabs button', { hasText: /^RAW$/ })).toHaveCount(1);
     expect(errors, errors.join('\n')).toEqual([]);
   });
 
