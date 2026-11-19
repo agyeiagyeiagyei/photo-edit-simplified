@@ -572,10 +572,13 @@ pub(crate) fn downscale_pixels(pixels: &[u8], w: usize, h: usize, long_edge: u32
 
 
 /// A new RAW import's starting edit: the camera rendering, plus a Smart
-/// denoise start from the photo's ISO (#15). Only new imports get it, as a
-/// visible slider value; restored sessions and stored Drive edits keep theirs.
+/// denoise start from the photo's ISO (#15) and capture sharpening, which a
+/// demosaiced frame needs to look as crisp as the camera's own JPEG. Only new
+/// imports get them, as visible slider values; restored sessions and stored
+/// Drive edits keep theirs.
 fn raw_import_edit(exif: Option<&[u8]>) -> EditParams {
     let mut edit = EditParams::default();
+    edit.raw.sharpen = pes_pixel::rawops::SHARPEN_START;
     if let Some(iso) = exif.and_then(rawmeta::iso_from_tiff) {
         edit.raw.denoise = pes_pixel::rawops::denoise_start_for_iso(iso);
     }

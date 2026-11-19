@@ -1,6 +1,6 @@
 //! RAW develop adjustments: edge-aware denoise, white balance, exposure,
 //! highlight recovery, shadow lift / noise suppression, and capture
-//! sharpening.
+//! sharpening (in `denoise.rs`).
 //!
 //! The tone stages run in linear light — sRGB is decoded in, adjusted,
 //! re-encoded out — and happen before the gamma-space colour controls. The
@@ -115,69 +115,6 @@ fn enc16() -> &'static [u16] {
     })
 }
 
-/// USM radius in sensor pixels. Renders below sensor resolution scale it by
-/// the proxy ratio, so the preview and the export sharpen the same spatial
-/// frequency.
-pub const USM_RADIUS: f32 = 0.8;
-
-/// Unsharp deltas below this (8-bit luma) are left alone, so noise in flat
-/// areas is not amplified along with real detail.
-pub const USM_THRESHOLD: f32 = 2.0 / 255.0;
-
-/// Separable Gaussian blur of the sRGB luma, used as the unsharp reference.
-/// One u16 per pixel so a 24MP develop pass adds 48MB per buffer, not another
-/// RGBA frame. Weights are 12-bit fixed point and `sigma` is in render pixels.
-fn blur_luma_gaussian_wide(buf: &[u16], w: usize, h: usize, sigma: f32) -> Vec<u16> {
-    let radius = (3.0 * sigma).ceil().clamp(1.0, 6.0) as usize;
-    let inv = 1.0 / (2.0 * sigma * sigma);
-    let mut floats = vec![0.0f32; 2 * radius + 1];
-    let mut sum = 0.0f32;
-    for i in 0..=radius {
-        let q = (-((i * i) as f32) * inv).exp();
-        floats[radius + i] = q;
-        if i > 0 {
-            floats[radius - i] = q;
-        }
-        sum += if i == 0 { q } else { 2.0 * q };
-    }
-    let mut weights = vec![0u32; 2 * radius + 1];
-    let mut total = 0u32;
-    for (dst, f) in weights.iter_mut().zip(floats.iter()) {
-        *dst = (f / sum * 4096.0).round() as u32;
-        total += *dst;
-    }
-    // Rounding leaves the sum a few LSB off unity; fold the difference into
-    // the centre tap so a flat field reproduces exactly.
-    weights[radius] = (weights[radius] as i32 + 4096 - total as i32).max(0) as u32;
-    let luma_at = |i: usize| -> u32 {
-        (54 * buf[i] as u32 + 183 * buf[i + 1] as u32 + 19 * buf[i + 2] as u32) >> 8
-    };
-    let mut horiz = vec![0u16; w * h];
-    for y in 0..h {
-        let row = y * w;
-        for x in 0..w {
-            let mut s = 0u32;
-            for (k, &wt) in weights.iter().enumerate() {
-                let xx = (x + k).saturating_sub(radius).min(w - 1);
-                s += wt * luma_at((row + xx) * 4);
-            }
-            horiz[row + x] = (s >> 12) as u16;
-        }
-    }
-    let mut out = vec![0u16; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            let mut s = 0u32;
-            for (k, &wt) in weights.iter().enumerate() {
-                let yy = (y + k).saturating_sub(radius).min(h - 1);
-                s += wt * horiz[yy * w + x] as u32;
-            }
-            out[y * w + x] = (s >> 12) as u16;
-        }
-    }
-    out
-}
-
 /// Apply the develop stage to a 16-bit sRGB RGBA frame in place. Identity
 /// leaves the buffer untouched. `px_scale` is sensor pixels per render pixel,
 /// 1.0 at full resolution; capture sharpening scales its radius by it.
@@ -185,14 +122,9 @@ pub fn develop_wide(buf: &mut [u16], w: usize, h: usize, adj: &RawAdjust, px_sca
     if adj.is_identity() || w == 0 || h == 0 {
         return;
     }
-    // Spatial denoise first, so sharpening and the tone curves act on the
-    // cleaned image rather than amplifying sensor noise. The denoiser works
-    // on an 8-bit narrowing of this buffer, but filters linear light
-    // internally, so the narrowing does not cost it linearity.
-    if adj.denoise > 0.0 {
-        denoise_wide(buf, w, h, adj.denoise, px_scale);
-    }
-    let sharp = (adj.sharpen / 100.0).clamp(0.0, 1.0);
+    // Denoise and capture sharpening first, so the tone stages act on the
+    // cleaned image.
+    detail_toned_wide(buf, w, h, adj, px_scale);
     let hl = (adj.highlights / 100.0).clamp(0.0, 1.0);
     let sh = (adj.shadows / 100.0).clamp(0.0, 1.0);
     let nr = (adj.noise / 100.0).clamp(0.0, 1.0);
@@ -203,38 +135,12 @@ pub fn develop_wide(buf: &mut [u16], w: usize, h: usize, adj: &RawAdjust, px_sca
     let enc = enc16();
     let encode = |v: f32| -> u16 { enc[(v.clamp(0.0, 1.0) * 65536.0) as usize] };
 
-    let sigma = (USM_RADIUS * px_scale.clamp(0.0, 2.0)).min(2.0);
-    let blur = if sharp > 0.0 && sigma >= 0.15 {
-        Some(blur_luma_gaussian_wide(buf, w, h, sigma))
-    } else {
-        None
-    };
-    let sharp_gain = sharp * 3.0;
-
-    for (i, px) in buf.chunks_exact_mut(4).enumerate() {
+    for px in buf.chunks_exact_mut(4) {
         let mut rgb = [
             dec[px[0] as usize] * gains[0] * exp_gain,
             dec[px[1] as usize] * gains[1] * exp_gain,
             dec[px[2] as usize] * gains[2] * exp_gain,
         ];
-
-        // Capture sharpening: unsharp gain on the perceptual luma edge
-        // signal, applied multiplicatively so hue is preserved in linear.
-        if let Some(bp) = &blur {
-            let yb = (54 * px[0] as u32 + 183 * px[1] as u32 + 19 * px[2] as u32) >> 8;
-            let mut d = (yb as f32 - bp[i] as f32) / 65535.0;
-            // Dead zone: subtract the threshold from the edge signal instead
-            // of hard-gating, so the gain stays continuous at the boundary.
-            if d.abs() <= USM_THRESHOLD {
-                d = 0.0;
-            } else {
-                d -= USM_THRESHOLD.copysign(d);
-            }
-            if d != 0.0 {
-                let g = (1.0 + sharp_gain * d).clamp(0.2, 4.0);
-                scale_rgb(&mut rgb, g);
-            }
-        }
 
         let mut y = luma(rgb[0], rgb[1], rgb[2]);
 
@@ -313,12 +219,13 @@ pub fn denoise_start_for_iso(iso: u32) -> f32 {
     ANCHORS[ANCHORS.len() - 1].1
 }
 
+/// Starting Sharpening for a newly imported RAW: about the fine-detail
+/// contrast of the camera's own JPEG (measured on an ISO 3200 ARW against its
+/// embedded JPEG). The noise gate keeps it off the grain at any ISO.
+pub const SHARPEN_START: f32 = 50.0;
+
 pub fn denoise_wide(buf: &mut [u16], w: usize, h: usize, denoise: f32, px_scale: f32) {
-    let strength = (denoise / 100.0).clamp(0.0, 1.0);
-    if strength <= 0.0 || w == 0 || h == 0 {
-        return;
-    }
-    crate::denoise::smart_denoise_wide(buf, w, h, strength, px_scale);
+    crate::denoise::detail_wide(buf, w, h, (denoise / 100.0).clamp(0.0, 1.0), 0.0, px_scale);
 }
 
 /// Denoise and capture sharpening on a camera-toned 16-bit frame: the
@@ -327,34 +234,8 @@ pub fn denoise_wide(buf: &mut [u16], w: usize, h: usize, denoise: f32, px_scale:
 /// with denoise or sharpening keeps the camera-tone-last rendering instead of
 /// falling back to the legacy pipeline (#15).
 pub fn detail_toned_wide(buf: &mut [u16], w: usize, h: usize, adj: &RawAdjust, px_scale: f32) {
-    if w == 0 || h == 0 {
-        return;
-    }
-    if adj.denoise > 0.0 {
-        denoise_wide(buf, w, h, adj.denoise, px_scale);
-    }
-    let sharp = (adj.sharpen / 100.0).clamp(0.0, 1.0);
-    let sigma = (USM_RADIUS * px_scale.clamp(0.0, 2.0)).min(2.0);
-    if sharp <= 0.0 || sigma < 0.15 {
-        return;
-    }
-    let blur = blur_luma_gaussian_wide(buf, w, h, sigma);
-    let dec = dec16();
-    let enc = enc16();
-    let encode = |v: f32| -> u16 { enc[(v.clamp(0.0, 1.0) * 65536.0) as usize] };
-    let gain = sharp * 3.0;
-    for (i, px) in buf.chunks_exact_mut(4).enumerate() {
-        let yb = (54 * px[0] as u32 + 183 * px[1] as u32 + 19 * px[2] as u32) >> 8;
-        let mut d = (yb as f32 - blur[i] as f32) / 65535.0;
-        if d.abs() <= USM_THRESHOLD {
-            continue;
-        }
-        d -= USM_THRESHOLD.copysign(d);
-        let g = (1.0 + gain * d).clamp(0.2, 4.0);
-        for c in 0..3 {
-            px[c] = encode(dec[px[c] as usize] * g);
-        }
-    }
+    let unit = |v: f32| (v / 100.0).clamp(0.0, 1.0);
+    crate::denoise::detail_wide(buf, w, h, unit(adj.denoise), unit(adj.sharpen), px_scale);
 }
 
 /// Develop the un-toned 16-bit sRGB RAW frame, white-relative.
@@ -625,66 +506,6 @@ mod tests {
         let after = out[1] as i32 - out[0] as i32;
         assert!(after.abs() < before.abs(), "chroma not reduced: {out:?}");
         assert!(out[0] as i32 + out[1] as i32 + out[2] as i32 > 30);
-    }
-
-    #[test]
-    fn sharpening_adds_edge_contrast() {
-        // 11x1: dark half, bright half; the edge at x=5 is 5 px from x=0,
-        // outside the Gaussian support, so only near-edge pixels may move.
-        let mut v = Vec::new();
-        for x in 0..11 {
-            let val = if x < 5 { 96 } else { 160 };
-            v.extend_from_slice(&[val, val, val, 255]);
-        }
-        let before = v.clone();
-        apply(&mut v, 11, 1, &RawAdjust { sharpen: 100.0, ..Default::default() });
-        // Pixels adjacent to the edge on each side must separate further.
-        assert!(v[4 * 4] < before[4 * 4], "dark side {v:?}");
-        assert!(v[5 * 4] > before[5 * 4], "bright side {v:?}");
-        assert_eq!(v[0], before[0], "far pixels are not touched");
-    }
-
-    #[test]
-    fn sharpening_threshold_leaves_low_contrast_texture_alone() {
-        // 1-code checkerboard: below the 2/255 dead zone, so no gain.
-        let mut v = Vec::new();
-        for y in 0..16 {
-            for x in 0..16 {
-                let val = if (x + y) % 2 == 0 { 100 } else { 102 };
-                v.extend_from_slice(&[val, val, val, 255]);
-            }
-        }
-        let before = v.clone();
-        apply(&mut v, 16, 16, &RawAdjust { sharpen: 100.0, ..Default::default() });
-        assert_eq!(v, before);
-    }
-
-    fn dark_side_after_sharpen(scale: f32) -> u8 {
-        // 21x1 step 64 -> 255 at x=10. x=8 is two pixels from the edge.
-        let mut buf: Vec<u16> = (0..21)
-            .flat_map(|x| {
-                let val = if x < 10 { 64u16 } else { 255u16 } * 257;
-                [val, val, val, 65535]
-            })
-            .collect();
-        develop_wide(
-            &mut buf,
-            21,
-            1,
-            &RawAdjust { sharpen: 100.0, ..Default::default() },
-            scale,
-        );
-        ((buf[8 * 4] as u32 + 128) / 257) as u8
-    }
-
-    #[test]
-    fn sharpening_radius_scales_with_proxy_ratio() {
-        assert!(dark_side_after_sharpen(1.0) < 64, "full-res USM must reach x=8");
-        assert_eq!(
-            dark_side_after_sharpen(0.25),
-            64,
-            "a quarter-size proxy shrinks the kernel below x=8"
-        );
     }
 
     #[test]

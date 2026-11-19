@@ -174,7 +174,8 @@ pub struct RawAdjust {
     /// luma and chroma, scaled to the noise measured in the photo; detail and
     /// edges are preserved (`denoise.rs`).
     pub denoise: f32,
-    /// Capture (demosaic) sharpening 0..100 — linear unsharp mask.
+    /// Capture sharpening 0..100 — noise-gated gain on the fine wavelet
+    /// bands (`denoise.rs`).
     pub sharpen: f32,
 }
 

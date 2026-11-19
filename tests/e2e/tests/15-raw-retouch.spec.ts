@@ -629,7 +629,11 @@ test.describe('RAW retouch (#42): non-destructive Heal/Clone', () => {
         heal_ca_export_h: dims.h,
       });
 
-      expect(boxPsnr, 'preview-vs-export PSNR inside the healed box').toBeGreaterThan(30);
+      // 27 dB with the default capture sharpening on (it was 30 without):
+      // the half-size preview sharpens the bands the export's land on, which
+      // agrees to about 39 dB over the frame and less inside a patch this
+      // contrasty (measured 28.0 dB here, 31.3 dB with Sharpening at 0).
+      expect(boxPsnr, 'preview-vs-export PSNR inside the healed box').toBeGreaterThan(27);
       expect(errors, errors.join('\n')).toEqual([]);
     });
   }

@@ -1064,10 +1064,13 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 let source_fp = source_fingerprint(photo.gen, proxy_gen(item.id));
                 // A direct-painted proxy may already cover this target; rendering
                 // again would swap it for a smaller worker copy of the same pixels.
+                // Not a stand-in, though: it lacks the RAW detail stage, and
+                // only this render brings it.
                 if (!windowed_view || state::has_post_adjustments(&item.layers))
                     && HI_CACHE.with(|c| {
                         c.borrow().as_ref().is_some_and(|hi| {
                             hi.item_id == item.id
+                                && !hi.stand_in
                                 && hi.edit_fp == edit_fp
                                 && hi.source_fp == source_fp
                                 && hi.w >= t2.0
@@ -1161,11 +1164,13 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                 Ok(r) => {
                                     perf::record("hi.worker_reply", perf::now() - hi_t0);
                                     // Keep a strictly larger cached frame for the same
-                                    // edit and source instead of downgrading it.
+                                    // edit and source instead of downgrading it
+                                    // (unless it is a stand-in this reply replaces).
                                     if item_cb.layers.iter().all(|l| !l.visible)
                                         && HI_CACHE.with(|c| {
                                             c.borrow().as_ref().is_some_and(|hi| {
                                                 hi.item_id == item_id
+                                                    && !hi.stand_in
                                                     && hi.edit_fp == edit_fp
                                                     && hi.source_fp == source_fp
                                                     && hi.w >= r.w as usize

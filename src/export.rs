@@ -349,7 +349,7 @@ pub(crate) fn photo_unedited(item: &MediaItem) -> bool {
     edit_unedited(&item.edit, item)
 }
 
-/// Unedited apart from RAW detail (Smart denoise, Demosaic sharpening). Those
+/// Unedited apart from RAW detail (Smart denoise, Sharpening). Those
 /// stages are tone-neutral (#15), so an unedited frame is a faithful stand-in
 /// on screen until the detailed render lands. The ISO-based denoise start
 /// makes this the common case for a restored high-ISO RAW.
