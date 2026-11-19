@@ -728,7 +728,14 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             LAST_NEED.with(|n| n.set((need_w, need_h)));
             (need_w, need_h)
         };
-        let want_hi = need_w > w as f64 * 1.05 || need_h > h as f64 * 1.05;
+        // A windowed view (cropped or zoomed) spreads only its window of the
+        // preview over the canvas, so that window is what must be fine enough.
+        let (cover_w, cover_h) = if windowed_view {
+            (w as f64 * img_win.w as f64, h as f64 * img_win.h as f64)
+        } else {
+            (w as f64, h as f64)
+        };
+        let want_hi = need_w > cover_w * 1.05 || need_h > cover_h * 1.05;
 
         // A restored edit can carry a RAW develop its stored proxy never saw;
         // ask for the sensor re-develop so the neutral pipeline can run.

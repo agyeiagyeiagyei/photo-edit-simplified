@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import {
-  openApp, trackErrors, importFiles, canvas, canvasSize, clickTab, thumbs,
+  openApp, trackErrors, importFiles, fileInput, canvas, canvasSize, clickTab, setRange, thumbs,
   JPEG_A, PNG_SMALL, RING, rawFixtures,
 } from './helpers';
 
@@ -320,7 +320,8 @@ test.describe('view zoom (#46)', () => {
     });
     const file = path.join(os.tmpdir(), `pes-checker-${Date.now()}.png`);
     fs.writeFileSync(file, Buffer.from(dataUrl.split(',')[1], 'base64'));
-    await importFiles(page, [file]);
+    // Not importFiles: it waits for a thumb count of 1, which is already true.
+    await fileInput(page).setInputFiles([file]);
     await expect(thumbs(page)).toHaveCount(2);
     await thumbNamed(page, path.basename(file)).click();
     await clickTab(page, 'Color');
@@ -384,5 +385,132 @@ test.describe('view zoom (#46)', () => {
     const rec = await itemRecipe(page);
     expect(rec.text, 'export changed the recipe').toBe(recipeFit);
     expect(rec.text, 'a 1:1 crop must be serialised').toContain('"crop"');
+  });
+
+  // QA B1: digits, +, - and Space are text in a text field, even with the
+  // pointer resting on the photo.
+  test('a text field keeps its keys while the pointer is over the canvas', async ({ page }) => {
+    await openApp(page);
+    await importFiles(page, [PNG_SMALL]);
+    await clickTab(page, 'Layers');
+    await page.locator('button.btn', { hasText: '＋ Text' }).click();
+    const field = page.locator('input[type=text]').first();
+    await field.click();
+    await field.fill('');
+    const b = await canvasBox(page);
+    await page.mouse.move(b.x + b.width * 0.5, b.y + b.height * 0.5);
+    await page.keyboard.type('Hi 10-1+2 ok', { delay: 20 });
+    await expect(field).toHaveValue('Hi 10-1+2 ok');
+    expect(await pctNum(page), 'typing in a text field zoomed the view').toBeLessThan(101);
+  });
+
+  /** A detailed random-block PNG: blur parity shows on it where bokeh hides it. */
+  async function blocksPng(page: Page, w: number, h: number): Promise<string> {
+    const dataUrl = await page.evaluate(([w, h]) => {
+      const c = document.createElement('canvas');
+      c.width = w;
+      c.height = h;
+      const x = c.getContext('2d')!;
+      let seed = 12345;
+      const rnd = () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296);
+      for (let yy = 0; yy < h; yy += 8) {
+        for (let xx = 0; xx < w; xx += 8) {
+          x.fillStyle = `rgb(${(rnd() * 256) | 0},${(rnd() * 256) | 0},${(rnd() * 256) | 0})`;
+          x.fillRect(xx, yy, 8, 8);
+        }
+      }
+      return c.toDataURL('image/png');
+    }, [w, h]);
+    const file = path.join(os.tmpdir(), `pes-blocks-${w}x${h}-${Date.now()}.png`);
+    fs.writeFileSync(file, Buffer.from(dataUrl.split(',')[1], 'base64'));
+    return file;
+  }
+
+  // QA B2: at dpr 1 the canvas is about as wide as the 1024 px preview, and
+  // the sharp-frame decision used to compare against the whole preview.
+  test('a zoomed view sharpens on a dpr-1 screen', async ({ browser }) => {
+    const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, deviceScaleFactor: 1 });
+    const page = await ctx.newPage();
+    await openApp(page);
+    const file = await blocksPng(page, 2400, 1800);
+    await importFiles(page, [file]);
+    await clickTab(page, 'Color');
+    await page.locator('.zoom-cluster .zoom-native').click();
+    await expect.poll(() => pctNum(page)).toBe(100);
+    // At 100% one image pixel is one CSS pixel: the backing must reach it.
+    await expect
+      .poll(async () => { const s = await canvasSize(page); return s.w / s.cw; }, { timeout: 20_000 })
+      .toBeGreaterThan(0.95);
+    fs.rmSync(file, { force: true });
+    await ctx.close();
+  });
+
+  // QA B3 (R7): with Blur on, the zoomed window's outer pixels must match the
+  // export too. Without an apron the outer 2 px were 7.7 levels off.
+  test('the edge of a zoomed, blurred view matches the export', async ({ page }) => {
+    test.setTimeout(180_000);
+    await openApp(page);
+    const file = await blocksPng(page, 2400, 1800);
+    await importFiles(page, [file]);
+    await clickTab(page, 'Color');
+    await setRange(page, /^Blur/, 60);
+    await page.locator('.zoom-cluster .zoom-native').click();
+    await expect.poll(() => pctNum(page)).toBe(100);
+    await page.waitForTimeout(2500);
+    const view = await canvas(page).evaluate((c: HTMLCanvasElement) => {
+      const d = c.getContext('2d')!.getImageData(0, 0, c.width, c.height).data;
+      let s = '';
+      for (let i = 0; i < d.length; i += 0x8000) s += String.fromCharCode.apply(null, Array.from(d.subarray(i, i + 0x8000)) as number[]);
+      return { w: c.width, h: c.height, b64: btoa(s) };
+    });
+    await clickTab(page, 'Export');
+    await page.locator('label', { hasText: 'Format' }).locator('select').selectOption('png');
+    const [dl] = await Promise.all([
+      page.waitForEvent('download', { timeout: 120_000 }),
+      page.locator('button.btn.primary', { hasText: 'Download this' }).click(),
+    ]);
+    const png = fs.readFileSync((await dl.path())!).toString('base64');
+    const band = await page.evaluate(async ({ view, png }) => {
+      const bin = atob(png);
+      const u8 = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+      const bmp = await createImageBitmap(new Blob([u8], { type: 'image/png' }));
+      const c = document.createElement('canvas');
+      c.width = bmp.width;
+      c.height = bmp.height;
+      const x = c.getContext('2d')!;
+      x.drawImage(bmp, 0, 0);
+      const e = x.getImageData(0, 0, c.width, c.height).data;
+      const vb = atob(view.b64);
+      const v = (i: number) => vb.charCodeAt(i);
+      const cx = Math.round((c.width - view.w) / 2);
+      const cy = Math.round((c.height - view.h) / 2);
+      // Mean |Δ| over a rectangle of the view, with the window at (ox, oy).
+      const diff = (ox: number, oy: number, x0: number, y0: number, x1: number, y1: number) => {
+        let s = 0, n = 0;
+        for (let yy = y0; yy < y1; yy++) for (let xx = x0; xx < x1; xx++) {
+          const a = (yy * view.w + xx) * 4, b = ((yy + oy) * c.width + xx + ox) * 4;
+          for (let k = 0; k < 3; k++) { s += Math.abs(v(a + k) - e[b + k]); n++; }
+        }
+        return s / n;
+      };
+      // The centred window can sit a pixel either way: take the best fit.
+      let best = { d: 1e9, ox: cx, oy: cy };
+      for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+        const d = diff(cx + dx, cy + dy, 100, 100, 260, 220);
+        if (d < best.d) best = { d, ox: cx + dx, oy: cy + dy };
+      }
+      const strips = [
+        diff(best.ox, best.oy, 0, 0, view.w, 2),
+        diff(best.ox, best.oy, 0, view.h - 2, view.w, view.h),
+        diff(best.ox, best.oy, 0, 0, 2, view.h),
+        diff(best.ox, best.oy, view.w - 2, 0, view.w, view.h),
+      ];
+      return { interior: best.d, edge: Math.max(...strips), vw: view.w, ew: c.width };
+    }, { view, png });
+    expect(band.vw, 'the view must be a window of the export').toBeLessThan(band.ew);
+    expect(band.interior, 'zoomed interior differs from the export').toBeLessThanOrEqual(0.5);
+    expect(band.edge, 'outer 2 px of the zoomed view differ from the export').toBeLessThanOrEqual(1.5);
+    fs.rmSync(file, { force: true });
   });
 });

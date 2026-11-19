@@ -78,22 +78,41 @@ fn wheel_px(ev: &web_sys::WheelEvent, v: f64) -> f32 {
     (v * scale) as f32
 }
 
-/// A focused control owns its keys — sliders, text fields and buttons all use
-/// arrows, +/− and Space themselves. Zoom shortcuts only win these back when
-/// the pointer sits on the canvas, where the user's intent is unambiguous.
-fn control_has_focus(ev: &web_sys::KeyboardEvent) -> bool {
+/// What kind of control has the keyboard. Text entry always owns its keys:
+/// digits, +/−, Space and arrows are text there, wherever the pointer rests.
+/// Other controls (sliders, checkboxes, buttons, selects) own them too,
+/// except while the pointer is on the canvas, where the intent is the view.
+#[derive(PartialEq)]
+enum KeyOwner {
+    None,
+    Text,
+    Control,
+}
+
+fn key_owner(ev: &web_sys::KeyboardEvent) -> KeyOwner {
     let Some(el) = ev
         .target()
         .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
     else {
-        return false;
+        return KeyOwner::None;
     };
-    matches!(
-        el.tag_name().as_str(),
-        "INPUT" | "TEXTAREA" | "SELECT" | "OPTION" | "BUTTON"
-    ) || el
+    let editable = el
         .dyn_ref::<web_sys::HtmlElement>()
-        .is_some_and(|h| h.is_content_editable())
+        .is_some_and(|h| h.is_content_editable());
+    match el.tag_name().as_str() {
+        "TEXTAREA" => KeyOwner::Text,
+        "INPUT" => {
+            let ty = el.get_attribute("type").unwrap_or_default().to_ascii_lowercase();
+            if matches!(ty.as_str(), "range" | "checkbox" | "radio" | "button" | "submit" | "reset" | "color" | "file") {
+                KeyOwner::Control
+            } else {
+                KeyOwner::Text
+            }
+        }
+        _ if editable => KeyOwner::Text,
+        "SELECT" | "OPTION" | "BUTTON" => KeyOwner::Control,
+        _ => KeyOwner::None,
+    }
 }
 
 fn pointer_over_canvas() -> bool {
@@ -271,7 +290,8 @@ pub(crate) fn ZoomControls(state: AppState, tab: RwSignal<Tab>) -> impl IntoView
         if !zoomable() {
             return;
         }
-        if control_has_focus(&ev) && !pointer_over_canvas() {
+        let owner = key_owner(&ev);
+        if owner == KeyOwner::Text || (owner == KeyOwner::Control && !pointer_over_canvas()) {
             return;
         }
         if ev.ctrl_key() || ev.meta_key() || ev.alt_key() {

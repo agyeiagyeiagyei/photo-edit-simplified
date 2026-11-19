@@ -727,14 +727,10 @@ fn wide_window_pipeline(
     fw: usize,
     fh: usize,
     edit: &EditParams,
-    req_w: f64,
-    req_h: f64,
-    max_edge: u32,
+    win: Win,
 ) -> (Vec<u16>, usize, usize, [f64; 3]) {
     let t0 = js_sys::Date::now();
-    let (ww, wh) = working_dims(fw, fh, edit);
-    let (cx, cy, cw, ch) = crop_px(edit, ww, wh);
-    let (tw, th) = hi_target(req_w, req_h, cw, ch, max_edge);
+    let Win { rect: (cx, cy, cw, ch), tw, th } = win;
     let fine_bits = edit.fine_angle.to_bits();
     let cached = WIDE_WINDOW_CACHE.with(|c| {
         c.borrow().as_ref().is_some_and(|w| {
@@ -899,15 +895,13 @@ fn neutral_window_render(
     fh: usize,
     edit: &EditParams,
     seed: u32,
-    req_w: f64,
-    req_h: f64,
-    max_edge: u32,
+    win: Win,
     sel_json: Option<String>,
     sel_mask: Option<Uint8Array>,
 ) -> (Vec<u8>, usize, usize, [f64; 5]) {
-    let (mut buf, tw, th, t) = wide_window_pipeline(id, fw, fh, edit, req_w, req_h, max_edge);
+    let (mut buf, tw, th, t) = wide_window_pipeline(id, fw, fh, edit, win);
     let (ww, wh) = working_dims(fw, fh, edit);
-    let (cx, cy, cw, ch) = crop_px(edit, ww, wh);
+    let (cx, cy, cw, ch) = win.rect;
     let place = Place::window(ww, wh, (cx, cy, cw, ch), tw);
     let rebased = pipeline::rebase_layer_masks(edit, ww, wh, (cx, cy, cw, ch), tw, th);
     let edit = &rebased;
@@ -1061,16 +1055,13 @@ fn render_window_pipeline(
     fh: usize,
     edit: &EditParams,
     seed: u32,
-    req_w: f64,
-    req_h: f64,
-    max_edge: u32,
+    win: Win,
     sel_json: Option<String>,
     sel_mask: Option<Uint8Array>,
 ) -> (Vec<u8>, usize, usize, [f64; 5]) {
     let t0 = js_sys::Date::now();
     let (ww, wh) = working_dims(fw, fh, edit);
-    let (cx, cy, cw, ch) = crop_px(edit, ww, wh);
-    let (tw, th) = hi_target(req_w, req_h, cw, ch, max_edge);
+    let Win { rect: (cx, cy, cw, ch), tw, th } = win;
     // Layer masks are normalized to the working frame; rasterize them there,
     // take the window, then scale — exactly like the global selection below.
     let rebased = pipeline::rebase_layer_masks(edit, ww, wh, (cx, cy, cw, ch), tw, th);
@@ -1169,17 +1160,81 @@ pub fn render_window(
 ) -> Result<JsValue, JsValue> {
     let edit = parse_edit(id, recipe);
     if let Some((fw, fh)) = neutral_dims(id, &edit) {
-        let (buf, tw, th, t) = neutral_window_render(
-            id, fw, fh, &edit, id, req_w, req_h, max_edge, sel_json, sel_mask,
-        );
+        let (win, trim) = Win::plan(&edit, fw, fh, req_w, req_h, max_edge);
+        let (buf, tw, th, t) = neutral_window_render(id, fw, fh, &edit, id, win, sel_json, sel_mask);
+        let (buf, tw, th) = trim_window(buf, tw, th, trim);
         return Ok(render_reply(buf, tw, th, t));
     }
     with_buffer(id, |(full, fw, fh)| {
-        let (buf, tw, th, t) = render_window_pipeline(
-            id, full, *fw, *fh, &edit, id, req_w, req_h, max_edge, sel_json, sel_mask,
-        );
+        let (win, trim) = Win::plan(&edit, *fw, *fh, req_w, req_h, max_edge);
+        let (buf, tw, th, t) =
+            render_window_pipeline(id, full, *fw, *fh, &edit, id, win, sel_json, sel_mask);
+        let (buf, tw, th) = trim_window(buf, tw, th, trim);
         render_reply(buf, tw, th, t)
     })
+}
+
+/// The part of the working frame a window render covers, and its size.
+#[derive(Clone, Copy)]
+struct Win {
+    rect: (usize, usize, usize, usize),
+    tw: usize,
+    th: usize,
+}
+
+impl Win {
+    /// The crop window at the size the display asks for. With Blur on, the
+    /// render takes an apron of three sigmas around the window, so the blur
+    /// at the window's edge reads the photo's real pixels as the export does
+    /// (#46 R7); the second value is where the window sits in that render
+    /// (x, y, w, h), for [`trim_window`].
+    fn plan(
+        edit: &EditParams,
+        fw: usize,
+        fh: usize,
+        req_w: f64,
+        req_h: f64,
+        max_edge: u32,
+    ) -> (Win, Option<(usize, usize, usize, usize)>) {
+        let (ww, wh) = working_dims(fw, fh, edit);
+        let rect = crop_px(edit, ww, wh);
+        let (cx, cy, cw, ch) = rect;
+        let (tw, th) = hi_target(req_w, req_h, cw, ch, max_edge);
+        let plain = (Win { rect, tw, th }, None);
+        if edit.blur <= 0.0 {
+            return plain;
+        }
+        // Render pixels per working pixel, and the apron in each.
+        let s = tw as f64 / cw.max(1) as f64;
+        let apron_t = (Place::window(ww, wh, rect, tw).blur_sigma(edit.blur) * 3.0).ceil() as usize + 2;
+        let apron_w = (apron_t as f64 / s).ceil() as usize;
+        let x0 = cx.saturating_sub(apron_w);
+        let y0 = cy.saturating_sub(apron_w);
+        let x1 = (cx + cw + apron_w).min(ww);
+        let y1 = (cy + ch + apron_w).min(wh);
+        if (x0, y0, x1, y1) == (cx, cy, cx + cw, cy + ch) {
+            return plain;
+        }
+        let (ew, eh) = (x1 - x0, y1 - y0);
+        let etw = ((ew as f64 * s).round() as usize).max(tw);
+        let eth = ((eh as f64 * s).round() as usize).max(th);
+        let ox = (((cx - x0) as f64 * s).round() as usize).min(etw - tw);
+        let oy = (((cy - y0) as f64 * s).round() as usize).min(eth - th);
+        (Win { rect: (x0, y0, ew, eh), tw: etw, th: eth }, Some((ox, oy, tw, th)))
+    }
+}
+
+/// Cut the window back out of a render that carried an apron.
+fn trim_window(
+    buf: Vec<u8>,
+    w: usize,
+    h: usize,
+    trim: Option<(usize, usize, usize, usize)>,
+) -> (Vec<u8>, usize, usize) {
+    match trim {
+        Some((x, y, tw, th)) => (crop_rows(&buf, w, x, y, tw, th, 4), tw, th),
+        None => (buf, w, h),
+    }
 }
 
 fn downscale(pixels: &[u8], w: usize, h: usize, long_edge: u32) -> (Vec<u8>, usize, usize) {
