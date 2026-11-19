@@ -307,7 +307,9 @@ fn strokes_from_json(v: &JsValue) -> Vec<RetouchStroke> {
         }
         out.push(RetouchStroke {
             mode,
-            radius: (jnum(&item, "r").unwrap_or(0.02) as f32).clamp(0.001, 0.25),
+            // 1e-5 is still a tenth of a pixel on a 60 MP frame; the old 0.001
+            // floor turned a reloaded close-up brush into a 7 px disc.
+            radius: (jnum(&item, "r").unwrap_or(0.02) as f32).clamp(0.00001, 0.25),
             pts,
             src,
             seed: jnum(&item, "seed").unwrap_or(0.0) as u32,

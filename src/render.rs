@@ -750,8 +750,14 @@ pub(crate) struct HiWindow {
 pub(crate) enum Sharp {
     /// Whole working image from [`HiCache`].
     Whole { w: usize },
-    /// Crop window from [`HiWindow`]; `cw` is the crop width in preview px.
-    Window { w: usize, cw: usize },
+    /// View window from [`HiWindow`]; `cw` is the window width and (`cx`,
+    /// `cy`) its origin, all in preview px.
+    Window {
+        w: usize,
+        cw: usize,
+        cx: usize,
+        cy: usize,
+    },
 }
 
 pub(crate) fn crop_key(c: &state::CropRect) -> [u32; 4] {

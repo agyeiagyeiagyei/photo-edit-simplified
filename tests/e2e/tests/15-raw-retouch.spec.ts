@@ -1,7 +1,7 @@
 import { test, expect, Page } from '@playwright/test';
 import * as fs from 'fs';
 import {
-  openApp, importFiles, thumbs, canvas, canvasSize, clickTab, setRange,
+  openApp, importFiles, thumbs, canvas, canvasSize, clickTab, setRange, setBrushFrac,
   trackErrors, recordMetrics, imageDims, rawFixtures,
 } from './helpers';
 
@@ -362,7 +362,7 @@ test.describe('RAW retouch (#42): non-destructive Heal/Clone', () => {
 
       await clickTab(page, 'Heal');
       await page.locator('.heal-panel .chip', { hasText: /^Smooth fill$/ }).click();
-      await setRange(page, /^Brush size:/, 0.06);
+      await setBrushFrac(page, /^Brush size:/, 0.06);
       await page.waitForTimeout(300);
 
       const pick = await pickHealAndControl(page);
@@ -468,7 +468,7 @@ test.describe('RAW retouch (#42): non-destructive Heal/Clone', () => {
       expect(preDelta, 'source and destination look alike; clone would prove nothing').toBeGreaterThan(12);
 
       await clickTab(page, 'Clone');
-      await setRange(page, /^Brush size:/, 0.07);
+      await setBrushFrac(page, /^Brush size:/, 0.07);
       await page.locator('.clone-panel .chip', { hasText: /^Set source$/ }).click();
       await clickNorm(page, src.x, src.y);
       await clickNorm(page, dest.x, dest.y);
@@ -573,7 +573,7 @@ test.describe('RAW retouch (#42): non-destructive Heal/Clone', () => {
 
       await clickTab(page, 'Heal');
       await page.locator('.heal-panel .chip', { hasText: /^Content-aware$/ }).click();
-      await setRange(page, /^Brush size:/, 0.06);
+      await setBrushFrac(page, /^Brush size:/, 0.06);
       await page.waitForTimeout(300);
 
       const pick = await pickHealAndControl(page);

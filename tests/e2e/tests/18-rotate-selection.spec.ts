@@ -1,7 +1,7 @@
 import { test, expect, Page } from '@playwright/test';
 import * as fs from 'fs';
 import {
-  openApp, trackErrors, recordMetrics, importFiles, canvas, canvasSize, clickTab, setRange, PNG_SMALL,
+  openApp, trackErrors, recordMetrics, importFiles, canvas, canvasSize, clickTab, setRange, setBrushFrac, PNG_SMALL,
 } from './helpers';
 
 // Selections and adjustment masks sit on the photo's pixels, so turning or
@@ -148,7 +148,7 @@ test.describe('selections turn with the photo', () => {
     // An off-centre brushed selection: a turn moves it somewhere else.
     await clickTab(page, 'Select');
     await page.locator('.select-tab .chip', { hasText: /^Brush$/ }).click();
-    await setRange(page, /^Size:/, 0.1);
+    await setBrushFrac(page, /^Size:/, 0.1);
     await setRange(page, /^Softness:/, 0);
     await parkPointer(page);
     await stroke(page, [[0.12, 0.2], [0.34, 0.24], [0.3, 0.4]]);

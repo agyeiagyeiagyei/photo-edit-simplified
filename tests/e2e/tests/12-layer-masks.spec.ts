@@ -1,7 +1,7 @@
 import { test, expect, Page } from '@playwright/test';
 import * as fs from 'fs';
 import {
-  openApp, trackErrors, recordMetrics, importFiles, canvas, canvasSize, clickTab, setRange,
+  openApp, trackErrors, recordMetrics, importFiles, canvas, canvasSize, clickTab, setRange, setBrushFrac,
   thumbs, PNG_SMALL, RING,
 } from './helpers';
 
@@ -396,7 +396,7 @@ test.describe('overlay layer masks (issue #36 Phase B)', () => {
     await selectBrush(page);
     await expect(page.locator('.select-tab p.dim', { hasText: /^Brush edits the selected layer's mask/ }))
       .toBeVisible();
-    await setRange(page, /^Size:/, 0.2);
+    await setBrushFrac(page, /^Size:/, 0.2);
     await setRange(page, /^Softness:/, 0);
     await selectChip(page, 'Remove').click();
     await parkPointer(page);

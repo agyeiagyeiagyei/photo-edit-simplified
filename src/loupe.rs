@@ -324,13 +324,22 @@ pub(crate) fn canvas_loupe_norm(state: AppState, tab: Tab, ev: &web_sys::Pointer
     let ny = ((ev.client_y() as f64 - r.top()) / r.height()).clamp(0.0, 1.0);
     let item = state.current()?;
     let crop = item.edit.crop;
+    // The wrap may show only a zoom window of the crop; map through it so the
+    // loupe samples the pixel under the cursor, not the fit-view equivalent.
+    let win = if zoomable_tab(tab) {
+        state.view_zoom.get_untracked().window()
+    } else {
+        state::ViewZoom::default().window()
+    };
+    let vx = win.x as f64 + nx * win.w as f64;
+    let vy = win.y as f64 + ny * win.h as f64;
     if tab != Tab::Crop && !crop_is_full(&crop) {
         Some((
-            crop.x as f64 + nx * crop.w as f64,
-            crop.y as f64 + ny * crop.h as f64,
+            crop.x as f64 + vx * crop.w as f64,
+            crop.y as f64 + vy * crop.h as f64,
         ))
     } else {
-        Some((nx, ny))
+        Some((vx, vy))
     }
 }
 
@@ -343,6 +352,12 @@ pub(crate) fn canvas_loupe_soon(state: AppState, tab: RwSignal<Tab>, ev: &web_sy
     }
     let Some(item) = state.current() else { return };
     if item.kind != MediaKind::Photo {
+        return;
+    }
+    // At 100% the canvas already shows native pixels; a 1:1 loupe would be a
+    // second copy of the same detail sitting under the cursor.
+    if view_at_native(state, tab.get_untracked()) {
+        canvas_loupe_clear(state);
         return;
     }
     let Some((nx, ny)) = canvas_loupe_norm(state, tab.get_untracked(), ev) else { return };
@@ -366,6 +381,10 @@ pub(crate) fn canvas_loupe_soon(state: AppState, tab: RwSignal<Tab>, ev: &web_sy
 pub(crate) fn canvas_loupe_move(state: AppState, tab: RwSignal<Tab>, ev: &web_sys::PointerEvent) {
     // Drags (heal/clone/crop/select/layers) never open the loupe.
     if ev.buttons() != 0 {
+        canvas_loupe_clear(state);
+        return;
+    }
+    if view_at_native(state, tab.get_untracked()) {
         canvas_loupe_clear(state);
         return;
     }
