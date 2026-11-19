@@ -208,6 +208,70 @@ test('Pen and Brush select or create a layer and draw', async ({ page }) => {
   expect(errors, errors.join('\n')).toEqual([]);
 });
 
+// Owner requests (19 Nov): a delete asks first and says what goes with the
+// layer, a masked adjustment reads as one group, and layers can be renamed.
+test('delete asks first, a mask is grouped with its layer, and a rename survives a reload', async ({ page }) => {
+  test.setTimeout(120_000);
+  const errors = trackErrors(page);
+  await openApp(page);
+  await importFiles(page, [PNG_SMALL]);
+  const labels = () => page.locator('.layer-row .layer-label').allTextContents();
+
+  // A rect selection folded into an adjustment: one group, mask included.
+  await clickTab(page, 'Select');
+  await page.locator('.select-tab .chip', { hasText: /^Rect$/ }).click();
+  const b = (await page.locator('.canvas-wrap').boundingBox())!;
+  await page.mouse.move(b.x + b.width * 0.2, b.y + b.height * 0.2);
+  await page.mouse.down();
+  await page.mouse.move(b.x + b.width * 0.5, b.y + b.height * 0.6, { steps: 6 });
+  await page.mouse.up();
+  await clickTab(page, 'Layers');
+  await page.locator('button.btn', { hasText: /＋ Adjust from sel\./ }).click();
+  await addText(page, 'X', '#ff0000');
+  expect(await labels()).toEqual(['T: X', 'Adjust']);
+  const group = page.locator('.layer-group', { hasText: 'Adjust' });
+  await expect(group).toHaveClass(/grouped/);
+  await expect(group.locator('.layer-sub')).toContainText('Mask');
+  await expect(page.locator('.layer-group', { hasText: 'T: X' })).not.toHaveClass(/grouped/);
+
+  // Rename by double-click; digits and spaces are text, not zoom keys.
+  await group.locator('.layer-label').dblclick();
+  const field = page.locator('input.layer-rename');
+  await expect(field).toBeFocused();
+  await field.fill('Bird 1 - brighter');
+  await field.press('Enter');
+  expect(await labels()).toEqual(['T: X', 'Bird 1 - brighter']);
+  // Escape leaves the name alone.
+  await page.locator('.layer-row', { hasText: 'Bird 1' }).locator('.layer-label').dblclick();
+  await page.locator('input.layer-rename').fill('nope');
+  await page.locator('input.layer-rename').press('Escape');
+  expect(await labels()).toEqual(['T: X', 'Bird 1 - brighter']);
+
+  // Delete asks, names what goes with the layer, and Cancel keeps it.
+  const row = page.locator('.layer-group', { hasText: 'Bird 1' });
+  await row.locator('button.delete').click();
+  await expect(row.locator('.layer-confirm')).toContainText('Delete “Bird 1 - brighter” and its mask?');
+  expect(await labels()).toHaveLength(2);
+  await row.locator('.layer-confirm button', { hasText: /^Cancel$/ }).click();
+  await expect(page.locator('.layer-confirm')).toHaveCount(0);
+  expect(await labels()).toHaveLength(2);
+
+  // The name is saved with the session.
+  await page.waitForTimeout(2200);
+  await page.reload();
+  await expect(thumbs(page)).toHaveCount(1, { timeout: 60_000 });
+  await clickTab(page, 'Layers');
+  await expect.poll(labels, { timeout: 20_000 }).toEqual(['T: X', 'Bird 1 - brighter']);
+
+  // Confirming deletes the layer and its mask together.
+  const again = page.locator('.layer-group', { hasText: 'Bird 1' });
+  await again.locator('button.delete').click();
+  await again.locator('.layer-confirm button', { hasText: /^Delete$/ }).click();
+  await expect.poll(labels).toEqual(['T: X']);
+  await expect(page.locator('.layer-sub')).toHaveCount(0);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
 test('arrows reach both ends of the one stack', async ({ page }) => {
   test.setTimeout(120_000);
   const errors = trackErrors(page);
@@ -286,6 +350,7 @@ test('Pen and Brush still draw after a photo switch, a deleted layer or another 
 
   // Deleting the layer it was drawing on.
   await page.locator('.layer-row', { hasText: 'Brush' }).locator('button.delete').click();
+  await page.locator('.layer-confirm button', { hasText: /^Delete$/ }).click();
   await page.waitForTimeout(300);
   expect(await labels()).toEqual(['T: X']);
   expect(await drag(0.6), 'Brush did nothing after its layer was deleted').toBeGreaterThan(50);

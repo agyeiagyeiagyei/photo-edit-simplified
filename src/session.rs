@@ -592,6 +592,9 @@ pub fn layers_json(layers: &[Layer]) -> Option<String> {
         if l.mask_version != 0 {
             out.push_str(&format!(",\"mv\":{}", l.mask_version));
         }
+        if !l.name.is_empty() {
+            out.push_str(&format!(",\"nm\":\"{}\"", esc(&l.name)));
+        }
         if let Some(m) = &l.mask {
             out.push_str(&format!(
                 ",\"mask\":{}",
@@ -744,6 +747,7 @@ pub fn layers_from_json(json: &str) -> Vec<Layer> {
             invert: crate::state::jbool(&lv, "inv").unwrap_or(false),
             show_mask: crate::state::jbool(&lv, "sm").unwrap_or(false),
             mask_version: crate::state::jnum(&lv, "mv").unwrap_or(0.0) as u64,
+            name: jstr(&lv, "nm").unwrap_or_default(),
             kind,
         });
     }

@@ -394,6 +394,8 @@ pub struct Layer {
     pub invert: bool,
     pub show_mask: bool,
     pub mask_version: u64,
+    /// The owner's name for the layer; empty shows the automatic label.
+    pub name: String,
     pub kind: LayerKind,
 }
 
@@ -407,6 +409,7 @@ impl Layer {
             invert: false,
             show_mask: false,
             mask_version: 0,
+            name: String::new(),
             kind,
         }
     }
@@ -591,6 +594,7 @@ pub fn migrate_adjust_layers(
             invert: al.invert,
             show_mask: false,
             mask_version: al.mask_version,
+            name: String::new(),
             kind: LayerKind::Adjust(AdjustLayerState { adjust: al.adjust, clip_to: None }),
         });
     }
