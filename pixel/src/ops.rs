@@ -232,6 +232,19 @@ pub fn rotate_auto_crop_wide(
 
 /// Generate an 8-bit alpha mask from a normalized selection.
 /// Result has length w*h; 255 = fully selected, 0 = unselected.
+/// Stable insertion sort for short lists (tens to a few hundred items).
+/// std's stable sort costs 3–17 KB of wasm for every element type it is used
+/// with; this is a few dozen bytes each.
+pub fn sort_small_by_key<T, K: PartialOrd>(v: &mut [T], key: impl Fn(&T) -> K) {
+    for i in 1..v.len() {
+        let mut j = i;
+        while j > 0 && key(&v[j]) < key(&v[j - 1]) {
+            v.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+}
+
 pub fn selection_mask(sel: &Selection, w: usize, h: usize) -> Vec<u8> {
     let mut mask = vec![0u8; w * h];
     match &sel.kind {

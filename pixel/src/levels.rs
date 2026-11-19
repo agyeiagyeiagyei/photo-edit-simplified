@@ -206,7 +206,7 @@ pub fn histogram_display_scale(bins: &[f64; 256]) -> f64 {
     if interior.is_empty() {
         return peak;
     }
-    interior.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    crate::ops::sort_small_by_key(&mut interior, |v| *v);
     let typical = interior[((interior.len() - 1) as f64 * 0.95) as usize];
     peak.min(typical * 4.0)
 }

@@ -243,7 +243,7 @@ pub(crate) fn evict_full_lru() {
                 )
             })
             .collect();
-        candidates.sort_by_key(|c| c.0);
+        ops::sort_small_by_key(&mut candidates, |c| c.0);
         let mut evicted = Vec::new();
         for (_, id, len) in candidates {
             if total <= budget {

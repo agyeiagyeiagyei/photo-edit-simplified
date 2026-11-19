@@ -386,9 +386,15 @@ pub(crate) fn restore_session(state: AppState) {
                 return;
             }
         };
-        let (mut records, thumb_records, meta) =
+        let (records, thumb_records, meta) =
             session::load_all(&db).await.unwrap_or_default();
-        records.sort_by_key(|(_, v)| state::jnum(v, "ord").unwrap_or(0.0) as usize);
+        // Read each record's order once: the key is a JS property lookup.
+        let mut keyed: Vec<(usize, (usize, JsValue))> = records
+            .into_iter()
+            .map(|r| (state::jnum(&r.1, "ord").unwrap_or(0.0) as usize, r))
+            .collect();
+        ops::sort_small_by_key(&mut keyed, |k| k.0);
+        let records: Vec<(usize, JsValue)> = keyed.into_iter().map(|k| k.1).collect();
         let thumbs: HashMap<usize, JsValue> = thumb_records.into_iter().collect();
         if records.is_empty() {
             SESSION_READY.with(|r| r.set(true));

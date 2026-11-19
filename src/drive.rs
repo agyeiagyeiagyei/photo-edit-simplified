@@ -96,7 +96,7 @@ pub fn add_pending_unstar(id: &str) {
     if ids.insert(id.to_string()) {
         if let Ok(Some(s)) = crate::web::window().local_storage() {
             let mut v: Vec<String> = ids.into_iter().collect();
-            v.sort();
+            v.sort_unstable();
             let _ = s.set_item(UNSTAR_KEY, &v.join("\n"));
         }
     }
@@ -362,12 +362,12 @@ pub fn manifest_json(
     edits: &std::collections::HashMap<String, String>,
 ) -> Vec<u8> {
     let mut ids: Vec<String> = starred.iter().map(|i| format!("\"{}\"", json_escape(i))).collect();
-    ids.sort();
+    ids.sort_unstable();
     let mut entries: Vec<String> = edits
         .iter()
         .map(|(k, r)| format!("\"{}\":{}", json_escape(k), r))
         .collect();
-    entries.sort();
+    entries.sort_unstable();
     format!(
         "{{\"version\":2,\"starred\":[{}],\"edits\":{{{}}}}}",
         ids.join(","),
