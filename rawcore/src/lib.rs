@@ -16,6 +16,41 @@ use rawmeta::tiff as tw;
 
 pub use rawmeta::{is_raw_name, largest_embedded_jpeg, RAW_EXTENSIONS};
 
+pub mod ca;
+
+/// The develop every path uses: rawler's steps, with lateral chromatic
+/// aberration removed from a Bayer mosaic before its demosaic ([`ca`]).
+fn developer(half: bool) -> RawDevelop {
+    let mut d = if half { RawDevelop::superpixel() } else { RawDevelop::default() };
+    d.before_demosaic = Some(std::sync::Arc::new(|pixels, cfa, roi| {
+        // Where the red, the two green and the blue sample sit in a cell.
+        let mut sites = [(0usize, 0usize); 4];
+        let mut seen = [0usize; 3];
+        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            let colour = cfa.color_at(roi.p.y + dy, roi.p.x + dx);
+            if colour > 2 {
+                return;
+            }
+            sites[[0, 1 + seen[1].min(1), 3][colour]] = (dx, dy);
+            seen[colour] += 1;
+        }
+        if seen != [1, 2, 1] {
+            return;
+        }
+        let stride = pixels.width;
+        ca::correct(&mut ca::Mosaic {
+            data: &mut pixels.data,
+            stride,
+            x0: roi.p.x,
+            y0: roi.p.y,
+            w: roi.d.w / 2,
+            h: roi.d.h / 2,
+            sites,
+        });
+    }));
+    d
+}
+
 /// Milliseconds for perf marks. wasm32 has no std clock; host builds only run
 /// this in tests, where the value is never asserted.
 fn now_ms() -> f64 {
@@ -56,7 +91,7 @@ fn develop_rgba(
         .raw_image(&rawfile, &params, false)
         .map_err(|e| format!("RAW decode failed: {e}"))?;
     let orientation = rawimage.orientation.to_u16();
-    let develop = RawDevelop::default();
+    let develop = developer(false);
     let intermediate = develop
         .develop_intermediate(&rawimage)
         .map_err(|e| format!("RAW develop failed: {e}"))?;
@@ -103,7 +138,7 @@ pub fn decode_raw_wide(
         .raw_image(&rawfile, &params, false)
         .map_err(|e| format!("RAW decode failed: {e}"))?;
     let orientation = rawimage.orientation.to_u16();
-    let intermediate = RawDevelop::default()
+    let intermediate = developer(false)
         .develop_intermediate(&rawimage)
         .map_err(|e| format!("RAW develop failed: {e}"))?;
     let (mut px, w, h) = intermediate_rgba_dual(intermediate, orientation);
@@ -172,7 +207,7 @@ pub fn decode_raw_proxy(bytes: &[u8], max_edge: u32) -> Result<RawProxy, String>
         && is_bayer_rgb(&rawimage)
         && (rawimage.width.max(rawimage.height) as f64) * 0.5
             >= max_edge as f64 * SUPERPIXEL_MIN_COVER;
-    let develop = if half { RawDevelop::superpixel() } else { RawDevelop::default() };
+    let develop = developer(half);
     let intermediate = develop
         .develop_intermediate(&rawimage)
         .map_err(|e| format!("RAW develop failed: {e}"))?;

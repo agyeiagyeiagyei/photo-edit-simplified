@@ -126,6 +126,10 @@ impl Intermediate {
 #[derive(Clone)]
 pub struct RawDevelop {
   pub steps: Vec<ProcessingStep>,
+  /// Called on a Bayer RGB mosaic (scaled to 0..1) just before its demosaic,
+  /// with the CFA and the area the demosaic will read: the place for
+  /// per-channel geometry such as lateral chromatic aberration.
+  pub before_demosaic: Option<std::sync::Arc<dyn Fn(&mut PixF32, &crate::CFA, Rect) + Send + Sync>>,
 }
 
 impl Default for RawDevelop {
@@ -141,13 +145,14 @@ impl Default for RawDevelop {
         ProcessingStep::CropDefault,
         ProcessingStep::SRgb,
       ],
+      before_demosaic: None,
     }
   }
 }
 
 impl RawDevelop {
   pub fn new_with(steps: &[ProcessingStep]) -> Self {
-    Self { steps: Vec::from(steps) }
+    Self { steps: Vec::from(steps), before_demosaic: None }
   }
 
   /// Half-size develop for display proxies: 2×2 superpixel binning on Bayer
@@ -164,6 +169,7 @@ impl RawDevelop {
         ProcessingStep::CropDefault,
         ProcessingStep::SRgb,
       ],
+      before_demosaic: None,
     }
   }
 
@@ -210,7 +216,7 @@ impl RawDevelop {
     if demosaic || superpixel {
       intermediate = match &rawimage.photometric {
         RawPhotometricInterpretation::Cfa(config) => {
-          if let Intermediate::Monochrome(pixels) = intermediate {
+          if let Intermediate::Monochrome(mut pixels) = intermediate {
             let roi = if self.steps.contains(&ProcessingStep::CropActiveArea) {
               if rawimage.active_area.is_some() && rawimage.fuji_rotation_width.is_some() {
                 panic!("ActiveArea is not possible when rotation is not normalized");
@@ -220,6 +226,9 @@ impl RawDevelop {
               pixels.rect()
             };
             if config.cfa.is_rgb() && config.sensor == SensorType::Bayer {
+              if let Some(hook) = &self.before_demosaic {
+                hook(&mut pixels, &config.cfa, roi);
+              }
               let mut rgb = if superpixel {
                 Superpixel3Channel::new().demosaic(&pixels, &config.cfa, &config.colors, roi)
               } else {
