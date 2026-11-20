@@ -100,6 +100,9 @@ pub(crate) struct ItemSig {
     pub(crate) drive_parent_id: Option<String>,
     pub(crate) drive_baked: bool,
     pub(crate) next_layer_id: usize,
+    /// Saved selections by id and name. A saved selection never changes in
+    /// place, so these stand for the list without comparing mask PNGs.
+    pub(crate) saved_selections: Vec<(usize, String)>,
 }
 
 thread_local! {
@@ -146,6 +149,7 @@ pub(crate) fn item_sig(item: &MediaItem, ord: usize) -> ItemSig {
         drive_parent_id: item.drive_parent_id.clone(),
         drive_baked: item.drive_baked,
         next_layer_id: item.next_layer_id,
+        saved_selections: item.saved_selections.iter().map(|s| (s.id, s.name.clone())).collect(),
     }
 }
 
@@ -226,6 +230,10 @@ pub(crate) async fn persist_session(state: AppState) {
         match &sig.layers {
             Some(l) => session::jset(rec_v, "layers", l.as_str()),
             None => session::jset(rec_v, "layers", JsValue::NULL),
+        }
+        match session::saved_selections_json(&item.saved_selections) {
+            Some(j) => session::jset(rec_v, "sels", j.as_str()),
+            None => session::jset(rec_v, "sels", JsValue::NULL),
         }
         match (&item.drive_file_id, &item.drive_parent_id) {
             (Some(a), Some(b)) => {
@@ -445,6 +453,12 @@ pub(crate) fn restore_session(state: AppState) {
             let drive_baked = state::jbool(&v, "dbaked").unwrap_or(false);
             let mut next_layer_id = state::jnum(&v, "nlid").unwrap_or(0.0) as usize;
             state::migrate_adjust_layers(&mut edit, &mut layers, &mut next_layer_id);
+            let saved_selections = Rc::new(
+                state::jget(&v, "sels")
+                    .and_then(|s| s.as_string())
+                    .map(|j| session::saved_selections_from_json(&j))
+                    .unwrap_or_default(),
+            );
             // A stack saved before one-stack semantics had every adjustment
             // below every overlay because that is where they were forced;
             // moving them to the bottom keeps those pixels identical.
@@ -491,6 +505,7 @@ pub(crate) fn restore_session(state: AppState) {
                     edit,
                     layers,
                     next_layer_id,
+                    saved_selections: saved_selections.clone(),
                     exif,
                     taken,
                     drive_file_id,
@@ -533,6 +548,7 @@ pub(crate) fn restore_session(state: AppState) {
                     edit,
                     layers,
                     next_layer_id,
+                    saved_selections: saved_selections.clone(),
                     exif,
                     taken,
                     drive_file_id,
@@ -573,6 +589,7 @@ pub(crate) fn restore_session(state: AppState) {
                     edit,
                     layers,
                     next_layer_id,
+                    saved_selections: saved_selections.clone(),
                     exif,
                     taken,
                     drive_file_id,
@@ -647,6 +664,7 @@ pub(crate) fn restore_session(state: AppState) {
                     edit,
                     layers,
                     next_layer_id,
+                    saved_selections: saved_selections.clone(),
                     exif,
                     taken,
                     drive_file_id,
@@ -692,6 +710,7 @@ pub(crate) fn restore_session(state: AppState) {
                     edit,
                     layers,
                     next_layer_id,
+                    saved_selections: saved_selections.clone(),
                     exif,
                     taken,
                     drive_file_id,
@@ -734,6 +753,7 @@ pub(crate) fn restore_session(state: AppState) {
                     edit,
                     layers,
                     next_layer_id,
+                    saved_selections: saved_selections.clone(),
                     exif,
                     taken,
                     drive_file_id,

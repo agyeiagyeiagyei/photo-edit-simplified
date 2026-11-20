@@ -157,6 +157,8 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
             .map(|s| s.feather)
             .unwrap_or(0.0)
     };
+    // The photo's saved selections; the list is rebuilt only when it changes.
+    let saved = create_memo(move |_| state.with_current(|m| m.saved_selections.clone()).unwrap_or_default());
     view! {
         <div class="select-tab">
             <Show
@@ -230,6 +232,96 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
                     }
                 })}
             </div>
+            <div class="row select-row selection-bar">
+                <button
+                    class="btn primary"
+                    disabled=move || !has_selection()
+                    title="Select everything outside the current selection"
+                    on:click=move |_| invert_selection(state)
+                >
+                    "Invert"
+                </button>
+                <button
+                    class="btn"
+                    disabled=move || !has_selection()
+                    title="Keep this selection with the photo, to load again later"
+                    on:click=move |_| save_selection(state)
+                >
+                    "Save selection"
+                </button>
+                <button
+                    class="btn"
+                    on:click=move |_| {
+                        state.subject_photo.set(None);
+                        clear_subject_brush_ops(state);
+                        state.update_current(|e| {
+                            e.selection = None;
+                            e.selection_rev += 1;
+                        });
+                    }
+                >
+                    "Clear"
+                </button>
+            </div>
+            <Show when=move || !saved.get().is_empty() fallback=|| ()>
+                <div class="saved-selections">
+                    <div class="panel-title">"Saved selections"</div>
+                    {move || saved.get().iter().map(|s| {
+                        let id = s.id;
+                        let name = s.name.clone();
+                        let shown = name.clone();
+                        view! {
+                            <div class="saved-row">
+                                <span
+                                    class="layer-label saved-name"
+                                    title="Double-click to rename"
+                                    on:dblclick=move |_| {
+                                        let asked = web::window()
+                                            .prompt_with_message_and_default("Name this selection", &name)
+                                            .ok()
+                                            .flatten();
+                                        if let Some(new_name) = asked {
+                                            rename_saved_selection(state, id, &new_name);
+                                        }
+                                    }
+                                >
+                                    {shown.clone()}
+                                </span>
+                                <button
+                                    class="btn"
+                                    title="Replace the current selection with this one"
+                                    on:click=move |_| load_saved_selection(state, id, LoadSaved::Replace)
+                                >
+                                    "Load"
+                                </button>
+                                <button
+                                    class="btn"
+                                    disabled=move || !has_selection()
+                                    title="Add this one to the current selection"
+                                    on:click=move |_| load_saved_selection(state, id, LoadSaved::Add)
+                                >
+                                    "Add"
+                                </button>
+                                <button
+                                    class="btn"
+                                    disabled=move || !has_selection()
+                                    title="Cut this one out of the current selection"
+                                    on:click=move |_| load_saved_selection(state, id, LoadSaved::Subtract)
+                                >
+                                    "Subtract"
+                                </button>
+                                <button
+                                    class="icon-btn"
+                                    title="Delete this saved selection"
+                                    on:click=move |_| delete_saved_selection(state, id)
+                                >
+                                    "✕"
+                                </button>
+                            </div>
+                        }
+                    }).collect_view()}
+                </div>
+            </Show>
             <Show
                 when=move || state.selected_select_tool.get() == SelectTool::Wand
                 fallback=|| ()
@@ -394,27 +486,6 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
                 >
                     "Content fill"
                 </button>
-                <button
-                    class="btn"
-                    disabled=move || !has_selection()
-                    title="Select everything outside the current selection"
-                    on:click=move |_| invert_selection(state)
-                >
-                    "Invert"
-                </button>
-                <button
-                    class="btn"
-                    on:click=move |_| {
-                        state.subject_photo.set(None);
-                        clear_subject_brush_ops(state);
-                        state.update_current(|e| {
-                            e.selection = None;
-                            e.selection_rev += 1;
-                        });
-                    }
-                >
-                    "Clear"
-                </button>
             </div>
             <label class="slider">
                 <span>"Feather: " {move || format!("{:.0}%", feather() * 100.0)}</span>
@@ -445,8 +516,11 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
                  Softness; each stroke is one undo step. \
                  With an adjustment selected, its mask shows in red: Brush paints it, and any \
                  selection can be added to it or removed from it. \
+                 Invert selects everything outside the selection. Save selection keeps it \
+                 with the photo: Load brings it back, Add and Subtract combine it with the \
+                 current one, and a double-click on its name renames it. \
                  Cut/Copy lift the selection to a raster layer; Content fill synthesizes it from \
-                 the surroundings; Invert selects everything outside the selection. \
+                 the surroundings. \
                  Isolate person runs MediaPipe Selfie Segmentation."
             </p>
             <Show when=is_raw fallback=|| ()>

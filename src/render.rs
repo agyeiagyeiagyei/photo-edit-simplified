@@ -1679,6 +1679,88 @@ pub(crate) fn invert_selection(state: AppState) {
     });
 }
 
+// --- saved selections ---------------------------------------------------------
+
+/// How a saved selection meets the photo's current one.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum LoadSaved {
+    Replace,
+    Add,
+    Subtract,
+}
+
+/// Keep the photo's current selection under a name ("Selection 3"), with the
+/// photo: it comes back with the session.
+pub(crate) fn save_selection(state: AppState) {
+    let Some(item) = state.current() else { return };
+    let Some(selection) = item.edit.selection.clone() else { return };
+    let id = item.saved_selections.iter().map(|s| s.id).max().map_or(1, |m| m + 1);
+    let json: Rc<str> = pes_pixel::recipe::selection_portable_json(&selection).into();
+    state.update_current_item(|m| {
+        Rc::make_mut(&mut m.saved_selections).push(state::SavedSelection {
+            id,
+            name: format!("Selection {id}"),
+            selection,
+            json,
+        });
+    });
+}
+
+/// Make a saved selection the current one, add it to the current one, or cut
+/// it out of the current one. Combining rasterises both at the brush's mask
+/// size and keeps the current selection's feather.
+pub(crate) fn load_saved_selection(state: AppState, id: usize, how: LoadSaved) {
+    let Some(item) = state.current() else { return };
+    let Some(saved) = item.saved_selections.iter().find(|s| s.id == id).map(|s| s.selection.clone()) else {
+        return;
+    };
+    let next = match (how, item.edit.selection.as_ref()) {
+        (LoadSaved::Replace, _) | (LoadSaved::Add, None) => saved,
+        (LoadSaved::Subtract, None) => return,
+        (how, Some(cur)) => {
+            let (w, h) = match &cur.kind {
+                SelectionKind::Mask { width, height, .. } if *width > 0 && *height > 0 => (*width, *height),
+                _ => match brush_dims(&item) {
+                    Some(d) => d,
+                    None => return,
+                },
+            };
+            let hard = |s: &Selection| ops::selection_mask(&Selection { kind: s.kind.clone(), feather: 0.0 }, w, h);
+            let mut data = hard(cur);
+            for (d, &o) in data.iter_mut().zip(&hard(&saved)) {
+                *d = if how == LoadSaved::Add { (*d).max(o) } else { (*d).min(255 - o) };
+            }
+            Selection {
+                kind: SelectionKind::Mask { data: Rc::new(data), width: w, height: h },
+                feather: cur.feather,
+            }
+        }
+    };
+    // The selection the subject taps and brush strokes built is replaced.
+    state.subject_photo.set(None);
+    start_new_subject_selection(state, item.id);
+    state.update_current(|e| {
+        e.selection = Some(next);
+        e.selection_rev += 1;
+    });
+}
+
+pub(crate) fn delete_saved_selection(state: AppState, id: usize) {
+    state.update_current_item(|m| Rc::make_mut(&mut m.saved_selections).retain(|s| s.id != id));
+}
+
+pub(crate) fn rename_saved_selection(state: AppState, id: usize, name: &str) {
+    let name = name.trim();
+    if name.is_empty() {
+        return;
+    }
+    state.update_current_item(|m| {
+        if let Some(s) = Rc::make_mut(&mut m.saved_selections).iter_mut().find(|s| s.id == id) {
+            s.name = name.to_string();
+        }
+    });
+}
+
 // --- selection brush ---------------------------------------------------------
 
 /// One stroke's undo budget: dirty-tile patches, never full-mask snapshots.

@@ -592,6 +592,22 @@ h1 { font-size: 17px; font-weight: 600; }
   min-width: 80px;
 }
 
+/* Saved selections: a name, then what to do with it. */
+.saved-selections {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.saved-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.saved-row .btn {
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
 button:disabled {
   opacity: 0.4;
   cursor: not-allowed;
