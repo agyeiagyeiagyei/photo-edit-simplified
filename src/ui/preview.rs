@@ -228,6 +228,8 @@ struct SoftDevelopKey {
 }
 
 thread_local! {
+    /// The photo and view window the brush fast paths last saw.
+    static FAST_PATH_VIEW: Cell<Option<(usize, [u32; 4])>> = const { Cell::new(None) };
     /// The photo and view window of the last paint, to tell a paint the view
     /// moved for from one an edit caused.
     static LAST_VIEW: Cell<Option<(usize, [u32; 4])>> = const { Cell::new(None) };
@@ -650,6 +652,10 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         brush_drag.track();
         brush_hover.track();
         state.brush_size.track();
+        // The brush fast paths below return before the full paint reads the
+        // view, so without this a zoom or pan step with the Brush tool up
+        // never reran the effect.
+        state.view_zoom.track();
         // Paint on the leading edge so the change that opened this frame shows
         // in it; a burst of further changes this frame coalesces into one
         // trailing rAF pass, so there is still at most one extra paint/frame.
@@ -662,6 +668,14 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 return;
             }
             let Some(canvas) = canvas_ref.get() else { return };
+            // The brush fast paths redraw only the ring, or a stroke's dirty
+            // rect, on the frame already on the canvas. After a pan or zoom
+            // step that frame is the wrong picture: the old view stayed up
+            // while strokes landed in the new one. A new view retires it.
+            let view_now = Some((item.id, crop_key(&state.view_zoom.get_untracked().window())));
+            if FAST_PATH_VIEW.with(|v| v.replace(view_now)) != view_now {
+                bump_paint_gen();
+            }
             // While a brush stroke is live, the base is already on the canvas
             // and only the new tint pixels changed; repainting the 24 MP frame
             // for every pointermove is the bulk of the drag's raster cost.
