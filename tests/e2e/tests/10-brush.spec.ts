@@ -1086,4 +1086,97 @@ test.describe('selection brush (issue #3)', () => {
     await expect(page.locator('.loupe-hover')).toHaveCount(0);
     expect(errors, errors.join('\n')).toEqual([]);
   });
+  test('saved selections: save, load, combine, rename, delete, and survive a reload', async ({ page }) => {
+    const errors = trackErrors(page);
+    await openApp(page);
+    await importFiles(page, [PNG_SMALL]);
+    await waitSmall(page);
+    const bar = page.locator('.select-tab .selection-bar');
+    const invert = bar.locator('button', { hasText: /^Invert$/ });
+    const save = bar.locator('button', { hasText: /^Save selection$/ });
+    const clear = bar.locator('button', { hasText: /^Clear$/ });
+    const rows = page.locator('.select-tab .saved-row');
+    const row = (name: string) => rows.filter({ hasText: name });
+    const act = (name: string, what: string) => row(name).locator('button', { hasText: new RegExp(`^${what}$`) });
+    const frame = async () => {
+      await parkPointer(page);
+      await settle(page);
+      return (await readCanvas(page)).bytes;
+    };
+
+    // Invert and Save sit right under the tools, and wait for a selection.
+    await selectRect(page);
+    const none = await frame();
+    await expect(invert).toBeDisabled();
+    await expect(save).toBeDisabled();
+    await expect(rows).toHaveCount(0);
+
+    // Save selection A, clear it, and load it back: the same tint returns.
+    await rectDrag(page, 0.15, 0.2, 0.45, 0.7);
+    const a = await frame();
+    // A rect selection shows as an outline, so its frame differs only a little.
+    expect(meanDiff(a, none), 'the rect selection does not show').toBeGreaterThan(0.1);
+    await save.click();
+    await expect(rows).toHaveCount(1);
+    await expect(row('Selection 1')).toHaveCount(1);
+    await clear.click();
+    expect(meanDiff(await frame(), none)).toBeLessThanOrEqual(0.1);
+    await expect(invert).toBeDisabled();
+    await expect(act('Selection 1', 'Add')).toBeDisabled();
+    await act('Selection 1', 'Load').click();
+    expect(meanDiff(await frame(), a), 'Load did not bring selection A back').toBeLessThanOrEqual(0.1);
+    await expect(invert).toBeEnabled();
+
+    // A second, separate selection B.
+    await clear.click();
+    await rectDrag(page, 0.55, 0.3, 0.85, 0.8);
+    const b = await frame();
+    await save.click();
+    await expect(rows).toHaveCount(2);
+
+    // B + A covers both; cutting B out again leaves A's area.
+    await act('Selection 1', 'Add').click();
+    const both = await frame();
+    expect(meanDiff(both, b), 'Add changed nothing').toBeGreaterThan(0.2);
+    expect(meanDiff(both, a)).toBeGreaterThan(0.2);
+    await act('Selection 2', 'Subtract').click();
+    const onlyA = await frame();
+    expect(meanDiff(onlyA, both), 'Subtract changed nothing').toBeGreaterThan(0.2);
+    expect(meanDiff(onlyA, a), 'B + A - B should cover what A covers').toBeLessThan(meanDiff(onlyA, b));
+
+    // Invert flips the loaded selection.
+    await act('Selection 1', 'Load').click();
+    await invert.click();
+    expect(meanDiff(await frame(), a), 'Invert changed nothing').toBeGreaterThan(0.2);
+
+    // Rename by double-click.
+    await row('Selection 1').locator('.saved-name').dblclick();
+    const field = rows.first().locator('input.layer-rename');
+    await field.fill('Bird');
+    await field.press('Enter');
+    await expect(row('Bird')).toHaveCount(1);
+    await expect(row('Selection 1')).toHaveCount(0);
+
+    // Reload: both come back with their names, and still load.
+    await page.waitForTimeout(2200);
+    await page.reload();
+    await expect(thumbs(page)).toHaveCount(1, { timeout: 60_000 });
+    await expect(page.locator('.overlay')).toHaveCount(0, { timeout: 60_000 });
+    await waitSmall(page);
+    await selectRect(page);
+    await expect(rows).toHaveCount(2);
+    await expect(row('Bird')).toHaveCount(1);
+    await expect(row('Selection 2')).toHaveCount(1);
+    await expect(invert).toBeDisabled();
+    await act('Bird', 'Load').click();
+    expect(meanDiff(await frame(), a), 'the reloaded selection is not selection A').toBeLessThanOrEqual(0.1);
+    await act('Selection 2', 'Load').click();
+    expect(meanDiff(await frame(), b), 'the reloaded selection is not selection B').toBeLessThanOrEqual(0.1);
+
+    // Delete removes one and keeps the other.
+    await row('Selection 2').locator('button.icon-btn').click();
+    await expect(rows).toHaveCount(1);
+    await expect(row('Bird')).toHaveCount(1);
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
 });

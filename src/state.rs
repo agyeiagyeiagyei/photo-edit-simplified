@@ -645,6 +645,17 @@ pub enum PhotoFormat {
     Png,
 }
 
+/// A selection kept with the photo under a name, to load again later.
+#[derive(Clone, PartialEq, Debug)]
+pub struct SavedSelection {
+    pub id: usize,
+    pub name: String,
+    pub selection: Selection,
+    /// `selection` in portable form (a raster mask as a PNG), encoded once:
+    /// the session record is rewritten on every edit.
+    pub json: std::rc::Rc<str>,
+}
+
 #[derive(Clone)]
 pub struct MediaItem {
     pub id: usize,
@@ -661,6 +672,9 @@ pub struct MediaItem {
     pub edit: EditParams,
     pub layers: Vec<Layer>,
     pub next_layer_id: usize,
+    /// Selections saved from the Select tab. Shared: the item is cloned on
+    /// every read of the current photo.
+    pub saved_selections: std::rc::Rc<Vec<SavedSelection>>,
     /// EXIF TIFF payload carried from the source file into exports.
     pub exif: Option<std::rc::Rc<Vec<u8>>>,
     /// Capture time (epoch seconds, EXIF read as-if-UTC) for filmstrip

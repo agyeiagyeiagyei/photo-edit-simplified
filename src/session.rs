@@ -607,6 +607,48 @@ pub fn layers_json(layers: &[Layer]) -> Option<String> {
     Some(out)
 }
 
+/// A photo's saved selections as JSON, `None` when it has none. Each
+/// selection's portable form was encoded when it was saved.
+pub fn saved_selections_json(saved: &[crate::state::SavedSelection]) -> Option<String> {
+    if saved.is_empty() {
+        return None;
+    }
+    let rows: Vec<String> = saved
+        .iter()
+        .map(|s| format!("{{\"i\":{},\"n\":\"{}\",\"s\":{}}}", s.id, esc(&s.name), s.json))
+        .collect();
+    Some(format!("[{}]", rows.join(",")))
+}
+
+/// Parse [`saved_selections_json`]. Malformed entries are skipped.
+pub fn saved_selections_from_json(json: &str) -> Vec<crate::state::SavedSelection> {
+    let mut out = Vec::new();
+    let Ok(v) = js_sys::JSON::parse(json) else { return out };
+    if !js_sys::Array::is_array(&v) {
+        return out;
+    }
+    let arr: js_sys::Array = v.unchecked_into();
+    for sv in arr.iter() {
+        let Some(shape) = crate::state::jget(&sv, "s") else { continue };
+        let Some(selection) = pes_pixel::recipe::selection_from_layer_value(&shape) else { continue };
+        // A mask whose PNG did not decode comes back empty: nothing to load.
+        if let crate::state::SelectionKind::Mask { data, .. } = &selection.kind {
+            if data.is_empty() {
+                continue;
+            }
+        }
+        let Some(json) = js_sys::JSON::stringify(&shape).ok().and_then(|j| j.as_string()) else { continue };
+        let id = crate::state::jnum(&sv, "i").unwrap_or(0.0) as usize;
+        out.push(crate::state::SavedSelection {
+            id,
+            name: jstr(&sv, "n").unwrap_or_else(|| format!("Selection {id}")),
+            selection,
+            json: json.into(),
+        });
+    }
+    out
+}
+
 fn jstr(v: &JsValue, key: &str) -> Option<String> {
     crate::state::jget(v, key).and_then(|s| s.as_string())
 }
