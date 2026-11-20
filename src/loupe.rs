@@ -354,9 +354,11 @@ pub(crate) fn canvas_loupe_soon(state: AppState, tab: RwSignal<Tab>, ev: &web_sy
     if item.kind != MediaKind::Photo {
         return;
     }
-    // At 100% the canvas already shows native pixels; a 1:1 loupe would be a
-    // second copy of the same detail sitting under the cursor.
-    if view_at_native(state, tab.get_untracked()) {
+    // Tabs with the zoom tool have no loupe: zoom shows the same detail in
+    // place, and the loupe's source is a whole-frame render on the worker
+    // the preview needs (about a second on a 24 MP RAW with denoise), which
+    // held up every brush stroke and pan made with the pointer at rest.
+    if zoomable_tab(tab.get_untracked()) {
         canvas_loupe_clear(state);
         return;
     }
@@ -384,7 +386,7 @@ pub(crate) fn canvas_loupe_move(state: AppState, tab: RwSignal<Tab>, ev: &web_sy
         canvas_loupe_clear(state);
         return;
     }
-    if view_at_native(state, tab.get_untracked()) {
+    if zoomable_tab(tab.get_untracked()) {
         canvas_loupe_clear(state);
         return;
     }

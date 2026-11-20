@@ -15,12 +15,6 @@ pub(crate) fn zoomable_tab(tab: Tab) -> bool {
     )
 }
 
-/// True when the view shows at least one image pixel per CSS pixel; the 1:1
-/// hover loupe would only repeat what the canvas already shows there.
-pub(crate) fn view_at_native(state: AppState, tab: Tab) -> bool {
-    zoomable_tab(tab) && state.view_zoom.get_untracked().zoom >= view_fit_zoom(state)
-}
-
 /// Zoom at which one image pixel lands on one CSS pixel, relative to Fit.
 pub(crate) fn view_fit_zoom(state: AppState) -> f32 {
     let Some(m) = state.current() else {

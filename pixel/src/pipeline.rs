@@ -348,7 +348,7 @@ pub fn finish(
 /// `finish` with the mask taken from `edit.selection`.
 pub fn finish_edit(frame: &mut Frame, edit: &EditParams, seed: u32, px_scale: f32, place: Place) {
     let wide_buf = develop(frame, edit, px_scale);
-    let mask = if edit.base_color_touched() {
+    let mask = if edit.selection_masks_pixels() {
         mask_for(frame, edit)
     } else {
         None
@@ -411,7 +411,7 @@ pub fn finish_neutral(
     px_scale: f32,
     place: Place,
 ) {
-    let mask = if edit.base_color_touched() {
+    let mask = if edit.selection_masks_pixels() {
         mask_for_dims(frame.w, frame.h, edit)
     } else {
         None
@@ -919,6 +919,37 @@ mod tests {
         assert!(!edit.develop_only().is_color_touched());
         edit.adjust_layers[0].adjust = PointAdjust::default();
         assert!(!edit.is_color_touched());
+    }
+
+    #[test]
+    fn a_selection_changes_no_pixel_of_a_develop_only_edit() {
+        // The RAW develop runs on the whole frame, so with no colour, blur or
+        // grain stage a selection is overlay only. Every RAW import is such
+        // an edit (Sharpening starts on), and a preview that took it for a
+        // masked one re-rendered the photo after each brush stroke.
+        let (w, h) = (64usize, 48usize);
+        let px: Vec<u8> = (0..w * h * 4).map(|i| if i % 4 == 3 { 255 } else { ((i * 37) % 251) as u8 }).collect();
+        let mut edit = EditParams::default();
+        edit.raw.exposure = 0.7;
+        edit.raw.sharpen = 50.0;
+        assert!(edit.base_color_touched());
+        assert!(!edit.selection_masks_pixels());
+        let run = |edit: &EditParams| {
+            let mut frame = Frame::new(px.clone(), w, h);
+            finish_edit(&mut frame, edit, 1, 1.0, Place::whole(w, h));
+            frame.pixels
+        };
+        let plain = run(&edit);
+        assert_ne!(plain, px, "the develop must change the frame");
+        edit.selection = Some(Selection { kind: SelectionKind::Rect { x: 0.2, y: 0.2, w: 0.4, h: 0.4 }, feather: 0.0 });
+        assert_eq!(run(&edit), plain);
+        // A colour stage is bounded by the same selection.
+        edit.brightness = 0.3;
+        assert!(edit.selection_masks_pixels());
+        let masked = run(&edit);
+        assert_ne!(masked, plain);
+        let at = |p: &[u8], x: usize, y: usize| p[(y * w + x) * 4];
+        assert_eq!(at(&masked, 2, 2), at(&plain, 2, 2), "outside the selection");
     }
 
     #[test]

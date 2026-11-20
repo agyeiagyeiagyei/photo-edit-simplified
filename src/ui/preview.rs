@@ -213,6 +213,50 @@ fn update_xform(state: AppState, d: &XformDrag, lx: f32, ly: f32, css: (f32, f32
     }
 }
 
+/// What the soft preview's develop stage depends on: the preview pixels
+/// (item, source generation, buffer, geometry) and every RAW field.
+#[derive(Clone, Copy, PartialEq)]
+struct SoftDevelopKey {
+    item: usize,
+    gen: u64,
+    source: (usize, usize),
+    dims: (usize, usize),
+    rot90: u8,
+    fine_bits: u32,
+    raw: [u32; 9],
+    px_scale: u32,
+}
+
+thread_local! {
+    /// The photo and view window of the last paint, to tell a paint the view
+    /// moved for from one an edit caused.
+    static LAST_VIEW: Cell<Option<(usize, [u32; 4])>> = const { Cell::new(None) };
+    /// The developed 1024 px preview. Every RAW carries a develop (Sharpening
+    /// starts on), and running denoise and sharpening on the main thread for
+    /// each soft frame cost about 100 ms a frame on a 24 MP RAW; colour,
+    /// brush and view changes leave the develop alone and start from this.
+    static SOFT_DEVELOPED: RefCell<Option<(SoftDevelopKey, Rc<Vec<u16>>)>> = const { RefCell::new(None) };
+}
+
+/// [`pipeline::develop`] for the soft preview, through [`SOFT_DEVELOPED`].
+fn soft_developed(frame: &mut PipeFrame, edit: &EditParams, px_scale: f32, key: SoftDevelopKey) -> Option<Vec<u16>> {
+    if edit.raw.is_identity() {
+        return None;
+    }
+    let hit = SOFT_DEVELOPED.with(|c| {
+        c.borrow()
+            .as_ref()
+            .filter(|(k, px)| *k == key && px.len() == frame.pixels.len())
+            .map(|(_, px)| px.as_ref().clone())
+    });
+    if hit.is_some() {
+        return hit;
+    }
+    let wide = pipeline::develop(frame, edit, px_scale)?;
+    SOFT_DEVELOPED.with(|c| *c.borrow_mut() = Some((key, Rc::new(wide.clone()))));
+    Some(wide)
+}
+
 pub(crate) fn skip_next_preview_paint() {
     SKIP_NEXT_PAINT.with(|s| s.set(true));
     let cb = Closure::once(|| SKIP_NEXT_PAINT.with(|s| s.set(false)));
@@ -777,6 +821,18 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         // A sharp frame from an older source stays on screen while the new
         // one renders, so a RAW proxy upgrade never flashes the soft preview.
         let mut stale_source = false;
+        // Right after a brush stroke on a mask the render reads, a sharp frame
+        // from before the stroke stays up the same way (see
+        // `keep_look_until_fresh`). So does one whose masks are out of date
+        // once the view moves: a pan or zoom step would otherwise drop to the
+        // soft preview until its own window is rendered. Any other mask edit
+        // keeps the soft preview's immediate feedback.
+        let view_now = Some((item.id, crop_key(&img_win)));
+        if windowed_view && LAST_VIEW.with(|v| v.replace(view_now)) != view_now {
+            crate::render::keep_look_until_fresh(item.id);
+        }
+        let keep_look = crate::render::keeping_look(item.id);
+        let mut stale_look = false;
         // Source fingerprint of the sharp frame this pass draws, if any.
         let mut drawn_src: Option<u64> = None;
         // GPU parametric preview: one shader draw per paint from the worker
@@ -840,18 +896,22 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 sharp = HI_WINDOW.with(|c| {
                     let b = c.borrow();
                     let win = b.as_ref()?;
-                    if win.item_id != item.id || win.edit_fp != edit_fp || win.crop != key {
+                    if win.item_id != item.id || win.crop != key {
+                        return None;
+                    }
+                    if win.edit_fp != edit_fp && !(keep_look && same_look(win.edit_fp, edit_fp)) {
                         return None;
                     }
                     if win.w < win_target.0 || win.h < win_target.1 {
                         return None;
                     }
+                    stale_look = win.edit_fp != edit_fp;
                     canvas.set_width(win.w as u32);
                     canvas.set_height(win.h as u32);
                     web::ctx2d(&canvas)
                         .draw_image_with_html_canvas_element(&win.canvas, 0.0, 0.0)
                         .unwrap();
-                    stale_source = win.source_fp != src_fp;
+                    stale_source = win.source_fp != src_fp || stale_look;
                     drawn_src = Some(win.source_fp);
                     Some(Sharp::Window {
                         w: win.w,
@@ -868,21 +928,34 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 sharp = HI_CACHE.with(|c| {
                     let b = c.borrow();
                     let hi = b.as_ref()?;
-                    if hi.item_id != item.id || hi.edit_fp != edit_fp {
+                    if hi.item_id != item.id {
                         return None;
                     }
-                    if hi.w < target.0 || hi.h < target.1 {
+                    if hi.edit_fp != edit_fp && !(keep_look && same_look(hi.edit_fp, edit_fp)) {
                         return None;
                     }
+                    // Inside a view window a whole frame finer than the soft
+                    // preview is the better stand-in even when it is short of
+                    // the target; the request below replaces it.
+                    let short = hi.w < target.0 || hi.h < target.1;
+                    if short && !(windowed_view && hi.w > w) {
+                        return None;
+                    }
+                    stale_look = hi.edit_fp != edit_fp || short;
                     if windowed_view {
                         blit_hi_frame(hi, &canvas, Some(rect_px(&img_win, hi.w, hi.h)));
                     } else {
                         blit_hi_frame(hi, &canvas, None);
                     }
-                    stale_source = hi.source_fp != src_fp || hi.stand_in;
+                    stale_source = hi.source_fp != src_fp || hi.stand_in || stale_look;
                     drawn_src = (!hi.stand_in).then_some(hi.source_fp);
                     Some(Sharp::Whole { w: hi.w })
                 });
+            }
+            // An up-to-date frame is on screen: back to the usual rule, where
+            // a changed mask shows through the soft preview at once.
+            if keep_look && sharp.is_some() && !stale_look {
+                crate::render::clear_keep_look();
             }
         }
         // A whole-frame cache capped at HI_MAX_EDGE is still softer than the
@@ -909,7 +982,29 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             let mut frame = PipeFrame::new(p.into_owned(), w, h);
             let px_scale = pipeline::px_scale_for(sw, sh, PipeTarget::new(w, h));
             let params = state::render_edit(&item.edit, &item.layers);
-            pipeline::finish_edit(&mut frame, &params, item.id as u32, px_scale, Place::whole(w, h));
+            // `pipeline::finish_edit`, with the develop taken from the cache:
+            // this frame is drawn on every pan step, slider tick and stroke
+            // that has no sharp frame yet.
+            let key = SoftDevelopKey {
+                item: item.id,
+                gen: photo.gen,
+                source: (pix.as_ptr() as usize, pix.len()),
+                dims: (w, h),
+                rot90: item.edit.rot90,
+                fine_bits: item.edit.fine_angle.to_bits(),
+                raw: {
+                    let r = &item.edit.raw;
+                    [r.temp, r.tint, r.exposure, r.highlights, r.shadows, r.noise, r.denoise, r.sharpen, r.texture].map(f32::to_bits)
+                },
+                px_scale: px_scale.to_bits(),
+            };
+            let developed = soft_developed(&mut frame, &params, px_scale, key);
+            let mask = if params.selection_masks_pixels() {
+                pipeline::mask_for(&frame, &params)
+            } else {
+                None
+            };
+            pipeline::colour(&mut frame, &params, item.id as u32, mask.as_deref(), developed, Place::whole(w, h));
             let p = frame.pixels;
             if windowed_view {
                 // Composite at full size offscreen, then blit the view region —
