@@ -1149,11 +1149,9 @@ test.describe('selection brush (issue #3)', () => {
     await invert.click();
     expect(meanDiff(await frame(), a), 'Invert changed nothing').toBeGreaterThan(0.2);
 
-    // Rename by double-click.
+    // Rename by double-click: the browser asks for the name.
+    page.once('dialog', (d) => d.accept('Bird'));
     await row('Selection 1').locator('.saved-name').dblclick();
-    const field = rows.first().locator('input.layer-rename');
-    await field.fill('Bird');
-    await field.press('Enter');
     await expect(row('Bird')).toHaveCount(1);
     await expect(row('Selection 1')).toHaveCount(0);
 

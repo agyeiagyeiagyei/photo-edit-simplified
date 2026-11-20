@@ -159,15 +159,6 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
     };
     // The photo's saved selections; the list is rebuilt only when it changes.
     let saved = create_memo(move |_| state.with_current(|m| m.saved_selections.clone()).unwrap_or_default());
-    // One saved selection at a time shows its name as a text field.
-    let renaming = create_rw_signal(None::<usize>);
-    let finish_rename = move |id: usize, name: String| {
-        if renaming.get_untracked() != Some(id) {
-            return;
-        }
-        renaming.set(None);
-        rename_saved_selection(state, id, &name);
-    };
     view! {
         <div class="select-tab">
             <Show
@@ -279,45 +270,23 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
                         let id = s.id;
                         let name = s.name.clone();
                         let shown = name.clone();
-                        let rename_ref = create_node_ref::<html::Input>();
-                        create_effect(move |_| {
-                            if renaming.get() == Some(id) {
-                                if let Some(el) = rename_ref.get() {
-                                    let _ = el.focus();
-                                    el.select();
-                                }
-                            }
-                        });
                         view! {
                             <div class="saved-row">
-                                {move || if renaming.get() == Some(id) {
-                                    let name = name.clone();
-                                    view! {
-                                        <input
-                                            node_ref=rename_ref
-                                            type="text"
-                                            class="layer-rename"
-                                            maxlength="40"
-                                            prop:value=name
-                                            on:keydown=move |ev| match ev.key().as_str() {
-                                                "Enter" => finish_rename(id, event_target_value(&ev)),
-                                                "Escape" => renaming.set(None),
-                                                _ => {}
-                                            }
-                                            on:blur=move |ev| finish_rename(id, event_target_value(&ev))
-                                        />
-                                    }.into_view()
-                                } else {
-                                    view! {
-                                        <span
-                                            class="layer-label saved-name"
-                                            title="Double-click to rename"
-                                            on:dblclick=move |_| renaming.set(Some(id))
-                                        >
-                                            {shown.clone()}
-                                        </span>
-                                    }.into_view()
-                                }}
+                                <span
+                                    class="layer-label saved-name"
+                                    title="Double-click to rename"
+                                    on:dblclick=move |_| {
+                                        let asked = web::window()
+                                            .prompt_with_message_and_default("Name this selection", &name)
+                                            .ok()
+                                            .flatten();
+                                        if let Some(new_name) = asked {
+                                            rename_saved_selection(state, id, &new_name);
+                                        }
+                                    }
+                                >
+                                    {shown.clone()}
+                                </span>
                                 <button
                                     class="btn"
                                     title="Replace the current selection with this one"
@@ -549,7 +518,7 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
                  selection can be added to it or removed from it. \
                  Invert selects everything outside the selection. Save selection keeps it \
                  with the photo: Load brings it back, Add and Subtract combine it with the \
-                 current one, and a double-click renames it. \
+                 current one, and a double-click on its name renames it. \
                  Cut/Copy lift the selection to a raster layer; Content fill synthesizes it from \
                  the surroundings. \
                  Isolate person runs MediaPipe Selfie Segmentation."
