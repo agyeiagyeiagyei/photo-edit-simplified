@@ -48,7 +48,7 @@ pub fn raw_fingerprint(raw: &pes_pixel::types::RawAdjust) -> u64 {
         return 0;
     }
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for v in [raw.temp, raw.tint, raw.exposure, raw.highlights, raw.shadows, raw.noise, raw.denoise, raw.sharpen] {
+    for v in [raw.temp, raw.tint, raw.exposure, raw.highlights, raw.shadows, raw.noise, raw.denoise, raw.sharpen, raw.texture] {
         h ^= v.to_bits() as u64;
         h = h.wrapping_mul(0x0100_0000_01b3);
     }

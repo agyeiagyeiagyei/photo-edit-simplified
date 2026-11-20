@@ -759,6 +759,11 @@ pub(crate) fn RawPanel(state: AppState) -> impl IntoView {
                     |r| r.sharpen, |r, v| r.sharpen = v,
                     |v| format!("{v:.0}"),
                 )}
+                {rslider(
+                    "Texture", -100.0, 100.0, 1.0,
+                    |r| r.texture, |r, v| r.texture = v,
+                    |v| format!("{v:+.0}"),
+                )}
                 <button class="btn dim-btn" on:click=move |_| {
                     state.update_current(|e| e.raw = RawAdjust::default());
                 }>"Reset RAW"</button>

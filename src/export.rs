@@ -357,6 +357,7 @@ pub(crate) fn photo_unedited_but_detail(item: &MediaItem) -> bool {
     let mut e = item.edit.clone();
     e.raw.denoise = 0.0;
     e.raw.sharpen = 0.0;
+    e.raw.texture = 0.0;
     edit_unedited(&e, item)
 }
 

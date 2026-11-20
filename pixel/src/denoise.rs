@@ -25,6 +25,19 @@
 //! a clear luma edge at the same place lends its energy to the colour bands,
 //! so a thin white beak against a blue wall keeps its colour.
 //!
+//! **Texture is told from noise by the next band.** Low-contrast texture
+//! (feathers, foliage) stands little above the noise in its own band, and a
+//! strong setting would take it with the noise. Sensor noise halves from one
+//! band to the next coarser one while texture does not, so where a band and
+//! the band above it both show structure, the band's threshold is lowered.
+//!
+//! **Texture works on edge-avoiding bands.** The Texture slider lifts or
+//! smooths the 4 to 16 px detail of the denoised luma. Bands that wide ring
+//! for their whole width beside an edge, and a gain on a plain band would
+//! put a halo in the smooth area next to every outline. Texture's bands come
+//! from a smoothing that does not cross an edge, so they hold the low and
+//! mid-contrast detail and no part of the edge.
+//!
 //! **Only the removed noise is subtracted.** The bands' removed parts are
 //! accumulated and taken off the 16-bit input, so a pixel the filter leaves
 //! alone comes back bit for bit and the tone is untouched.
@@ -82,16 +95,46 @@ const SHARP_LONE: f32 = 0.3;
 /// does not grow a bright and dark rim.
 const SHARP_LIMIT: f32 = 30.0;
 
+/// Texture: the gain on the 4, 8 and 16 px sensor bands of the denoised
+/// luma at +100, the mid-size detail between what Sharpening lifts and what
+/// contrast moves (bark, fabric, feathers, skin). At -100 the bands lose the
+/// `TEXTURE_SMOOTH` share of it instead.
+const TEXTURE_GAIN: [f32; 5] = [0.0, 0.0, TEX_G2, TEX_G3, TEX_G4];
+const TEX_G2: f32 = 1.5;
+const TEX_G3: f32 = 2.5;
+const TEX_G4: f32 = 2.5;
+const TEXTURE_SMOOTH: [f32; 5] = [0.0, 0.0, 0.5, 0.9, 0.9];
+/// Texture's bands come from an edge-avoiding smoothing: a tap counts for
+/// less the further its value is from the centre's, by half at this many
+/// 8-bit codes. Detail up to about that contrast is smoothed out and so
+/// lands in the band; an edge is not smoothed across and stays out of it.
+/// Narrower, and Texture finds little to work on; wider, and outlines of
+/// moderate contrast start to grow halos.
+const TEXTURE_RANGE: f32 = TEX_RANGE;
+const TEX_RANGE: f32 = 20.0;
+/// The same for the levels below Texture's bands, which are dropped.
+const TEXTURE_FINE_RANGE: f32 = TEX_FINE;
+const TEX_FINE: f32 = 16.0;
+/// Texture protection: where a band and the next coarser one both show
+/// structure, the band's noise threshold falls by this share. Low-contrast
+/// texture (feathers, foliage) sits close to the noise in its own band and a
+/// strong denoise would take it for noise; the coarser band, where the noise
+/// is half as strong, tells the two apart.
+const PROTECT: f32 = 0.9;
+
 #[derive(Clone, Copy, Debug)]
 struct Params {
     ky: f32,
     kc: f32,
-    /// Sharpening gain per frame band.
+    /// Sharpening gain on the kept luma detail per frame band.
     sharp: [f32; MAX_LEVELS],
+    /// Texture gain per frame band; negative smooths.
+    tex: [f32; MAX_LEVELS],
+    protect: f32,
     levels: usize,
 }
 
-fn params(strength: f32, sharpen: f32, px_scale: f32, w: usize, h: usize) -> Params {
+fn params(strength: f32, sharpen: f32, texture: f32, px_scale: f32, w: usize, h: usize) -> Params {
     let t = strength.clamp(0.0, 1.0);
     let p = px_scale.max(1.0);
     // Every dilated tap must stay inside the frame (half-sample reflection).
@@ -100,23 +143,41 @@ fn params(strength: f32, sharpen: f32, px_scale: f32, w: usize, h: usize) -> Par
     // Frame band j sits at sensor scale p * 2^j: it takes the gain of the
     // sensor band it lands on (between two, a blend), so a preview sharpens
     // the detail the export does.
-    let mut sharp = [0f32; MAX_LEVELS];
+    let (mut sharp, mut tex) = ([0f32; MAX_LEVELS], [0f32; MAX_LEVELS]);
     let a = sharpen.clamp(0.0, 1.0);
-    if a > 0.0 {
-        for (j, g) in sharp.iter_mut().enumerate() {
+    let x = texture.clamp(-1.0, 1.0);
+    if a > 0.0 || x != 0.0 {
+        for j in 0..MAX_LEVELS {
             let s = p.log2() + j as f32;
             let (i, f) = (s.floor() as usize, s.fract());
-            let at = |i: usize| SHARP_GAIN.get(i).copied().unwrap_or(0.0);
-            *g = a * (at(i) * (1.0 - f) + at(i + 1) * f);
-            if *g > 0.0 {
-                // One band past the last sharpened one, for its gate.
+            let at = |t: &[f32], i: usize| t.get(i).copied().unwrap_or(0.0);
+            let mix = |t: &[f32]| at(t, i) * (1.0 - f) + at(t, i + 1) * f;
+            sharp[j] = a * mix(&SHARP_GAIN);
+            tex[j] = x * mix(if x < 0.0 { &TEXTURE_SMOOTH } else { &TEXTURE_GAIN });
+            if sharp[j] != 0.0 || tex[j] != 0.0 {
+                // One band past the last boosted one, for its gate.
                 levels = levels.max(j + 2);
             }
         }
     }
     let levels = levels.min(by_size).min(MAX_LEVELS);
     sharp[levels..].fill(0.0);
-    Params { ky: KY_MAX * t, kc: KC * (t / KC_FULL_AT).min(1.0), sharp, levels }
+    tex[levels..].fill(0.0);
+    Params { ky: KY_MAX * t, kc: KC * (t / KC_FULL_AT).min(1.0), sharp, tex, protect: PROTECT, levels }
+}
+
+impl Params {
+    fn boosts(&self) -> bool {
+        self.sharp.iter().chain(&self.tex).any(|&g| g != 0.0)
+    }
+
+    /// Pixels a tile's result depends on, on each side: the bands' apron,
+    /// and past it the taps of Texture's smoothings, which read the denoised
+    /// luma.
+    fn apron(&self) -> usize {
+        let texture = self.tex.iter().rposition(|&g| g != 0.0).map_or(0, |last| (4 << last) - 2);
+        apron(self.levels) + texture
+    }
 }
 
 /// Pixels a band-`levels` result depends on, on each side: the smoothing
@@ -358,8 +419,153 @@ fn estimate_noise(buf: &[u16], w: usize, h: usize, levels: usize) -> Vec<[f32; 3
     sig
 }
 
-/// Shrink a region's bands and sharpen the kept luma detail. Returns the
-/// part to take off each channel: the removed noise, less the added contrast.
+/// Noise variance the gates measure a luma band's energy against.
+fn gate_var(sig: &[[f32; 3]], j: usize) -> f32 {
+    let s = sig[j][0].max(SHARP_SIGMA_FLOOR);
+    s * s
+}
+
+/// Settle luma band `j` once the next coarser band's energy is known (`None`
+/// for the coarsest band): shrink it into `rem` and put its Sharpening boost
+/// in `add`. `band` holds its coefficients, their local energy and that
+/// energy over a wider patch; `coarse` is the latter for the next band.
+/// A band Texture lifts leaves its boost gate in `gate`.
+#[allow(clippy::too_many_arguments)]
+fn settle(rem: &mut [f32], add: &mut [f32], gate: &mut Vec<f32>, p: Params, sig: &[[f32; 3]], j: usize, band: [&[f32]; 3], coarse: Option<&[f32]>) {
+    let [pb, pe, pg] = band;
+    let ty = (p.ky * sig[j][0]) * (p.ky * sig[j][0]);
+    let (gs, gt) = (p.sharp[j], p.tex[j]);
+    // The gates: 0..1 shares of "this stands clear of the noise", from the
+    // wide-patch energy in noise variances.
+    let span = 1.0 / (SHARP_E1 - SHARP_E0);
+    let own_k = span / gate_var(sig, j);
+    let own = move |v: f32| (v * own_k - SHARP_E0 * span).clamp(0.0, 1.0);
+    // The coarsest band has no coarser one to ask: it is not protected, and
+    // takes its boost on its own gate.
+    let (cv, protect, lone, c_k) = match coarse {
+        Some(c) => (c, p.protect, SHARP_LONE, span / gate_var(sig, j + 1)),
+        None => (pg, 0.0, 1.0, own_k),
+    };
+    let up = move |v: f32| (v * c_k - SHARP_E0 * span).clamp(0.0, 1.0);
+    // A boost needs this band clear of its noise, and the coarser one too:
+    // structure shows in both, noise in the finer alone.
+    let clear = move |o: f32, c: f32| o * (lone + (1.0 - lone) * c);
+    if gt > 0.0 {
+        gate.clear();
+        gate.extend(pg.iter().zip(cv).map(|(&ov, &c)| clear(own(ov), up(c))));
+    }
+    // Structure in this band and the coarser one lowers the threshold.
+    let cut = move |e: f32, o: f32, c: f32| (ty * (1.0 - protect * o * c) / e.max(1e-12)).min(1.0);
+    let it = rem.iter_mut().zip(pb).zip(pe).zip(pg).zip(cv);
+    if gs > 0.0 {
+        for (((((r, &bv), &e), &ov), &c), a) in it.zip(add.iter_mut()) {
+            let (o, c) = (own(ov), up(c));
+            let cut = cut(e, o, c);
+            *r += bv * cut;
+            *a += gs * clear(o, c) * bv * (1.0 - cut);
+        }
+    } else if ty > 0.0 {
+        for ((((r, &bv), &e), &ov), &c) in it {
+            *r += bv * cut(e, own(ov), up(c));
+        }
+    }
+}
+
+/// Edge-avoiding B3 smoothing at spacing `d`, rows then columns: each tap is
+/// weighted down by how far its value is from the centre's (by half at
+/// `range` codes), so texture is smoothed and an edge is not smoothed
+/// across. `tmp` holds the row pass.
+///
+/// `steep` picks the fall-off past `range`. Steep, `1 / (1 + t)^4`, is
+/// close to a Gaussian without an exponential per tap: a tap across a clear
+/// edge counts for next to nothing, which is what keeps a band free of the
+/// edge. Shallow, `1 / (1 + t)`, still takes in a value well off the
+/// centre's, which is what clears grain and speckle out of the levels below
+/// Texture's bands.
+fn edge_filter(src: &[f32], dst: &mut [f32], tmp: &mut [f32], w: usize, h: usize, d: usize, range: f32, steep: bool) {
+    let inv = if steep { (2f32.powf(0.25) - 1.0) / (range * range) } else { 1.0 / (range * range) };
+    let taps = [(-2isize, B3[0]), (-1, B3[1]), (1, B3[3]), (2, B3[4])];
+    let (mut sum, mut wsum) = (vec![0f32; w], vec![0f32; w]);
+    // One tap's share of a run of pixels: `c` the centres, `v` the tap's values.
+    let tap = |sum: &mut [f32], wsum: &mut [f32], c: &[f32], v: &[f32], k: f32| {
+        for (((s, ws), &c), &v) in sum.iter_mut().zip(wsum.iter_mut()).zip(c).zip(v) {
+            let q = 1.0 + (v - c) * (v - c) * inv;
+            let wt = if steep { k / ((q * q) * (q * q)) } else { k / q };
+            *s += wt * v;
+            *ws += wt;
+        }
+    };
+    let reach = 2 * d;
+    for y in 0..h {
+        let row = &src[y * w..(y + 1) * w];
+        for (s, &c) in sum.iter_mut().zip(row) {
+            *s = B3[2] * c;
+        }
+        wsum.fill(B3[2]);
+        if w > 2 * reach {
+            for (i, k) in taps {
+                let off = (reach as isize + i * d as isize) as usize;
+                tap(&mut sum[reach..w - reach], &mut wsum[reach..w - reach], &row[reach..w - reach], &row[off..off + w - 2 * reach], k);
+            }
+        }
+        // The edge columns (or every column of a narrow plane) reflect.
+        let (a, b) = if w > 2 * reach { (reach, w - reach) } else { (w, w) };
+        for x in (0..a).chain(b..w) {
+            for (i, k) in taps {
+                let v = row[refl(x as isize + i * d as isize, w as isize)];
+                tap(&mut sum[x..x + 1], &mut wsum[x..x + 1], &row[x..x + 1], &[v], k);
+            }
+        }
+        for ((o, &s), &ws) in tmp[y * w..(y + 1) * w].iter_mut().zip(&sum).zip(&wsum) {
+            *o = s / ws;
+        }
+    }
+    for y in 0..h {
+        let row = &tmp[y * w..(y + 1) * w];
+        for (s, &c) in sum.iter_mut().zip(row) {
+            *s = B3[2] * c;
+        }
+        wsum.fill(B3[2]);
+        for (i, k) in taps {
+            let sy = refl(y as isize + i * d as isize, h as isize);
+            tap(&mut sum, &mut wsum, row, &tmp[sy * w..(sy + 1) * w], k);
+        }
+        for ((o, &s), &ws) in dst[y * w..(y + 1) * w].iter_mut().zip(&sum).zip(&wsum) {
+            *o = s / ws;
+        }
+    }
+}
+
+/// Texture: put the gain on the edge-avoiding bands of the denoised luma
+/// `y` in `add`. A lift goes where the plain band stood clear of its noise
+/// (`gates`), so mottle left in a flat area is not lifted; smoothing goes
+/// everywhere. `s` and `tmp` are scratch planes.
+#[allow(clippy::too_many_arguments)]
+fn texture(mut y: Vec<f32>, add: &mut [f32], gates: &[Vec<f32>], s: &mut Vec<f32>, tmp: &mut [f32], w: usize, h: usize, p: Params) {
+    let Some(last) = p.tex.iter().rposition(|&g| g != 0.0) else { return };
+    for j in 0..=last {
+        // The finer bands are not Texture's, but they are dropped the same
+        // way: a plain smoothing would spread an edge into the next band,
+        // and the gain on it would soften the edge and halo its sides.
+        let g = p.tex[j];
+        edge_filter(&y, s, tmp, w, h, 1 << j, if g == 0.0 { TEXTURE_FINE_RANGE } else { TEXTURE_RANGE }, g != 0.0);
+        let band = y.iter().zip(s.iter()).map(|(&c, &sv)| c - sv);
+        if g > 0.0 {
+            for ((a, b), &gate) in add.iter_mut().zip(band).zip(&gates[j]) {
+                *a += g * gate * b;
+            }
+        } else if g < 0.0 {
+            for (a, b) in add.iter_mut().zip(band) {
+                *a += g * b;
+            }
+        }
+        std::mem::swap(&mut y, s);
+    }
+}
+
+/// Shrink a region's bands and boost (or smooth) the kept luma detail.
+/// Returns the part to take off each channel: the removed noise, less the
+/// added contrast.
 fn removed(mut planes: [Vec<f32>; 3], w: usize, h: usize, p: Params, sig: &[[f32; 3]]) -> [Vec<f32>; 3] {
     let n = w * h;
     let colour = p.kc > 0.0;
@@ -369,64 +575,52 @@ fn removed(mut planes: [Vec<f32>; 3], w: usize, h: usize, p: Params, sig: &[[f32
     }
     let cn = if colour { n } else { 0 };
     let mut rem = [vec![0f32; n], vec![0f32; cn], vec![0f32; cn]];
-    let sharpening = p.sharp.iter().any(|&g| g > 0.0);
-    let mut add = vec![0f32; if sharpening { n } else { 0 }];
+    let mut add = vec![0f32; if p.boosts() { n } else { 0 }];
+    // Texture works on the denoised luma, once every band is settled.
+    let texturing = p.tex.iter().any(|&g| g != 0.0);
+    let mut luma = if texturing { planes[0].clone() } else { Vec::new() };
+    let mut gates: Vec<Vec<f32>> = vec![Vec::new(); MAX_LEVELS];
     let (mut ey, mut ec, mut sq, mut tmp) = (vec![0f32; n], vec![0f32; cn], vec![0f32; n], vec![0f32; n]);
-    let (mut eg, mut pend) = (vec![0f32; add.len()], vec![0f32; add.len()]);
+    // A luma band is settled once the next coarser band's energy is known:
+    // until then its coefficients, energy and wide-patch energy wait here.
+    let (mut eg, mut pb, mut pe, mut pg) = (vec![0f32; n], vec![0f32; n], vec![0f32; n], vec![0f32; n]);
     bands(planes, w, h, p.levels, &mut |j, b| {
         let d = 1 << j;
         let [sy, scb, scr] = sig[j];
         energy(&b[0], &mut ey, &mut sq, &mut tmp, w, h, d);
-        let ty = (p.ky * sy) * (p.ky * sy);
-        let g = p.sharp[j];
-        let gated = g > 0.0 || (j > 0 && p.sharp[j - 1] > 0.0);
-        if gated {
-            // The gate reads the energy over a wider patch than the shrinkage
-            // does, as a 0..1 share of "this stands clear of the noise".
-            let var = sy.max(SHARP_SIGMA_FLOOR) * sy.max(SHARP_SIGMA_FLOOR);
-            let (e0, span) = (SHARP_E0 * var, 1.0 / ((SHARP_E1 - SHARP_E0) * var));
-            sep_filter(&ey, &mut eg, &mut tmp, w, h, &[0.25, 0.5, 0.25], d);
-            for v in eg.iter_mut() {
-                *v = ((*v - e0) * span).clamp(0.0, 1.0);
-            }
-            // The finer band's boost was waiting for this band's verdict:
-            // structure shows in both, noise in the finer one alone.
-            for ((a, pv), &gate) in add.iter_mut().zip(pend.iter_mut()).zip(&eg) {
-                *a += *pv * (SHARP_LONE + (1.0 - SHARP_LONE) * gate);
-                *pv = 0.0;
+        // The gates read the energy over a wider patch than the shrinkage.
+        sep_filter(&ey, &mut eg, &mut tmp, w, h, &[0.25, 0.5, 0.25], d);
+        if j > 0 {
+            settle(&mut rem[0], &mut add, &mut gates[j - 1], p, sig, j - 1, [&pb, &pe, &pg], Some(&eg));
+        }
+        if colour {
+            // Where luma has a clear edge, the colour bands keep at least the
+            // share an edge-only luma gain would keep there.
+            let te = (EDGE_T * sy) * (EDGE_T * sy);
+            for (ch, sc) in [(1usize, scb), (2, scr)] {
+                energy(&b[ch], &mut ec, &mut sq, &mut tmp, w, h, d);
+                let tc = (p.kc * sc) * (p.kc * sc);
+                for (((r, &bv), &e), &eyv) in rem[ch].iter_mut().zip(&b[ch]).zip(&ec).zip(&ey) {
+                    let cut = (tc / e.max(1e-12)).min(1.0);
+                    let edge_cut = (te / eyv.max(1e-12)).min(1.0);
+                    let edge_cut = edge_cut * edge_cut;
+                    *r += bv * cut.min(edge_cut);
+                }
             }
         }
-        if g > 0.0 {
-            for ((((r, pv), &bv), &e), &gate) in rem[0].iter_mut().zip(pend.iter_mut()).zip(&b[0]).zip(&ey).zip(&eg) {
-                let cut = (ty / e.max(1e-12)).min(1.0);
-                *r += bv * cut;
-                *pv = g * gate * bv * (1.0 - cut);
-            }
-        } else if ty > 0.0 {
-            for ((r, &bv), &e) in rem[0].iter_mut().zip(&b[0]).zip(&ey) {
-                *r += bv * (ty / e.max(1e-12)).min(1.0);
-            }
-        }
-        if !colour {
-            return;
-        }
-        // Where luma has a clear edge, the colour bands keep at least the
-        // share an edge-only luma gain would keep there.
-        let te = (EDGE_T * sy) * (EDGE_T * sy);
-        for (ch, sc) in [(1usize, scb), (2, scr)] {
-            energy(&b[ch], &mut ec, &mut sq, &mut tmp, w, h, d);
-            let tc = (p.kc * sc) * (p.kc * sc);
-            for (((r, &bv), &e), &eyv) in rem[ch].iter_mut().zip(&b[ch]).zip(&ec).zip(&ey) {
-                let cut = (tc / e.max(1e-12)).min(1.0);
-                let edge_cut = (te / eyv.max(1e-12)).min(1.0);
-                let edge_cut = edge_cut * edge_cut;
-                *r += bv * cut.min(edge_cut);
-            }
-        }
+        // The band plane is scratch for the next level from here on.
+        std::mem::swap(&mut b[0], &mut pb);
+        std::mem::swap(&mut ey, &mut pe);
+        std::mem::swap(&mut eg, &mut pg);
     });
-    // A coarsest band that was sharpened has no coarser one to ask.
-    for ((r, &a), &pv) in rem[0].iter_mut().zip(&add).zip(&pend) {
-        let a = a + pv;
+    settle(&mut rem[0], &mut add, &mut gates[p.levels - 1], p, sig, p.levels - 1, [&pb, &pe, &pg], None);
+    if texturing {
+        for (l, &r) in luma.iter_mut().zip(&rem[0]) {
+            *l -= r;
+        }
+        texture(luma, &mut add, &gates, &mut ey, &mut tmp, w, h, p);
+    }
+    for (r, &a) in rem[0].iter_mut().zip(&add) {
         *r -= a * SHARP_LIMIT / (SHARP_LIMIT + a.abs());
     }
     rem
@@ -434,11 +628,10 @@ fn removed(mut planes: [Vec<f32>; 3], w: usize, h: usize, p: Params, sig: &[[f32
 
 fn denoise_tiled(buf: &mut [u16], w: usize, h: usize, p: Params, tile: usize) {
     let sig = estimate_noise(buf, w, h, p.levels);
-    let sharpening = p.sharp.iter().any(|&g| g > 0.0);
-    if !sharpening && sig.iter().all(|s| s.iter().all(|&v| v <= 0.0)) {
+    if !p.boosts() && sig.iter().all(|s| s.iter().all(|&v| v <= 0.0)) {
         return;
     }
-    let a = apron(p.levels);
+    let a = p.apron();
     // Tiles read their apron from the frame as it was: each row of tiles
     // takes its source rows from `src`, a copy holding rows `src_y0..`.
     // Rows above the current tile row were written already, so they come
@@ -490,24 +683,26 @@ fn denoise_tiled(buf: &mut [u16], w: usize, h: usize, p: Params, tile: usize) {
 /// no-op); `px_scale` is sensor pixels per frame pixel (1 for a full-size
 /// export, larger for a downscaled preview).
 pub fn smart_denoise_wide(buf: &mut [u16], w: usize, h: usize, strength: f32, px_scale: f32) {
-    detail_wide(buf, w, h, strength, 0.0, px_scale);
+    detail_wide(buf, w, h, strength, 0.0, 0.0, px_scale);
 }
 
-/// Smart denoise and capture sharpening in one pass over the same bands:
-/// each luma band's noise is shrunk as above, and what is kept of the 1, 2
-/// and 4 px sensor bands is given more contrast.
+/// Smart denoise, capture sharpening and Texture in one pass: each luma
+/// band's noise is shrunk as above, what is kept of the 1, 2 and 4 px sensor
+/// bands is given more contrast (`sharpen`), and the 4 to 16 px detail of the
+/// denoised luma is lifted or smoothed (`texture`), on edge-avoiding bands so
+/// that an edge is neither haloed nor softened.
 ///
-/// **Sharpening follows the measured noise.** A band is sharpened only where
-/// its local energy stands clear of the band's noise, so the grain of a flat
+/// **A boost follows the measured noise.** A band is boosted only where its
+/// local energy stands clear of the band's noise, so the grain of a flat
 /// wall is not sharpened along with a feather, at any ISO. The added contrast
 /// is soft-limited per pixel, which keeps hard edges free of halos.
 ///
-/// `strength` and `sharpen` are 0..=1; both 0 is a no-op.
-pub fn detail_wide(buf: &mut [u16], w: usize, h: usize, strength: f32, sharpen: f32, px_scale: f32) {
-    if (strength <= 0.0 && sharpen <= 0.0) || w == 0 || h == 0 || buf.len() < w * h * 4 {
+/// `strength` and `sharpen` are 0..=1, `texture` is -1..=1; all 0 is a no-op.
+pub fn detail_wide(buf: &mut [u16], w: usize, h: usize, strength: f32, sharpen: f32, texture: f32, px_scale: f32) {
+    if (strength <= 0.0 && sharpen <= 0.0 && texture == 0.0) || w == 0 || h == 0 || buf.len() < w * h * 4 {
         return;
     }
-    let p = params(strength, sharpen, px_scale, w, h);
+    let p = params(strength, sharpen, texture, px_scale, w, h);
     if p.levels == 0 {
         return;
     }
@@ -728,7 +923,7 @@ mod tests {
         let (w, h) = (300, 220);
         let f = |x: usize, y: usize| [100.0 + (x % 37) as f32, 120.0 + (y % 23) as f32, 90.0];
         let src = frame(w, h, f, 6.0, 8.0, 3, 8);
-        let p = params(0.6, 0.5, 1.0, w, h);
+        let p = params(0.6, 0.5, 0.4, 1.0, w, h);
         let (mut whole, mut tiled) = (src.clone(), src.clone());
         denoise_tiled(&mut whole, w, h, p, 4096);
         denoise_tiled(&mut tiled, w, h, p, 70);
@@ -778,7 +973,7 @@ mod tests {
         for (lo, hi) in [(96.0f32, 126.0f32), (40.0, 210.0)] {
             let f = move |x: usize, _| if x < 48 { [lo; 3] } else { [hi; 3] };
             let mut a = frame(w, h, f, 0.0, 0.0, 1, 10);
-            detail_wide(&mut a, w, h, 0.0, 1.0, 1.0);
+            detail_wide(&mut a, w, h, 0.0, 1.0, 0.0, 1.0);
             let row = luma_row(&a, w, 32);
             assert!(row[47] < lo - 2.0 && row[48] > hi + 2.0, "step {lo}..{hi}: {:?}", &row[44..52]);
             // Neither side over- or undershoots past the limit, and pixels
@@ -797,7 +992,7 @@ mod tests {
         let f = |x: usize, _| if x >= 128 && x % 6 < 3 { [142.0; 3] } else { [118.0; 3] };
         let src = frame(w, h, f, 5.0, 0.0, 1, 11);
         let mut a = src.clone();
-        detail_wide(&mut a, w, h, 0.0, 1.0, 1.0);
+        detail_wide(&mut a, w, h, 0.0, 1.0, 0.0, 1.0);
         let (b, p) = (planes(&src, w, h), planes(&a, w, h));
         let flat = (16, 16, 104, h - 16);
         let (nb, na) = (sd_at(&b[0], w, flat, 1), sd_at(&p[0], w, flat, 1));
@@ -808,8 +1003,8 @@ mod tests {
         // With denoise as well, the flat half ends cleaner than it started,
         // and the stripes stand out more than denoise alone leaves them.
         let (mut c, mut dn) = (src.clone(), src.clone());
-        detail_wide(&mut c, w, h, 0.5, 1.0, 1.0);
-        detail_wide(&mut dn, w, h, 0.5, 0.0, 1.0);
+        detail_wide(&mut c, w, h, 0.5, 1.0, 0.0, 1.0);
+        detail_wide(&mut dn, w, h, 0.5, 0.0, 0.0, 1.0);
         let (q, dq) = (planes(&c, w, h), planes(&dn, w, h));
         assert!(sd_at(&q[0], w, flat, 1) < 0.7 * nb);
         let (td, ts) = (sd_at(&dq[0], w, tex, 1), sd_at(&q[0], w, tex, 1));
@@ -820,14 +1015,95 @@ mod tests {
     fn a_preview_sharpens_the_bands_the_export_does() {
         // Half size: frame band 0 is the sensor's 2 px band. An eighth: the
         // sharpened bands are below the preview's pixel, so nothing changes.
-        let full = params(0.0, 1.0, 1.0, 512, 512);
-        let half = params(0.0, 1.0, 2.0, 512, 512);
+        let full = params(0.0, 1.0, 0.0, 1.0, 512, 512);
+        let half = params(0.0, 1.0, 0.0, 2.0, 512, 512);
         assert_eq!((full.levels, half.levels), (4, 3));
         assert_eq!(half.sharp[..2], full.sharp[1..3]);
         let (w, h) = (96, 64);
         let mut a = frame(w, h, |x, _| if x < 48 { [96.0; 3] } else { [160.0; 3] }, 0.0, 0.0, 1, 12);
         let b = a.clone();
-        detail_wide(&mut a, w, h, 0.0, 1.0, 8.0);
+        detail_wide(&mut a, w, h, 0.0, 1.0, 0.0, 8.0);
         assert_eq!(a, b);
+    }
+
+    /// Amplitude of the `period` px sine across x in the column means of a
+    /// window (the noise averages away down the columns).
+    fn sine_amp(v: &[f32], w: usize, h: usize, (x0, x1): (usize, usize), period: f32) -> f32 {
+        let (mut sc, mut ss) = (0.0, 0.0);
+        for x in x0..x1 {
+            let col = (16..h - 16).map(|y| v[y * w + x]).sum::<f32>() / (h - 32) as f32;
+            let ph = std::f32::consts::TAU * x as f32 / period;
+            sc += col * ph.cos();
+            ss += col * ph.sin();
+        }
+        2.0 * (sc * sc + ss * ss).sqrt() / (x1 - x0) as f32
+    }
+
+    #[test]
+    fn texture_lifts_and_smooths_mid_size_detail_and_leaves_flat_noise() {
+        // Left half flat, right half ripples 12, 24 and 48 px long, 5 codes
+        // each, under luma noise of 4.
+        let (w, h) = (384, 192);
+        let f = |x: usize, _| {
+            let s = |p: f32| 5.0 * (std::f32::consts::TAU * x as f32 / p).sin();
+            [118.0 + if x >= 192 { s(12.0) + s(24.0) + s(48.0) } else { 0.0 }; 3]
+        };
+        let src = frame(w, h, f, 4.0, 0.0, 1, 13);
+        let flat = (16, 16, 160, h - 16);
+        let run = |texture: f32| {
+            let mut a = src.clone();
+            detail_wide(&mut a, w, h, 0.0, 0.0, texture, 1.0);
+            let p = planes(&a, w, h);
+            (sine_amp(&p[0], w, h, (216, 360), 24.0), sd_at(&p[0], w, flat, 1))
+        };
+        let (base, noise) = run(0.0);
+        let (up, up_noise) = run(1.0);
+        let (down, down_noise) = run(-1.0);
+        eprintln!("texture {base:.2} up {up:.2} down {down:.2}; noise {noise:.2} {up_noise:.2} {down_noise:.2}");
+        assert!(up > 1.3 * base, "texture +100: {base:.2} -> {up:.2}");
+        assert!(up_noise < 1.1 * noise, "flat noise at +100: {noise:.2} -> {up_noise:.2}");
+        assert!(down < 0.75 * base, "texture -100: {base:.2} -> {down:.2}");
+        assert!(down_noise <= noise, "flat noise at -100: {noise:.2} -> {down_noise:.2}");
+    }
+
+    #[test]
+    fn texture_leaves_a_hard_edge_and_the_flat_ground_beside_it() {
+        // No halo at +100, no softening at -100: the bands Texture works on
+        // ring for 16 px and more beside a 170-code step.
+        let (w, h) = (128, 64);
+        for texture in [1.0f32, -1.0] {
+            let mut a = frame(w, h, |x, _| if x < 64 { [40.0; 3] } else { [210.0; 3] }, 0.0, 0.0, 1, 14);
+            detail_wide(&mut a, w, h, 0.0, 0.0, texture, 1.0);
+            let row = luma_row(&a, w, 32);
+            for (x, &v) in row.iter().enumerate() {
+                let want = if x < 64 { 40.0 } else { 210.0 };
+                assert!((v - want).abs() <= 2.0, "texture {texture}: {v} at {x}, {:?}", &row[48..80]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_strong_denoise_protects_texture_and_still_cleans_the_flat_part() {
+        // Left half flat, right half ripples 5 and 10 px long, 6 codes each,
+        // under luma noise of 4: the fine ripple stands above the noise in
+        // its band, but under the full-strength threshold.
+        let (w, h) = (384, 192);
+        let f = |x: usize, _| {
+            let s = |p: f32| 6.0 * (std::f32::consts::TAU * x as f32 / p).sin();
+            [118.0 + if x >= 192 { s(5.0) + s(10.0) } else { 0.0 }; 3]
+        };
+        let src = frame(w, h, f, 4.0, 0.0, 1, 15);
+        let flat = (16, 16, 160, h - 16);
+        let run = |protect: f32| {
+            let mut a = src.clone();
+            denoise_tiled(&mut a, w, h, Params { protect, ..params(1.0, 0.0, 0.0, 1.0, w, h) }, TILE);
+            let p = planes(&a, w, h);
+            (sine_amp(&p[0], w, h, (216, 360), 5.0), sd_at(&p[0], w, flat, 1))
+        };
+        let (bare, bare_noise) = run(0.0);
+        let (kept, noise) = run(PROTECT);
+        eprintln!("ripple {bare:.2} -> {kept:.2}; flat noise {bare_noise:.2} -> {noise:.2}");
+        assert!(kept > 1.15 * bare, "fine ripple {bare:.2} -> {kept:.2} of 6");
+        assert!(noise < 1.1 * bare_noise && noise < 1.5, "flat noise {bare_noise:.2} -> {noise:.2}");
     }
 }

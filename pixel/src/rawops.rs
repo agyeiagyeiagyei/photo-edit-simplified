@@ -225,7 +225,7 @@ pub fn denoise_start_for_iso(iso: u32) -> f32 {
 pub const SHARPEN_START: f32 = 50.0;
 
 pub fn denoise_wide(buf: &mut [u16], w: usize, h: usize, denoise: f32, px_scale: f32) {
-    crate::denoise::detail_wide(buf, w, h, (denoise / 100.0).clamp(0.0, 1.0), 0.0, px_scale);
+    crate::denoise::detail_wide(buf, w, h, (denoise / 100.0).clamp(0.0, 1.0), 0.0, 0.0, px_scale);
 }
 
 /// Denoise and capture sharpening on a camera-toned 16-bit frame: the
@@ -235,7 +235,7 @@ pub fn denoise_wide(buf: &mut [u16], w: usize, h: usize, denoise: f32, px_scale:
 /// falling back to the legacy pipeline (#15).
 pub fn detail_toned_wide(buf: &mut [u16], w: usize, h: usize, adj: &RawAdjust, px_scale: f32) {
     let unit = |v: f32| (v / 100.0).clamp(0.0, 1.0);
-    crate::denoise::detail_wide(buf, w, h, unit(adj.denoise), unit(adj.sharpen), px_scale);
+    crate::denoise::detail_wide(buf, w, h, unit(adj.denoise), unit(adj.sharpen), (adj.texture / 100.0).clamp(-1.0, 1.0), px_scale);
 }
 
 /// Develop the un-toned 16-bit sRGB RAW frame, white-relative.

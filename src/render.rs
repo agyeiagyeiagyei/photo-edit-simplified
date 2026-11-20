@@ -895,6 +895,7 @@ pub(crate) fn edit_fingerprint(item: &MediaItem) -> u64 {
         e.raw.noise,
         e.raw.denoise,
         e.raw.sharpen,
+        e.raw.texture,
     ] {
         h.write_u32(v.to_bits());
     }
