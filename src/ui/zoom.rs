@@ -54,6 +54,13 @@ pub(crate) fn sync_canvas_rendering(canvas: &web_sys::HtmlCanvasElement) {
     }
 }
 
+/// Tabs where no tool takes a plain drag on the photo. There a drag is the
+/// hand: it pans the zoomed view. Elsewhere the drag belongs to the tab's
+/// tool, and Space or the middle button pans.
+pub(crate) fn drag_pans(tab: Tab) -> bool {
+    matches!(tab, Tab::Raw | Tab::Color | Tab::Export)
+}
+
 fn percent_label(p: f32) -> String {
     if p >= 10.0 || p <= 0.0 {
         format!("{:.0}%", p)
@@ -195,8 +202,9 @@ pub(crate) fn ZoomControls(state: AppState, tab: RwSignal<Tab>) -> impl IntoView
             .ok();
     });
 
-    // Space / middle-button drag pans while zoomed. Capture phase so the pan
-    // wins over the tool handlers on the canvas.
+    // Space / middle-button drag pans while zoomed, and so does a plain drag
+    // on the tabs without a drawing tool. Capture phase so the pan wins over
+    // the tool handlers on the canvas.
     let pan = Rc::new(Cell::new(None::<(i32, f64, f64)>));
     let space = Rc::new(Cell::new(false));
     let pan_ptr = pan.clone();
@@ -213,7 +221,15 @@ pub(crate) fn ZoomControls(state: AppState, tab: RwSignal<Tab>) -> impl IntoView
         if !inside || !state.view_zoom.get_untracked().zoomed() {
             return;
         }
-        if ev.button() != 1 && !pan_space.get() {
+        // A plain drag pans where no tool wants it, and only from the photo
+        // itself: the zoom buttons and layer handles keep their presses.
+        let hand = ev.button() == 0
+            && drag_pans(tab.get_untracked())
+            && ev
+                .target()
+                .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                .is_some_and(|el| el.tag_name() == "CANVAS");
+        if ev.button() != 1 && !pan_space.get() && !hand {
             return;
         }
         ev.prevent_default();
