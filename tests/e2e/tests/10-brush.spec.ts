@@ -1177,4 +1177,86 @@ test.describe('selection brush (issue #3)', () => {
     await expect(row('Bird')).toHaveCount(1);
     expect(errors, errors.join('\n')).toEqual([]);
   });
+  test('with the Brush tool up, zoom and pan repaint the view and strokes land under the pointer', async ({ page }) => {
+    test.setTimeout(300_000);
+    const errors = trackErrors(page);
+    await openApp(page);
+    await importFiles(page, [JPEG_A]);
+    await expect.poll(() => canvasSize(page).then((s) => s.w), { timeout: 60_000 }).toBeGreaterThan(0);
+    await settle(page, 800);
+    await selectBrush(page);
+    await setRange(page, /^Softness:/, 0);
+    const chip = (name: string) => page.locator('.select-tab .chip', { hasText: new RegExp(`^${name}$`) });
+    const zoomIn = () => page.locator('.zoom-cluster button[title="Zoom in (+)"]').click();
+    const frame = async () => {
+      await parkPointer(page);
+      await settle(page, 600);
+      return readCanvasScaled(page, 512);
+    };
+    // Mean colour distance between two frames in a small patch around a
+    // normalised point: the tint is there in one and not in the other.
+    const patch = (a: Frame, b: Frame, nx: number, ny: number) => {
+      let sum = 0;
+      let n = 0;
+      for (let dy = -2; dy <= 2; dy++) {
+        for (let dx = -2; dx <= 2; dx++) {
+          const i = ((Math.round(ny * a.h) + dy) * a.w + Math.round(nx * a.w) + dx) * 4;
+          sum += Math.abs(a.bytes[i] - b.bytes[i]) + Math.abs(a.bytes[i + 1] - b.bytes[i + 1]) + Math.abs(a.bytes[i + 2] - b.bytes[i + 2]);
+          n++;
+        }
+      }
+      return sum / n;
+    };
+
+    // Stroke 1 at Fit, across the middle.
+    const bare = await frame();
+    await chip('Add').click();
+    await stroke(page, [[0.35, 0.5], [0.65, 0.5]], 12);
+    const s1 = await frame();
+    expect(patch(s1, bare, 0.5, 0.5), 'stroke 1 shows no tint').toBeGreaterThan(20);
+
+    // A zoom step must repaint: the tint band grows with the picture. (The
+    // brush ring fast path used to leave the old view on the canvas.)
+    await zoomIn();
+    const z1 = await frame();
+    expect(z1.w === s1.w && z1.h === s1.h ? meanDiff(z1.bytes, s1.bytes) : 99, 'the zoom step did not repaint the view').toBeGreaterThan(2);
+
+    // Stroke 2 at 1.4x, down the screen at x = 0.3: image x = 0.5 - 0.2 / 1.4.
+    await stroke(page, [[0.3, 0.3], [0.3, 0.7]], 12);
+    // Remove across stroke 1 at the screen centre: image x = 0.5.
+    await chip('Remove').click();
+    await stroke(page, [[0.5, 0.3], [0.5, 0.7]], 12);
+    // Pan right by 10% of the canvas, then stroke 3 at screen x = 0.7:
+    // image x = (0.5 - 0.1 / 1.4) + 0.2 / 1.4, y from 0.5 - 0.3 / 1.4.
+    const b = await wrapBox(page);
+    const [cx, cy] = [b.x + b.width / 2, b.y + b.height / 2];
+    await page.mouse.move(cx, cy);
+    await page.keyboard.down('Space');
+    await page.mouse.down();
+    for (let i = 1; i <= 8; i++) {
+      await page.mouse.move(cx + (b.width * 0.1 * i) / 8, cy);
+      await page.waitForTimeout(16);
+    }
+    await page.mouse.up();
+    await page.keyboard.up('Space');
+    const panned = await frame();
+    expect(panned.w === z1.w ? meanDiff(panned.bytes, z1.bytes) : 99, 'the pan did not repaint the view').toBeGreaterThan(1);
+    await chip('Add').click();
+    await stroke(page, [[0.7, 0.2], [0.7, 0.35]], 12);
+
+    // Back at Fit, every stroke sits at its place in the image, and not
+    // where it would be had the view been ignored.
+    await page.locator('.zoom-cluster button[title="Fit (0)"]').click();
+    const all = await frame();
+    await page.locator('.select-tab .selection-bar button', { hasText: /^Clear$/ }).click();
+    const none = await frame();
+    const tinted = (nx: number, ny: number) => patch(all, none, nx, ny);
+    expect(tinted(0.4, 0.5), 'stroke 1 is gone').toBeGreaterThan(20);
+    expect(tinted(0.357, 0.42), 'stroke 2 is not where it was painted').toBeGreaterThan(20);
+    expect(tinted(0.29, 0.42), 'stroke 2 landed as if the view were at Fit').toBeLessThan(5);
+    expect(tinted(0.5, 0.5), 'the Remove stroke did not cut stroke 1').toBeLessThan(5);
+    expect(tinted(0.5714, 0.34), 'stroke 3 is not where it was painted after the pan').toBeGreaterThan(20);
+    expect(tinted(0.66, 0.34), 'stroke 3 landed as if the view had not been panned').toBeLessThan(5);
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
 });
