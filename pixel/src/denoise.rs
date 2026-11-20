@@ -385,10 +385,16 @@ fn estimate_noise(buf: &[u16], w: usize, h: usize, levels: usize) -> Vec<[f32; 3
     sig
 }
 
-/// Settle luma band `j` once the next coarser band's gate is known (`None`
+/// Noise variance the gates measure a luma band's energy against.
+fn gate_var(sig: &[[f32; 3]], j: usize) -> f32 {
+    let s = sig[j][0].max(SHARP_SIGMA_FLOOR);
+    s * s
+}
+
+/// Settle luma band `j` once the next coarser band's energy is known (`None`
 /// for the coarsest band): shrink it into `rem` and put its boost in `add`.
 /// `band` holds its coefficients, their local energy and that energy over a
-/// wider patch in noise variances; `coarse` is the latter for the next band.
+/// wider patch; `coarse` is the latter for the next band.
 fn settle(rem: &mut [f32], add: &mut [f32], p: Params, sig: &[[f32; 3]], j: usize, band: [&[f32]; 3], coarse: Option<&[f32]>) {
     let [pb, pe, pg] = band;
     let ty = (p.ky * sig[j][0]) * (p.ky * sig[j][0]);
@@ -396,22 +402,39 @@ fn settle(rem: &mut [f32], add: &mut [f32], p: Params, sig: &[[f32; 3]], j: usiz
     if ty <= 0.0 && g == 0.0 {
         return;
     }
-    // 0..1 shares of "this stands clear of the noise".
-    let gate = |v: f32| ((v - SHARP_E0) * (1.0 / (SHARP_E1 - SHARP_E0))).clamp(0.0, 1.0);
-    for i in 0..rem.len() {
-        let c = coarse.map(|c| c[i]);
-        // Structure in this band and the coarser one lowers the threshold.
-        let keep = if ty > 0.0 { p.protect * gate(pg[i]) * c.map_or(0.0, gate) } else { 0.0 };
-        let cut = (ty * (1.0 - keep) / pe[i].max(1e-12)).min(1.0);
-        let bv = pb[i];
-        rem[i] += bv * cut;
-        if g > 0.0 {
-            // A boost needs this band clear of its noise, and the coarser
-            // one too: structure shows in both, noise in the finer alone.
-            // The coarsest band has no coarser one to ask.
-            add[i] += g * gate(pg[i]) * bv * (1.0 - cut) * c.map_or(1.0, |c| SHARP_LONE + (1.0 - SHARP_LONE) * gate(c));
-        } else if g < 0.0 {
-            add[i] += g * bv * (1.0 - cut);
+    // The gates: 0..1 shares of "this stands clear of the noise", from the
+    // wide-patch energy in noise variances.
+    let span = 1.0 / (SHARP_E1 - SHARP_E0);
+    let own_k = span / gate_var(sig, j);
+    let own = move |v: f32| (v * own_k - SHARP_E0 * span).clamp(0.0, 1.0);
+    // The coarsest band has no coarser one to ask: it is not protected, and
+    // takes its boost on its own gate.
+    let (cv, protect, lone, c_k) = match coarse {
+        Some(c) => (c, p.protect, SHARP_LONE, span / gate_var(sig, j + 1)),
+        None => (pg, 0.0, 1.0, own_k),
+    };
+    let up = move |v: f32| (v * c_k - SHARP_E0 * span).clamp(0.0, 1.0);
+    // Structure in this band and the coarser one lowers the threshold.
+    let cut = move |e: f32, o: f32, c: f32| (ty * (1.0 - protect * o * c) / e.max(1e-12)).min(1.0);
+    let it = rem.iter_mut().zip(pb).zip(pe).zip(pg).zip(cv);
+    if g == 0.0 {
+        for ((((r, &bv), &e), &ov), &c) in it {
+            *r += bv * cut(e, own(ov), up(c));
+        }
+    } else if g > 0.0 {
+        // A boost needs this band clear of its noise, and the coarser one
+        // too: structure shows in both, noise in the finer alone.
+        for (((((r, &bv), &e), &ov), &c), a) in it.zip(add.iter_mut()) {
+            let (o, c) = (own(ov), up(c));
+            let cut = cut(e, o, c);
+            *r += bv * cut;
+            *a += g * o * (lone + (1.0 - lone) * c) * bv * (1.0 - cut);
+        }
+    } else {
+        for (((((r, &bv), &e), &ov), &c), a) in it.zip(add.iter_mut()) {
+            let cut = cut(e, own(ov), up(c));
+            *r += bv * cut;
+            *a += g * bv * (1.0 - cut);
         }
     }
 }
@@ -431,20 +454,15 @@ fn removed(mut planes: [Vec<f32>; 3], w: usize, h: usize, p: Params, sig: &[[f32
     let boosting = p.gain.iter().any(|&g| g != 0.0);
     let mut add = vec![0f32; if boosting { n } else { 0 }];
     let (mut ey, mut ec, mut sq, mut tmp) = (vec![0f32; n], vec![0f32; cn], vec![0f32; n], vec![0f32; n]);
-    // A luma band is settled once the next coarser band's gate is known:
-    // until then its coefficients, energy and own gate wait here.
+    // A luma band is settled once the next coarser band's energy is known:
+    // until then its coefficients, energy and wide-patch energy wait here.
     let (mut eg, mut pb, mut pe, mut pg) = (vec![0f32; n], vec![0f32; n], vec![0f32; n], vec![0f32; n]);
     bands(planes, w, h, p.levels, &mut |j, b| {
         let d = 1 << j;
         let [sy, scb, scr] = sig[j];
         energy(&b[0], &mut ey, &mut sq, &mut tmp, w, h, d);
-        // The gates read the energy over a wider patch than the shrinkage
-        // does, in noise variances.
-        let var = sy.max(SHARP_SIGMA_FLOOR) * sy.max(SHARP_SIGMA_FLOOR);
+        // The gates read the energy over a wider patch than the shrinkage.
         sep_filter(&ey, &mut eg, &mut tmp, w, h, &[0.25, 0.5, 0.25], d);
-        for v in eg.iter_mut() {
-            *v /= var;
-        }
         if j > 0 {
             settle(&mut rem[0], &mut add, p, sig, j - 1, [&pb, &pe, &pg], Some(&eg));
         }
