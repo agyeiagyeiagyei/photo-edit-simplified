@@ -1023,4 +1023,67 @@ test.describe('selection brush (issue #3)', () => {
     expect(settleMs, `RAW brush preview settle ${settleMs} ms > 700 ms`).toBeLessThanOrEqual(700);
     expect(errors, errors.join('\n')).toEqual([]);
   });
+  test('brushing a selection on a zoomed RAW keeps the sharp frame, and the loupe stays shut', async ({ page }) => {
+    test.skip(!RAW, 'no RAW fixture');
+    test.setTimeout(300_000);
+    const errors = trackErrors(page);
+    await openApp(page);
+    await importFiles(page, [RAW]);
+    await expect.poll(
+      () => page.evaluate(() => ((window as any).__pes?.perf?.() || []).some((e: any) => e.name === 'proxy.raw_develop' || e.name === 'pool.develop')),
+      { timeout: 180_000 },
+    ).toBe(true);
+    await expect(page.locator('.developing-badge')).toHaveCount(0, { timeout: 60_000 });
+    await settle(page, 1000);
+
+    // A new RAW import carries a develop (Sharpening starts on) and nothing
+    // the selection masks, so the selection is pure overlay.
+    await selectBrush(page);
+    await setBrushFrac(page, /^Size:/, 0.15);
+    for (let i = 0; i < 2; i++) {
+      await page.locator('.zoom-cluster button[title="Zoom in (+)"]').click();
+      await page.waitForTimeout(200);
+    }
+    await settle(page, 1500);
+
+    // Sample the canvas backing width on every frame through three strokes
+    // and the second after each. The soft preview's window is 1024 px over
+    // the zoom factor, far below any sharp frame of this view.
+    const sharpWidth = await canvas(page).evaluate((c: HTMLCanvasElement) => c.width);
+    await page.evaluate(() => {
+      const w = window as any;
+      w.__qaMinW = Infinity;
+      w.__qaRenders = () => {
+        const names = (w.__pes.perf() as any[]).map((e) => e.name);
+        return { whole: names.filter((n) => n === 'worker.render').length, windows: names.filter((n) => n === 'worker.render_window').length };
+      };
+      w.__pes.reset();
+      const tick = () => {
+        const c = document.querySelector('.canvas-wrap canvas') as HTMLCanvasElement;
+        w.__qaMinW = Math.min(w.__qaMinW, c.width);
+        w.__qaRaf = requestAnimationFrame(tick);
+      };
+      w.__qaRaf = requestAnimationFrame(tick);
+    });
+    for (const y of [0.35, 0.5, 0.65]) {
+      await stroke(page, [[0.3, y], [0.7, y + 0.05]], 10);
+      await page.waitForTimeout(1000);
+    }
+    // Rest the pointer on the photo: with zoom on the tab, no loupe opens
+    // and nothing asks the worker for a whole-frame render. The view may
+    // take its native-density window once; it must not take one per stroke.
+    const b = await wrapBox(page);
+    await page.mouse.move(b.x + b.width * 0.6, b.y + b.height * 0.4);
+    await page.waitForTimeout(1200);
+    const { minW, renders } = await page.evaluate(() => {
+      const w = window as any;
+      cancelAnimationFrame(w.__qaRaf);
+      return { minW: w.__qaMinW as number, renders: w.__qaRenders() as { whole: number; windows: number } };
+    });
+    expect(minW, `the canvas fell to a ${minW} px backing during the strokes (sharp was ${sharpWidth} px)`).toBeGreaterThanOrEqual(sharpWidth * 0.5);
+    expect(renders.whole, 'a resting pointer asked for a whole-frame render (the loupe)').toBe(0);
+    expect(renders.windows, 'selection-only strokes re-rendered the view').toBeLessThanOrEqual(1);
+    await expect(page.locator('.loupe-hover')).toHaveCount(0);
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
 });

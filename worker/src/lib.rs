@@ -67,7 +67,12 @@ thread_local! {
     /// base and every RAW develop field. Colour, brush and layer edits leave
     /// the develop alone, so they start from this instead of denoising again
     /// (#53). Cleared with the caches above.
-    static DEVELOPED_CACHE: RefCell<Option<DevelopedCache>> = const { RefCell::new(None) };
+    ///
+    /// Two slots: a whole-frame develop and a crop-window one. A zoomed view
+    /// asks for both kinds in turn (the frame behind the view, then the
+    /// window at native density), and in one slot each evicted the other, so
+    /// every brush stroke or pan paid for the denoise again.
+    static DEVELOPED_CACHE: RefCell<[Option<DevelopedCache>; 2]> = const { RefCell::new([None, None]) };
     /// Raster masks for adjustment layers, keyed by (item, layer id). The app
     /// sends one per mask version; render recipes carry a versioned reference
     /// so a slider drag never re-ships the bytes. A miss disables the layer.
@@ -200,12 +205,36 @@ struct DevelopedCache {
     pixels: Vec<u16>,
 }
 
+/// The slot a developed frame of this key lives in.
+fn developed_slot(key: &DevelopedKey) -> usize {
+    key.crop.is_some() as usize
+}
+
+/// Hand the cached developed pixels for `key` to `take`, when they are held
+/// at `len` samples. Returns whether they were.
+fn developed_get(key: &DevelopedKey, len: usize, take: impl FnOnce(&[u16])) -> bool {
+    DEVELOPED_CACHE.with(|c| match &c.borrow()[developed_slot(key)] {
+        Some(d) if &d.key == key && d.pixels.len() == len => {
+            take(&d.pixels);
+            true
+        }
+        _ => false,
+    })
+}
+
+fn developed_put(key: DevelopedKey, pixels: Vec<u16>) {
+    DEVELOPED_CACHE.with(|c| {
+        let slot = developed_slot(&key);
+        c.borrow_mut()[slot] = Some(DevelopedCache { key, pixels });
+    });
+}
+
 fn clear_render_caches() {
     BASE_CACHE.with(|c| *c.borrow_mut() = None);
     WINDOW_CACHE.with(|c| *c.borrow_mut() = None);
     WIDE_BASE_CACHE.with(|c| *c.borrow_mut() = None);
     WIDE_WINDOW_CACHE.with(|c| *c.borrow_mut() = None);
-    DEVELOPED_CACHE.with(|c| *c.borrow_mut() = None);
+    DEVELOPED_CACHE.with(|c| *c.borrow_mut() = [None, None]);
 }
 
 fn drop_neutral(id: u32) {
@@ -281,7 +310,7 @@ pub fn load_neutral(id: u32, pixels: Uint16Array, w: u32, h: u32, white: f32, to
     };
     WIDE_BASE_CACHE.with(|c| *c.borrow_mut() = None);
     WIDE_WINDOW_CACHE.with(|c| *c.borrow_mut() = None);
-    DEVELOPED_CACHE.with(|c| *c.borrow_mut() = None);
+    DEVELOPED_CACHE.with(|c| *c.borrow_mut() = [None, None]);
     NEUTRAL.with(|n| {
         n.borrow_mut().insert(
             id,
@@ -601,17 +630,13 @@ fn develop_cached(frame: &mut Frame, edit: &EditParams, px_scale: f32, key: Deve
         return None;
     }
     let len = frame.pixels.len();
-    let hit = DEVELOPED_CACHE.with(|c| {
-        c.borrow()
-            .as_ref()
-            .filter(|d| d.key == key && d.pixels.len() == len)
-            .map(|d| d.pixels.clone())
-    });
+    let mut hit = None;
+    developed_get(&key, len, |px| hit = Some(px.to_vec()));
     if hit.is_some() {
         return hit;
     }
     let wide = pipeline::develop(frame, edit, px_scale)?;
-    DEVELOPED_CACHE.with(|c| *c.borrow_mut() = Some(DevelopedCache { key, pixels: wide.clone() }));
+    developed_put(key, wide.clone());
     Some(wide)
 }
 
@@ -638,7 +663,7 @@ fn render_pipeline(
     let key = DevelopedKey::legacy(id, edit, None, tw, th, px_scale);
     let wide_buf = develop_cached(&mut frame, edit, px_scale, key);
     let t1 = js_sys::Date::now();
-    let mask = if edit.is_color_touched() {
+    let mask = if edit.selection_masks_pixels() {
         sel_json
             .and_then(|j| selection_from_json(&j, sel_mask.map(|m| m.to_vec())))
             .map(|sel| ops::selection_mask(&sel, tw, th))
@@ -799,18 +824,8 @@ fn neutral_finish(
     cache: Option<DevelopedKey>,
 ) -> (Vec<u8>, f64, f64) {
     let t0 = js_sys::Date::now();
-    let hit = cache.as_ref().is_some_and(|k| {
-        DEVELOPED_CACHE.with(|c| {
-            let c = c.borrow();
-            match c.as_ref() {
-                Some(d) if &d.key == k && d.pixels.len() == buf.len() => {
-                    buf.copy_from_slice(&d.pixels);
-                    true
-                }
-                _ => false,
-            }
-        })
-    });
+    let len = buf.len();
+    let hit = cache.as_ref().is_some_and(|k| developed_get(k, len, |px| buf.copy_from_slice(px)));
     if !hit {
         rawops::develop_neutral_wide(buf, w, h, &edit.raw, white);
         if let Some(lut) = tone {
@@ -819,7 +834,7 @@ fn neutral_finish(
         }
         rawops::detail_toned_wide(buf, w, h, &edit.raw, px_scale);
         if let Some(key) = cache {
-            DEVELOPED_CACHE.with(|c| *c.borrow_mut() = Some(DevelopedCache { key, pixels: buf.to_vec() }));
+            developed_put(key, buf.to_vec());
         }
     }
     let t1 = js_sys::Date::now();
@@ -840,7 +855,7 @@ fn selection_mask_for(
     sel_json: Option<String>,
     sel_mask: Option<Uint8Array>,
 ) -> Option<Vec<u8>> {
-    if !edit.base_color_touched() {
+    if !edit.selection_masks_pixels() {
         return None;
     }
     sel_json
@@ -907,7 +922,7 @@ fn neutral_window_render(
     let edit = &rebased;
     let px_scale = pipeline::px_scale_for(fw, fh, Target::new(ww, wh))
         * pipeline::px_scale_for(cw, ch, Target::new(tw, th));
-    let mask = if edit.base_color_touched() {
+    let mask = if edit.selection_masks_pixels() {
         sel_json
             .and_then(|j| selection_from_json(&j, sel_mask.map(|m| m.to_vec())))
             .map(|sel| {
@@ -1124,7 +1139,7 @@ fn render_window_pipeline(
     let wide_buf = develop_cached(&mut frame, edit, px_scale, key);
     let t3 = js_sys::Date::now();
     let hit = if cached { 1.0 } else { 0.0 };
-    let mask = if edit.base_color_touched() {
+    let mask = if edit.selection_masks_pixels() {
         sel_json
             .and_then(|j| selection_from_json(&j, sel_mask.map(|m| m.to_vec())))
             .map(|sel| {
@@ -1755,7 +1770,7 @@ fn export_mask(
     sel_json: Option<String>,
     sel_mask: Option<Uint8Array>,
 ) -> Option<Vec<u8>> {
-    if !edit.base_color_touched() {
+    if !edit.selection_masks_pixels() {
         return None;
     }
     let (cx, cy, cw, ch) = rect;

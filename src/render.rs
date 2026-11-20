@@ -434,7 +434,7 @@ fn segment_fp(item_id: usize, layers: &[state::Layer], w: usize, h: usize) -> u6
     w.hash(&mut hsh);
     h.hash(&mut hsh);
     for l in layers {
-        hash_layer(&mut hsh, l);
+        hash_layer(&mut hsh, l, true);
     }
     hsh.finish()
 }
@@ -878,7 +878,59 @@ fn hash_selection(h: &mut std::collections::hash_map::DefaultHasher, sel: Option
     }
 }
 
+thread_local! {
+    /// Recent `(edit fingerprint, look fingerprint)` pairs, newest last.
+    static LOOKS: RefCell<Vec<(u64, u64)>> = const { RefCell::new(Vec::new()) };
+    /// The photo whose sharp frame stays up through a mask change (see
+    /// [`keep_look_until_fresh`]).
+    static KEEP_LOOK: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Everything a rendered frame depends on. Also remembers the frame's look
+/// (see [`same_look`]).
 pub(crate) fn edit_fingerprint(item: &MediaItem) -> u64 {
+    let fp = fingerprint(item, true);
+    LOOKS.with(|l| {
+        let mut l = l.borrow_mut();
+        if !l.iter().any(|&(f, _)| f == fp) {
+            if l.len() >= 16 {
+                l.remove(0);
+            }
+            l.push((fp, fingerprint(item, false)));
+        }
+    });
+    fp
+}
+
+/// True when two edit fingerprints describe the same photo apart from where
+/// its masked edits apply: same develop, colour, geometry and layers, with
+/// only a selection or a layer mask changed between them.
+pub(crate) fn same_look(a: u64, b: u64) -> bool {
+    LOOKS.with(|l| {
+        let l = l.borrow();
+        let look = |fp: u64| l.iter().find(|&&(f, _)| f == fp).map(|&(_, look)| look);
+        matches!((look(a), look(b)), (Some(x), Some(y)) if x == y)
+    })
+}
+
+/// Keep a sharp frame of this photo on screen although its masks are out of
+/// date, until one rendered with the current masks is drawn. Set by a brush
+/// stroke on a mask the render reads (the frame is right everywhere but
+/// under the stroke, and the live tint covers that) and by a pan or zoom
+/// step, so neither drops to the soft preview while its frame renders.
+pub(crate) fn keep_look_until_fresh(item_id: usize) {
+    KEEP_LOOK.with(|m| m.set(Some(item_id)));
+}
+
+pub(crate) fn keeping_look(item_id: usize) -> bool {
+    KEEP_LOOK.with(|m| m.get() == Some(item_id))
+}
+
+pub(crate) fn clear_keep_look() {
+    KEEP_LOOK.with(|m| m.set(None));
+}
+
+fn fingerprint(item: &MediaItem, masks: bool) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let e = &item.edit;
@@ -930,31 +982,34 @@ pub(crate) fn edit_fingerprint(item: &MediaItem) -> u64 {
     format!("{:?}", e.levels).hash(&mut h);
     format!("{:?}", e.curves).hash(&mut h);
     // The render only consumes the global selection as an effect mask when a
-    // colour stage is active; painting one on an otherwise untouched photo
+    // colour stage is active; painting one on a photo without such a stage
     // must not invalidate the hi-res render (a full 3200 px re-render and blit
-    // per brush stroke).
-    if e.base_color_touched() {
+    // per brush stroke). The RAW develop is whole-frame and does not count:
+    // every RAW import carries one (Sharpening starts on).
+    if masks && e.selection_masks_pixels() {
         hash_selection(&mut h, e.selection.as_ref());
         h.write_u64(e.selection_rev);
     }
     item.layers.len().hash(&mut h);
     for l in &item.layers {
-        hash_layer(&mut h, l);
+        hash_layer(&mut h, l, masks);
     }
     h.finish()
 }
 
-fn hash_layer(h: &mut std::collections::hash_map::DefaultHasher, l: &state::Layer) {
+fn hash_layer(h: &mut std::collections::hash_map::DefaultHasher, l: &state::Layer, masks: bool) {
     use std::hash::{Hash, Hasher};
     l.id.hash(h);
     l.visible.hash(h);
     h.write_u32(l.opacity.to_bits());
-    l.invert.hash(h);
-    // Every mask change bumps the version; the selection hash only samples
-    // 8 bytes of a raster mask, so two wand masks of the same size can
-    // collide without it.
-    l.mask_version.hash(h);
-    hash_selection(h, l.mask.as_ref());
+    if masks {
+        l.invert.hash(h);
+        // Every mask change bumps the version; the selection hash only samples
+        // 8 bytes of a raster mask, so two wand masks of the same size can
+        // collide without it.
+        l.mask_version.hash(h);
+        hash_selection(h, l.mask.as_ref());
+    }
     match &l.kind {
         LayerKind::Text(t) => {
             h.write_u8(1);
@@ -2292,14 +2347,18 @@ pub(crate) fn brush_commit(state: AppState, drag: BrushDrag) {
     // for the new mask and skip the full-frame repaint the selection bump
     // would trigger (the next pointer move paints as usual).
     let overlay_only = drag.target == BrushTarget::Global
-        && state.current().is_some_and(|m| !m.edit.base_color_touched())
+        && state.current().is_some_and(|m| !m.edit.selection_masks_pixels())
         && drag.tint.borrow().is_some();
     if overlay_only {
         skip_next_preview_paint();
     }
+    if !overlay_only {
+        keep_look_until_fresh(drag.item_id);
+    }
     let _sp = perf::Span::new("brush.commit.store");
     if !brush_store(state, drag.item_id, drag.target, after, drag.w, drag.h) {
         cancel_skipped_preview_paint();
+        clear_keep_look();
         return;
     }
     if overlay_only {

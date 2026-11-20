@@ -322,8 +322,10 @@ impl EditParams {
         }
     }
 
-    /// True when a global (non-layer) colour or develop stage is active.
-    pub fn base_color_touched(&self) -> bool {
+    /// True when a stage the global selection masks is active: the colour,
+    /// blur and grain stages. The RAW develop runs on the whole frame, so a
+    /// selection on a photo with only develop settings changes no pixel.
+    pub fn selection_masks_pixels(&self) -> bool {
         self.brightness != 0.0
             || self.contrast != 0.0
             || self.saturation != 0.0
@@ -332,7 +334,11 @@ impl EditParams {
             || self.grain > 0.0
             || !self.levels.is_identity()
             || !self.curves.is_identity()
-            || !self.raw.is_identity()
+    }
+
+    /// True when a global (non-layer) colour or develop stage is active.
+    pub fn base_color_touched(&self) -> bool {
+        self.selection_masks_pixels() || !self.raw.is_identity()
     }
 
     pub fn is_color_touched(&self) -> bool {
