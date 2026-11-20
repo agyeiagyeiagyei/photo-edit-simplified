@@ -387,6 +387,63 @@ test.describe('view zoom (#46)', () => {
     expect(rec.text, 'a 1:1 crop must be serialised').toContain('"crop"');
   });
 
+  test('a plain drag pans the zoomed view on tabs without a drawing tool', async ({ page }) => {
+    const raws = rawFixtures();
+    test.skip(raws.length === 0, 'no RAW fixture in dl-raw');
+    const raw = raws.find((p) => /synthetic/i.test(p)) || raws[0];
+    const errors = trackErrors(page);
+    await openApp(page);
+    await importFiles(page, [raw]);
+    const leftDrag = async (dx: number) => {
+      const b = await canvasBox(page);
+      const [x, y] = [b.x + b.width / 2, b.y + b.height / 2];
+      await page.mouse.move(x, y);
+      await page.mouse.down();
+      for (let i = 1; i <= 8; i++) {
+        await page.mouse.move(x + (dx * i) / 8, y);
+        await page.waitForTimeout(16);
+      }
+      await page.mouse.up();
+      await page.waitForTimeout(250);
+    };
+    const wrap = page.locator('.canvas-wrap');
+
+    // At Fit there is nothing to pan, and the photo shows no hand.
+    await clickTab(page, 'Color');
+    await expect(wrap).not.toHaveClass(/pannable/);
+    await zoomIn(page); // 1.4x Fit
+    await expect.poll(() => pctNum(page)).toBeCloseTo(140, 0);
+    await expect(wrap).toHaveClass(/pannable/);
+
+    // Drag right by 10% of the canvas on Color: the point under the centre
+    // moves left by 0.1 / 1.4 in crop units. A heal dab reads it back.
+    const b = await canvasBox(page);
+    await leftDrag(b.width * 0.1);
+    await clickTab(page, 'Heal');
+    await expect(wrap, 'Heal keeps the drag for its brush').not.toHaveClass(/pannable/);
+    await page.locator('.heal-panel .chip', { hasText: /^Smooth fill$/ }).click();
+    await canvasClick(page, 0.5, 0.5);
+    await waitHs(page, 1);
+    let rec = await itemRecipe(page);
+    expect(rec.hs[0].p[0][0]).toBeCloseTo(0.5 - 0.1 / 1.4, 2);
+    expect(rec.hs[0].p[0][1]).toBeCloseTo(0.5, 2);
+
+    // The same drag on Heal paints a stroke and leaves the view where it is.
+    await leftDrag(b.width * 0.1);
+    await waitHs(page, 2);
+    await canvasClick(page, 0.5, 0.5);
+    await waitHs(page, 3);
+    rec = await itemRecipe(page);
+    expect(rec.hs[1].p.length, 'the drag on Heal should be a stroke').toBeGreaterThan(1);
+    expect(rec.hs[2].p[0][0], 'a drag on Heal must not pan').toBeCloseTo(0.5 - 0.1 / 1.4, 2);
+
+    // The zoom buttons sit over the photo and still take their clicks.
+    await clickTab(page, 'RAW');
+    await page.locator('.zoom-cluster button[title="Fit (0)"]').click();
+    await expect.poll(() => pctNum(page)).toBeCloseTo(100, 0);
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
   // QA B1: digits, +, - and Space are text in a text field, even with the
   // pointer resting on the photo.
   test('a text field keeps its keys while the pointer is over the canvas', async ({ page }) => {

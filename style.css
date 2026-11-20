@@ -249,6 +249,9 @@ h1 { font-size: 17px; font-weight: 600; }
   border-radius: 10px;
   background: #000;
 }
+/* A zoomed view on a tab without a drawing tool: a drag pans it. */
+.canvas-wrap.pannable canvas { cursor: grab; }
+.canvas-wrap.pannable canvas:active { cursor: grabbing; }
 /* Shown while a RAW's own develop is still on its way: the look will change. */
 .developing-badge {
   position: absolute;

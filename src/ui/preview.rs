@@ -1556,6 +1556,11 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                 format!("--ar:{}", dw as f64 / dh.max(1) as f64)
                             }).unwrap_or_default()
                         }
+                        class:pannable=move || {
+                            drag_pans(tab.get())
+                                && state.view_zoom.get().zoomed()
+                                && state.current().is_some_and(|m| m.kind == MediaKind::Photo)
+                        }
                         class:cropped=move || {
                             tab.get() != Tab::Crop
                                 && state.current().map(|m| m.kind == MediaKind::Photo && !crop_is_full(&m.edit.crop)).unwrap_or(false)
