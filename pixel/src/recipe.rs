@@ -428,6 +428,9 @@ fn recipe_json(e: &EditParams, portable_masks: bool) -> Option<String> {
         if e.raw.sharpen != d.sharpen {
             f.push(format!("\"sp\":{}", e.raw.sharpen));
         }
+        if e.raw.texture != d.texture {
+            f.push(format!("\"tx\":{}", e.raw.texture));
+        }
         parts.push(format!("\"raw\":{{{}}}", f.join(",")));
     }
     if !e.curves.is_identity() {
@@ -549,6 +552,9 @@ pub fn edit_params_from_recipe(json: &str) -> Option<EditParams> {
         }
         if let Some(t) = jnum(&r, "sp") {
             ra.sharpen = (t as f32).clamp(0.0, 100.0);
+        }
+        if let Some(t) = jnum(&r, "tx") {
+            ra.texture = (t as f32).clamp(-100.0, 100.0);
         }
         e.raw = ra;
     }

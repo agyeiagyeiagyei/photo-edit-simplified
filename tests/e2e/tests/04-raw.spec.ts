@@ -205,6 +205,10 @@ test.describe('RAW (ARW/DNG) import → develop → export', () => {
     await rawTab.click();
     await expect(page.locator('.raw-panel .panel-title', { hasText: 'RAW develop' })).toBeVisible();
     await expect(page.locator('label.slider', { hasText: /^Exposure/ })).toBeVisible();
+    // Texture runs from -100 (smooth) to +100 and starts at 0.
+    const texture = page.locator('label.slider', { hasText: /^Texture/ }).locator('input');
+    await expect(texture).toHaveValue('0');
+    expect(await texture.evaluate((el: HTMLInputElement) => [el.min, el.max])).toEqual(['-100', '100']);
     await clickTab(page, 'Color');
     await expect(page.locator('.raw-panel'), 'RAW controls belong on the RAW tab only').toHaveCount(0);
 
@@ -214,6 +218,47 @@ test.describe('RAW (ARW/DNG) import → develop → export', () => {
     await expect(rawTab).toHaveCount(0);
     await expect(page.locator('.tabs button.active')).toHaveText('Color');
     await expect(page.locator('label.slider', { hasText: /^Brightness/ })).toBeVisible();
+    expect(errors.filter((e) => !/favicon/.test(e)), errors.join('\n')).toEqual([]);
+  });
+
+  test('Texture changes the developed RAW export in both directions', async ({ page }) => {
+    test.setTimeout(300_000);
+    const errors = trackErrors(page);
+    await openApp(page);
+    await importFiles(page, [RAWS[0]]);
+    await expect(page.locator('.developing-badge')).toHaveCount(0, { timeout: 120_000 });
+    // Mean absolute luma step between neighbouring pixels 8 px apart, over
+    // the centre of the export: the mid-size contrast Texture works on.
+    const midContrast = async (value: number) => {
+      await clickTab(page, 'RAW');
+      await page.locator('label.slider', { hasText: /^Texture/ }).locator('input').evaluate((el: HTMLInputElement, v) => {
+        el.value = String(v); el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true }));
+      }, value);
+      await clickTab(page, 'Export');
+      await page.locator('label', { hasText: 'Format' }).locator('select').selectOption('png');
+      const [dl] = await Promise.all([
+        page.waitForEvent('download', { timeout: 180_000 }),
+        page.locator('button.btn.primary', { hasText: 'Download this' }).click(),
+      ]);
+      const b64 = fs.readFileSync((await dl.path())!).toString('base64');
+      return page.evaluate(async (b64) => {
+        const bmp = await createImageBitmap(await (await fetch(`data:image/png;base64,${b64}`)).blob());
+        const [w, h] = [Math.min(1024, bmp.width), Math.min(1024, bmp.height)];
+        const c = new OffscreenCanvas(w, h);
+        const g = c.getContext('2d')!;
+        g.drawImage(bmp, (bmp.width - w) >> 1, (bmp.height - h) >> 1, w, h, 0, 0, w, h);
+        const d = g.getImageData(0, 0, w, h).data;
+        const y = (i: number) => 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+        let s = 0, n = 0;
+        for (let yy = 0; yy < h; yy += 2) for (let xx = 0; xx + 8 < w; xx += 2) { s += Math.abs(y((yy * w + xx) * 4) - y((yy * w + xx + 8) * 4)); n++; }
+        return s / n;
+      }, b64);
+    };
+    const base = await midContrast(0);
+    const up = await midContrast(100);
+    const down = await midContrast(-100);
+    expect(up, `Texture +100 should add mid-size contrast (${base.toFixed(2)} -> ${up.toFixed(2)})`).toBeGreaterThan(base * 1.02);
+    expect(down, `Texture -100 should smooth mid-size contrast (${base.toFixed(2)} -> ${down.toFixed(2)})`).toBeLessThan(base * 0.98);
     expect(errors.filter((e) => !/favicon/.test(e)), errors.join('\n')).toEqual([]);
   });
 });

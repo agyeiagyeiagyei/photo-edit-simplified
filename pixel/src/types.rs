@@ -177,6 +177,9 @@ pub struct RawAdjust {
     /// Capture sharpening 0..100 — noise-gated gain on the fine wavelet
     /// bands (`denoise.rs`).
     pub sharpen: f32,
+    /// Texture -100..100 — gain on the mid-size wavelet bands; negative
+    /// smooths them (`denoise.rs`).
+    pub texture: f32,
 }
 
 impl Default for RawAdjust {
@@ -190,6 +193,7 @@ impl Default for RawAdjust {
             noise: 0.0,
             denoise: 0.0,
             sharpen: 0.0,
+            texture: 0.0,
         }
     }
 }
