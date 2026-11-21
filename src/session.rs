@@ -169,20 +169,30 @@ pub async fn put_meta(db: &Database, value: &JsValue) -> Result<(), JsValue> {
     Ok(())
 }
 
-fn lp_key(item_id: usize, layer_id: usize) -> JsValue {
-    JsValue::from_str(&format!("{item_id}:{layer_id}"))
+/// A layer's pixel PNG, or with `baked` the develop those pixels hold
+/// (`render::copy_key`, for a copy that follows the photo's RAW settings).
+fn lp_key(item_id: usize, layer_id: usize, baked: bool) -> JsValue {
+    JsValue::from_str(&format!("{item_id}:{layer_id}{}", if baked { ":k" } else { "" }))
 }
 
+/// Store a layer's pixels and the develop they hold in one transaction, so a
+/// reload never pairs the pixels of one develop with the record of another.
 pub async fn put_layer_pixels(
     db: &Database,
     item_id: usize,
     layer_id: usize,
     blob: &JsValue,
+    baked: u64,
 ) -> Result<(), JsValue> {
     let tx = db.transaction(&[LAYER_PIXELS], TransactionMode::ReadWrite).map_err(err)?;
     let store = tx.object_store(LAYER_PIXELS).map_err(err)?;
     store
-        .put(blob, Some(&lp_key(item_id, layer_id)))
+        .put(blob, Some(&lp_key(item_id, layer_id, false)))
+        .map_err(err)?
+        .await
+        .map_err(err)?;
+    store
+        .put(&JsValue::from_f64(baked as f64), Some(&lp_key(item_id, layer_id, true)))
         .map_err(err)?
         .await
         .map_err(err)?;
@@ -194,10 +204,11 @@ pub async fn get_layer_pixels(
     db: &Database,
     item_id: usize,
     layer_id: usize,
+    baked: bool,
 ) -> Result<Option<JsValue>, JsValue> {
     let tx = db.transaction(&[LAYER_PIXELS], TransactionMode::ReadOnly).map_err(err)?;
     let store = tx.object_store(LAYER_PIXELS).map_err(err)?;
-    store.get(lp_key(item_id, layer_id)).map_err(err)?.await.map_err(err)
+    store.get(lp_key(item_id, layer_id, baked)).map_err(err)?.await.map_err(err)
 }
 
 pub async fn delete_layer_pixel(
@@ -207,7 +218,9 @@ pub async fn delete_layer_pixel(
 ) -> Result<(), JsValue> {
     let tx = db.transaction(&[LAYER_PIXELS], TransactionMode::ReadWrite).map_err(err)?;
     let store = tx.object_store(LAYER_PIXELS).map_err(err)?;
-    store.delete(lp_key(item_id, layer_id)).map_err(err)?.await.map_err(err)?;
+    for baked in [false, true] {
+        store.delete(lp_key(item_id, layer_id, baked)).map_err(err)?.await.map_err(err)?;
+    }
     tx.commit().map_err(err)?.await.map_err(err)?;
     Ok(())
 }
@@ -571,6 +584,9 @@ pub fn layers_json(layers: &[Layer]) -> Option<String> {
                     num(r.scale),
                     num(r.angle),
                 ));
+                if let Some(c) = &r.live {
+                    out.push_str(&format!(",\"live\":[{},{},{}]", c.rot90, num(c.fine_angle), c.strokes));
+                }
             }
             LayerKind::Adjust(a) => {
                 out.push_str(&format!(
@@ -771,6 +787,18 @@ pub fn layers_from_json(json: &str) -> Vec<Layer> {
                 scale: crate::state::jnum(&lv, "scale").unwrap_or(1.0) as f32,
                 angle: crate::state::jnum(&lv, "ang").unwrap_or(0.0) as f32,
                 rev: 0,
+                // Where a copy of a RAW was taken from. The develop its saved
+                // pixels hold is stored with them and filled in by the caller.
+                live: crate::state::jget(&lv, "live").map(|v| {
+                    let a = js_sys::Array::from(&v);
+                    let n = |i: u32| a.get(i).as_f64().unwrap_or(0.0);
+                    crate::state::LiveCopy {
+                        rot90: n(0) as u8,
+                        fine_angle: n(1) as f32,
+                        strokes: n(2) as usize,
+                        baked: 0,
+                    }
+                }),
             }),
             "adjust" => LayerKind::Adjust(AdjustLayerState {
                 adjust: crate::state::jget(&lv, "adj")

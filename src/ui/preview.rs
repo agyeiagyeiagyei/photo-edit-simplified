@@ -727,6 +727,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             }
             bump_paint_gen();
             let Some(photo) = get_photo(item.id) else { return };
+            copies_follow(state, &item);
             let mut render_span = perf::Span::new("preview.render");
 
         // A lazily restored item has no preview until the selection effect's
@@ -2279,8 +2280,10 @@ fn raw_develop_pending(state: AppState) -> bool {
         return false;
     }
     let Some(photo) = get_photo(item.id) else { return false };
-    // A layer copy of a RAW is developed at full size first.
-    if photo.raw && crate::render::copying_to_layer() {
+    // A layer copy of a RAW is developed at full size, when it is made and
+    // again after a RAW change. A RAW that was cut is restored as a plain
+    // image that still carries its RAW settings.
+    if (photo.raw || !item.edit.raw.is_identity()) && crate::render::copying_to_layer() {
         return true;
     }
     if !photo.raw || photo.full {

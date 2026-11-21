@@ -362,6 +362,22 @@ pub enum LayerKind {
     Adjust(AdjustLayerState),
 }
 
+/// What a copy of a RAW photo was taken from. The copy is the photo's own
+/// pixels, so when the photo's RAW settings change it is developed again
+/// from the same place (`render::refresh_copies`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct LiveCopy {
+    /// The photo's turn and straighten when the copy was taken. Overlay
+    /// layers keep their place on the canvas when the photo turns later.
+    pub rot90: u8,
+    pub fine_angle: f32,
+    /// How many retouch strokes the photo had. Later ones stay out of the
+    /// copy: it follows the develop, not the retouching.
+    pub strokes: usize,
+    /// The develop its pixels hold (`render::copy_key`); 0 when not known.
+    pub baked: u64,
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct RasterLayer {
     /// Rc so cloning a MediaItem (every AppState::current read) is cheap;
@@ -381,6 +397,8 @@ pub struct RasterLayer {
     /// segment cache does not keep serving the previous pixels — its
     /// fingerprint only samples a few bytes.
     pub rev: u64,
+    /// Set on a copy of a RAW photo that still follows its RAW settings.
+    pub live: Option<LiveCopy>,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -438,6 +456,7 @@ impl Layer {
                 scale: 1.0,
                 angle: 0.0,
                 rev: 0,
+                live: None,
             }),
         )
     }
