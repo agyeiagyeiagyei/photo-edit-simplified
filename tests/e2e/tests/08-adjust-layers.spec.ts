@@ -609,9 +609,18 @@ test.describe('adjustment layers (issue #26)', () => {
 
     await selectTool(page, 'Rect');
     await rectDrag(page, 0.25, 0.25, 0.75, 0.75);
+    // The copy develops the photo at full size, seconds on a camera RAW: the
+    // Developing badge is up meanwhile.
+    await page.evaluate(() => {
+      new MutationObserver(() => {
+        if (document.querySelector('.developing-badge')) (window as any).__copyBadge = true;
+      }).observe(document.querySelector('.canvas-wrap')!, { childList: true, subtree: true });
+    });
     await page.locator('.select-row button', { hasText: /^Copy to layer$/ }).click();
     await clickTab(page, 'Layers');
     await expect(page.locator('.layer-row')).toHaveCount(1, { timeout: 120_000 });
+    await expect(page.locator('.developing-badge')).toHaveCount(0, { timeout: 30_000 });
+    expect(await page.evaluate(() => (window as any).__copyBadge === true), 'no Developing badge during the copy').toBe(true);
     await settle(page, 1000);
     const copied = await middle(await exportPng(page));
     recordMetrics(testInfo, {

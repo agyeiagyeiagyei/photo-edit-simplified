@@ -1153,6 +1153,21 @@ pub(crate) fn aspect_fit(cx: usize, cy: usize, cw: usize, ch: usize, aspect: Asp
     (cx + (cw - nw) / 2, cy + (ch - nh) / 2, nw, nh)
 }
 
+thread_local! {
+    /// Copy or Cut to layer is in the worker. On a RAW it develops the photo
+    /// at full size for the layer, which takes seconds.
+    static COPYING: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(crate) fn copying_to_layer() -> bool {
+    COPYING.with(|c| c.get())
+}
+
+fn set_copying(state: AppState, on: bool) {
+    COPYING.with(|c| c.set(on));
+    state.hi_built.update(|g| *g += 1);
+}
+
 pub(crate) fn selection_to_layer(state: AppState, cut: bool) {
     let Some(item) = state.current() else { return };
     if item.kind != MediaKind::Photo {
@@ -1171,7 +1186,9 @@ pub(crate) fn selection_to_layer(state: AppState, cut: bool) {
             let Some(sel) = item.edit.selection.clone() else { return false };
             let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
             let item_id = item.id;
-            pworker::extract(item_id, &recipe, &sel, cut, move |res| {
+            set_copying(state, true);
+            let sent = pworker::extract(item_id, &recipe, &sel, cut, move |res| {
+                set_copying(state, false);
                 match res {
                     Ok(Some(r)) => {
                         state.items.update(|v| {
@@ -1188,7 +1205,11 @@ pub(crate) fn selection_to_layer(state: AppState, cut: bool) {
                     Ok(None) => {}
                     Err(()) => {}
                 }
-            })
+            });
+            if !sent {
+                set_copying(state, false);
+            }
+            sent
         },
     );
 }
