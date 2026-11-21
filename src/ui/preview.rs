@@ -2268,6 +2268,10 @@ fn raw_develop_pending(state: AppState) -> bool {
         return false;
     }
     let Some(photo) = get_photo(item.id) else { return false };
+    // A layer copy of a RAW is developed at full size first.
+    if photo.raw && crate::render::copying_to_layer() {
+        return true;
+    }
     if !photo.raw || photo.full {
         return false;
     }
