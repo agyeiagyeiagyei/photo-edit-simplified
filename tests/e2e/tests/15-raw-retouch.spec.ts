@@ -346,6 +346,38 @@ async function psnrCanvasVsExport(page: Page, bytes: Buffer, mime: string): Prom
   );
 }
 
+/** Mean R, G, B of the normalized box at (x, y) ± half, once two reads a
+ *  moment apart agree: the render behind an edit has landed. */
+async function settledPatch(page: Page, x: number, y: number, half = 0.04): Promise<number[]> {
+  const read = () =>
+    canvas(page).evaluate(
+      (c: HTMLCanvasElement, [x, y, half]) => {
+        const x0 = Math.round(c.width * (x - half));
+        const y0 = Math.round(c.height * (y - half));
+        const w = Math.max(1, Math.round(c.width * half * 2));
+        const h = Math.max(1, Math.round(c.height * half * 2));
+        const d = c.getContext('2d')!.getImageData(x0, y0, w, h).data;
+        const sum = [0, 0, 0];
+        for (let i = 0; i < d.length; i += 4) for (let k = 0; k < 3; k++) sum[k] += d[i + k];
+        return sum.map((v) => v / (d.length / 4));
+      },
+      [x, y, half],
+    );
+  let prev = await read();
+  let same = 0;
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    await page.waitForTimeout(500);
+    const cur = await read();
+    same = cur.every((v, i) => Math.abs(v - prev[i]) < 0.05) ? same + 1 : 0;
+    prev = cur;
+    if (same >= 3) return cur;
+  }
+  throw new Error('canvas patch never settled');
+}
+
+const rgbGap = (a: number[], b: number[]) => Math.max(...a.map((v, i) => Math.abs(v - b[i])));
+
 test.describe('RAW retouch (#42): non-destructive Heal/Clone', () => {
   test.skip(RAWS.length === 0, 'no RAW fixture in dl-raw; run gen_dng.py to create one');
 
@@ -445,6 +477,54 @@ test.describe('RAW retouch (#42): non-destructive Heal/Clone', () => {
         heal_record_raster: rec!.raster,
       });
 
+      expect(errors, errors.join('\n')).toEqual([]);
+    });
+
+    // Issue #69: a stroke used to move the whole RAW onto the 8-bit develop
+    // path, where the highlights are already clipped. One Heal stroke in a
+    // corner brightened the rest of the frame by up to 60 levels, and the
+    // Highlights slider did nothing afterwards. Strokes now replay on the
+    // 16-bit develop, so a stroke changes the pixels under it and no others.
+    test(`RAW ${name} keeps its develop when a stroke is added`, async ({ page }, testInfo) => {
+      test.setTimeout(300_000);
+      const errors = trackErrors(page);
+
+      await openApp(page);
+      await importFiles(page, [RAW]);
+      await waitDeveloped(page);
+
+      await clickTab(page, 'RAW');
+      await setRange(page, /^Exposure/, 0.7);
+      await setRange(page, /^Highlights/, 60);
+      // Far from the stroke, which goes in the bottom-right corner.
+      const far: [number, number] = [0.12, 0.12];
+      const before = await settledPatch(page, ...far);
+
+      await clickTab(page, 'Heal');
+      await page.locator('.heal-panel .chip', { hasText: /^Smooth fill$/ }).click();
+      await setBrushFrac(page, /^Brush size:/, 0.03);
+      const box = (await canvas(page).boundingBox())!;
+      await page.mouse.move(box.x + box.width * 0.9, box.y + box.height * 0.9);
+      await page.mouse.down();
+      await page.mouse.move(box.x + box.width * 0.92, box.y + box.height * 0.92, { steps: 4 });
+      await page.mouse.up();
+      // The stroke is in the recipe, and the item is still a RAW.
+      await expect
+        .poll(async () => (await itemRecord(page))?.hs?.length ?? 0, { timeout: 30_000 })
+        .toBe(1);
+      expect((await itemRecord(page))?.raw, 'the item stopped being a RAW').toBe(true);
+      const after = await settledPatch(page, ...far);
+      expect(rgbGap(before, after), 'a stroke in one corner changed the far side of the photo').toBeLessThanOrEqual(1);
+
+      // The develop is still live: Highlights still acts on the photo.
+      await clickTab(page, 'RAW');
+      await setRange(page, /^Highlights/, 0);
+      const flat = await settledPatch(page, ...far);
+      expect(rgbGap(after, flat), 'Highlights no longer changes a RAW that has a stroke').toBeGreaterThan(3);
+      recordMetrics(testInfo, {
+        [`raw_stroke_far_shift_${name}`]: Math.round(rgbGap(before, after) * 100) / 100,
+        [`raw_stroke_highlights_range_${name}`]: Math.round(rgbGap(after, flat) * 100) / 100,
+      });
       expect(errors, errors.join('\n')).toEqual([]);
     });
 

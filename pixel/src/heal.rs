@@ -7,6 +7,8 @@
 //! plain 0..=255 clamp per channel; and the stride parameter is dropped
 //! (tightly packed rows).
 
+use crate::resample::Sample;
+
 const OUTSIDE: u8 = 0;
 const RING: u8 = 1;
 const HOLE: u8 = 2;
@@ -68,7 +70,7 @@ fn source_fits(wx0: i64, wy0: i64, ww: i64, wh: i64, dx: i64, dy: i64, w: i64, h
 /// Mean squared difference between the ring around the spot and the ring
 /// around the patch offset by (dx, dy). Infinite when the patch would overlap
 /// the spot or leave the image.
-fn heal_score(rgba: &[u8], role: &[u8], wx0: i64, wy0: i64, ww: i64, wh: i64, dx: i64, dy: i64, w: i64, h: i64) -> f64 {
+fn heal_score<T: Sample>(rgba: &[T], role: &[u8], wx0: i64, wy0: i64, ww: i64, wh: i64, dx: i64, dy: i64, w: i64, h: i64) -> f64 {
     if !source_fits(wx0, wy0, ww, wh, dx, dy, w, h) {
         return f64::INFINITY;
     }
@@ -83,7 +85,7 @@ fn heal_score(rgba: &[u8], role: &[u8], wx0: i64, wy0: i64, ww: i64, wh: i64, dx
             let t = (wy0 + y) as usize * stride + (wx0 + x) as usize * 4;
             let s = (wy0 + y + dy) as usize * stride + (wx0 + x + dx) as usize * 4;
             for c in 0..4 {
-                let d = rgba[t + c] as f64 - rgba[s + c] as f64;
+                let d = rgba[t + c].to_f32() as f64 - rgba[s + c].to_f32() as f64;
                 sum += d * d;
             }
             n += 1;
@@ -256,7 +258,7 @@ fn spot_layout(coverage: &[u8], width: usize, height: usize) -> Option<SpotLayou
 
 /// Search the 5 scales × 24 angles around the spot for the patch whose ring
 /// matches best, then refine by ±3 px so repeating texture lines up.
-fn search_source(rgba: &[u8], l: &SpotLayout, w: i64, h: i64, mode: HealMode) -> Option<(i64, i64)> {
+fn search_source<T: Sample>(rgba: &[T], l: &SpotLayout, w: i64, h: i64, mode: HealMode) -> Option<(i64, i64)> {
     const FACTORS: [f64; 5] = [1.05, 1.35, 1.75, 2.25, 2.8];
     let count = if mode == HealMode::ProximityMatch { 2 } else { 5 };
     let mut best = f64::INFINITY;
@@ -302,7 +304,7 @@ fn search_source(rgba: &[u8], l: &SpotLayout, w: i64, h: i64, mode: HealMode) ->
 /// sample its patch. Persisting it with the stroke lets a replay at another
 /// resolution reuse the same source region instead of running a fresh search
 /// that could land elsewhere.
-pub fn find_source(rgba: &[u8], coverage: &[u8], width: usize, height: usize, mode: HealMode) -> Option<(i64, i64)> {
+pub fn find_source<T: Sample>(rgba: &[T], coverage: &[u8], width: usize, height: usize, mode: HealMode) -> Option<(i64, i64)> {
     if mode == HealMode::SmoothFill {
         return None;
     }
@@ -313,15 +315,17 @@ pub fn find_source(rgba: &[u8], coverage: &[u8], width: usize, height: usize, mo
 /// Heal the pixels under `coverage` (w*h, 255 = full strength). Returns false
 /// when there was nothing to heal. `opacity` scales the blend. `seed` drives
 /// the detail grain on smooth fills.
-pub fn spot_heal(rgba: &mut [u8], coverage: &[u8], width: usize, height: usize, opacity: f32, mode: HealMode, seed: u32) -> bool {
+pub fn spot_heal<T: Sample>(rgba: &mut [T], coverage: &[u8], width: usize, height: usize, opacity: f32, mode: HealMode, seed: u32) -> bool {
     spot_heal_from(rgba, coverage, width, height, opacity, mode, seed, None)
 }
 
 /// [`spot_heal`] with an already-chosen source offset. An offset that no
 /// longer fits the frame at this resolution falls back to the search.
+/// Generic over the sample type, so a RAW's strokes heal its 16-bit develop:
+/// every value below is relative to the data, so nothing depends on its range.
 #[allow(clippy::too_many_arguments)]
-pub fn spot_heal_from(
-    rgba: &mut [u8],
+pub fn spot_heal_from<T: Sample>(
+    rgba: &mut [T],
     coverage: &[u8],
     width: usize,
     height: usize,
@@ -367,7 +371,7 @@ pub fn spot_heal_from(
             let t = iy as usize * stride + ix as usize * 4;
             let s = have_source.then(|| (iy + oy) as usize * stride + (ix + ox) as usize * 4);
             for c in 0..4 {
-                value[p * 4 + c] = rgba[t + c] as f32 - s.map_or(0.0, |s| rgba[s + c] as f32);
+                value[p * 4 + c] = rgba[t + c].to_f32() - s.map_or(0.0, |s| rgba[s + c].to_f32());
                 mean[c] += value[p * 4 + c] as f64;
             }
             if !have_source {
@@ -380,11 +384,11 @@ pub fn spot_heal_from(
                         if nx < 0 || ny < 0 || nx >= w || ny >= h {
                             continue;
                         }
-                        around += rgba[ny as usize * stride + nx as usize * 4 + c] as f64;
+                        around += rgba[ny as usize * stride + nx as usize * 4 + c].to_f32() as f64;
                         n += 1;
                     }
                     if n > 0 {
-                        let d = rgba[t + c] as f64 - around / n as f64;
+                        let d = rgba[t + c].to_f32() as f64 - around / n as f64;
                         detail[c] += d * d;
                     }
                 }
@@ -424,10 +428,10 @@ pub fn spot_heal_from(
                 grain = (-2.0 * (1.0 - u1).ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
             }
             for c in 0..4 {
-                let healed = s.map_or(0.0, |s| rgba[s + c] as f64) + value[p * 4 + c] as f64
+                let healed = s.map_or(0.0, |s| rgba[s + c].to_f32() as f64) + value[p * 4 + c] as f64
                     + if c < 3 { grain * detail[c] } else { 0.0 };
-                let out = rgba[t + c] as f64 + (healed - rgba[t + c] as f64) * amount;
-                rgba[t + c] = out.clamp(0.0, 255.0).round() as u8;
+                let was = rgba[t + c].to_f32() as f64;
+                rgba[t + c] = T::nearest(was + (healed - was) * amount);
             }
         }
     }
@@ -498,7 +502,7 @@ mod tests {
     fn content_aware_continues_stripes() {
         // Vertical stripes; damage a stripe junction; content-aware should
         // find an intact stripe column and continue the pattern.
-        let mut img = Vec::new();
+        let mut img: Vec<u8> = Vec::new();
         for _y in 0..64 {
             for x in 0..64 {
                 let v = if x % 8 < 4 { 230 } else { 30 };
@@ -577,5 +581,39 @@ mod tests {
         // Half-strength coverage should land between the defect (0) and the
         // full heal.
         assert!(half[b] > 10 && half[b] < full[b], "half={} full={}", half[b], full[b]);
+    }
+    /// The same stroke on the same picture at 8 and 16 bits (v * 257) heals
+    /// to the same picture: a RAW's strokes replay on its 16-bit develop, and
+    /// must not come out differently from the 8-bit replay they replaced.
+    #[test]
+    fn heals_16_bit_as_8_bit() {
+        let (w, h) = (64usize, 64usize);
+        let mut img8: Vec<u8> = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let v = (40 + x * 2 + (y % 5) * 9) as u8;
+                img8.extend_from_slice(&[v, v / 2 + 60, 255 - v, 255]);
+            }
+        }
+        for y in 24..34 {
+            for x in 24..34 {
+                let b = (y * w + x) * 4;
+                img8[b..b + 4].copy_from_slice(&[0, 0, 0, 255]);
+            }
+        }
+        let cov = dot_coverage(w, h, 29, 29, 7);
+        for mode in [HealMode::ContentAware, HealMode::ProximityMatch, HealMode::SmoothFill] {
+            let mut a = img8.clone();
+            let mut b: Vec<u16> = img8.iter().map(|&v| v as u16 * 257).collect();
+            assert!(spot_heal(&mut a, &cov, w, h, 1.0, mode, 7));
+            assert!(spot_heal(&mut b, &cov, w, h, 1.0, mode, 7));
+            let worst = a
+                .iter()
+                .zip(&b)
+                .map(|(&x, &y)| (x as f64 - y as f64 / 257.0).abs())
+                .fold(0.0, f64::max);
+            // Half a code of 8-bit rounding, plus float noise.
+            assert!(worst <= 0.51, "{mode:?}: 16-bit heal differs from 8-bit by {worst}");
+        }
     }
 }
