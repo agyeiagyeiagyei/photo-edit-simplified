@@ -905,6 +905,17 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         if want_hi {
             if windowed_view && !post_adjust {
                 let (_, _, fcw, fch) = rect_px(&img_win, fw, fh);
+                // Zoomed in past what a RAW's display proxy holds: load the
+                // sensor pixels, as an export does. A close-up of the proxy
+                // enlarged shows neither the photo's detail nor its noise.
+                if view.zoomed()
+                    && photo.raw
+                    && !full_present(item.id)
+                    && need_w > fcw as f64 * 1.05
+                    && item.width.max(item.height) > sw.max(sh)
+                {
+                    ensure_full(state, item.id, None);
+                }
                 let win_target = hi_target(need_w, need_h, fcw, fch, WINDOW_MAX_EDGE as u32);
                 let key = crop_key(&img_win);
                 sharp = HI_WINDOW.with(|c| {

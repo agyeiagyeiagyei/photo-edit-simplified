@@ -502,6 +502,35 @@ test.describe('view zoom (#46)', () => {
     await ctx.close();
   });
 
+  // 21 Nov: a RAW shows from a display proxy (half the sensor's size on a
+  // 24 MP camera) until something needs its sensor pixels, and a zoomed view
+  // never asked for them: "100%" was the proxy enlarged two times, so denoise
+  // and sharpening could not be judged there. The synthetic DNG's proxy holds
+  // every sensor pixel, so this needs a camera RAW.
+  test('a RAW zoomed past its display proxy loads the sensor pixels', async ({ browser }) => {
+    const raw = rawFixtures().find((p) => !/synthetic/i.test(p));
+    test.skip(!raw, 'no camera RAW in dl-raw');
+    test.setTimeout(240_000);
+    const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, deviceScaleFactor: 1 });
+    const page = await ctx.newPage();
+    const errors = trackErrors(page);
+    await openApp(page);
+    await importFiles(page, [raw!]);
+    await clickTab(page, 'RAW');
+    await page.locator('.zoom-cluster .zoom-native').click();
+    await expect.poll(() => pctNum(page)).toBe(100);
+    // At 100% one sensor pixel is one CSS pixel: the backing must reach it.
+    // The proxy alone gives half of that on a 24 MP camera.
+    await expect
+      .poll(async () => { const s = await canvasSize(page); return s.w / s.cw; }, { timeout: 180_000 })
+      .toBeGreaterThan(0.95);
+    // Back at Fit the view is whole again, and the zoom did not disturb it.
+    await page.locator('.zoom-cluster .zoom-fit').click();
+    await expect.poll(async () => (await canvasSize(page)).w, { timeout: 60_000 }).toBeGreaterThanOrEqual(1024);
+    expect(errors).toEqual([]);
+    await ctx.close();
+  });
+
   // QA B3 (R7): with Blur on, the zoomed window's outer pixels must match the
   // export too. Without an apron the outer 2 px were 7.7 levels off.
   test('the edge of a zoomed, blurred view matches the export', async ({ page }) => {
