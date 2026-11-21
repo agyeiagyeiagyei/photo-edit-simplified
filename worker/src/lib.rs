@@ -1409,9 +1409,33 @@ pub fn fill_selection(
     })
 }
 
+/// The photo as its RAW settings develop it, at working size and before any
+/// colour edit: the pixels a layer copy carries. The stored frame is the
+/// camera rendering, so a copy taken from it would show the photo without its
+/// white balance, exposure, denoise and sharpening. `None` without a develop.
+fn developed_frame(id: u32, edit: &EditParams) -> Result<Option<Vec<u8>>, JsValue> {
+    if edit.raw.is_identity() {
+        return Ok(None);
+    }
+    let (fw, fh) = BUFFERS
+        .with(|b| b.borrow().get(&id).map(|(_, w, h)| (*w, *h)))
+        .ok_or_else(|| JsValue::from_str("not loaded"))?;
+    let only = EditParams {
+        raw: edit.raw,
+        rot90: edit.rot90,
+        fine_angle: edit.fine_angle,
+        strokes: edit.strokes.clone(),
+        ..EditParams::default()
+    };
+    let (ww, wh) = working_dims(fw, fh, &only);
+    let (px, _, _) = export_pixels(id, fw, fh, &only, (0, 0, ww, wh), ww, wh, None, None)?;
+    Ok(Some(px))
+}
+
 /// Extract the selection as a full-size RGBA layer (alpha-masked pixels at
-/// working dims). `also_cut` additionally punches the region out of the item
-/// buffer; the result then carries the destructive-op fields too.
+/// working dims, developed as the photo is). `also_cut` additionally punches
+/// the region out of the item buffer; the result then carries the
+/// destructive-op fields too.
 #[wasm_bindgen]
 pub fn extract(
     id: u32,
@@ -1420,8 +1444,9 @@ pub fn extract(
     sel_mask: Option<Uint8Array>,
     also_cut: bool,
 ) -> Result<JsValue, JsValue> {
+    let edit = parse_edit(id, recipe);
+    let developed = developed_frame(id, &edit)?;
     with_buffer(id, |(full, fw, fh)| {
-        let edit = parse_edit(id, recipe);
         let (base, w, h) = geometry(full, *fw, *fh, &edit);
         let mut base = base.into_owned();
         replay_strokes(&mut base, w, h, *fw, *fh, &edit);
@@ -1429,7 +1454,16 @@ pub fn extract(
             return JsValue::NULL;
         };
         let mask = ops::selection_mask(&sel, w, h);
-        let layer = ops::extract_masked(&base, &mask);
+        let layer = match developed.filter(|d| d.len() == base.len()) {
+            // The developed colours, under the stored frame's alpha.
+            Some(mut d) => {
+                for ((px, b), m) in d.chunks_exact_mut(4).zip(base.chunks_exact(4)).zip(&mask) {
+                    px[3] = (b[3] as f32 * (*m as f32 / 255.0)).min(255.0) as u8;
+                }
+                d
+            }
+            None => ops::extract_masked(&base, &mask),
+        };
         let mut pairs: Vec<(&str, JsValue)> = vec![
             ("layer", js_buf(layer)),
             ("lw", (w as u32).into()),

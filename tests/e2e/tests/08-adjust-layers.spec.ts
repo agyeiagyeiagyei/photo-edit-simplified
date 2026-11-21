@@ -566,6 +566,62 @@ test.describe('adjustment layers (issue #26)', () => {
     expect(errors, errors.join('\n')).toEqual([]);
   });
 
+  // Owner report (21 Nov): with Smart denoise at 100 the photo was clean with
+  // its layer copies hidden and noisy with them shown. Copy to layer read the
+  // stored camera rendering, so a copy carried none of the RAW tab's develop.
+  // Exposure is the develop setting that shows on any RAW, the noise-free
+  // synthetic DNG included.
+  test('a layer copy of a RAW carries the RAW develop', async ({ page }, testInfo) => {
+    test.skip(!RAW, 'no RAW fixture in dl-raw');
+    test.setTimeout(420_000);
+    const errors = trackErrors(page);
+    await openApp(page);
+    await importFiles(page, [RAW]);
+    await expect(page.locator('.developing-badge')).toHaveCount(0, { timeout: 120_000 });
+    await settle(page, 1000);
+    // Mean colour of the middle of an exported PNG, well inside the copy.
+    const middle = (png: Buffer) => page.evaluate(async (b64) => {
+      const bin = atob(b64);
+      const u8 = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+      const bmp = await createImageBitmap(new Blob([u8], { type: 'image/png' }));
+      const c = document.createElement('canvas');
+      c.width = 300;
+      c.height = 200;
+      const x = c.getContext('2d')!;
+      x.imageSmoothingQuality = 'high';
+      x.drawImage(bmp, 0, 0, 300, 200);
+      bmp.close();
+      const d = x.getImageData(105, 70, 90, 60).data;
+      const sum = [0, 0, 0];
+      for (let i = 0; i < d.length; i += 4) for (let k = 0; k < 3; k++) sum[k] += d[i + k];
+      return sum.map((v) => v / (d.length / 4));
+    }, png.toString('base64'));
+    const gap = (a: number[], b: number[]) => Math.max(...a.map((v, i) => Math.abs(v - b[i])));
+
+    const camera = await middle(await exportPng(page));
+    await clickTab(page, 'RAW');
+    await setRange(page, /^Exposure/, 1);
+    await setRange(page, /^Smart denoise/, 100);
+    await settle(page, 1000);
+    const developed = await middle(await exportPng(page));
+    expect(gap(camera, developed), 'Exposure +1 should change the export').toBeGreaterThan(8);
+
+    await selectTool(page, 'Rect');
+    await rectDrag(page, 0.25, 0.25, 0.75, 0.75);
+    await page.locator('.select-row button', { hasText: /^Copy to layer$/ }).click();
+    await clickTab(page, 'Layers');
+    await expect(page.locator('.layer-row')).toHaveCount(1, { timeout: 120_000 });
+    await settle(page, 1000);
+    const copied = await middle(await exportPng(page));
+    recordMetrics(testInfo, {
+      raw_layer_copy_develop_gap: Math.round(gap(developed, copied) * 100) / 100,
+      raw_layer_copy_camera_gap: Math.round(gap(camera, copied) * 100) / 100,
+    });
+    expect(gap(developed, copied), 'the layer copy does not look like the developed photo it was copied from').toBeLessThanOrEqual(1);
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
   // setRange sets a value with one scripted event, so it can't see an editor
   // that rebuilds itself mid-drag. This drags with the mouse like a person.
   test('layer sliders follow a real mouse drag, and rows are told apart', async ({ page }) => {
