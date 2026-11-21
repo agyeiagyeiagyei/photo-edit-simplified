@@ -1239,7 +1239,8 @@ pub(crate) fn refresh_copies(state: AppState, item_id: usize) {
                                 r.live = None;
                                 continue;
                             }
-                            for (o, n) in Rc::make_mut(&mut r.pixels).chunks_exact_mut(4).zip(d.layer.chunks_exact(4)) {
+                            let new = d.layer.as_chunks::<4>().0;
+                            for (o, n) in Rc::make_mut(&mut r.pixels).as_chunks_mut::<4>().0.iter_mut().zip(new) {
                                 o[..3].copy_from_slice(&n[..3]);
                             }
                             r.rev += 1;
