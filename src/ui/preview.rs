@@ -2280,8 +2280,10 @@ fn raw_develop_pending(state: AppState) -> bool {
         return false;
     }
     let Some(photo) = get_photo(item.id) else { return false };
-    // A layer copy of a RAW is developed at full size first.
-    if photo.raw && crate::render::copying_to_layer() {
+    // A layer copy of a RAW is developed at full size, when it is made and
+    // again after a RAW change. A RAW that was cut is restored as a plain
+    // image that still carries its RAW settings.
+    if (photo.raw || !item.edit.raw.is_identity()) && crate::render::copying_to_layer() {
         return true;
     }
     if !photo.raw || photo.full {
