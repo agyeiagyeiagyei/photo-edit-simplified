@@ -139,6 +139,8 @@ struct WideBaseCache {
     id: u32,
     rot90: u8,
     fine_bits: u32,
+    /// Retouch strokes are baked into the cached pixels here too.
+    strokes_fp: u64,
     tw: usize,
     th: usize,
     pixels: Vec<u16>,
@@ -148,6 +150,7 @@ struct WideWindowCache {
     id: u32,
     rot90: u8,
     fine_bits: u32,
+    strokes_fp: u64,
     crop: (usize, usize, usize, usize),
     tw: usize,
     th: usize,
@@ -690,6 +693,25 @@ fn neutral_dims(id: u32, edit: &EditParams) -> Option<(usize, usize)> {
     })
 }
 
+/// The neutral frame in working geometry with the recipe's Heal and Clone
+/// strokes replayed on it: the 16-bit working frame every neutral render
+/// starts from. Replaying here keeps a retouched RAW on the neutral path, so
+/// a stroke changes the pixels under it and nothing else (#69).
+fn retouched_wide<'a>(
+    neutral: &'a [u16],
+    fw: usize,
+    fh: usize,
+    edit: &EditParams,
+) -> (std::borrow::Cow<'a, [u16]>, usize, usize) {
+    let (p, gw, gh) = geometry_wide(neutral, fw, fh, edit);
+    if edit.strokes.is_empty() {
+        return (p, gw, gh);
+    }
+    let mut owned = p.into_owned();
+    replay_strokes(&mut owned, gw, gh, fw, fh, edit);
+    (std::borrow::Cow::Owned(owned), gw, gh)
+}
+
 /// Geometry + resample on the neutral frame, with a 16-bit base cache keyed
 /// like the u8 one. Neutral pixel edits (exposure, highlights, shadows, WB)
 /// rerun develop on a copy of this base, so they never compound.
@@ -706,11 +728,13 @@ fn wide_base_pipeline(
     let (ww, wh) = working_dims(fw, fh, edit);
     let (tw, th) = hi_target(req_w, req_h, ww, wh, max_edge);
     let fine_bits = edit.fine_angle.to_bits();
+    let strokes_fp = strokes_fingerprint(edit);
     let cached = WIDE_BASE_CACHE.with(|c| {
         c.borrow().as_ref().is_some_and(|b| {
             b.id == id
                 && b.rot90 == edit.rot90
                 && b.fine_bits == fine_bits
+                && b.strokes_fp == strokes_fp
                 && b.tw == tw
                 && b.th == th
         })
@@ -725,7 +749,7 @@ fn wide_base_pipeline(
         let (v, t1, t2) = NEUTRAL.with(|n| {
             let n = n.borrow();
             let src = n.get(&id).expect("neutral frame missing");
-            let (p, gw, gh) = geometry_wide(&src.pixels, fw, fh, edit);
+            let (p, gw, gh) = retouched_wide(&src.pixels, fw, fh, edit);
             let t1 = js_sys::Date::now();
             let frame = pipeline::resize_wide(&p, gw, gh, Target::new(tw, th));
             let t2 = js_sys::Date::now();
@@ -736,6 +760,7 @@ fn wide_base_pipeline(
                 id,
                 rot90: edit.rot90,
                 fine_bits,
+                strokes_fp,
                 tw,
                 th,
                 pixels: v.clone(),
@@ -757,11 +782,13 @@ fn wide_window_pipeline(
     let t0 = js_sys::Date::now();
     let Win { rect: (cx, cy, cw, ch), tw, th } = win;
     let fine_bits = edit.fine_angle.to_bits();
+    let strokes_fp = strokes_fingerprint(edit);
     let cached = WIDE_WINDOW_CACHE.with(|c| {
         c.borrow().as_ref().is_some_and(|w| {
             w.id == id
                 && w.rot90 == edit.rot90
                 && w.fine_bits == fine_bits
+                && w.strokes_fp == strokes_fp
                 && w.crop == (cx, cy, cw, ch)
                 && w.tw == tw
                 && w.th == th
@@ -777,7 +804,7 @@ fn wide_window_pipeline(
         let (v, t1, t2) = NEUTRAL.with(|n| {
             let n = n.borrow();
             let src = n.get(&id).expect("neutral frame missing");
-            let (p, gw, gh) = geometry_wide(&src.pixels, fw, fh, edit);
+            let (p, gw, gh) = retouched_wide(&src.pixels, fw, fh, edit);
             let t1 = js_sys::Date::now();
             let win: Vec<u16> = if (cx, cy, cw, ch) == (0, 0, gw, gh) {
                 p.into_owned()
@@ -793,6 +820,7 @@ fn wide_window_pipeline(
                 id,
                 rot90: edit.rot90,
                 fine_bits,
+                strokes_fp,
                 crop: (cx, cy, cw, ch),
                 tw,
                 th,
@@ -987,8 +1015,8 @@ pub fn render_base(
     let edit = parse_edit(id, recipe);
     // A RAW with develop edits gets a developed base: the neutral develop,
     // camera tone and detail at the base size, without colour. The shader then
-    // applies only the colour edits, so colour drags stay on the GPU. Strokes
-    // make the edit ineligible: they replay on the 8-bit base instead.
+    // applies only the colour edits, so colour drags stay on the GPU. The app
+    // keeps an edit with retouch strokes on the CPU path (`gpu::eligible`).
     if pipeline::neutral_eligible(&edit) {
         let Some((fw, fh)) = neutral_dims(id, &edit) else {
             return Err(JsValue::from_str("developed base needs the neutral frame"));
@@ -1882,7 +1910,7 @@ fn export_pixels(
             let src = n
                 .get(&id)
                 .ok_or_else(|| JsValue::from_str("neutral frame missing"))?;
-            let (p, gw, gh) = geometry_wide(&src.pixels, fw, fh, edit);
+            let (p, gw, gh) = retouched_wide(&src.pixels, fw, fh, edit);
             let win = if (cx, cy, cw, ch) == (0, 0, gw, gh) {
                 p.into_owned()
             } else {

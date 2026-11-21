@@ -105,10 +105,16 @@ fn lanczos3(x: f64) -> f64 {
     (px.sin() / px) * ((px / 3.0).sin() / (px / 3.0))
 }
 
-/// A channel sample the resampler can read and write.
-trait Sample: Copy {
+/// A channel sample, 8-bit or 16-bit: what the resampler and the retouch
+/// tools read and write, so one implementation serves the stored 8-bit frame
+/// and the 16-bit RAW develop.
+pub trait Sample: Copy {
     fn to_f32(self) -> f32;
     fn from_f32(v: f32) -> Self;
+    /// The nearest code to `v`, clamped to the type's range.
+    fn nearest(v: f64) -> Self;
+    fn to_u32(self) -> u32;
+    fn from_u32(v: u32) -> Self;
 }
 
 impl Sample for u8 {
@@ -120,6 +126,18 @@ impl Sample for u8 {
     fn from_f32(v: f32) -> Self {
         (v + 0.5).clamp(0.0, 255.0) as u8
     }
+    #[inline]
+    fn nearest(v: f64) -> Self {
+        v.clamp(0.0, 255.0).round() as u8
+    }
+    #[inline]
+    fn to_u32(self) -> u32 {
+        self as u32
+    }
+    #[inline]
+    fn from_u32(v: u32) -> Self {
+        v as u8
+    }
 }
 
 impl Sample for u16 {
@@ -130,6 +148,18 @@ impl Sample for u16 {
     #[inline]
     fn from_f32(v: f32) -> Self {
         (v + 0.5).clamp(0.0, 65535.0) as u16
+    }
+    #[inline]
+    fn nearest(v: f64) -> Self {
+        v.clamp(0.0, 65535.0).round() as u16
+    }
+    #[inline]
+    fn to_u32(self) -> u32 {
+        self as u32
+    }
+    #[inline]
+    fn from_u32(v: u32) -> Self {
+        v as u16
     }
 }
 
