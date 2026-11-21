@@ -727,6 +727,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             }
             bump_paint_gen();
             let Some(photo) = get_photo(item.id) else { return };
+            copies_follow(state, &item);
             let mut render_span = perf::Span::new("preview.render");
 
         // A lazily restored item has no preview until the selection effect's

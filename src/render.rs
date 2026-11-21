@@ -1154,18 +1154,142 @@ pub(crate) fn aspect_fit(cx: usize, cy: usize, cw: usize, ch: usize, aspect: Asp
 }
 
 thread_local! {
-    /// Copy or Cut to layer is in the worker. On a RAW it develops the photo
-    /// at full size for the layer, which takes seconds.
-    static COPYING: Cell<bool> = const { Cell::new(false) };
+    /// Layer copies being developed in the worker: a Copy or Cut to layer,
+    /// or copies following a RAW change. On a RAW each is a full-size
+    /// develop, which takes seconds.
+    static COPYING: Cell<u32> = const { Cell::new(0) };
+    /// The develop the copies of the photo on screen are waiting to follow:
+    /// (item, `copy_key`). A newer change replaces it and restarts the wait.
+    static COPY_WANT: Cell<(usize, u64)> = const { Cell::new((0, 0)) };
 }
 
 pub(crate) fn copying_to_layer() -> bool {
-    COPYING.with(|c| c.get())
+    COPYING.with(|c| c.get() > 0)
 }
 
 fn set_copying(state: AppState, on: bool) {
-    COPYING.with(|c| c.set(on));
+    COPYING.with(|c| c.set(if on { c.get() + 1 } else { c.get().saturating_sub(1) }));
     state.hi_built.update(|g| *g += 1);
+}
+
+/// The develop a copy made now would hold, as one number: the RAW settings,
+/// and a bit that flips when the photo changes develop path. A retouch
+/// stroke or a destructive edit puts a RAW on the 8-bit path, which does not
+/// render as the 16-bit one does (#69), and a copy has to match the photo
+/// around it. 52 bits, so the session stores it as a number; never 0, which
+/// marks a copy whose develop is not known.
+fn copy_key(edit: &EditParams, photo: &PhotoData) -> u64 {
+    let r = &edit.raw;
+    let mut k = (photo.raw && photo.gen == 0 && edit.strokes.is_empty()) as u64;
+    for v in [r.temp, r.tint, r.exposure, r.highlights, r.shadows, r.noise, r.denoise, r.sharpen, r.texture] {
+        k = k.wrapping_mul(0x100_0000_01b3) ^ v.to_bits() as u64;
+    }
+    (k >> 12) | (1 << 52)
+}
+
+/// A copy on the item whose pixels hold another develop than the photo has
+/// now, with the develop it should hold.
+fn stale_copy(item: &MediaItem) -> Option<(u64, state::LiveCopy)> {
+    let photo = get_photo(item.id)?;
+    let key = copy_key(&item.edit, &photo);
+    item.layers.iter().find_map(|l| match &l.kind {
+        LayerKind::Raster(r) => r.live.filter(|c| c.baked != key).map(|c| (key, c)),
+        _ => None,
+    })
+}
+
+/// Develop the item's layer copies again when its RAW settings have moved on
+/// from the ones their pixels hold. A copy is the photo's own pixels, so it
+/// follows the develop as the photo does; as a snapshot it kept the settings
+/// of the moment it was made, and a later Smart denoise left the copies noisy
+/// on a clean photo (owner report, 21 Nov). One full-size develop serves
+/// every copy taken in the same geometry; the copy keeps its alpha.
+/// `copying_to_layer` is true until the copies are current.
+pub(crate) fn refresh_copies(state: AppState, item_id: usize) {
+    let job = move || {
+        state.items.with_untracked(|v| {
+            let m = v.iter().find(|m| m.id == item_id)?;
+            Some((stale_copy(m)?, pes_pixel::recipe::edit_params_full_json(&m.edit)))
+        })
+    };
+    if job().is_none() {
+        return;
+    }
+    set_copying(state, true);
+    let run = move || {
+        pworker::destructive(move || {
+            let sent = job().is_some_and(|((key, from), recipe)| {
+                pworker::redevelop(item_id, &recipe, &from, move |res| {
+                    let px = res.ok().flatten();
+                    state.items.update(|v| {
+                        let Some(m) = v.iter_mut().find(|m| m.id == item_id) else { return };
+                        for l in &mut m.layers {
+                            let LayerKind::Raster(r) = &mut l.kind else { continue };
+                            let Some(c) = &mut r.live else { continue };
+                            if c.baked == key || (c.rot90, c.fine_angle, c.strokes) != (from.rot90, from.fine_angle, from.strokes) {
+                                continue;
+                            }
+                            // A develop that failed is not asked for again
+                            // until the settings next change.
+                            c.baked = key;
+                            let Some(d) = &px else { continue };
+                            if (d.lw, d.lh) != (r.width, r.height) {
+                                // The photo is no longer the size the copy was
+                                // taken at: its pixels are not there to follow.
+                                r.live = None;
+                                continue;
+                            }
+                            for (o, n) in Rc::make_mut(&mut r.pixels).chunks_exact_mut(4).zip(d.layer.chunks_exact(4)) {
+                                o[..3].copy_from_slice(&n[..3]);
+                            }
+                            r.rev += 1;
+                        }
+                    });
+                    set_copying(state, false);
+                    // Copies taken in another geometry, or settings that
+                    // moved while this develop ran.
+                    refresh_copies(state, item_id);
+                })
+            });
+            if !sent {
+                set_copying(state, false);
+            }
+            sent
+        });
+    };
+    if full_present(item_id) {
+        run();
+    } else {
+        ensure_full(state, item_id, Some(Box::new(run)));
+    }
+}
+
+/// The photo on screen has copies behind its RAW settings: develop them again
+/// once the change has settled. The develop holds the worker for seconds and
+/// preview renders queue behind it, so it waits until the slider is let go.
+/// Called on every preview pass; only a new change starts a wait.
+pub(crate) fn copies_follow(state: AppState, item: &MediaItem) {
+    if copying_to_layer() {
+        return;
+    }
+    let Some((key, _)) = stale_copy(item) else { return };
+    let want = (item.id, key);
+    if COPY_WANT.with(|w| w.replace(want)) == want {
+        return;
+    }
+    spawn_local(async move {
+        loop {
+            sleep_ms(600).await;
+            if COPY_WANT.with(|w| w.get()) != want {
+                return;
+            }
+            if !matches!(web::document().query_selector("input:active"), Ok(Some(_))) {
+                break;
+            }
+        }
+        COPY_WANT.with(|w| w.set((0, 0)));
+        refresh_copies(state, want.0);
+    });
 }
 
 pub(crate) fn selection_to_layer(state: AppState, cut: bool) {
@@ -1186,6 +1310,13 @@ pub(crate) fn selection_to_layer(state: AppState, cut: bool) {
             let Some(sel) = item.edit.selection.clone() else { return false };
             let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
             let item_id = item.id;
+            // A copy of a RAW follows the photo's RAW settings from here on.
+            let live = get_photo(item_id).filter(|p| p.raw).map(|p| state::LiveCopy {
+                rot90: item.edit.rot90,
+                fine_angle: item.edit.fine_angle,
+                strokes: item.edit.strokes.len(),
+                baked: copy_key(&item.edit, &p),
+            });
             set_copying(state, true);
             let sent = pworker::extract(item_id, &recipe, &sel, cut, move |res| {
                 set_copying(state, false);
@@ -1195,11 +1326,15 @@ pub(crate) fn selection_to_layer(state: AppState, cut: bool) {
                             if let Some(m) = v.iter_mut().find(|m| m.id == item_id) {
                                 let nid = m.next_layer_id;
                                 m.next_layer_id += 1;
-                                m.layers.push(Layer::new_raster(nid, r.layer, r.lw, r.lh));
+                                let mut layer = Layer::new_raster(nid, r.layer, r.lw, r.lh);
+                                if let LayerKind::Raster(l) = &mut layer.kind {
+                                    l.live = live;
+                                }
+                                m.layers.push(layer);
                             }
                         });
                         if let Some(c) = r.cut {
-                            destructive_apply(state, item_id, c);
+                            destructive_apply(state, item_id, c, true);
                         }
                     }
                     Ok(None) => {}
@@ -1234,7 +1369,7 @@ pub(crate) fn delete_selection(state: AppState) {
             let item_id = item.id;
             pworker::cut(item_id, &recipe, &sel, move |res| {
                 match res {
-                    Ok(Some(r)) => destructive_apply(state, item_id, r),
+                    Ok(Some(r)) => destructive_apply(state, item_id, r, true),
                     Ok(None) => {}
                     Err(()) => {}
                 }
@@ -1265,7 +1400,7 @@ pub(crate) fn content_fill_selection(state: AppState) {
             let item_id = item.id;
             pworker::fill(item_id, &recipe, &sel, move |res| {
                 match res {
-                    Ok(Some(r)) => destructive_apply(state, item_id, r),
+                    Ok(Some(r)) => destructive_apply(state, item_id, r, false),
                     Ok(None) => {}
                     Err(()) => {}
                 }
@@ -1277,7 +1412,9 @@ pub(crate) fn content_fill_selection(state: AppState) {
 /// Swap an item's cached pixels after a destructive op (worker or sync).
 /// Rotation is baked into the new pixels, so it resets; the crop rect is a
 /// render-time window over the working frame and is deliberately preserved.
-pub(crate) fn destructive_apply(state: AppState, item_id: usize, r: pworker::DestructiveResult) {
+/// `keeps_colour`: the op only cleared alpha (a cut or a delete), so the
+/// pixels a layer copy was taken from are still in the frame.
+pub(crate) fn destructive_apply(state: AppState, item_id: usize, r: pworker::DestructiveResult, keeps_colour: bool) {
     camera_loupe_invalidate(item_id);
     CACHE.with(|c| {
         if let Some(pd) = c.borrow_mut().photos.get_mut(&item_id) {
@@ -1294,6 +1431,18 @@ pub(crate) fn destructive_apply(state: AppState, item_id: usize, r: pworker::Des
     });
     state.items.update(|v| {
         if let Some(m) = v.iter_mut().find(|m| m.id == item_id) {
+            // A copy goes on following the RAW settings only if the new frame
+            // still holds what it was taken from: same turn, same strokes,
+            // colours untouched. The turn and strokes are baked in now.
+            for l in &mut m.layers {
+                let LayerKind::Raster(l) = &mut l.kind else { continue };
+                let e = &m.edit;
+                l.live = l
+                    .live
+                    .take()
+                    .filter(|c| keeps_colour && (c.rot90, c.fine_angle, c.strokes) == (e.rot90, e.fine_angle, e.strokes.len()))
+                    .map(|c| state::LiveCopy { rot90: 0, fine_angle: 0.0, strokes: 0, ..c });
+            }
             m.edit.rot90 = 0;
             m.edit.fine_angle = 0.0;
             // The worker replayed any recorded RAW strokes into the pixels it
@@ -1412,7 +1561,7 @@ pub(crate) fn apply_heal(state: AppState, pts: &[(f32, f32)]) {
             let item_id = item.id;
             pworker::heal(item_id, &recipe, &pts, radius, mode, move |res| {
                 match res {
-                    Ok(Some(r)) => destructive_apply(state, item_id, r),
+                    Ok(Some(r)) => destructive_apply(state, item_id, r, false),
                     Ok(None) => {}
                     Err(()) => {}
                 }
@@ -1490,7 +1639,7 @@ pub(crate) fn apply_clone(state: AppState, pts: &[(f32, f32)]) {
             let item_id = item.id;
             pworker::clone_stamp(item_id, &recipe, &pts, radius, dx, dy, move |res| {
                 match res {
-                    Ok(Some(r)) => destructive_apply(state, item_id, r),
+                    Ok(Some(r)) => destructive_apply(state, item_id, r, false),
                     Ok(None) => {}
                     Err(()) => {}
                 }
@@ -1559,6 +1708,8 @@ fn swap_layer_pixels(state: AppState, layer_id: usize, px: Vec<u8>) {
             if let LayerKind::Raster(r) = &mut l.kind {
                 r.pixels = Rc::new(px);
                 r.rev += 1;
+                // Retouched by hand: developing it again would undo that.
+                r.live = None;
             }
         }
     });

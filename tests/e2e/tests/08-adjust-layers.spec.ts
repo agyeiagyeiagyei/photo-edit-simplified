@@ -211,6 +211,39 @@ async function exportPng(page: Page): Promise<Buffer> {
   return fs.readFileSync((await dl.path())!);
 }
 
+// Mean colour of the middle of an exported PNG, well inside a layer copy made
+// from a 0.25..0.75 rect.
+const exportMiddle = (page: Page, png: Buffer): Promise<number[]> => page.evaluate(async (b64) => {
+  const bin = atob(b64);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  const bmp = await createImageBitmap(new Blob([u8], { type: 'image/png' }));
+  const c = document.createElement('canvas');
+  c.width = 300;
+  c.height = 200;
+  const x = c.getContext('2d')!;
+  x.imageSmoothingQuality = 'high';
+  x.drawImage(bmp, 0, 0, 300, 200);
+  bmp.close();
+  const d = x.getImageData(105, 70, 90, 60).data;
+  const sum = [0, 0, 0];
+  for (let i = 0; i < d.length; i += 4) for (let k = 0; k < 3; k++) sum[k] += d[i + k];
+  return sum.map((v) => v / (d.length / 4));
+}, png.toString('base64'));
+
+// The same region of the canvas on screen.
+const screenMiddle = (page: Page): Promise<number[]> =>
+  canvas(page).evaluate((c: HTMLCanvasElement) => {
+    const [x0, y0] = [Math.round(c.width * 0.35), Math.round(c.height * 0.35)];
+    const [w, h] = [Math.round(c.width * 0.3), Math.round(c.height * 0.3)];
+    const d = c.getContext('2d')!.getImageData(x0, y0, w, h).data;
+    const sum = [0, 0, 0];
+    for (let i = 0; i < d.length; i += 4) for (let k = 0; k < 3; k++) sum[k] += d[i + k];
+    return sum.map((v) => v / (d.length / 4));
+  });
+
+const gap = (a: number[], b: number[]) => Math.max(...a.map((v, i) => Math.abs(v - b[i])));
+
 async function layerSliderValue(page: Page, idx: number): Promise<number> {
   const v = await page.locator('.adjust-editor label.slider').nth(idx).locator('input').inputValue();
   return Number(v);
@@ -579,25 +612,7 @@ test.describe('adjustment layers (issue #26)', () => {
     await importFiles(page, [RAW]);
     await expect(page.locator('.developing-badge')).toHaveCount(0, { timeout: 120_000 });
     await settle(page, 1000);
-    // Mean colour of the middle of an exported PNG, well inside the copy.
-    const middle = (png: Buffer) => page.evaluate(async (b64) => {
-      const bin = atob(b64);
-      const u8 = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-      const bmp = await createImageBitmap(new Blob([u8], { type: 'image/png' }));
-      const c = document.createElement('canvas');
-      c.width = 300;
-      c.height = 200;
-      const x = c.getContext('2d')!;
-      x.imageSmoothingQuality = 'high';
-      x.drawImage(bmp, 0, 0, 300, 200);
-      bmp.close();
-      const d = x.getImageData(105, 70, 90, 60).data;
-      const sum = [0, 0, 0];
-      for (let i = 0; i < d.length; i += 4) for (let k = 0; k < 3; k++) sum[k] += d[i + k];
-      return sum.map((v) => v / (d.length / 4));
-    }, png.toString('base64'));
-    const gap = (a: number[], b: number[]) => Math.max(...a.map((v, i) => Math.abs(v - b[i])));
+    const middle = (png: Buffer) => exportMiddle(page, png);
 
     const camera = await middle(await exportPng(page));
     await clickTab(page, 'RAW');
@@ -628,6 +643,87 @@ test.describe('adjustment layers (issue #26)', () => {
       raw_layer_copy_camera_gap: Math.round(gap(camera, copied) * 100) / 100,
     });
     expect(gap(developed, copied), 'the layer copy does not look like the developed photo it was copied from').toBeLessThanOrEqual(1);
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  // Owner request (21 Nov): layer copies stay up to date with the RAW changes.
+  // A copy used to be a snapshot, so one made before a RAW change kept the
+  // develop of the moment it was made. The copy here is taken at Exposure +1
+  // and the RAW tab then moves on.
+  test('a layer copy of a RAW follows a later RAW change', async ({ page }, testInfo) => {
+    test.skip(!RAW, 'no RAW fixture in dl-raw');
+    test.setTimeout(600_000);
+    const errors = trackErrors(page);
+    await openApp(page);
+    await importFiles(page, [RAW]);
+    const badge = page.locator('.developing-badge');
+    await expect(badge).toHaveCount(0, { timeout: 120_000 });
+    await settle(page, 1000);
+    const toggleCopy = async () => {
+      await clickTab(page, 'Layers');
+      await page.locator('.layer-row .icon-btn').first().click();
+      await settle(page, 800);
+    };
+
+    await clickTab(page, 'RAW');
+    await setRange(page, /^Exposure/, 1);
+    await settle(page, 1000);
+    await selectTool(page, 'Rect');
+    await rectDrag(page, 0.25, 0.25, 0.75, 0.75);
+    await page.locator('.select-row button', { hasText: /^Copy to layer$/ }).click();
+    await clickTab(page, 'Layers');
+    await expect(page.locator('.layer-row')).toHaveCount(1, { timeout: 120_000 });
+    await expect(badge).toHaveCount(0, { timeout: 30_000 });
+    await settle(page, 1000);
+    const made = await exportMiddle(page, await exportPng(page));
+
+    // An export started right after the change already carries the copy
+    // developed again: it does not wait for the preview to catch up.
+    await clickTab(page, 'RAW');
+    await setRange(page, /^Exposure/, -1);
+    const followed = await exportMiddle(page, await exportPng(page));
+    await toggleCopy();
+    const photo = await exportMiddle(page, await exportPng(page));
+    await toggleCopy();
+    expect(gap(made, photo), 'Exposure -1 should change the export').toBeGreaterThan(8);
+    expect(gap(photo, followed), 'the exported copy kept the develop it was made with').toBeLessThanOrEqual(1);
+
+    // On screen the copy follows once the change has settled.
+    await clickTab(page, 'RAW');
+    await page.evaluate(() => (window as any).__pes.reset());
+    await setRange(page, /^Exposure/, 0.5);
+    await waitMark(page, 'worker.redevelop', 0, 120_000);
+    await expect(badge).toHaveCount(0, { timeout: 30_000 });
+    await settle(page, 1000);
+    const shown = await screenMiddle(page);
+    await toggleCopy();
+    const under = await screenMiddle(page);
+    await toggleCopy();
+    expect(gap(shown, under), 'the copy on screen is not the photo under it').toBeLessThanOrEqual(4);
+
+    // A reload brings the copy back at its latest develop, with nothing to
+    // develop again: its pixels were stored after the change, with the
+    // develop they hold. Wait for a session save that began after it.
+    await expect.poll(() => page.evaluate(() => {
+      const p = (window as any).__pes.perf() as { name: string; at: number; dur_ms: number }[];
+      const last = p.filter((e) => e.name === 'worker.redevelop').pop();
+      return !!last && p.some((e) => e.name === 'session.persist' && e.at - e.dur_ms > last.at);
+    }), { timeout: 120_000 }).toBe(true);
+    await page.reload();
+    await expect(thumbs(page)).toHaveCount(1, { timeout: 60_000 });
+    await expect(page.locator('.overlay')).toHaveCount(0, { timeout: 60_000 });
+    await expect(badge).toHaveCount(0, { timeout: 120_000 });
+    await settle(page, 1500);
+    const restored = await screenMiddle(page);
+    await toggleCopy();
+    const restoredUnder = await screenMiddle(page);
+    expect(gap(restored, restoredUnder), 'the restored copy is not the photo under it').toBeLessThanOrEqual(4);
+    expect(await markCount(page, 'worker.redevelop'), 'the reload developed the copy again').toBe(0);
+    recordMetrics(testInfo, {
+      raw_layer_copy_follow_export_gap: Math.round(gap(photo, followed) * 100) / 100,
+      raw_layer_copy_follow_screen_gap: Math.round(gap(shown, under) * 100) / 100,
+      raw_layer_copy_follow_reload_gap: Math.round(gap(restored, restoredUnder) * 100) / 100,
+    });
     expect(errors, errors.join('\n')).toEqual([]);
   });
 

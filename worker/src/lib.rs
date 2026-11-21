@@ -1412,11 +1412,9 @@ pub fn fill_selection(
 /// The photo as its RAW settings develop it, at working size and before any
 /// colour edit: the pixels a layer copy carries. The stored frame is the
 /// camera rendering, so a copy taken from it would show the photo without its
-/// white balance, exposure, denoise and sharpening. `None` without a develop.
-fn developed_frame(id: u32, edit: &EditParams) -> Result<Option<Vec<u8>>, JsValue> {
-    if edit.raw.is_identity() {
-        return Ok(None);
-    }
+/// white balance, exposure, denoise and sharpening. `legacy` keeps the
+/// develop on the 8-bit path, for a copy of a photo that renders there.
+fn developed_frame(id: u32, edit: &EditParams, legacy: bool) -> Result<(Vec<u8>, usize, usize), JsValue> {
     let (fw, fh) = BUFFERS
         .with(|b| b.borrow().get(&id).map(|(_, w, h)| (*w, *h)))
         .ok_or_else(|| JsValue::from_str("not loaded"))?;
@@ -1428,8 +1426,28 @@ fn developed_frame(id: u32, edit: &EditParams) -> Result<Option<Vec<u8>>, JsValu
         ..EditParams::default()
     };
     let (ww, wh) = working_dims(fw, fh, &only);
-    let (px, _, _) = export_pixels(id, fw, fh, &only, (0, 0, ww, wh), ww, wh, None, None)?;
-    Ok(Some(px))
+    export_pixels(id, fw, fh, &only, (0, 0, ww, wh), ww, wh, None, None, legacy)
+}
+
+/// A layer copy's pixels again, for the photo's RAW settings as they are now.
+/// A copy is the photo's own pixels, so it follows the develop as the photo
+/// does; the app keeps the copy's alpha and takes these colours. The copy
+/// keeps the turn, straighten and retouch strokes it was taken with, and its
+/// develop takes the path the photo itself renders on, so the two keep one
+/// look. Returns {layer, lw, lh} as `extract` does.
+#[wasm_bindgen]
+pub fn redevelop(id: u32, recipe: &str, rot90: u8, fine_angle: f32, strokes: u32) -> Result<JsValue, JsValue> {
+    let mut edit = parse_edit(id, recipe);
+    let legacy = neutral_dims(id, &edit).is_none();
+    edit.rot90 = rot90;
+    edit.fine_angle = fine_angle;
+    edit.strokes.truncate(strokes as usize);
+    let (px, w, h) = developed_frame(id, &edit, legacy)?;
+    Ok(result_obj(&[
+        ("layer", js_buf(px)),
+        ("lw", (w as u32).into()),
+        ("lh", (h as u32).into()),
+    ]))
 }
 
 /// Extract the selection as a full-size RGBA layer (alpha-masked pixels at
@@ -1445,7 +1463,12 @@ pub fn extract(
     also_cut: bool,
 ) -> Result<JsValue, JsValue> {
     let edit = parse_edit(id, recipe);
-    let developed = developed_frame(id, &edit)?;
+    // Without a develop the stored frame is the photo: the path below.
+    let developed = if edit.raw.is_identity() {
+        None
+    } else {
+        Some(developed_frame(id, &edit, false)?.0)
+    };
     with_buffer(id, |(full, fw, fh)| {
         let (base, w, h) = geometry(full, *fw, *fh, &edit);
         let mut base = base.into_owned();
@@ -1824,6 +1847,7 @@ fn export_mask(
 /// Render exactly the export rectangle at export dims. The rect is in working
 /// coordinates (the app derives it from dims + crop + aspect lock); the worker
 /// applies geometry, crop, resample and the full develop/colour pipeline.
+/// `legacy` renders on the 8-bit path even when the neutral one could.
 fn export_pixels(
     id: u32,
     fw: usize,
@@ -1834,6 +1858,7 @@ fn export_pixels(
     eh: usize,
     sel_json: Option<String>,
     sel_mask: Option<Uint8Array>,
+    legacy: bool,
 ) -> Result<(Vec<u8>, usize, usize), JsValue> {
     let (ww, wh) = working_dims(fw, fh, edit);
     let (cx, cy, cw, ch) = rect;
@@ -1844,12 +1869,13 @@ fn export_pixels(
     // coordinates their selections are normalized to.
     let rebased = pipeline::rebase_layer_masks(edit, ww, wh, rect, ew, eh);
     let edit = &rebased;
-    let neutral = NEUTRAL.with(|n| {
-        n.borrow()
-            .get(&id)
-            .is_some_and(|n| n.w == fw && n.h == fh)
-            && pipeline::neutral_eligible(edit)
-    });
+    let neutral = !legacy
+        && NEUTRAL.with(|n| {
+            n.borrow()
+                .get(&id)
+                .is_some_and(|n| n.w == fw && n.h == fh)
+                && pipeline::neutral_eligible(edit)
+        });
     if neutral {
         let (mut buf, out_w, out_h) = NEUTRAL.with(|n| {
             let n = n.borrow();
@@ -1979,6 +2005,7 @@ pub fn export_photo(
         eh as usize,
         sel_json,
         sel_mask,
+        false,
     )?;
     let bytes = if format == 1 {
         encode_png_slice(&px, out_w as u32, out_h as u32)?

@@ -93,8 +93,10 @@ pub(crate) struct ItemSig {
     pub(crate) ord: usize,
     pub(crate) recipe: Option<String>,
     pub(crate) layers: Option<String>,
-    /// Raster layer ids whose pixel PNGs are already stored.
-    pub(crate) raster_layers: Vec<usize>,
+    /// Raster layers whose pixel PNGs are already stored: id and pixel
+    /// revision, so pixels that change in place (a retouch, a copy developed
+    /// again after a RAW change) are stored again.
+    pub(crate) raster_layers: Vec<(usize, u64)>,
     pub(crate) exif_len: usize,
     pub(crate) drive_file_id: Option<String>,
     pub(crate) drive_parent_id: Option<String>,
@@ -129,10 +131,13 @@ pub(crate) fn item_sig(item: &MediaItem, ord: usize) -> ItemSig {
         MediaKind::Photo if is_raw => BytesSig::Raw(raw_len, gen),
         MediaKind::Photo => BytesSig::Photo(item.object_url.clone(), gen),
     };
-    let mut raster_layers: Vec<usize> = item
+    let mut raster_layers: Vec<(usize, u64)> = item
         .layers
         .iter()
-        .filter_map(|l| matches!(l.kind, LayerKind::Raster(_)).then_some(l.id))
+        .filter_map(|l| match &l.kind {
+            LayerKind::Raster(r) => Some((l.id, r.rev)),
+            _ => None,
+        })
         .collect();
     raster_layers.sort_unstable();
     ItemSig {
@@ -331,20 +336,21 @@ pub(crate) async fn persist_session(state: AppState) {
 
         // Raster layer pixel PNGs: store once per layer id (immutable), drop
         // records for layers that no longer exist.
-        let prev_rasters: Vec<usize> = prev.map(|p| p.raster_layers).unwrap_or_default();
+        let prev_rasters: Vec<(usize, u64)> = prev.map(|p| p.raster_layers).unwrap_or_default();
         for layer in &item.layers {
             let LayerKind::Raster(r) = &layer.kind else { continue };
-            if prev_rasters.contains(&layer.id) {
+            if prev_rasters.contains(&(layer.id, r.rev)) {
                 continue;
             }
             match pixels_to_png_blob(&r.pixels, r.width, r.height).await {
                 Ok(b) => {
-                    let _ = session::put_layer_pixels(&db, item.id, layer.id, b.as_ref()).await;
+                    let baked = r.live.map_or(0, |c| c.baked);
+                    let _ = session::put_layer_pixels(&db, item.id, layer.id, b.as_ref(), baked).await;
                 }
                 Err(e) => web::log(&format!("layer pixels: {}", js_err(&e))),
             }
         }
-        for old in prev_rasters.iter().filter(|id| !sig.raster_layers.contains(id)) {
+        for (old, _) in prev_rasters.iter().filter(|(id, _)| !sig.raster_layers.iter().any(|(i, _)| i == id)) {
             let _ = session::delete_layer_pixel(&db, item.id, *old).await;
         }
         let healed_raw = healed && matches!(sig.bytes, BytesSig::Raw(_, _));
@@ -433,9 +439,15 @@ pub(crate) fn restore_session(state: AppState) {
             // Fill raster layer pixels from their PNG blobs.
             for layer in &mut layers {
                 let LayerKind::Raster(r) = &mut layer.kind else { continue };
-                let Ok(Some(px_v)) = session::get_layer_pixels(&db, id, layer.id).await else {
+                let Ok(Some(px_v)) = session::get_layer_pixels(&db, id, layer.id, false).await else {
                     continue;
                 };
+                if let Some(c) = &mut r.live {
+                    // The develop these pixels hold; 0 (not known) has the
+                    // copy developed again on view.
+                    let baked = session::get_layer_pixels(&db, id, layer.id, true).await;
+                    c.baked = baked.ok().flatten().and_then(|v| v.as_f64()).unwrap_or(0.0) as u64;
+                }
                 let Ok(px_blob) = px_v.dyn_into::<Blob>() else { continue };
                 if let Ok((img, _)) = web::load_image(&px_blob).await {
                     let (px, pw, ph) = web::rgba_from_image(&img);

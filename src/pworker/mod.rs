@@ -1259,6 +1259,35 @@ pub fn fill(
     destructive_call("fill_selection", args, transfer, cb)
 }
 
+/// The reply to `extract` and `redevelop`: a layer's pixels, with the
+/// destructive result when the op also cut.
+fn layer_reply(cb: Box<dyn FnOnce(Result<Option<ExtractResult>, ()>)>) -> Box<dyn FnOnce(Reply)> {
+    Box::new(move |reply| {
+        let out = match reply {
+            Ok(v) if v.is_null() || v.is_undefined() => Ok(None),
+            Ok(v) => {
+                let parsed = match (
+                    get_buf(&v, "layer"),
+                    get_u32(&v, "lw"),
+                    get_u32(&v, "lh"),
+                ) {
+                    (Some(layer), Some(lw), Some(lh)) => Some(ExtractResult {
+                        layer: layer.to_vec(),
+                        lw: lw as usize,
+                        lh: lh as usize,
+                        cut: parse_destructive(&v),
+                    }),
+                    _ => None,
+                };
+                parsed.map(Some).ok_or(())
+            }
+            Err(_) => Err(()),
+        };
+        cb(out);
+        op_done();
+    })
+}
+
 pub fn extract(
     id: usize,
     recipe: &str,
@@ -1270,35 +1299,25 @@ pub fn extract(
     let mut args = vec![JsValue::from(id as u32), JsValue::from_str(recipe)];
     args.extend(sargs);
     args.push(JsValue::from(also_cut));
-    call(
-        "extract",
-        &args,
-        &transfer,
-        Box::new(move |reply| {
-            let out = match reply {
-                Ok(v) if v.is_null() || v.is_undefined() => Ok(None),
-                Ok(v) => {
-                    let parsed = match (
-                        get_buf(&v, "layer"),
-                        get_u32(&v, "lw"),
-                        get_u32(&v, "lh"),
-                    ) {
-                        (Some(layer), Some(lw), Some(lh)) => Some(ExtractResult {
-                            layer: layer.to_vec(),
-                            lw: lw as usize,
-                            lh: lh as usize,
-                            cut: parse_destructive(&v),
-                        }),
-                        _ => None,
-                    };
-                    parsed.map(Some).ok_or(())
-                }
-                Err(_) => Err(()),
-            };
-            cb(out);
-            op_done();
-        }),
-    )
+    call("extract", &args, &transfer, layer_reply(Box::new(cb)))
+}
+
+/// A layer copy's pixels for the photo's RAW settings as they are now, in
+/// the geometry and with the retouch strokes the copy was taken with.
+pub fn redevelop(
+    id: usize,
+    recipe: &str,
+    from: &crate::state::LiveCopy,
+    cb: impl FnOnce(Result<Option<ExtractResult>, ()>) + 'static,
+) -> bool {
+    let args = [
+        JsValue::from(id as u32),
+        JsValue::from_str(recipe),
+        JsValue::from(from.rot90),
+        JsValue::from(from.fine_angle),
+        JsValue::from(from.strokes as u32),
+    ];
+    call("redevelop", &args, &[], layer_reply(Box::new(cb)))
 }
 
 /// Queue a destructive op. `op` calls one of the destructive fns above and

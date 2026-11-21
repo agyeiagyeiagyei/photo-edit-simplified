@@ -60,6 +60,20 @@ pub(crate) async fn render_photo_export(
             web::view_to_blob(&bytes, if png { "image/png" } else { "image/jpeg" }).ok()
         })
     } else {
+        // Layer copies taken before the last RAW change are developed again
+        // first, so the file never carries a copy the preview has not caught
+        // up on yet.
+        refresh_copies(state, id);
+        for _ in 0..1200 {
+            if !copying_to_layer() {
+                break;
+            }
+            sleep_ms(50).await;
+        }
+        let layers = state
+            .items
+            .with_untracked(|v| v.iter().find(|m| m.id == id).map(|m| m.layers.clone()))
+            .unwrap_or_default();
         // Layers composite on a canvas, so the edited base has to land here at
         // working resolution: one worker render, then crop+scale into the
         // export canvas.
@@ -78,7 +92,7 @@ pub(crate) async fn render_photo_export(
         .await?;
         let base = web::create_canvas(frame.w, frame.h);
         web::put_pixels_view(&base, &frame.pixels, frame.w, frame.h);
-        composite_stack(&base, item.id, &item.layers, frame.w as usize, frame.h as usize);
+        composite_stack(&base, item.id, &layers, frame.w as usize, frame.h as usize);
         let out = web::create_canvas(ew as u32, eh as u32);
         web::ctx2d(&out)
             .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
