@@ -20,7 +20,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 use pes_pixel::geo::{
-    crop_px, geometry, geometry_wide, hi_target, replay_strokes, stamp_stroke, working_dims,
+    crop_px, geometry, geometry_wide, hi_target, replay_strokes_from, stamp_stroke, strokes_fingerprint, working_dims,
 };
 use pes_pixel::pipeline::{self, Frame, Place, Target};
 use pes_pixel::rawops;
@@ -186,7 +186,7 @@ impl DevelopedKey {
             legacy: false,
             rot90: edit.rot90,
             fine_bits: edit.fine_angle.to_bits(),
-            strokes_fp: strokes_fingerprint(edit),
+            strokes_fp: strokes_fingerprint(&edit.strokes),
             crop,
             tw,
             th,
@@ -497,8 +497,8 @@ fn parse_edit(id: u32, recipe: &str) -> EditParams {
 
 /// Fill worker-side mask references from the mask cache. A layer whose
 /// reference does not match in version or dims is disabled: applying it
-/// without its mask would paint the whole frame. A recorded cut left without
-/// its raster removes nothing.
+/// without its mask would paint the whole frame. A recorded cut or fill left
+/// without its raster does nothing.
 fn resolve_adjust_masks(id: u32, edit: &mut EditParams) {
     for layer in &mut edit.adjust_layers {
         if let Some(sel) = &mut layer.mask {
@@ -508,7 +508,7 @@ fn resolve_adjust_masks(id: u32, edit: &mut EditParams) {
         }
     }
     for s in &mut edit.strokes {
-        if let Some(e) = &mut s.erase {
+        if let Some(e) = &mut s.area {
             resolve_mask(id, e.id, 0, &mut e.sel);
         }
     }
@@ -537,37 +537,6 @@ fn resolve_mask(id: u32, key: u64, version: u64, sel: &mut Selection) -> bool {
     }
 }
 
-/// Stable fingerprint of the retouch strokes, for the render cache keys.
-fn strokes_fingerprint(edit: &EditParams) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut mix = |v: u64| {
-        h ^= v;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    };
-    for s in &edit.strokes {
-        if let Some(e) = &s.erase {
-            mix(e.id);
-            mix(e.rot90 as u64);
-            mix(e.fine_angle.to_bits() as u64);
-        }
-        mix(s.mode as u64);
-        mix(s.radius.to_bits() as u64);
-        mix(s.seed as u64);
-        mix(s.pts.len() as u64);
-        for p in &s.pts {
-            mix(p.0.to_bits() as u64);
-            mix(p.1.to_bits() as u64);
-        }
-        let src = s.src;
-        mix(src.is_some() as u64);
-        if let Some((x, y)) = src {
-            mix(x.to_bits() as u64);
-            mix(y.to_bits() as u64);
-        }
-    }
-    h
-}
-
 /// Geometry + resample front half of the render pipeline, with the base
 /// cache. Returns pre-develop, pre-colour pixels.
 fn base_pipeline(
@@ -586,7 +555,7 @@ fn base_pipeline(
     let (ww, wh) = working_dims(fw, fh, edit);
     let (tw, th) = hi_target(req_w, req_h, ww, wh, max_edge);
     let fine_bits = edit.fine_angle.to_bits();
-    let strokes_fp = strokes_fingerprint(edit);
+    let strokes_fp = strokes_fingerprint(&edit.strokes);
     let cached = BASE_CACHE.with(|c| {
         c.borrow().as_ref().is_some_and(|b| {
             b.id == id
@@ -612,7 +581,7 @@ fn base_pipeline(
             p
         } else {
             let mut owned = p.into_owned();
-            replay_strokes(&mut owned, gw, gh, fw, fh, edit);
+            replay_strokes_from(&mut owned, gw, gh, Some(full), fw, fh, edit);
             std::borrow::Cow::Owned(owned)
         };
         let buf = pipeline::resize(&p, gw, gh, Target::new(tw, th)).pixels;
@@ -718,7 +687,7 @@ fn retouched_wide<'a>(
         return (p, gw, gh);
     }
     let mut owned = p.into_owned();
-    replay_strokes(&mut owned, gw, gh, fw, fh, edit);
+    replay_strokes_from(&mut owned, gw, gh, Some(neutral), fw, fh, edit);
     (std::borrow::Cow::Owned(owned), gw, gh)
 }
 
@@ -738,7 +707,7 @@ fn wide_base_pipeline(
     let (ww, wh) = working_dims(fw, fh, edit);
     let (tw, th) = hi_target(req_w, req_h, ww, wh, max_edge);
     let fine_bits = edit.fine_angle.to_bits();
-    let strokes_fp = strokes_fingerprint(edit);
+    let strokes_fp = strokes_fingerprint(&edit.strokes);
     let cached = WIDE_BASE_CACHE.with(|c| {
         c.borrow().as_ref().is_some_and(|b| {
             b.id == id
@@ -792,7 +761,7 @@ fn wide_window_pipeline(
     let t0 = js_sys::Date::now();
     let Win { rect: (cx, cy, cw, ch), tw, th } = win;
     let fine_bits = edit.fine_angle.to_bits();
-    let strokes_fp = strokes_fingerprint(edit);
+    let strokes_fp = strokes_fingerprint(&edit.strokes);
     let cached = WIDE_WINDOW_CACHE.with(|c| {
         c.borrow().as_ref().is_some_and(|w| {
             w.id == id
@@ -1120,7 +1089,7 @@ fn render_window_pipeline(
     let rebased = pipeline::rebase_layer_masks(edit, ww, wh, (cx, cy, cw, ch), tw, th);
     let edit = &rebased;
     let fine_bits = edit.fine_angle.to_bits();
-    let strokes_fp = strokes_fingerprint(edit);
+    let strokes_fp = strokes_fingerprint(&edit.strokes);
     let cached = WINDOW_CACHE.with(|c| {
         c.borrow().as_ref().is_some_and(|w| {
             w.id == id
@@ -1145,7 +1114,7 @@ fn render_window_pipeline(
             p
         } else {
             let mut owned = p.into_owned();
-            replay_strokes(&mut owned, gw, gh, fw, fh, edit);
+            replay_strokes_from(&mut owned, gw, gh, Some(full), fw, fh, edit);
             std::borrow::Cow::Owned(owned)
         };
         // Identity geometry borrows the stored frame: copy only the window's
@@ -1351,7 +1320,7 @@ pub fn heal_stroke(
         let edit = parse_edit(id, recipe);
         let (base, w, h) = geometry(full, *fw, *fh, &edit);
         let mut base = base.into_owned();
-        replay_strokes(&mut base, w, h, *fw, *fh, &edit);
+        replay_strokes_from(&mut base, w, h, Some(&full[..]), *fw, *fh, &edit);
         let diag = ((w * w + h * h) as f32).sqrt();
         let r = (radius_frac * diag).max(1.0);
         let pts = parse_pts(pts);
@@ -1380,7 +1349,7 @@ pub fn clone_stamp(
         let edit = parse_edit(id, recipe);
         let (base, w, h) = geometry(full, *fw, *fh, &edit);
         let mut base = base.into_owned();
-        replay_strokes(&mut base, w, h, *fw, *fh, &edit);
+        replay_strokes_from(&mut base, w, h, Some(&full[..]), *fw, *fh, &edit);
         let diag = ((w * w + h * h) as f32).sqrt();
         let r = (radius_frac * diag).max(1.0);
         let pts = parse_pts(pts);
@@ -1411,7 +1380,7 @@ pub fn cut(
         let edit = parse_edit(id, recipe);
         let (base, w, h) = geometry(full, *fw, *fh, &edit);
         let mut base = base.into_owned();
-        replay_strokes(&mut base, w, h, *fw, *fh, &edit);
+        replay_strokes_from(&mut base, w, h, Some(&full[..]), *fw, *fh, &edit);
         let Some(sel) = selection_from_json(sel_json, sel_mask.map(|m| m.to_vec())) else {
             return JsValue::NULL;
         };
@@ -1434,7 +1403,7 @@ pub fn fill_selection(
         let edit = parse_edit(id, recipe);
         let (base, w, h) = geometry(full, *fw, *fh, &edit);
         let mut base = base.into_owned();
-        replay_strokes(&mut base, w, h, *fw, *fh, &edit);
+        replay_strokes_from(&mut base, w, h, Some(&full[..]), *fw, *fh, &edit);
         let Some(sel) = selection_from_json(sel_json, sel_mask.map(|m| m.to_vec())) else {
             return JsValue::NULL;
         };
@@ -1445,6 +1414,21 @@ pub fn fill_selection(
         commit(id, full, fw, fh, &base, w, h);
         destructive_result(&base, w, h)
     })
+}
+
+/// Whether the Content fill that ends the recipe's retouch list finds pixels
+/// to copy, on the frame this photo renders from. A RAW's fill is recorded,
+/// not written (#69): the app asks first, and records it on a yes. The fill
+/// is kept, so the render that follows pastes it.
+#[wasm_bindgen]
+pub fn try_fill(id: u32, recipe: &str) -> Result<bool, JsValue> {
+    let edit = parse_edit(id, recipe);
+    if let Some((fw, fh)) = neutral_dims(id, &edit) {
+        return Ok(NEUTRAL.with(|n| {
+            n.borrow().get(&id).is_some_and(|f| pes_pixel::geo::try_fill(&f.pixels, fw, fh, &edit))
+        }));
+    }
+    with_buffer(id, |(full, fw, fh)| pes_pixel::geo::try_fill(full, *fw, *fh, &edit))
 }
 
 /// The photo as its RAW settings develop it, at working size and before any
@@ -1510,16 +1494,22 @@ pub fn extract(
     with_buffer(id, |(full, fw, fh)| {
         let (base, w, h) = geometry(full, *fw, *fh, &edit);
         let mut base = base.into_owned();
-        replay_strokes(&mut base, w, h, *fw, *fh, &edit);
+        let developed = developed.filter(|d| d.len() == base.len());
+        // The developed frame has the retouch list in it, holes included.
+        // The stored frame needs the list only where its pixels are used: a
+        // replay there would synthesise every recorded fill a second time.
+        if developed.is_none() || also_cut {
+            replay_strokes_from(&mut base, w, h, Some(&full[..]), *fw, *fh, &edit);
+        }
         let Some(sel) = selection_from_json(sel_json, sel_mask.map(|m| m.to_vec())) else {
             return JsValue::NULL;
         };
         let mask = ops::selection_mask(&sel, w, h);
-        let layer = match developed.filter(|d| d.len() == base.len()) {
-            // The developed colours, under the stored frame's alpha.
+        let layer = match developed {
+            // The developed colours and their alpha, inside the selection.
             Some(mut d) => {
-                for ((px, b), m) in d.chunks_exact_mut(4).zip(base.chunks_exact(4)).zip(&mask) {
-                    px[3] = (b[3] as f32 * (*m as f32 / 255.0)).min(255.0) as u8;
+                for (px, m) in d.chunks_exact_mut(4).zip(&mask) {
+                    px[3] = (px[3] as f32 * (*m as f32 / 255.0)).min(255.0) as u8;
                 }
                 d
             }
@@ -1962,7 +1952,7 @@ fn export_pixels(
             p
         } else {
             let mut owned = p.into_owned();
-            replay_strokes(&mut owned, gw, gh, fw, fh, edit);
+            replay_strokes_from(&mut owned, gw, gh, Some(full), fw, fh, edit);
             std::borrow::Cow::Owned(owned)
         };
         let win = if (cx, cy, cw, ch) == (0, 0, gw, gh) {

@@ -904,6 +904,15 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             }
         }
         if want_hi {
+            // A recorded Content fill is synthesised on the frame the render
+            // starts from, and the display proxy's is not the sensor frame's:
+            // show the fill the export has.
+            if photo.raw
+                && !full_present(item.id)
+                && item.edit.strokes.iter().any(|s| s.mode == pes_pixel::types::RetouchStroke::FILL)
+            {
+                ensure_full(state, item.id, None);
+            }
             if windowed_view && !post_adjust {
                 let (_, _, fcw, fch) = rect_px(&img_win, fw, fh);
                 // Zoomed in past what a RAW's display proxy holds: load the
@@ -1731,7 +1740,9 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     >
                         <canvas node_ref=canvas_ref></canvas>
                         <Show when=move || raw_develop_pending(state) fallback=|| ()>
-                            <div class="developing-badge" role="status" aria-live="polite">"Developing RAW…"</div>
+                            <div class="developing-badge" role="status" aria-live="polite">
+                                {move || if state.current().is_some_and(|i| crate::render::filling(i.id)) { "Filling…" } else { "Developing RAW…" }}
+                            </div>
                         </Show>
                         <Show when=move || tab.get() == Tab::Crop fallback=|| ()>
                             <CropOverlay state=state working=working drag=crop_drag pinch=crop_pinch/>
@@ -2284,6 +2295,10 @@ fn raw_develop_pending(state: AppState) -> bool {
     // again after a RAW change. A RAW that was cut is restored as a plain
     // image that still carries its RAW settings.
     if (photo.raw || !item.edit.raw.is_identity()) && crate::render::copying_to_layer() {
+        return true;
+    }
+    // A Content fill of a RAW is being worked out.
+    if crate::render::filling(item.id) {
         return true;
     }
     if !photo.raw || photo.full {

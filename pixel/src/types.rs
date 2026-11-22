@@ -205,14 +205,14 @@ impl RawAdjust {
 }
 
 /// One non-destructive retouch on a RAW photo: a Heal or Clone stroke, or a
-/// recorded Cut or Delete ([`Erase`]). Points and clone source are
-/// original-image normalized (0..1), so a stroke survives geometry changes;
-/// the worker replays the list in order right after `geometry()` on the
-/// working frame.
+/// recorded Cut, Delete or Content fill (an [`Area`]). Points and clone
+/// source are original-image normalized (0..1), so a stroke survives geometry
+/// changes; the worker replays the list in order right after `geometry()` on
+/// the working frame.
 #[derive(Clone, PartialEq, Debug)]
 pub struct RetouchStroke {
     /// 0 = ContentAware, 1 = SmoothFill, 2 = ProximityMatch, 3 = Clone,
-    /// 4 = Erase.
+    /// 4 = Erase, 5 = Fill.
     pub mode: u8,
     /// Brush radius as a fraction of the working-frame diagonal.
     pub radius: f32,
@@ -225,20 +225,23 @@ pub struct RetouchStroke {
     pub src: Option<(f32, f32)>,
     /// Deterministic seed for Content-aware's texture search.
     pub seed: u32,
-    /// Set on an [`Self::ERASE`] entry, which has no path of its own.
-    pub erase: Option<Erase>,
+    /// Set on an [`Self::ERASE`] or [`Self::FILL`] entry, which has no path
+    /// of its own: the selection it was applied to.
+    pub area: Option<Area>,
 }
 
-/// A Cut or Delete on a RAW, recorded instead of written into the pixels so
-/// the photo keeps its develop (#69). The replay clears alpha under the
-/// selection and leaves the colours alone.
+/// The selection of a Cut, Delete or Content fill on a RAW. These are
+/// recorded instead of written into the pixels, so the photo keeps its
+/// develop (#69). The replay of an erase clears alpha under the selection
+/// and leaves the colours alone; the replay of a fill synthesises it from
+/// the pixels around it.
 #[derive(Clone, PartialEq, Debug)]
-pub struct Erase {
-    /// Unique per erase: tells two of them apart in cache keys and names the
+pub struct Area {
+    /// Unique per entry: tells two of them apart in cache keys and names the
     /// raster of a mask selection in the worker's mask cache.
     pub id: u64,
-    /// The selection that was removed, in the working frame of `rot90` and
-    /// `fine_angle`: the turn and straighten the photo had at the time.
+    /// The selection, in the working frame of `rot90` and `fine_angle`: the
+    /// turn and straighten the photo had at the time.
     pub sel: Selection,
     pub rot90: u8,
     pub fine_angle: f32,
@@ -250,10 +253,26 @@ impl RetouchStroke {
     pub const PROXIMITY_MATCH: u8 = 2;
     pub const CLONE: u8 = 3;
     pub const ERASE: u8 = 4;
+    pub const FILL: u8 = 5;
 
     /// The retouch-list entry for a Cut or Delete.
-    pub fn erase(erase: Erase) -> Self {
-        RetouchStroke { mode: Self::ERASE, radius: 0.0, pts: Vec::new(), src: None, seed: 0, erase: Some(erase) }
+    pub fn erase(area: Area) -> Self {
+        Self::on_area(Self::ERASE, area)
+    }
+
+    /// The retouch-list entry for a Content fill.
+    pub fn fill(area: Area) -> Self {
+        Self::on_area(Self::FILL, area)
+    }
+
+    /// An entry of `mode` ([`Self::ERASE`] or [`Self::FILL`]) on `area`.
+    pub fn on_area(mode: u8, area: Area) -> Self {
+        RetouchStroke { mode, radius: 0.0, pts: Vec::new(), src: None, seed: 0, area: Some(area) }
+    }
+
+    /// The area of a recorded Cut or Delete.
+    pub fn erased(&self) -> Option<&Area> {
+        self.area.as_ref().filter(|_| self.mode == Self::ERASE)
     }
 
     /// True when this stroke samples from `src` rather than synthesising.

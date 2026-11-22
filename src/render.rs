@@ -777,6 +777,9 @@ pub(crate) struct PreviewGeo {
 }
 
 thread_local! {
+    /// [`preview_filled`]'s last result, by (item, preview generation, fills).
+    #[allow(clippy::type_complexity)]
+    static PREVIEW_FILLED: RefCell<Option<((usize, u64, u64), Rc<Vec<u8>>)>> = const { RefCell::new(None) };
     pub(crate) static HI_CACHE: RefCell<Option<HiCache>> = const { RefCell::new(None) };
     /// Crop-window render for the cropped view (separate from the whole-frame
     /// cache: it holds a different region at a different density).
@@ -802,17 +805,51 @@ thread_local! {
     pub(crate) static GPU_BASE_REQ: RefCell<Option<gpu::BaseKey>> = const { RefCell::new(None) };
 }
 
+/// The stored 1024px preview with the recorded Content fills of a RAW made on
+/// it (#69), kept until a fill is added or the preview changes. None when
+/// the photo has no fill. The fills run before the turn and straighten, so a
+/// straighten drag does not make them again at each step.
+fn preview_filled(
+    item_id: usize,
+    photo_gen: u64,
+    preview: &(Vec<u8>, usize, usize),
+    edit: &EditParams,
+) -> Option<Rc<Vec<u8>>> {
+    use pes_pixel::types::RetouchStroke;
+    let fills = edit
+        .strokes
+        .iter()
+        .filter(|s| s.mode == RetouchStroke::FILL)
+        .filter_map(|s| s.area.as_ref())
+        .fold(0u64, |h, a| h.wrapping_mul(31).wrapping_add(a.id));
+    if fills == 0 {
+        return None;
+    }
+    let key = (item_id, photo_gen, fills);
+    PREVIEW_FILLED.with(|c| {
+        let mut c = c.borrow_mut();
+        if let Some((_, p)) = c.as_ref().filter(|(k, _)| *k == key) {
+            return Some(p.clone());
+        }
+        let mut p = preview.0.clone();
+        pes_pixel::geo::replay_fills(&mut p, preview.1, preview.2, edit);
+        let p = Rc::new(p);
+        *c = Some((key, p.clone()));
+        Some(p)
+    })
+}
+
 /// Geometry applied to the 1024px preview, cached across renders, with the
-/// recorded cuts of a RAW (#69): without them this frame would show a hole
-/// filled in until the sharp frame replaces it. None when it is the stored
-/// preview as it is.
+/// recorded cuts and fills of a RAW (#69): without them this frame would show
+/// a hole filled in, or a filled area as it was, until the sharp frame
+/// replaces it. None when it is the stored preview as it is.
 pub(crate) fn preview_geometry_cached(
     item_id: usize,
     photo_gen: u64,
     preview: &(Vec<u8>, usize, usize),
     edit: &EditParams,
 ) -> Option<(Rc<Vec<u8>>, usize, usize)> {
-    let cuts = edit.strokes.iter().filter_map(|s| s.erase.as_ref()).fold(0u64, |h, e| h.wrapping_mul(31).wrapping_add(e.id));
+    let cuts = edit.strokes.iter().filter_map(|s| s.area.as_ref()).fold(0u64, |h, e| h.wrapping_mul(31).wrapping_add(e.id));
     if edit.rot90.is_multiple_of(4) && edit.fine_angle.abs() <= 0.01 && cuts == 0 {
         return None;
     }
@@ -829,7 +866,8 @@ pub(crate) fn preview_geometry_cached(
                 return Some((g.pixels.clone(), g.w, g.h));
             }
         }
-        let (p, w, h) = geometry(&preview.0, preview.1, preview.2, edit);
+        let filled = preview_filled(item_id, photo_gen, preview, edit);
+        let (p, w, h) = geometry(filled.as_deref().unwrap_or(&preview.0), preview.1, preview.2, edit);
         let mut p = p.into_owned();
         pes_pixel::geo::replay_erases(&mut p, w, h, preview.1, preview.2, edit);
         let pixels = Rc::new(p);
@@ -968,7 +1006,7 @@ fn fingerprint(item: &MediaItem, masks: bool) -> u64 {
         h.write_u8(s.mode);
         h.write_u32(s.radius.to_bits());
         h.write_u32(s.seed);
-        h.write_u64(s.erase.as_ref().map_or(0, |c| c.id));
+        h.write_u64(s.area.as_ref().map_or(0, |c| c.id));
         h.write_u64(s.pts.len() as u64);
         for p in &s.pts {
             h.write_u32(p.0.to_bits());
@@ -1402,11 +1440,17 @@ pub(crate) fn delete_selection(state: AppState) {
 /// its develop and stays a RAW (#69). `rot90` and `fine_angle` are the
 /// geometry `sel` was drawn in.
 fn record_erase(state: AppState, item_id: usize, sel: pes_pixel::types::Selection, rot90: u8, fine_angle: f32) {
-    use pes_pixel::types::{Erase, RetouchStroke};
+    use pes_pixel::types::{Area, RetouchStroke};
+    let id = js_sys::Date::now() as u64;
+    record_area(state, item_id, RetouchStroke::erase(Area { id, sel, rot90, fine_angle }));
+}
+
+/// Add a recorded Cut, Delete or Content fill to the item's retouch list and
+/// drop the selection it was made from.
+fn record_area(state: AppState, item_id: usize, entry: pes_pixel::types::RetouchStroke) {
     state.items.update(|v| {
         if let Some(m) = v.iter_mut().find(|m| m.id == item_id) {
-            let id = js_sys::Date::now() as u64;
-            m.edit.strokes.push(RetouchStroke::erase(Erase { id, sel, rot90, fine_angle }));
+            m.edit.strokes.push(entry);
             m.edit.selection = None;
             m.edit.selection_rev += 1;
         }
@@ -1415,8 +1459,26 @@ fn record_erase(state: AppState, item_id: usize, sel: pes_pixel::types::Selectio
     clear_subject_brush_ops_for(item_id);
 }
 
+thread_local! {
+    /// The RAW whose Content fill the worker is working out.
+    static FILLING: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// True while the worker is working out a Content fill of this RAW: seconds
+/// on a full-size frame, with the badge up meanwhile.
+pub(crate) fn filling(item_id: usize) -> bool {
+    FILLING.with(|f| f.get() == Some(item_id))
+}
+
+fn set_filling(state: AppState, item: Option<usize>) {
+    FILLING.with(|f| f.set(item));
+    state.hi_built.update(|g| *g += 1);
+}
+
 /// Content-aware fill: synthesize the selection from surrounding texture
-/// (PatchMatch-style), destructive on the base pixels like delete_selection.
+/// (PatchMatch-style). Written into the base pixels like delete_selection,
+/// except on a RAW, where the fill is recorded in the recipe and the worker
+/// replays it on the frame the develop starts from (#69).
 pub(crate) fn content_fill_selection(state: AppState) {
     let Some(item) = state.current() else { return; };
     if item.kind != MediaKind::Photo {
@@ -1433,8 +1495,30 @@ pub(crate) fn content_fill_selection(state: AppState) {
         move || {
             let Some(item) = state.current() else { return false };
             let Some(sel) = item.edit.selection.clone() else { return false };
-            let recipe = pworker::edit_recipe(item.id, &item.edit);
             let item_id = item.id;
+            if live_raw_dims(item_id).is_some() {
+                use pes_pixel::types::{Area, RetouchStroke};
+                // The worker makes the fill first and keeps it. Recorded on
+                // a yes, it is there for the render that follows; a fill
+                // with nothing to copy from is not recorded.
+                let id = js_sys::Date::now() as u64;
+                let fill = RetouchStroke::fill(Area { id, sel, rot90: item.edit.rot90, fine_angle: item.edit.fine_angle });
+                let mut edit = item.edit.clone();
+                edit.strokes.push(fill.clone());
+                let recipe = pworker::edit_recipe(item_id, &edit);
+                set_filling(state, Some(item_id));
+                let sent = pworker::try_fill(item_id, &recipe, move |filled| {
+                    set_filling(state, None);
+                    if filled {
+                        record_area(state, item_id, fill);
+                    }
+                });
+                if !sent {
+                    set_filling(state, None);
+                }
+                return sent;
+            }
+            let recipe = pworker::edit_recipe(item.id, &item.edit);
             pworker::fill(item_id, &recipe, &sel, move |res| {
                 match res {
                     Ok(Some(r)) => destructive_apply(state, item_id, r, false),
@@ -1558,7 +1642,7 @@ fn record_retouch(
             pts: orig_pts,
             src: orig_src.or(anchor),
             seed,
-            erase: None,
+            area: None,
         });
     });
     true

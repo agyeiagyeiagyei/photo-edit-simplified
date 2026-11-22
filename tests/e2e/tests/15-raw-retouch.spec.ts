@@ -2,7 +2,7 @@ import { test, expect, Page } from '@playwright/test';
 import * as fs from 'fs';
 import {
   openApp, importFiles, thumbs, canvas, canvasSize, clickTab, setRange, setBrushFrac,
-  trackErrors, recordMetrics, imageDims, rawFixtures,
+  trackErrors, recordMetrics, imageDims, rawFixtures, perfMarks, RING,
 } from './helpers';
 
 // Issue #42: a Heal/Clone on a RAW is recorded in the recipe (mode, radius,
@@ -426,6 +426,102 @@ const pngPatch = (page: Page, png: Buffer, x: number, y: number): Promise<number
     { b64: png.toString('base64'), x, y },
   );
 
+type Box4 = [number, number, number, number];
+
+/** Decode `png` in the page and keep the RGBA of some boxes of it, each
+ *  [x, y, w, h] in pixels, under their keys. Returns the image's size. */
+const keepRegions = (page: Page, png: Buffer, boxes: Record<string, Box4>): Promise<[number, number]> =>
+  page.evaluate(
+    async ({ b64, boxes }) => {
+      const bin = atob(b64);
+      const u8 = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+      const bmp = await createImageBitmap(new Blob([u8], { type: 'image/png' }));
+      const store = ((window as any).__regions ??= {});
+      for (const [key, [x, y, w, h]] of Object.entries(boxes)) {
+        const c = document.createElement('canvas');
+        c.width = w;
+        c.height = h;
+        const g = c.getContext('2d', { willReadFrequently: true })!;
+        g.drawImage(bmp, x, y, w, h, 0, 0, w, h);
+        store[key] = { d: g.getImageData(0, 0, w, h).data, w, h };
+      }
+      const size: [number, number] = [bmp.width, bmp.height];
+      bmp.close();
+      return size;
+    },
+    { b64: png.toString('base64'), boxes },
+  );
+
+/** How two kept regions differ: the share of pixels that are not identical,
+ *  and the mean over pixels of the largest channel difference. `turned`: `b`
+ *  is `a` after a clockwise quarter turn. */
+const regionDiff = (page: Page, a: string, b: string, turned = false): Promise<{ changed: number; mean: number }> =>
+  page.evaluate(
+    ({ a, b, turned }) => {
+      const A = (window as any).__regions[a];
+      const B = (window as any).__regions[b];
+      let changed = 0;
+      let sum = 0;
+      for (let y = 0; y < A.h; y++) {
+        for (let x = 0; x < A.w; x++) {
+          const i = (y * A.w + x) * 4;
+          const j = turned ? (x * B.w + (A.h - 1 - y)) * 4 : i;
+          let d = 0;
+          for (let k = 0; k < 4; k++) d = Math.max(d, Math.abs(A.d[i + k] - B.d[j + k]));
+          if (d) changed++;
+          sum += d;
+        }
+      }
+      return { changed: changed / (A.w * A.h), mean: sum / (A.w * A.h) };
+    },
+    { a, b, turned },
+  );
+
+/** Share of a kept region's pixels that are orange: the ring of ring.jpg. */
+const orangeShare = (page: Page, key: string): Promise<number> =>
+  page.evaluate((key) => {
+    const R = (window as any).__regions[key];
+    let n = 0;
+    for (let i = 0; i < R.d.length; i += 4) if (R.d[i] > R.d[i + 2] + 40) n++;
+    return n / (R.w * R.h);
+  }, key);
+
+// The fill is the same search for every photo; a RAW records it (#69) and
+// any other photo has it written into its pixels. This is the written one.
+test('Content fill on a JPEG removes what is selected and leaves the rest', async ({ page }) => {
+  test.setTimeout(240_000);
+  const errors = trackErrors(page);
+  await openApp(page);
+  await importFiles(page, [RING]);
+  await expect.poll(async () => (await canvasSize(page)).w, { timeout: 60_000 }).toBeGreaterThan(1200);
+  await page.waitForTimeout(800);
+  const whole = await exportPng(page);
+  const { w: W, h: H } = await imageDims(page, whole, 'image/png');
+  const px = (x0: number, y0: number, x1: number, y1: number): Box4 => [
+    Math.round(W * x0),
+    Math.round(H * y0),
+    Math.round(W * (x1 - x0)),
+    Math.round(H * (y1 - y0)),
+  ];
+  const ring = px(0.3, 0.2, 0.7, 0.8);
+  const corner = px(0.02, 0.02, 0.2, 0.12);
+  await keepRegions(page, whole, { ring0: ring, corner0: corner });
+  expect(await orangeShare(page, 'ring0'), 'the fixture has no ring').toBeGreaterThan(0.3);
+
+  await rectSelect(page, 0.26, 0.15, 0.74, 0.85);
+  await page.locator('.select-row button', { hasText: /^Content fill$/ }).click();
+  await expect
+    .poll(async () => Object.keys(await perfMarks(page, /^worker\.fill_selection$/)).length, { timeout: 120_000 })
+    .toBeGreaterThan(0);
+  await page.waitForTimeout(1500);
+  const filled = await exportPng(page);
+  await keepRegions(page, filled, { ring1: ring, corner1: corner });
+  expect(await orangeShare(page, 'ring1'), 'the ring is still there after the fill').toBeLessThan(0.002);
+  expect((await regionDiff(page, 'corner0', 'corner1')).changed, 'the fill changed pixels outside the selection').toBe(0);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
 test.describe('RAW retouch (#42): non-destructive Heal/Clone', () => {
   test.skip(RAWS.length === 0, 'no RAW fixture in dl-raw; run gen_dng.py to create one');
 
@@ -676,6 +772,125 @@ test.describe('RAW retouch (#42): non-destructive Heal/Clone', () => {
         [`raw_cut_far_shift_${name}`]: Math.round(rgbGap(rgb(before), rgb(keptCut)) * 100) / 100,
         [`raw_cut_piece_gap_${name}`]: Math.round(rgbGap(rgb(pieceBefore), rgb(pieceCut)) * 100) / 100,
         [`raw_cut_highlights_range_${name}`]: Math.round(rgbGap(rgb(keptCut), rgb(flat)) * 100) / 100,
+      });
+      expect(errors, errors.join('\n')).toEqual([]);
+    });
+
+    // #69, part 3. Content fill was the last edit that wrote a RAW's pixels
+    // and so moved it onto the 8-bit develop. It is now recorded like a cut:
+    // the worker makes the fill once on the 16-bit frame the develop starts
+    // from and pastes it on every render, through a turn and after a reload.
+    test(`RAW ${name} keeps its develop through Content fill`, async ({ page }, testInfo) => {
+      test.setTimeout(600_000);
+      const errors = trackErrors(page);
+      const rgb = (p: number[]) => p.slice(0, 3);
+      const far: [number, number] = [0.12, 0.12];
+
+      await openApp(page);
+      await importFiles(page, [RAW]);
+      await waitDeveloped(page);
+
+      await clickTab(page, 'RAW');
+      await setRange(page, /^Exposure/, 0.7);
+      await setRange(page, /^Highlights/, 60);
+      await settledPatch(page, ...far);
+      const whole = await exportPng(page);
+      const { w: W, h: H } = await imageDims(page, whole, 'image/png');
+      const px = (x0: number, y0: number, x1: number, y1: number): Box4 => [
+        Math.round(W * x0),
+        Math.round(H * y0),
+        Math.round(W * (x1 - x0)),
+        Math.round(H * (y1 - y0)),
+      ];
+      // Well inside the selection, and well away from it. The selection
+      // takes in a corner of the synthetic frame's flat grey patch, so the
+      // fill has something to remove there too.
+      const inside = px(0.61, 0.66, 0.69, 0.74);
+      const spot: [number, number] = [0.65, 0.7];
+      const away = px(0.05, 0.05, 0.3, 0.3);
+      await keepRegions(page, whole, { in0: inside, away0: away });
+      const before = await pngPatch(page, whole, ...far);
+
+      await rectSelect(page, 0.59, 0.64, 0.71, 0.76);
+      const t0 = Date.now();
+      await page.locator('.select-row button', { hasText: /^Content fill$/ }).click();
+      await expect
+        .poll(async () => (await itemRecord(page))?.hs?.length ?? 0, { timeout: 180_000 })
+        .toBe(1);
+      const fillMs = Date.now() - t0;
+      const rec = await itemRecord(page);
+      expect(rec?.hs?.[0]?.m, 'the fill was not recorded as a fill').toBe(5);
+      expect(rec?.raw, 'Content fill stopped the item being a RAW').toBe(true);
+      await expect(page.locator('.developing-badge')).toHaveCount(0, { timeout: 180_000 });
+      await settledPatch(page, ...far);
+      const filled = await exportPng(page);
+      await keepRegions(page, filled, { in1: inside, away1: away });
+      const kept = await pngPatch(page, filled, ...far);
+      const made = await regionDiff(page, 'in0', 'in1');
+      const outside = await regionDiff(page, 'away0', 'away1');
+      expect(made.changed, 'the fill left the selected area as it was').toBeGreaterThan(0.2);
+      expect((await pngPatch(page, filled, ...spot))[3], 'the filled area is not opaque').toBeGreaterThan(254);
+      expect(rgbGap(rgb(before), rgb(kept)), 'Content fill changed the photo outside the selection').toBeLessThanOrEqual(1);
+      // Not exactly 0: the noise reduction measures the noise over the whole
+      // frame, fill included, so a far pixel can move by a level.
+      expect(outside.mean, 'Content fill changed pixels far from the selection').toBeLessThan(0.5);
+
+      // The develop is still live, and it runs over the fill as well.
+      await clickTab(page, 'RAW');
+      await setRange(page, /^Highlights/, 0);
+      await settledPatch(page, ...far);
+      await expect(page.locator('.developing-badge')).toHaveCount(0, { timeout: 120_000 });
+      const flat = await exportPng(page);
+      await keepRegions(page, flat, { in2: inside });
+      const flatFar = await pngPatch(page, flat, ...far);
+      expect(rgbGap(rgb(kept), rgb(flatFar)), 'Highlights no longer changes a RAW that has a fill').toBeGreaterThan(3);
+      const developed = await regionDiff(page, 'in1', 'in2');
+      expect(developed.changed, 'Highlights does not reach the filled area').toBeGreaterThan(0.05);
+
+      // A quarter turn carries the fill: the same pixels, turned.
+      await clickTab(page, 'Rotate');
+      await page.locator('button.btn', { hasText: '⟳ 90°' }).click();
+      await page.waitForTimeout(800);
+      await expect(page.locator('.developing-badge')).toHaveCount(0, { timeout: 120_000 });
+      await settledPatch(page, 0.5, 0.12);
+      const turned = await exportPng(page);
+      const [ix, iy, iw, ih] = inside;
+      const insideTurned: Box4 = [H - (iy + ih), ix, ih, iw];
+      const [TW, TH] = await keepRegions(page, turned, { in3: insideTurned });
+      expect([TW, TH], 'the export was not turned').toEqual([H, W]);
+      const carried = await regionDiff(page, 'in2', 'in3', true);
+      expect(carried.mean, 'the fill is not the same after a quarter turn').toBeLessThan(1.5);
+
+      // A reload makes the fill again from the recipe: the same pixels.
+      await page.waitForTimeout(2500);
+      await page.reload();
+      await expect(thumbs(page)).toHaveCount(1, { timeout: 60_000 });
+      // A RAW with a fill loads its full-size frame straight away: the fill
+      // on screen has to be the one the export makes, and the display
+      // proxy's would be another.
+      await expect
+        .poll(async () => Object.keys(await perfMarks(page, /^worker\.raw_develop$/)).length, { timeout: 120_000 })
+        .toBeGreaterThan(0);
+      await expect(page.locator('.developing-badge')).toHaveCount(0, { timeout: 180_000 });
+      const recBack = await itemRecord(page);
+      expect(recBack?.raw, 'the reload restored a baked image').toBe(true);
+      expect(recBack?.hs?.length, 'the fill was not restored').toBe(1);
+      await settledPatch(page, 0.5, 0.12);
+      await expect(page.locator('.developing-badge')).toHaveCount(0, { timeout: 180_000 });
+      const back = await exportPng(page);
+      // The reload emptied the page: the export from before it goes back in.
+      await keepRegions(page, turned, { in3: insideTurned });
+      await keepRegions(page, back, { in4: insideTurned });
+      const again = await regionDiff(page, 'in3', 'in4');
+      expect(again.changed, 'the fill is not the same after a reload').toBe(0);
+      recordMetrics(testInfo, {
+        [`raw_fill_ms_${name}`]: fillMs,
+        [`raw_fill_far_shift_${name}`]: Math.round(rgbGap(rgb(before), rgb(kept)) * 100) / 100,
+        [`raw_fill_area_changed_${name}`]: Math.round(made.changed * 1e3) / 1e3,
+        [`raw_fill_outside_mean_${name}`]: Math.round(outside.mean * 1e3) / 1e3,
+        [`raw_fill_highlights_area_${name}`]: Math.round(developed.changed * 1e3) / 1e3,
+        [`raw_fill_turn_gap_${name}`]: Math.round(carried.mean * 100) / 100,
+        [`raw_fill_highlights_range_${name}`]: Math.round(rgbGap(rgb(kept), rgb(flatFar)) * 100) / 100,
       });
       expect(errors, errors.join('\n')).toEqual([]);
     });
