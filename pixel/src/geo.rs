@@ -391,6 +391,39 @@ pub fn heal_anchor(
     Some(orig_from_work_norm(anchor, sw, sh, edit))
 }
 
+/// Replay a recorded Cut or Delete: clear alpha under its selection, carried
+/// from the geometry it was made in to the frame's. Colours stay, so what is
+/// under the hole still develops and a later clone can fill it.
+fn erase_alpha<T: crate::resample::Sample>(
+    pixels: &mut [T],
+    w: usize,
+    h: usize,
+    fw: usize,
+    fh: usize,
+    e: &crate::types::Erase,
+    edit: &EditParams,
+) -> bool {
+    let from = EditParams { rot90: e.rot90, fine_angle: e.fine_angle, ..EditParams::default() };
+    let mask = ops::selection_mask(&remap_selection(&e.sel, fw, fh, &from, edit), w, h);
+    let mut changed = false;
+    for (px, &m) in pixels.chunks_exact_mut(4).zip(&mask) {
+        if m > 0 {
+            px[3] = T::from_u32((px[3].to_u32() * (255 - m as u32) + 127) / 255);
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// The recorded cuts of `edit` alone, on an 8-bit frame that has been through
+/// [`geometry`]: for the app's low-res preview, which does not replay the
+/// Heal and Clone strokes but must not show a hole filled in.
+pub fn replay_erases(pixels: &mut [u8], w: usize, h: usize, fw: usize, fh: usize, edit: &EditParams) {
+    for e in edit.strokes.iter().filter_map(|s| s.erase.as_ref()) {
+        erase_alpha(pixels, w, h, fw, fh, e, edit);
+    }
+}
+
 /// Replay recorded Heal/Clone strokes onto a working frame of (w, h) that has
 /// already been through [`geometry`] from the (fw, fh) original. Stroke points
 /// are original-image normalized and map through the geometry; the radius is
@@ -411,10 +444,15 @@ pub fn replay_strokes<T: crate::resample::Sample>(
         return false;
     }
     let diag = ((w * w + h * h) as f32).sqrt();
-    let mut coverage = vec![0u8; w * h];
+    let mut coverage = Vec::new();
     let mut changed = false;
     for s in &edit.strokes {
-        coverage.fill(0);
+        if let Some(e) = &s.erase {
+            changed |= erase_alpha(pixels, w, h, fw, fh, e, edit);
+            continue;
+        }
+        coverage.clear();
+        coverage.resize(w * h, 0u8);
         let pts: Vec<(f32, f32)> = s
             .pts
             .iter()
@@ -548,6 +586,7 @@ mod tests {
             pts: vec![(0.7, 0.7), (0.72, 0.7)],
             src: Some((0.3, 0.3)),
             seed: 7,
+            erase: None,
         });
         let mut a = src.clone();
         let mut b = src.clone();
@@ -595,6 +634,7 @@ mod tests {
                 pts: pts.to_vec(),
                 src: Some(anchor),
                 seed,
+                erase: None,
             });
             let (ga, sw, sh) = geometry(&small, w, h, &edit);
             let (gb, bw, bh) = geometry(&big, w * 2, h * 2, &edit);
@@ -775,5 +815,54 @@ mod tests {
             panic!()
         };
         assert!(Rc::ptr_eq(a, b));
+    }
+
+    fn erased(sel: Selection, rot90: u8) -> EditParams {
+        let mut edit = EditParams::default();
+        edit.strokes.push(RetouchStroke::erase(crate::types::Erase { id: 1, sel, rot90, fine_angle: 0.0 }));
+        edit
+    }
+
+    #[test]
+    fn an_erase_clears_alpha_and_keeps_colour_at_8_and_16_bits() {
+        let (w, h) = (40usize, 20usize);
+        let narrow: Vec<u8> = (0..w * h * 4).map(|i| if i % 4 == 3 { 255 } else { (i % 251) as u8 }).collect();
+        let wide: Vec<u16> = narrow.iter().map(|&v| v as u16 * 257).collect();
+        let sel = Selection { kind: SelectionKind::Rect { x: 0.25, y: 0.5, w: 0.5, h: 0.5 }, feather: 0.2 };
+        let edit = erased(sel, 0);
+        let (mut a, mut b) = (narrow.clone(), wide.clone());
+        assert!(replay_strokes(&mut a, w, h, w, h, &edit));
+        assert!(replay_strokes(&mut b, w, h, w, h, &edit));
+        let alpha = |x: usize, y: usize| a[(y * w + x) * 4 + 3];
+        assert_eq!(alpha(20, 15), 0, "inside the selection");
+        assert_eq!(alpha(2, 2), 255, "outside it");
+        assert!((1..255).contains(&alpha(10, 15)), "the feathered edge is partial: {}", alpha(10, 15));
+        for (i, (p, q)) in a.iter().zip(&b).enumerate() {
+            if i % 4 == 3 {
+                assert!((*p as i32 - (*q as f32 / 257.0).round() as i32).abs() <= 1, "alpha {p} vs {q} at {i}");
+            } else {
+                assert_eq!((*p, *q), (narrow[i], wide[i]), "colour moved at {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_erase_turns_with_the_photo() {
+        // Cut the top-left quarter of an 8x4 photo, then turn it clockwise:
+        // that quarter is now the top-right of the 4x8 frame.
+        let (w, h) = (8usize, 4usize);
+        let sel = Selection { kind: SelectionKind::Rect { x: 0.0, y: 0.0, w: 0.5, h: 0.5 }, feather: 0.0 };
+        let mut edit = erased(sel, 0);
+        edit.rot90 = 1;
+        let src = vec![255u8; w * h * 4];
+        let (g, gw, gh) = geometry(&src, w, h, &edit);
+        let mut px = g.into_owned();
+        assert!(replay_strokes(&mut px, gw, gh, w, h, &edit));
+        for y in 0..gh {
+            for x in 0..gw {
+                let want = if x >= 2 && y < 4 { 0 } else { 255 };
+                assert_eq!(px[(y * gw + x) * 4 + 3], want, "({x}, {y})");
+            }
+        }
     }
 }

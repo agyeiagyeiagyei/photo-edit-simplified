@@ -525,9 +525,9 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
             </p>
             <Show when=is_raw fallback=|| ()>
                 <p class="dim">
-                    "This is a RAW photo. Cut, Delete and Content fill bake the pixels into an \
-                     8-bit image: a reload restores the baked result and the RAW develop \
-                     settings no longer apply. Heal and Clone stay non-destructive."
+                    "This is a RAW photo. Content fill bakes the pixels into an 8-bit image: \
+                     a reload restores the baked result and the RAW develop settings no \
+                     longer apply. Cut, Delete, Heal and Clone stay non-destructive."
                 </p>
             </Show>
         </div>

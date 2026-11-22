@@ -943,25 +943,23 @@ pub fn unload(id: usize) {
     }
 }
 
-/// Post any adjustment-layer raster mask the worker has not seen at its
-/// current version for buffer `wid`. Called immediately before a recipe is
-/// sent, so the worker's FIFO message order guarantees the cache is filled
-/// first.
+/// Post any raster mask of the recipe (an adjustment layer's, or a recorded
+/// cut's) the worker has not seen at its current version for buffer `wid`.
+/// Called immediately before a recipe is sent, so the worker's FIFO message
+/// order guarantees the cache is filled first.
 fn sync_adjust_masks(wid: usize, edit: &EditParams) {
     let id = wid as u32;
-    for layer in &edit.adjust_layers {
-        let Some(Selection {
-            kind: SelectionKind::Mask { data, width, height },
-            ..
-        }) = &layer.mask
-        else {
+    let layers = edit.adjust_layers.iter().filter_map(|l| Some((l.id, l.mask_version, l.mask.as_ref()?)));
+    let cuts = edit.strokes.iter().filter_map(|s| s.erase.as_ref().map(|e| (e.id, 0, &e.sel)));
+    for (mask_id, version, sel) in layers.chain(cuts) {
+        let SelectionKind::Mask { data, width, height } = &sel.kind else {
             continue;
         };
         if data.is_empty() || *width == 0 || *height == 0 || data.len() != width * height {
             continue;
         }
-        let key = (id, layer.id);
-        if SYNCED_MASKS.with(|s| s.borrow().get(&key) == Some(&layer.mask_version)) {
+        let key = (id, mask_id);
+        if SYNCED_MASKS.with(|s| s.borrow().get(&key) == Some(&version)) {
             continue;
         }
         init();
@@ -971,8 +969,8 @@ fn sync_adjust_masks(wid: usize, edit: &EditParams) {
             "cache_adjust_mask",
             &[
                 JsValue::from(id),
-                JsValue::from(layer.id as f64),
-                JsValue::from(layer.mask_version as f64),
+                JsValue::from(mask_id as f64),
+                JsValue::from(version as f64),
                 JsValue::from(*width as u32),
                 JsValue::from(*height as u32),
                 arr.into(),
@@ -982,7 +980,7 @@ fn sync_adjust_masks(wid: usize, edit: &EditParams) {
         );
         if posted {
             SYNCED_MASKS.with(|s| {
-                s.borrow_mut().insert(key, layer.mask_version);
+                s.borrow_mut().insert(key, version);
             });
         }
     }
@@ -994,9 +992,14 @@ fn sync_adjust_masks(wid: usize, edit: &EditParams) {
 /// call that carries the recipe, so `wid` must be that id — a RAW shown from
 /// its proxy renders against `proxy_wid(item.id)`, not `item.id`.
 pub(crate) fn render_recipe(item: &crate::state::MediaItem, wid: usize) -> String {
-    let edit = crate::state::render_edit(&item.edit, &item.layers);
-    sync_adjust_masks(wid, &edit);
-    pes_pixel::recipe::edit_params_full_json(&edit)
+    edit_recipe(wid, &crate::state::render_edit(&item.edit, &item.layers))
+}
+
+/// The worker recipe for `edit` against buffer `wid`, with the raster masks
+/// it references synced first.
+pub(crate) fn edit_recipe(wid: usize, edit: &EditParams) -> String {
+    sync_adjust_masks(wid, edit);
+    pes_pixel::recipe::edit_params_full_json(edit)
 }
 
 /// Selection wire args: (sel_json, sel_mask) + transfer list for mask bytes.

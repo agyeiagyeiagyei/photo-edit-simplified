@@ -9,7 +9,7 @@ use wasm_bindgen::JsValue;
 use crate::curves::{CurvePoint, CurvesSettings};
 use crate::levels::{LevelRange, LevelsSettings};
 use crate::types::{
-    AdjustLayer, Aspect, CropRect, EditParams, PointAdjust, RetouchStroke, Selection,
+    AdjustLayer, Aspect, CropRect, EditParams, Erase, PointAdjust, RetouchStroke, Selection,
     SelectionKind,
 };
 
@@ -150,12 +150,35 @@ pub fn point_adjust_from_json(v: &JsValue) -> PointAdjust {
     }
 }
 
+thread_local! {
+    /// The rasters last encoded for a recipe. A photo's recipe is written
+    /// again on every edit (the Drive manifest, the session), and encoding an
+    /// unchanged multi-megapixel mask each time costs tens of milliseconds on
+    /// the app thread. Keyed by the allocation, held weakly: the address
+    /// cannot be reused while the entry is here, and no mask is kept alive.
+    static PNG_MEMO: std::cell::RefCell<Vec<(std::rc::Weak<Vec<u8>>, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn mask_png_memo(data: &Rc<Vec<u8>>, w: usize, h: usize) -> String {
+    PNG_MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        m.retain(|(k, _)| k.strong_count() > 0);
+        if let Some((_, png)) = m.iter().find(|(k, _)| k.as_ptr() == Rc::as_ptr(data)) {
+            return png.clone();
+        }
+        let png = crate::mask_png::encode_gray(data, w, h).unwrap_or_default();
+        m.push((Rc::downgrade(data), png.clone()));
+        png
+    })
+}
+
 /// Portable selection form: vector selections inline, raster masks as a
 /// grayscale PNG so the recipe alone can rebuild them (Drive round-trip).
 pub fn selection_portable_json(sel: &Selection) -> String {
     match &sel.kind {
         SelectionKind::Mask { data, width, height } => {
-            let png = crate::mask_png::encode_gray(data, *width, *height).unwrap_or_default();
+            let png = mask_png_memo(data, *width, *height);
             format!(
                 "{{\"t\":\"png\",\"w\":{},\"h\":{},\"f\":{},\"d\":\"{}\"}}",
                 width, height, sel.feather, png
@@ -235,7 +258,7 @@ fn adjust_layers_from_json(v: &JsValue) -> Vec<AdjustLayer> {
     out
 }
 
-fn strokes_json(e: &EditParams) -> Option<String> {
+fn strokes_json(e: &EditParams, portable: bool) -> Option<String> {
     if e.strokes.is_empty() {
         return None;
     }
@@ -243,6 +266,14 @@ fn strokes_json(e: &EditParams) -> Option<String> {
         .strokes
         .iter()
         .map(|s| {
+            if let Some(c) = &s.erase {
+                // A raster selection travels like an adjustment layer's mask.
+                let sel = if portable { selection_portable_json(&c.sel) } else { selection_worker_json(&c.sel, 0) };
+                return format!(
+                    "{{\"m\":{},\"id\":{},\"rot\":{},\"fine\":{},\"cut\":{}}}",
+                    s.mode, c.id, c.rot90, c.fine_angle, sel
+                );
+            }
             let pts: Vec<String> = s.pts.iter().map(|p| format!("[{},{}]", p.0, p.1)).collect();
             let mut parts = vec![
                 format!("\"m\":{}", s.mode),
@@ -269,6 +300,17 @@ fn strokes_from_json(v: &JsValue) -> Vec<RetouchStroke> {
     let mut out = Vec::new();
     for item in arr.iter() {
         let mode = jnum(&item, "m").unwrap_or(0.0) as u8;
+        if mode == RetouchStroke::ERASE {
+            if let Some(sel) = jget(&item, "cut").and_then(|c| selection_from_layer_value(&c)) {
+                out.push(RetouchStroke::erase(Erase {
+                    id: jnum(&item, "id").unwrap_or(0.0) as u64,
+                    sel,
+                    rot90: jnum(&item, "rot").unwrap_or(0.0) as u8,
+                    fine_angle: jnum(&item, "fine").unwrap_or(0.0) as f32,
+                }));
+            }
+            continue;
+        }
         if mode > RetouchStroke::CLONE {
             continue;
         }
@@ -313,6 +355,7 @@ fn strokes_from_json(v: &JsValue) -> Vec<RetouchStroke> {
             pts,
             src,
             seed: jnum(&item, "seed").unwrap_or(0.0) as u32,
+            erase: None,
         });
     }
     out
@@ -439,7 +482,7 @@ fn recipe_json(e: &EditParams, portable_masks: bool) -> Option<String> {
     if let Some(adj) = adjust_layers_json(e, portable_masks) {
         parts.push(format!("\"adj\":{}", adj));
     }
-    if let Some(hs) = strokes_json(e) {
+    if let Some(hs) = strokes_json(e, portable_masks) {
         parts.push(format!("\"hs\":{}", hs));
     }
     if e.trim != d.trim {
@@ -651,4 +694,26 @@ fn selection_from_value(v: &JsValue, mask: Option<Vec<u8>>) -> Option<Selection>
         _ => return None,
     };
     Some(Selection { kind, feather })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_mask_is_encoded_once_until_it_changes() {
+        let mut mask = Rc::new(vec![0u8; 64 * 64]);
+        let first = mask_png_memo(&mask, 64, 64);
+        assert_eq!(crate::mask_png::decode_gray(&first).map(|d| d.0), Some((*mask).clone()));
+        assert_eq!(PNG_MEMO.with(|m| m.borrow().len()), 1);
+        assert_eq!(mask_png_memo(&mask, 64, 64), first);
+        assert_eq!(PNG_MEMO.with(|m| m.borrow().len()), 1, "the same raster was encoded again");
+        // An edit in place gives the raster a new allocation, so the old
+        // encoding cannot be served for it.
+        Rc::make_mut(&mut mask)[100] = 255;
+        let second = mask_png_memo(&mask, 64, 64);
+        assert_ne!(second, first);
+        assert_eq!(crate::mask_png::decode_gray(&second).map(|d| d.0), Some((*mask).clone()));
+        assert_eq!(PNG_MEMO.with(|m| m.borrow().len()), 1, "the dropped raster's entry was kept");
+    }
 }
