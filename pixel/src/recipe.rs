@@ -9,7 +9,7 @@ use wasm_bindgen::JsValue;
 use crate::curves::{CurvePoint, CurvesSettings};
 use crate::levels::{LevelRange, LevelsSettings};
 use crate::types::{
-    AdjustLayer, Aspect, CropRect, EditParams, PointAdjust, RetouchStroke, Selection,
+    AdjustLayer, Aspect, CropRect, EditParams, Erase, PointAdjust, RetouchStroke, Selection,
     SelectionKind,
 };
 
@@ -235,7 +235,7 @@ fn adjust_layers_from_json(v: &JsValue) -> Vec<AdjustLayer> {
     out
 }
 
-fn strokes_json(e: &EditParams) -> Option<String> {
+fn strokes_json(e: &EditParams, portable: bool) -> Option<String> {
     if e.strokes.is_empty() {
         return None;
     }
@@ -243,6 +243,14 @@ fn strokes_json(e: &EditParams) -> Option<String> {
         .strokes
         .iter()
         .map(|s| {
+            if let Some(c) = &s.erase {
+                // A raster selection travels like an adjustment layer's mask.
+                let sel = if portable { selection_portable_json(&c.sel) } else { selection_worker_json(&c.sel, 0) };
+                return format!(
+                    "{{\"m\":{},\"id\":{},\"rot\":{},\"fine\":{},\"cut\":{}}}",
+                    s.mode, c.id, c.rot90, c.fine_angle, sel
+                );
+            }
             let pts: Vec<String> = s.pts.iter().map(|p| format!("[{},{}]", p.0, p.1)).collect();
             let mut parts = vec![
                 format!("\"m\":{}", s.mode),
@@ -269,6 +277,17 @@ fn strokes_from_json(v: &JsValue) -> Vec<RetouchStroke> {
     let mut out = Vec::new();
     for item in arr.iter() {
         let mode = jnum(&item, "m").unwrap_or(0.0) as u8;
+        if mode == RetouchStroke::ERASE {
+            if let Some(sel) = jget(&item, "cut").and_then(|c| selection_from_layer_value(&c)) {
+                out.push(RetouchStroke::erase(Erase {
+                    id: jnum(&item, "id").unwrap_or(0.0) as u64,
+                    sel,
+                    rot90: jnum(&item, "rot").unwrap_or(0.0) as u8,
+                    fine_angle: jnum(&item, "fine").unwrap_or(0.0) as f32,
+                }));
+            }
+            continue;
+        }
         if mode > RetouchStroke::CLONE {
             continue;
         }
@@ -313,6 +332,7 @@ fn strokes_from_json(v: &JsValue) -> Vec<RetouchStroke> {
             pts,
             src,
             seed: jnum(&item, "seed").unwrap_or(0.0) as u32,
+            erase: None,
         });
     }
     out
@@ -439,7 +459,7 @@ fn recipe_json(e: &EditParams, portable_masks: bool) -> Option<String> {
     if let Some(adj) = adjust_layers_json(e, portable_masks) {
         parts.push(format!("\"adj\":{}", adj));
     }
-    if let Some(hs) = strokes_json(e) {
+    if let Some(hs) = strokes_json(e, portable_masks) {
         parts.push(format!("\"hs\":{}", hs));
     }
     if e.trim != d.trim {

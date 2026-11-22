@@ -769,6 +769,8 @@ pub(crate) struct PreviewGeo {
     pub(crate) gen: u64,
     pub(crate) rot90: u8,
     pub(crate) fine_bits: u32,
+    /// Which recorded cuts the pixels carry.
+    pub(crate) cuts: u64,
     pub(crate) pixels: Rc<Vec<u8>>,
     pub(crate) w: usize,
     pub(crate) h: usize,
@@ -800,14 +802,18 @@ thread_local! {
     pub(crate) static GPU_BASE_REQ: RefCell<Option<gpu::BaseKey>> = const { RefCell::new(None) };
 }
 
-/// Geometry applied to the 1024px preview, cached across renders.
+/// Geometry applied to the 1024px preview, cached across renders, with the
+/// recorded cuts of a RAW (#69): without them this frame would show a hole
+/// filled in until the sharp frame replaces it. None when it is the stored
+/// preview as it is.
 pub(crate) fn preview_geometry_cached(
     item_id: usize,
     photo_gen: u64,
     preview: &(Vec<u8>, usize, usize),
     edit: &EditParams,
 ) -> Option<(Rc<Vec<u8>>, usize, usize)> {
-    if edit.rot90.is_multiple_of(4) && edit.fine_angle.abs() <= 0.01 {
+    let cuts = edit.strokes.iter().filter_map(|s| s.erase.as_ref()).fold(0u64, |h, e| h.wrapping_mul(31).wrapping_add(e.id));
+    if edit.rot90.is_multiple_of(4) && edit.fine_angle.abs() <= 0.01 && cuts == 0 {
         return None;
     }
     let (rot90, fine_bits) = (edit.rot90, edit.fine_angle.to_bits());
@@ -818,17 +824,21 @@ pub(crate) fn preview_geometry_cached(
                 && g.gen == photo_gen
                 && g.rot90 == rot90
                 && g.fine_bits == fine_bits
+                && g.cuts == cuts
             {
                 return Some((g.pixels.clone(), g.w, g.h));
             }
         }
         let (p, w, h) = geometry(&preview.0, preview.1, preview.2, edit);
-        let pixels = Rc::new(p.into_owned());
+        let mut p = p.into_owned();
+        pes_pixel::geo::replay_erases(&mut p, w, h, preview.1, preview.2, edit);
+        let pixels = Rc::new(p);
         *c = Some(PreviewGeo {
             item_id,
             gen: photo_gen,
             rot90,
             fine_bits,
+            cuts,
             pixels: pixels.clone(),
             w,
             h,
@@ -958,6 +968,7 @@ fn fingerprint(item: &MediaItem, masks: bool) -> u64 {
         h.write_u8(s.mode);
         h.write_u32(s.radius.to_bits());
         h.write_u32(s.seed);
+        h.write_u64(s.erase.as_ref().map_or(0, |c| c.id));
         h.write_u64(s.pts.len() as u64);
         for p in &s.pts {
             h.write_u32(p.0.to_bits());
@@ -1209,7 +1220,7 @@ pub(crate) fn refresh_copies(state: AppState, item_id: usize) {
     let job = move || {
         state.items.with_untracked(|v| {
             let m = v.iter().find(|m| m.id == item_id)?;
-            Some((stale_copy(m)?, pes_pixel::recipe::edit_params_full_json(&m.edit)))
+            Some((stale_copy(m)?, pworker::edit_recipe(item_id, &m.edit)))
         })
     };
     if job().is_none() {
@@ -1309,7 +1320,7 @@ pub(crate) fn selection_to_layer(state: AppState, cut: bool) {
         move || {
             let Some(item) = state.current() else { return false };
             let Some(sel) = item.edit.selection.clone() else { return false };
-            let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
+            let recipe = pworker::edit_recipe(item.id, &item.edit);
             let item_id = item.id;
             // A copy of a RAW follows the photo's RAW settings from here on.
             let live = get_photo(item_id).filter(|p| p.raw).map(|p| state::LiveCopy {
@@ -1318,8 +1329,10 @@ pub(crate) fn selection_to_layer(state: AppState, cut: bool) {
                 strokes: item.edit.strokes.len(),
                 baked: copy_key(&item.edit, &p),
             });
+            // A RAW keeps its pixels: the cut is recorded once the piece is out.
+            let erase = (cut && live.is_some()).then(|| (sel.clone(), item.edit.rot90, item.edit.fine_angle));
             set_copying(state, true);
-            let sent = pworker::extract(item_id, &recipe, &sel, cut, move |res| {
+            let sent = pworker::extract(item_id, &recipe, &sel, cut && erase.is_none(), move |res| {
                 set_copying(state, false);
                 match res {
                     Ok(Some(r)) => {
@@ -1336,6 +1349,9 @@ pub(crate) fn selection_to_layer(state: AppState, cut: bool) {
                         });
                         if let Some(c) = r.cut {
                             destructive_apply(state, item_id, c, true);
+                        }
+                        if let Some((sel, rot90, fine_angle)) = erase {
+                            record_erase(state, item_id, sel, rot90, fine_angle);
                         }
                     }
                     Ok(None) => {}
@@ -1355,7 +1371,9 @@ pub(crate) fn delete_selection(state: AppState) {
     if item.kind != MediaKind::Photo {
         return;
     }
-    if item.edit.selection.is_none() {
+    let Some(sel) = item.edit.selection.clone() else { return };
+    if live_raw_dims(item.id).is_some() {
+        record_erase(state, item.id, sel, item.edit.rot90, item.edit.fine_angle);
         return;
     }
     if !full_present(item.id) {
@@ -1366,7 +1384,7 @@ pub(crate) fn delete_selection(state: AppState) {
         move || {
             let Some(item) = state.current() else { return false };
             let Some(sel) = item.edit.selection.clone() else { return false };
-            let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
+            let recipe = pworker::edit_recipe(item.id, &item.edit);
             let item_id = item.id;
             pworker::cut(item_id, &recipe, &sel, move |res| {
                 match res {
@@ -1377,6 +1395,24 @@ pub(crate) fn delete_selection(state: AppState) {
             })
         },
     );
+}
+
+/// Record a Cut or Delete on a RAW in the item's recipe instead of writing
+/// pixels: the worker clears alpha under `sel` at replay, so the photo keeps
+/// its develop and stays a RAW (#69). `rot90` and `fine_angle` are the
+/// geometry `sel` was drawn in.
+fn record_erase(state: AppState, item_id: usize, sel: pes_pixel::types::Selection, rot90: u8, fine_angle: f32) {
+    use pes_pixel::types::{Erase, RetouchStroke};
+    state.items.update(|v| {
+        if let Some(m) = v.iter_mut().find(|m| m.id == item_id) {
+            let id = js_sys::Date::now() as u64;
+            m.edit.strokes.push(RetouchStroke::erase(Erase { id, sel, rot90, fine_angle }));
+            m.edit.selection = None;
+            m.edit.selection_rev += 1;
+        }
+    });
+    state.subject_photo.set(None);
+    clear_subject_brush_ops_for(item_id);
 }
 
 /// Content-aware fill: synthesize the selection from surrounding texture
@@ -1397,7 +1433,7 @@ pub(crate) fn content_fill_selection(state: AppState) {
         move || {
             let Some(item) = state.current() else { return false };
             let Some(sel) = item.edit.selection.clone() else { return false };
-            let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
+            let recipe = pworker::edit_recipe(item.id, &item.edit);
             let item_id = item.id;
             pworker::fill(item_id, &recipe, &sel, move |res| {
                 match res {
@@ -1522,6 +1558,7 @@ fn record_retouch(
             pts: orig_pts,
             src: orig_src.or(anchor),
             seed,
+            erase: None,
         });
     });
     true
@@ -1556,7 +1593,7 @@ pub(crate) fn apply_heal(state: AppState, pts: &[(f32, f32)]) {
             if item.kind != MediaKind::Photo {
                 return false;
             }
-            let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
+            let recipe = pworker::edit_recipe(item.id, &item.edit);
             let radius = state.heal_radius.get_untracked();
             let mode = heal_mode_u8(state.heal_mode.get_untracked());
             let item_id = item.id;
@@ -1635,7 +1672,7 @@ pub(crate) fn apply_clone(state: AppState, pts: &[(f32, f32)]) {
             let (ww, wh) = working_dims(photo.full_dims.0, photo.full_dims.1, &item.edit);
             let dx = (offset.0 * ww as f32).round() as i32;
             let dy = (offset.1 * wh as f32).round() as i32;
-            let recipe = pes_pixel::recipe::edit_params_full_json(&item.edit);
+            let recipe = pworker::edit_recipe(item.id, &item.edit);
             let radius = state.clone_radius.get_untracked();
             let item_id = item.id;
             pworker::clone_stamp(item_id, &recipe, &pts, radius, dx, dy, move |res| {

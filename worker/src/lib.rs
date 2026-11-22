@@ -495,40 +495,45 @@ fn parse_edit(id: u32, recipe: &str) -> EditParams {
     edit
 }
 
-/// Fill worker-side mask references from the mask cache. A reference whose
-/// version or dims don't match leaves the layer disabled: applying it without
-/// its mask would paint the whole frame.
+/// Fill worker-side mask references from the mask cache. A layer whose
+/// reference does not match in version or dims is disabled: applying it
+/// without its mask would paint the whole frame. A recorded cut left without
+/// its raster removes nothing.
 fn resolve_adjust_masks(id: u32, edit: &mut EditParams) {
     for layer in &mut edit.adjust_layers {
-        let unresolved = matches!(
-            &layer.mask,
-            Some(Selection { kind: SelectionKind::Mask { data, .. }, .. }) if data.is_empty()
-        );
-        if !unresolved {
-            continue;
-        }
-        let Some(Selection {
-            kind: SelectionKind::Mask { width, height, .. },
-            feather,
-        }) = layer.mask.take()
-        else {
-            continue;
-        };
-        let cached = ADJUST_MASKS.with(|c| {
-            c.borrow().get(&(id, layer.id)).and_then(|m| {
-                (m.version == layer.mask_version && m.w == width && m.h == height)
-                    .then(|| m.data.clone())
-            })
-        });
-        match cached {
-            Some(data) => {
-                layer.mask = Some(Selection {
-                    kind: SelectionKind::Mask { data, width, height },
-                    feather,
-                });
+        if let Some(sel) = &mut layer.mask {
+            if !resolve_mask(id, layer.id, layer.mask_version, sel) {
+                layer.visible = false;
             }
-            None => layer.visible = false,
         }
+    }
+    for s in &mut edit.strokes {
+        if let Some(e) = &mut s.erase {
+            resolve_mask(id, e.id, 0, &mut e.sel);
+        }
+    }
+}
+
+/// Give a raster selection that arrived as a reference its bytes from the
+/// mask cache. False when the cache does not hold them.
+fn resolve_mask(id: u32, key: u64, version: u64, sel: &mut Selection) -> bool {
+    let SelectionKind::Mask { data, width, height } = &mut sel.kind else {
+        return true;
+    };
+    if !data.is_empty() {
+        return true;
+    }
+    let cached = ADJUST_MASKS.with(|c| {
+        c.borrow().get(&(id, key)).and_then(|m| {
+            (m.version == version && m.w == *width && m.h == *height).then(|| m.data.clone())
+        })
+    });
+    match cached {
+        Some(d) => {
+            *data = d;
+            true
+        }
+        None => false,
     }
 }
 
@@ -540,6 +545,11 @@ fn strokes_fingerprint(edit: &EditParams) -> u64 {
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     };
     for s in &edit.strokes {
+        if let Some(e) = &s.erase {
+            mix(e.id);
+            mix(e.rot90 as u64);
+            mix(e.fine_angle.to_bits() as u64);
+        }
         mix(s.mode as u64);
         mix(s.radius.to_bits() as u64);
         mix(s.seed as u64);

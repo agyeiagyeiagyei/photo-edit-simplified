@@ -378,6 +378,54 @@ async function settledPatch(page: Page, x: number, y: number, half = 0.04): Prom
 
 const rgbGap = (a: number[], b: number[]) => Math.max(...a.map((v, i) => Math.abs(v - b[i])));
 
+/** Drag a rectangle selection over the photo, in fractions of the canvas. */
+async function rectSelect(page: Page, x0: number, y0: number, x1: number, y1: number) {
+  await clickTab(page, 'Select');
+  await page.locator('.select-tab .chip', { hasText: /^Rect$/ }).click();
+  const b = (await canvas(page).boundingBox())!;
+  await page.mouse.move(b.x + b.width * x0, b.y + b.height * y0);
+  await page.mouse.down();
+  await page.mouse.move(b.x + b.width * (x0 + x1) / 2, b.y + b.height * (y0 + y1) / 2, { steps: 5 });
+  await page.mouse.move(b.x + b.width * x1, b.y + b.height * y1, { steps: 5 });
+  await page.mouse.up();
+  await page.waitForTimeout(150);
+}
+
+async function exportPng(page: Page): Promise<Buffer> {
+  await clickTab(page, 'Export');
+  await page.locator('label', { hasText: 'Format' }).locator('select').selectOption('png');
+  const [dl] = await Promise.all([
+    page.waitForEvent('download', { timeout: 180_000 }),
+    page.locator('button.btn.primary', { hasText: 'Download this' }).click(),
+  ]);
+  return fs.readFileSync((await dl.path())!);
+}
+
+/** Mean R, G, B and alpha of an exported PNG around a normalized point.
+ *  Colour is read un-premultiplied, so it means something only where the
+ *  patch is opaque. */
+const pngPatch = (page: Page, png: Buffer, x: number, y: number): Promise<number[]> =>
+  page.evaluate(
+    async ({ b64, x, y }) => {
+      const bin = atob(b64);
+      const u8 = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+      const bmp = await createImageBitmap(new Blob([u8], { type: 'image/png' }));
+      const c = document.createElement('canvas');
+      c.width = 600;
+      c.height = Math.round((600 * bmp.height) / bmp.width);
+      const g = c.getContext('2d')!;
+      g.imageSmoothingQuality = 'high';
+      g.drawImage(bmp, 0, 0, c.width, c.height);
+      bmp.close();
+      const d = g.getImageData(Math.round(c.width * x) - 12, Math.round(c.height * y) - 12, 24, 24).data;
+      const sum = [0, 0, 0, 0];
+      for (let i = 0; i < d.length; i += 4) for (let k = 0; k < 4; k++) sum[k] += d[i + k];
+      return sum.map((v) => v / (d.length / 4));
+    },
+    { b64: png.toString('base64'), x, y },
+  );
+
 test.describe('RAW retouch (#42): non-destructive Heal/Clone', () => {
   test.skip(RAWS.length === 0, 'no RAW fixture in dl-raw; run gen_dng.py to create one');
 
@@ -524,6 +572,110 @@ test.describe('RAW retouch (#42): non-destructive Heal/Clone', () => {
       recordMetrics(testInfo, {
         [`raw_stroke_far_shift_${name}`]: Math.round(rgbGap(before, after) * 100) / 100,
         [`raw_stroke_highlights_range_${name}`]: Math.round(rgbGap(after, flat) * 100) / 100,
+      });
+      expect(errors, errors.join('\n')).toEqual([]);
+    });
+
+    // #69, part 2. Cut and Delete used to write the hole into the pixels,
+    // which moved a RAW onto the 8-bit develop: the whole photo changed, the
+    // Highlights slider stopped working, and the session kept a baked PNG.
+    // Both are now recorded in the recipe and replayed on the develop, for a
+    // drawn selection and for a painted one.
+    test(`RAW ${name} keeps its develop through Delete and Cut to layer`, async ({ page }, testInfo) => {
+      test.setTimeout(600_000);
+      const errors = trackErrors(page);
+      const rgb = (p: number[]) => p.slice(0, 3);
+
+      await openApp(page);
+      await importFiles(page, [RAW]);
+      await waitDeveloped(page);
+
+      await clickTab(page, 'RAW');
+      await setRange(page, /^Exposure/, 0.7);
+      await setRange(page, /^Highlights/, 60);
+      await settledPatch(page, 0.12, 0.12);
+      const whole = await exportPng(page);
+      const far: [number, number] = [0.12, 0.12];
+      const piece: [number, number] = [0.5, 0.82];
+      const before = await pngPatch(page, whole, ...far);
+      const pieceBefore = await pngPatch(page, whole, ...piece);
+
+      // Delete the middle of the photo.
+      await rectSelect(page, 0.4, 0.4, 0.6, 0.6);
+      await page.locator('.select-row button', { hasText: /^Delete$/ }).click();
+      await expect
+        .poll(async () => (await itemRecord(page))?.hs?.length ?? 0, { timeout: 30_000 })
+        .toBe(1);
+      expect((await itemRecord(page))?.raw, 'Delete stopped the item being a RAW').toBe(true);
+      await settledPatch(page, ...far);
+      const deleted = await exportPng(page);
+      const hole = await pngPatch(page, deleted, 0.5, 0.5);
+      const kept = await pngPatch(page, deleted, ...far);
+      expect(hole[3], 'the deleted area is not transparent in the export').toBeLessThan(1);
+      expect(kept[3], 'the photo outside the deleted area lost alpha').toBeGreaterThan(254);
+      expect(rgbGap(rgb(before), rgb(kept)), 'Delete changed the photo outside the selection').toBeLessThanOrEqual(1);
+
+      // Cut another area to a layer: the piece sits where it was cut from.
+      await rectSelect(page, 0.4, 0.74, 0.6, 0.9);
+      await page.locator('.select-row button', { hasText: /^Cut to layer$/ }).click();
+      await expect
+        .poll(async () => (await itemRecord(page))?.hs?.length ?? 0, { timeout: 120_000 })
+        .toBe(2);
+      expect((await itemRecord(page))?.raw, 'Cut to layer stopped the item being a RAW').toBe(true);
+      await expect(page.locator('.developing-badge')).toHaveCount(0, { timeout: 120_000 });
+      await settledPatch(page, ...far);
+      const cut = await exportPng(page);
+      const keptCut = await pngPatch(page, cut, ...far);
+      const pieceCut = await pngPatch(page, cut, ...piece);
+      expect(rgbGap(rgb(before), rgb(keptCut)), 'Cut to layer changed the photo outside the selection').toBeLessThanOrEqual(1);
+      expect(pieceCut[3], 'the cut piece does not cover its hole').toBeGreaterThan(254);
+      expect(rgbGap(rgb(pieceBefore), rgb(pieceCut)), 'the cut piece is not the photo it was cut from').toBeLessThanOrEqual(2);
+
+      // A painted selection is a raster mask: the worker gets it by reference
+      // and the session stores it with the recipe.
+      await clickTab(page, 'Select');
+      await page.locator('.select-tab .chip', { hasText: /^Brush$/ }).click();
+      await setBrushFrac(page, /^Size:/, 0.2);
+      await setRange(page, /^Softness:/, 0);
+      const box = (await canvas(page).boundingBox())!;
+      await page.mouse.move(box.x + box.width * 0.5, box.y + box.height * 0.18);
+      await page.mouse.down();
+      await page.mouse.move(box.x + box.width * 0.56, box.y + box.height * 0.18, { steps: 6 });
+      await page.mouse.up();
+      await page.waitForTimeout(300);
+      await page.locator('.select-row button', { hasText: /^Delete$/ }).click();
+      await expect
+        .poll(async () => (await itemRecord(page))?.hs?.length ?? 0, { timeout: 30_000 })
+        .toBe(3);
+      const painted: [number, number] = [0.53, 0.18];
+
+      // The develop is still live: Highlights changes the photo.
+      await clickTab(page, 'RAW');
+      await setRange(page, /^Highlights/, 0);
+      await settledPatch(page, ...far);
+      await expect(page.locator('.developing-badge')).toHaveCount(0, { timeout: 120_000 });
+      const last = await exportPng(page);
+      const flat = await pngPatch(page, last, ...far);
+      expect(rgbGap(rgb(keptCut), rgb(flat)), 'Highlights no longer changes a RAW that has a cut').toBeGreaterThan(3);
+      expect((await pngPatch(page, last, ...painted))[3], 'the painted area is not transparent in the export').toBeLessThan(1);
+
+      // A reload brings back a RAW with both holes and the same develop.
+      await page.waitForTimeout(2500);
+      await page.reload();
+      await expect(thumbs(page)).toHaveCount(1, { timeout: 60_000 });
+      await waitDeveloped(page);
+      expect((await itemRecord(page))?.raw, 'the reload restored a baked image').toBe(true);
+      await settledPatch(page, ...far);
+      const back = await exportPng(page);
+      const holeBack = await pngPatch(page, back, 0.5, 0.5);
+      const keptBack = await pngPatch(page, back, ...far);
+      expect(holeBack[3], 'the deleted area came back after a reload').toBeLessThan(1);
+      expect((await pngPatch(page, back, ...painted))[3], 'the painted hole came back after a reload').toBeLessThan(1);
+      expect(rgbGap(rgb(flat), rgb(keptBack)), 'the develop changed across the reload').toBeLessThanOrEqual(1);
+      recordMetrics(testInfo, {
+        [`raw_cut_far_shift_${name}`]: Math.round(rgbGap(rgb(before), rgb(keptCut)) * 100) / 100,
+        [`raw_cut_piece_gap_${name}`]: Math.round(rgbGap(rgb(pieceBefore), rgb(pieceCut)) * 100) / 100,
+        [`raw_cut_highlights_range_${name}`]: Math.round(rgbGap(rgb(keptCut), rgb(flat)) * 100) / 100,
       });
       expect(errors, errors.join('\n')).toEqual([]);
     });
