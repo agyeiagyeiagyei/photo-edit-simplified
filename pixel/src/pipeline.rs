@@ -106,18 +106,20 @@ pub fn resize_wide(src: &[u16], w: usize, h: usize, target: Target) -> Frame16 {
     }
 }
 
-/// Whether a RAW edit can render from the un-toned 16-bit develop: the
-/// develop is actually non-identity, and neither stage the neutral path
-/// lacks (denoise, capture sharpen) is in use. Callers fall back to the
-/// legacy u8 pipeline otherwise, so an edit never silently loses a stage.
+/// Whether a RAW edit renders from the un-toned 16-bit develop: the develop
+/// is actually non-identity. Callers fall back to the legacy u8 pipeline
+/// otherwise.
 pub fn neutral_eligible(edit: &EditParams) -> bool {
     // Denoise and capture sharpening run inside the neutral path (after the
     // camera tone, in `rawops::detail_toned_wide`), so they no longer push a
     // RAW back onto the legacy toned-then-develop rendering (#15).
     //
-    // Retouch strokes replay on the 8-bit working frame, so any stroke forces
-    // the legacy path — the same rendering a baked heal produced before #42.
-    !edit.raw.is_identity() && edit.strokes.is_empty()
+    // Retouch strokes replay on the 16-bit working frame too
+    // (`geo::replay_strokes` is generic over the sample type). They used to
+    // force the legacy path, so the first Heal or Clone stroke on a RAW swapped
+    // the renderer under the whole photo: highlight recovery was lost and the
+    // frame brightened by up to 60 levels (#69).
+    !edit.raw.is_identity()
 }
 
 /// Selection mask for an edit at `w`×`h`, when the edit is masked.

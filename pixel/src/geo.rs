@@ -398,8 +398,8 @@ pub fn heal_anchor(
 /// at a different working resolution scales with it. A heal stroke that
 /// carries a source anchor ([`heal_anchor`]) samples that patch instead of
 /// searching again. Returns true when any stroke changed pixels.
-pub fn replay_strokes(
-    pixels: &mut [u8],
+pub fn replay_strokes<T: crate::resample::Sample>(
+    pixels: &mut [T],
     w: usize,
     h: usize,
     fw: usize,

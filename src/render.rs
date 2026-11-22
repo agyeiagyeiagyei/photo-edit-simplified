@@ -1173,14 +1173,14 @@ fn set_copying(state: AppState, on: bool) {
 }
 
 /// The develop a copy made now would hold, as one number: the RAW settings,
-/// and a bit that flips when the photo changes develop path. A retouch
-/// stroke or a destructive edit puts a RAW on the 8-bit path, which does not
-/// render as the 16-bit one does (#69), and a copy has to match the photo
-/// around it. 52 bits, so the session stores it as a number; never 0, which
-/// marks a copy whose develop is not known.
+/// and a bit that flips when the photo changes develop path. A destructive
+/// edit puts a RAW on the 8-bit path, which does not render as the 16-bit
+/// one does (#69), and a copy has to match the photo around it. 52 bits, so
+/// the session stores it as a number; never 0, which marks a copy whose
+/// develop is not known.
 fn copy_key(edit: &EditParams, photo: &PhotoData) -> u64 {
     let r = &edit.raw;
-    let mut k = (photo.raw && photo.gen == 0 && edit.strokes.is_empty()) as u64;
+    let mut k = (photo.raw && photo.gen == 0) as u64;
     for v in [r.temp, r.tint, r.exposure, r.highlights, r.shadows, r.noise, r.denoise, r.sharpen, r.texture] {
         k = k.wrapping_mul(0x100_0000_01b3) ^ v.to_bits() as u64;
     }

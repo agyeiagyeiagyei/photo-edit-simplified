@@ -6,7 +6,9 @@
 
 /// Stamp through `coverage` (255 = full copy), blending each covered pixel
 /// toward the pixel at `(x + dx, y + dy)`. Offset is in whole pixels.
-pub fn clone_stamp(rgba: &mut [u8], width: usize, height: usize, coverage: &[u8], dx: i32, dy: i32) {
+/// Generic over the sample type: the same stamp runs on the stored 8-bit
+/// frame and on a RAW's 16-bit develop.
+pub fn clone_stamp<T: crate::resample::Sample>(rgba: &mut [T], width: usize, height: usize, coverage: &[u8], dx: i32, dy: i32) {
     let src = rgba.to_vec();
     for y in 0..height {
         for x in 0..width {
@@ -20,7 +22,7 @@ pub fn clone_stamp(rgba: &mut [u8], width: usize, height: usize, coverage: &[u8]
             let s = &src[(sy * width + sx) * 4..];
             let p = &mut rgba[i * 4..];
             for c in 0..4 {
-                p[c] = ((p[c] as u32 * (255 - a) + s[c] as u32 * a + 127) / 255) as u8;
+                p[c] = T::from_u32((p[c].to_u32() * (255 - a) + s[c].to_u32() * a + 127) / 255);
             }
         }
     }
@@ -106,5 +108,22 @@ mod tests {
         // read the original gradient, so (16,16) = original (18,16) = [18,16,..].
         let p = &img[(16 * 32 + 16) * 4..];
         assert_eq!(&p[..4], &[18, 16, 100, 255]);
+    }
+    #[test]
+    fn stamps_16_bit_as_8_bit() {
+        let mut a = gradient(32, 32);
+        let mut b: Vec<u16> = a.iter().map(|&v| v as u16 * 257).collect();
+        // A soft-edged disc: partial coverage blends target and source.
+        let mut cov = disc(32, 32, 20, 20, 4);
+        for (i, c) in cov.iter_mut().enumerate() {
+            if *c == 255 && (i % 3) == 0 {
+                *c = 128;
+            }
+        }
+        clone_stamp(&mut a, 32, 32, &cov, -10, -10);
+        clone_stamp(&mut b, 32, 32, &cov, -10, -10);
+        for (x, y) in a.iter().zip(&b) {
+            assert!((*x as f64 - *y as f64 / 257.0).abs() <= 0.51);
+        }
     }
 }
