@@ -391,6 +391,15 @@ pub fn heal_anchor(
     Some(orig_from_work_norm(anchor, sw, sh, edit))
 }
 
+/// An edit that only turns and straightens: the frame an [`Area`] was drawn
+/// in. One copy of the default edit's construction, not one per caller.
+///
+/// [`Area`]: crate::types::Area
+#[inline(never)]
+fn turned_by(rot90: u8, fine_angle: f32) -> EditParams {
+    EditParams { rot90, fine_angle, ..EditParams::default() }
+}
+
 /// Replay a recorded Cut or Delete: clear alpha under its selection, carried
 /// from the geometry it was made in to the frame's. Colours stay, so what is
 /// under the hole still develops and a later clone can fill it.
@@ -403,7 +412,7 @@ fn erase_alpha<T: crate::resample::Sample>(
     e: &crate::types::Area,
     edit: &EditParams,
 ) -> bool {
-    let from = EditParams { rot90: e.rot90, fine_angle: e.fine_angle, ..EditParams::default() };
+    let from = turned_by(e.rot90, e.fine_angle);
     let mask = ops::selection_mask(&remap_selection(&e.sel, fw, fh, &from, edit), w, h);
     let mut changed = false;
     for (px, &m) in pixels.chunks_exact_mut(4).zip(&mask) {
@@ -429,10 +438,10 @@ pub fn replay_erases(pixels: &mut [u8], w: usize, h: usize, fw: usize, fh: usize
 /// what a fill removed. The texture is this frame's own, not the one the
 /// full-size fill finds. Returns true when a fill wrote pixels.
 pub fn replay_fills(pixels: &mut [u8], w: usize, h: usize, edit: &EditParams) -> bool {
-    let unturned = EditParams::default();
+    let unturned = turned_by(0, 0.0);
     let mut changed = false;
     for a in edit.strokes.iter().filter(|s| s.mode == crate::types::RetouchStroke::FILL).filter_map(|s| s.area.as_ref()) {
-        let from = EditParams { rot90: a.rot90, fine_angle: a.fine_angle, ..EditParams::default() };
+        let from = turned_by(a.rot90, a.fine_angle);
         let mask = ops::selection_mask(&remap_selection(&a.sel, w, h, &from, &unturned), w, h);
         changed |= crate::fill::fill_near(pixels, &mask, w, h).is_some();
     }
@@ -546,7 +555,7 @@ fn replay_fill<T: Frame>(
     at: usize,
     a: &crate::types::Area,
 ) -> bool {
-    let from = EditParams { rot90: a.rot90, fine_angle: a.fine_angle, ..EditParams::default() };
+    let mut from = turned_by(a.rot90, a.fine_angle);
     // The patch is in this frame's own pixels: no carrying over.
     let here = src.is_none() || same_geometry(&from, edit);
     let mut key = strokes_fingerprint(&edit.strokes[..at]);
@@ -577,7 +586,8 @@ fn replay_fill<T: Frame>(
         }
         None => {
             let Some(src) = src else { return false };
-            let from = EditParams { strokes: edit.strokes[..at].to_vec(), ..from.clone() };
+            // The frame the fill was recorded on, with the entries before it.
+            from.strokes = edit.strokes[..at].to_vec();
             let (frame, w0, h0) = T::turned(src, fw, fh, &from);
             let mut frame = frame.into_owned();
             replay_strokes_from(&mut frame, w0, h0, Some(src), fw, fh, &from);
@@ -701,7 +711,8 @@ pub fn try_fill<T: Frame>(src: &[T], fw: usize, fh: usize, edit: &EditParams) ->
     let Some((at, a)) = edit.strokes.len().checked_sub(1).and_then(|i| Some((i, edit.strokes[i].area.as_ref()?))) else {
         return false;
     };
-    let before = EditParams { strokes: edit.strokes[..at].to_vec(), ..edit.clone() };
+    let mut before = turned_by(edit.rot90, edit.fine_angle);
+    before.strokes = edit.strokes[..at].to_vec();
     let (p, w, h) = T::turned(src, fw, fh, edit);
     let mut frame = p.into_owned();
     replay_strokes_from(&mut frame, w, h, Some(src), fw, fh, &before);

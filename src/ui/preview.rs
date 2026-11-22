@@ -2301,10 +2301,17 @@ fn raw_develop_pending(state: AppState) -> bool {
     if crate::render::filling(item.id) {
         return true;
     }
-    if !photo.raw || photo.full {
+    if !photo.raw {
         return false;
     }
-    if !proxy_developed(item.id) || proxy_wants_neutral(state, item.id) {
+    if photo.full {
+        // The full-size frame renders in a fraction of a second, except
+        // where the worker has a recorded Content fill to make first: after
+        // a reload that is seconds, with the soft preview up meanwhile.
+        if !item.edit.strokes.iter().any(|s| s.mode == pes_pixel::types::RetouchStroke::FILL) {
+            return false;
+        }
+    } else if !proxy_developed(item.id) || proxy_wants_neutral(state, item.id) {
         return true;
     }
     let src_fp = source_fingerprint(photo.gen, proxy_gen(item.id));
