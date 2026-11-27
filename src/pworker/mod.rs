@@ -950,7 +950,7 @@ pub fn unload(id: usize) {
 fn sync_adjust_masks(wid: usize, edit: &EditParams) {
     let id = wid as u32;
     let layers = edit.adjust_layers.iter().filter_map(|l| Some((l.id, l.mask_version, l.mask.as_ref()?)));
-    let cuts = edit.strokes.iter().filter_map(|s| s.erase.as_ref().map(|e| (e.id, 0, &e.sel)));
+    let cuts = edit.strokes.iter().filter_map(|s| s.area.as_ref().map(|e| (e.id, 0, &e.sel)));
     for (mask_id, version, sel) in layers.chain(cuts) {
         let SelectionKind::Mask { data, width, height } = &sel.kind else {
             continue;
@@ -1260,6 +1260,22 @@ pub fn fill(
     let mut args = vec![JsValue::from(id as u32), JsValue::from_str(recipe)];
     args.extend(sargs);
     destructive_call("fill_selection", args, transfer, cb)
+}
+
+/// Ask the worker to make the Content fill that ends `recipe`'s retouch list.
+/// `cb` gets true when the fill found pixels to copy; the worker keeps it for
+/// the renders that follow. Runs in the destructive queue: it holds the
+/// worker for seconds.
+pub fn try_fill(id: usize, recipe: &str, cb: impl FnOnce(bool) + 'static) -> bool {
+    call(
+        "try_fill",
+        &[JsValue::from(id as u32), JsValue::from_str(recipe)],
+        &[],
+        Box::new(move |reply| {
+            cb(reply.is_ok_and(|v| v.as_bool() == Some(true)));
+            op_done();
+        }),
+    )
 }
 
 /// The reply to `extract` and `redevelop`: a layer's pixels, with the

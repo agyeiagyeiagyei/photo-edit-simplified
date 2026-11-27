@@ -904,6 +904,15 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             }
         }
         if want_hi {
+            // A recorded Content fill is synthesised on the frame the render
+            // starts from, and the display proxy's is not the sensor frame's:
+            // show the fill the export has.
+            if photo.raw
+                && !full_present(item.id)
+                && item.edit.strokes.iter().any(|s| s.mode == pes_pixel::types::RetouchStroke::FILL)
+            {
+                ensure_full(state, item.id, None);
+            }
             if windowed_view && !post_adjust {
                 let (_, _, fcw, fch) = rect_px(&img_win, fw, fh);
                 // Zoomed in past what a RAW's display proxy holds: load the
@@ -1731,7 +1740,9 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                     >
                         <canvas node_ref=canvas_ref></canvas>
                         <Show when=move || raw_develop_pending(state) fallback=|| ()>
-                            <div class="developing-badge" role="status" aria-live="polite">"Developing RAW…"</div>
+                            <div class="developing-badge" role="status" aria-live="polite">
+                                {move || if state.current().is_some_and(|i| crate::render::filling(i.id)) { "Filling…" } else { "Developing RAW…" }}
+                            </div>
                         </Show>
                         <Show when=move || tab.get() == Tab::Crop fallback=|| ()>
                             <CropOverlay state=state working=working drag=crop_drag pinch=crop_pinch/>
@@ -2286,10 +2297,21 @@ fn raw_develop_pending(state: AppState) -> bool {
     if (photo.raw || !item.edit.raw.is_identity()) && crate::render::copying_to_layer() {
         return true;
     }
-    if !photo.raw || photo.full {
+    // A Content fill of a RAW is being worked out.
+    if crate::render::filling(item.id) {
+        return true;
+    }
+    if !photo.raw {
         return false;
     }
-    if !proxy_developed(item.id) || proxy_wants_neutral(state, item.id) {
+    if photo.full {
+        // The full-size frame renders in a fraction of a second, except
+        // where the worker has a recorded Content fill to make first: after
+        // a reload that is seconds, with the soft preview up meanwhile.
+        if !item.edit.strokes.iter().any(|s| s.mode == pes_pixel::types::RetouchStroke::FILL) {
+            return false;
+        }
+    } else if !proxy_developed(item.id) || proxy_wants_neutral(state, item.id) {
         return true;
     }
     let src_fp = source_fingerprint(photo.gen, proxy_gen(item.id));

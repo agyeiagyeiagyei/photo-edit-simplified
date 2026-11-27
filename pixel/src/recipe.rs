@@ -9,7 +9,7 @@ use wasm_bindgen::JsValue;
 use crate::curves::{CurvePoint, CurvesSettings};
 use crate::levels::{LevelRange, LevelsSettings};
 use crate::types::{
-    AdjustLayer, Aspect, CropRect, EditParams, Erase, PointAdjust, RetouchStroke, Selection,
+    AdjustLayer, Aspect, CropRect, EditParams, Area, PointAdjust, RetouchStroke, Selection,
     SelectionKind,
 };
 
@@ -266,7 +266,7 @@ fn strokes_json(e: &EditParams, portable: bool) -> Option<String> {
         .strokes
         .iter()
         .map(|s| {
-            if let Some(c) = &s.erase {
+            if let Some(c) = &s.area {
                 // A raster selection travels like an adjustment layer's mask.
                 let sel = if portable { selection_portable_json(&c.sel) } else { selection_worker_json(&c.sel, 0) };
                 return format!(
@@ -300,14 +300,15 @@ fn strokes_from_json(v: &JsValue) -> Vec<RetouchStroke> {
     let mut out = Vec::new();
     for item in arr.iter() {
         let mode = jnum(&item, "m").unwrap_or(0.0) as u8;
-        if mode == RetouchStroke::ERASE {
+        if mode == RetouchStroke::ERASE || mode == RetouchStroke::FILL {
             if let Some(sel) = jget(&item, "cut").and_then(|c| selection_from_layer_value(&c)) {
-                out.push(RetouchStroke::erase(Erase {
+                let area = Area {
                     id: jnum(&item, "id").unwrap_or(0.0) as u64,
                     sel,
                     rot90: jnum(&item, "rot").unwrap_or(0.0) as u8,
                     fine_angle: jnum(&item, "fine").unwrap_or(0.0) as f32,
-                }));
+                };
+                out.push(RetouchStroke::on_area(mode, area));
             }
             continue;
         }
@@ -355,7 +356,7 @@ fn strokes_from_json(v: &JsValue) -> Vec<RetouchStroke> {
             pts,
             src,
             seed: jnum(&item, "seed").unwrap_or(0.0) as u32,
-            erase: None,
+            area: None,
         });
     }
     out
