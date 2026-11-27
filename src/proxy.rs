@@ -589,8 +589,23 @@ pub(crate) fn oriented_dims(w: usize, h: usize, orientation: u16) -> (usize, usi
 }
 
 /// Poll a worker callback until it fires (the raw worker has no awaitable
-/// API). 60 s covers a slow develop on a large sensor.
-pub(crate) async fn await_worker<T: 'static>(
+/// API), for up to 60 s. A batch import's queued display develops rely on
+/// this ceiling. A plain fn, so each caller builds one future, not two.
+pub(crate) fn await_worker<T: 'static>(
+    start: impl FnOnce(Box<dyn FnOnce(Option<T>)>) -> bool,
+) -> impl std::future::Future<Output = Option<T>> {
+    await_worker_ms(60_000, start)
+}
+
+/// Ceiling for a call that may queue behind other heavy work on a busy
+/// machine: the full-size develop and the export render (#76). The workers
+/// always answer, because a worker error or shutdown fails every queued
+/// call, so this only guards against a worker that hangs.
+pub(crate) const LONG_WAIT_MS: u32 = 600_000;
+
+/// `await_worker` with its own ceiling in milliseconds.
+pub(crate) async fn await_worker_ms<T: 'static>(
+    ms: u32,
     start: impl FnOnce(Box<dyn FnOnce(Option<T>)>) -> bool,
 ) -> Option<T> {
     let out: Rc<RefCell<Option<T>>> = Rc::new(RefCell::new(None));
@@ -603,7 +618,7 @@ pub(crate) async fn await_worker<T: 'static>(
     if !started {
         return None;
     }
-    for _ in 0..6000 {
+    for _ in 0..ms / 10 {
         if done.get() {
             break;
         }
@@ -674,7 +689,11 @@ pub(crate) async fn raw_develop_async(id: usize, src: &JsValue) -> Option<FullDe
     let src = src.clone();
     let tone = tone_of(id);
     let t0 = perf::now();
-    let r = await_worker(move |cb| pworker::raw_develop(id, &src, tone.as_ref(), cb)).await;
+    // A full-size develop queues behind any display proxy still developing.
+    let r = await_worker_ms(LONG_WAIT_MS, move |cb| {
+        pworker::raw_develop(id, &src, tone.as_ref(), cb)
+    })
+    .await;
     perf::record("proxy.raw_develop_full", perf::now() - t0);
     r.map(|f| FullDevelop {
         neutral: (f.neutral.length() > 0).then(|| NeutralData {

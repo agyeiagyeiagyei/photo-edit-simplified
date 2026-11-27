@@ -3,23 +3,62 @@
 use crate::prelude::*;
 use crate::*;
 
+/// Why a photo export produced no file. Each one is shown on the Export tab
+/// and recorded as an `export.failed` perf mark, so an export never stops
+/// without a word (#76).
+#[derive(Clone, Copy)]
+pub(crate) enum ExportFail {
+    /// The full-size pixels never landed: the RAW could not be read back or
+    /// developed, or the source could not be decoded.
+    FullSize,
+    /// The worker render of the edited photo failed.
+    Render,
+    /// The rendered photo could not be encoded.
+    Encode,
+}
+
+impl ExportFail {
+    /// Detail of the `export.failed` perf mark.
+    fn code(self) -> &'static str {
+        match self {
+            ExportFail::FullSize => "full_size",
+            ExportFail::Render => "render",
+            ExportFail::Encode => "encode",
+        }
+    }
+
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            ExportFail::FullSize => "the full-size photo could not be prepared",
+            ExportFail::Render => "the edited photo could not be rendered",
+            ExportFail::Encode => "the file could not be encoded",
+        }
+    }
+}
+
 /// Render a photo through the full edit pipeline into an encoded blob.
 /// Returns (blob, mime, filename).
 pub(crate) async fn render_photo_export(
     state: AppState,
     item: &MediaItem,
-) -> Option<(Blob, &'static str, String)> {
+) -> Result<(Blob, &'static str, String), ExportFail> {
+    let out = render_photo(state, item).await;
+    if let Err(e) = out {
+        perf::record_detail("export.failed", 0.0, Some(e.code().into()));
+        web::log(&format!("export of {} stopped: {}", item.name, e.reason()));
+    }
+    out
+}
+
+async fn render_photo(
+    state: AppState,
+    item: &MediaItem,
+) -> Result<(Blob, &'static str, String), ExportFail> {
     let _total = perf::Span::new("export.total").detail(item.name.clone());
     let ensure = perf::Span::new("export.ensure_full");
     let ensured = ensure_full_async(state, item.id).await;
     drop(ensure);
-    if !ensured {
-        return None;
-    }
-    let photo = get_photo(item.id)?;
-    if !photo.full {
-        return None;
-    }
+    let photo = get_photo(item.id).filter(|p| ensured && p.full).ok_or(ExportFail::FullSize)?;
     let (fw, fh) = photo.full_dims;
     let (ww, wh) = working_dims(fw, fh, &item.edit);
     let (cx, cy, cw, ch) = crop_px(&item.edit, ww, wh);
@@ -37,12 +76,12 @@ pub(crate) async fn render_photo_export(
     // Adjustment layers are part of the worker's pixel pipeline (the recipe
     // carries them); only overlay layers need the canvas composite below.
     let has_overlays = item.layers.iter().any(|l| !matches!(l.kind, state::LayerKind::Adjust(_)));
-    let encoded = if !has_overlays {
+    let blob = if !has_overlays {
         // The worker renders exactly the export rect and encodes there, so a
         // full-resolution RGBA frame never crosses to this thread.
         let png = format == PhotoFormat::Png;
         let quality = if format == PhotoFormat::JpegMax { 97 } else { 92 };
-        await_worker(move |cb| {
+        let bytes = await_worker_ms(LONG_WAIT_MS, move |cb| {
             pworker::export_photo(
                 id,
                 &recipe,
@@ -56,9 +95,9 @@ pub(crate) async fn render_photo_export(
             )
         })
         .await
-        .and_then(|bytes| {
-            web::view_to_blob(&bytes, if png { "image/png" } else { "image/jpeg" }).ok()
-        })
+        .ok_or(ExportFail::Render)?;
+        web::view_to_blob(&bytes, if png { "image/png" } else { "image/jpeg" })
+            .map_err(|_| ExportFail::Encode)?
     } else {
         // Layer copies taken before the last RAW change are developed again
         // first, so the file never carries a copy the preview has not caught
@@ -77,7 +116,7 @@ pub(crate) async fn render_photo_export(
         // Layers composite on a canvas, so the edited base has to land here at
         // working resolution: one worker render, then crop+scale into the
         // export canvas.
-        let frame = await_worker(move |cb| {
+        let frame = await_worker_ms(LONG_WAIT_MS, move |cb| {
             let max_edge = ww.max(wh) as u32;
             pworker::render(
                 id,
@@ -89,7 +128,8 @@ pub(crate) async fn render_photo_export(
                 move |r| cb(r.ok()),
             )
         })
-        .await?;
+        .await
+        .ok_or(ExportFail::Render)?;
         let base = web::create_canvas(frame.w, frame.h);
         web::put_pixels_view(&base, &frame.pixels, frame.w, frame.h);
         composite_stack(&base, item.id, &layers, frame.w as usize, frame.h as usize);
@@ -104,13 +144,13 @@ pub(crate) async fn render_photo_export(
         // Export composites at native resolution; drop the overlay scratch
         // canvases so they don't sit in memory at 25 MP until the next paint.
         crate::render::clear_overlay_caches();
-        match format {
+        let blob = match format {
             PhotoFormat::Jpeg | PhotoFormat::JpegMax => {
                 let quality = if format == PhotoFormat::JpegMax { 97 } else { 92 };
                 let fallback = if format == PhotoFormat::JpegMax { 1.0 } else { 0.92 };
                 let jpeg = match web::image_data_view(&out, ew as u32, eh as u32) {
                     Some(view) => {
-                        await_worker(move |cb| {
+                        await_worker_ms(LONG_WAIT_MS, move |cb| {
                             pworker::encode_jpeg(&view, ew as u32, eh as u32, quality, cb)
                         })
                         .await
@@ -123,9 +163,9 @@ pub(crate) async fn render_photo_export(
                 }
             }
             PhotoFormat::Png => web::canvas_to_blob(&out, "image/png").await.ok(),
-        }
+        };
+        blob.ok_or(ExportFail::Encode)?
     };
-    let blob = encoded?;
     let (mime, ext) = match format {
         PhotoFormat::Png => ("image/png", "png"),
         _ => ("image/jpeg", "jpg"),
@@ -156,14 +196,21 @@ pub(crate) async fn render_photo_export(
     drop(encode_span);
     let base = item.name.rsplitn(2, '.').last().unwrap_or("photo");
     let filename = format!("edited-{}-{}.{}", item.edit.aspect.slug(), base, ext);
-    Some((blob, mime, filename))
+    Ok((blob, mime, filename))
+}
+
+/// The Export tab's line for an export that produced no file.
+fn not_exported(name: &str, reason: &str) -> String {
+    format!("{name} was not exported: {reason}. Try again.")
 }
 
 pub(crate) fn export_photo(state: AppState, item: MediaItem) {
     spawn_local(async move {
         state.busy.set(Some(format!("Exporting {}…", item.name)));
-        if let Some((blob, _mime, filename)) = render_photo_export(state, &item).await {
-            web::download_blob(&blob, &filename);
+        state.export_error.set(None);
+        match render_photo_export(state, &item).await {
+            Ok((blob, _mime, filename)) => web::download_blob(&blob, &filename),
+            Err(e) => state.export_error.set(Some(not_exported(&item.name, e.reason()))),
         }
         state.busy.set(None);
     });
@@ -230,9 +277,8 @@ pub(crate) async fn save_photo_to_drive_inner(state: AppState, item: MediaItem) 
         Some(_) => None,
         None => Some(edits_folder_id(state, &token, &folder_id).await?),
     };
-    let Some((blob, mime, filename)) = render_photo_export(state, &item).await else {
-        return Err("render failed".into());
-    };
+    let (blob, mime, filename) =
+        render_photo_export(state, &item).await.map_err(|e| e.reason().to_string())?;
     let result = async {
         let bytes = web::blob_to_bytes(&blob).await?;
         let parent = dest.as_deref().unwrap_or(&folder_id);
@@ -402,9 +448,14 @@ pub(crate) fn passthru_mime(name: &str) -> Option<&'static str> {
 pub(crate) fn export_video(state: AppState, item: MediaItem) {
     spawn_local(async move {
         state.busy.set(Some(format!("Exporting {}…", item.name)));
+        state.export_error.set(None);
         state.progress.set(0.0);
-        if let Some((out, filename)) = render_video_export(state, &item).await {
-            web::download_blob(&out, &filename);
+        match render_video_export(state, &item).await {
+            Some((out, filename)) => web::download_blob(&out, &filename),
+            None => state.export_error.set(Some(not_exported(
+                &item.name,
+                "the video could not be converted",
+            ))),
         }
         state.busy.set(None);
         state.progress.set(0.0);
@@ -457,20 +508,33 @@ pub(crate) fn download_edited_zip(state: AppState) {
             return;
         }
         let n = targets.len();
+        state.export_error.set(None);
         let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut missing: Vec<String> = Vec::new();
         for (i, item) in targets.into_iter().enumerate() {
             state.busy.set(Some(format!("Packaging zip… ({}/{})", i + 1, n)));
             let rendered = match item.kind {
                 MediaKind::Photo => render_photo_export(state, &item)
                     .await
+                    .ok()
                     .map(|(b, _, f)| (b, f)),
                 MediaKind::Video => render_video_export(state, &item).await,
             };
-            if let Some((blob, filename)) = rendered {
-                if let Ok(bytes) = web::blob_to_bytes(&blob).await {
-                    entries.push((filename, bytes));
-                }
+            let bytes = match rendered {
+                Some((blob, filename)) => web::blob_to_bytes(&blob).await.ok().map(|b| (filename, b)),
+                None => None,
+            };
+            match bytes {
+                Some(entry) => entries.push(entry),
+                None => missing.push(item.name),
             }
+        }
+        if !missing.is_empty() {
+            let what = if entries.is_empty() { "No zip was made" } else { "Left out of the zip" };
+            state.export_error.set(Some(format!(
+                "{what}: {} could not be exported. Try again.",
+                missing.join(", ")
+            )));
         }
         if !entries.is_empty() {
             state.busy.set(Some("Building zip…".into()));

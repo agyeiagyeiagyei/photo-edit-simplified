@@ -411,19 +411,36 @@ pub(crate) async fn sleep_ms(ms: i32) {
     let _ = wasm_bindgen_futures::JsFuture::from(p).await;
 }
 
-/// Awaitable ensure_full for the export path. False when undecodable.
+/// Awaitable ensure_full for the export path. Waits for as long as the
+/// develop or decode runs: reading a RAW back from the session store and
+/// developing it at sensor size behind a display proxy can take more than
+/// the 30 s this used to allow on a busy machine, and the export then
+/// stopped without a file (#76). One that fails is tried once more. False
+/// when the pixels could not be made, or the item is gone.
 pub(crate) async fn ensure_full_async(state: AppState, id: usize) -> bool {
-    if full_present(id) {
-        return true;
-    }
-    let done = Rc::new(Cell::new(false));
-    let done2 = done.clone();
-    ensure_full(state, id, Some(Box::new(move || done2.set(true))));
-    for _ in 0..600 {
-        if done.get() {
-            break;
+    for attempt in 0..2 {
+        if full_present(id) {
+            return true;
         }
-        sleep_ms(50).await;
+        if attempt > 0 {
+            if !CACHE.with(|c| c.borrow().photos.contains_key(&id)) {
+                return false;
+            }
+            perf::record("export.full_retry", 0.0);
+        }
+        let done = Rc::new(Cell::new(false));
+        let done2 = done.clone();
+        ensure_full(state, id, Some(Box::new(move || done2.set(true))));
+        // The waiter runs when the develop lands or fails; the ceiling only
+        // guards against a worker that hangs, where a retry would just queue
+        // behind it.
+        let deadline = perf::now() + LONG_WAIT_MS as f64;
+        while !done.get() {
+            if perf::now() > deadline {
+                return full_present(id);
+            }
+            sleep_ms(50).await;
+        }
     }
     full_present(id)
 }

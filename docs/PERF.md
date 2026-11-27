@@ -54,6 +54,8 @@ cleared right after the measure so the timeline never accumulates marks.
 | `export.ensure_full` | waiting for full-res pixels to materialise | — |
 | `export.encode` | worker render → (layers) composite → crop → encode → EXIF injection | output `WxH` |
 | `export.total` | full export of one item (including `ensure_full`) | item name |
+| `export.full_retry` | zero-length mark: the full-res pixels failed once and are being made again | — |
+| `export.failed` | zero-length mark: an export produced no file; the Export tab says why (#76) | `full_size`, `render` or `encode` |
 | `session.persist` | one IndexedDB session write pass | item count |
 | `restore.session` | whole startup restore | item count |
 | `restore.item` | restoring one item | `name #id` |
