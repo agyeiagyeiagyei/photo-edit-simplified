@@ -262,3 +262,114 @@ test.describe('RAW (ARW/DNG) import → develop → export', () => {
     expect(errors.filter((e) => !/favicon/.test(e)), errors.join('\n')).toEqual([]);
   });
 });
+
+// #76: an export of a RAW sometimes produced no file and no message. A RAW
+// is developed at full size only when it is exported (or zoomed), from the
+// copy kept in the session store, so these tests get in the way of that read.
+test.describe('A RAW export never stops without a word (#76)', () => {
+  test.skip(RAWS.length === 0, 'no RAW fixture in dl-raw; run gen_dng.py to create one');
+  // The synthetic DNG develops fastest; the path is the same for any RAW.
+  const RAW = RAWS.find((r) => /\.dng$/i.test(r)) ?? RAWS[0];
+  const download = (page: Page) => page.locator('button.btn.primary', { hasText: 'Download this' });
+  const marks = (page: Page, name: string): Promise<any[]> =>
+    page.evaluate((n) => ((window as any).__pes?.perf?.() || []).filter((e: any) => e.name === n), name);
+
+  async function openDeveloped(page: Page) {
+    await openApp(page);
+    await importFiles(page, [RAW]);
+    await expect(page.locator('.developing-badge')).toHaveCount(0, { timeout: 120_000 });
+    await clickTab(page, 'Export');
+    await page.evaluate(() => (window as any).__pes.reset());
+  }
+
+  test('waits for a slow read of the RAW and still downloads', async ({ page }, testInfo) => {
+    test.setTimeout(300_000);
+    const errors = trackErrors(page);
+    await openDeveloped(page);
+    // Keep a write transaction open on the stored RAWs for 35 s. The
+    // develop's read waits behind it, as it can behind a busy disk. The
+    // export used to give up after 30 s with no file and no message.
+    const HOLD = 35_000;
+    await page.evaluate((hold) => new Promise<void>((res, rej) => {
+      const req = indexedDB.open('pes-session');
+      req.onerror = () => rej(req.error);
+      req.onsuccess = () => {
+        const db = req.result;
+        const store = db.transaction('raw_src', 'readwrite').objectStore('raw_src');
+        const until = performance.now() + hold;
+        // A transaction commits once no request is left, so chain them.
+        const spin = () => { if (performance.now() < until) store.count().onsuccess = spin; else db.close(); };
+        spin();
+        res();
+      };
+    }), HOLD);
+    const t0 = Date.now();
+    const [dl] = await Promise.all([
+      page.waitForEvent('download', { timeout: 180_000 }),
+      download(page).click(),
+    ]);
+    const exportMs = Date.now() - t0;
+    const bytes = fs.readFileSync((await dl.path())!);
+    const dims = await imageDims(page, bytes, 'image/jpeg');
+    expect(dims.w * dims.h, 'exported at sensor size').toBeGreaterThan(4_000_000);
+    const [ensure] = await marks(page, 'export.ensure_full');
+    expect(ensure?.dur_ms, 'the read of the RAW was held up').toBeGreaterThan(HOLD - 5_000);
+    expect(await marks(page, 'export.failed')).toEqual([]);
+    await expect(page.locator('.export-error')).toHaveCount(0);
+    recordMetrics(testInfo, { raw_slow_read_export_ms: exportMs, raw_slow_read_ensure_full_ms: Math.round(ensure.dur_ms) });
+    expect(errors.filter((e) => !/favicon/.test(e)), errors.join('\n')).toEqual([]);
+  });
+
+  test('says why when the RAW cannot be read back, and the next export clears it', async ({ page }) => {
+    test.setTimeout(300_000);
+    const errors = trackErrors(page);
+    await openDeveloped(page);
+    // Take the stored RAW away (and keep it, to put back afterwards).
+    await page.evaluate(() => new Promise<void>((res, rej) => {
+      const req = indexedDB.open('pes-session');
+      req.onerror = () => rej(req.error);
+      req.onsuccess = () => {
+        const db = req.result;
+        const tx = db.transaction('raw_src', 'readwrite');
+        const store = tx.objectStore('raw_src');
+        const keys = store.getAllKeys();
+        const vals = store.getAll();
+        vals.onsuccess = () => { (window as any).__qaRaw = { keys: keys.result, vals: vals.result }; store.clear(); };
+        tx.oncomplete = () => { db.close(); res(); };
+        tx.onerror = () => rej(tx.error);
+      };
+    }));
+    let downloads = 0;
+    page.on('download', () => downloads++);
+    await download(page).click();
+    const msg = page.locator('.export-error');
+    await expect(msg).toBeVisible({ timeout: 120_000 });
+    await expect(msg).toHaveText(`${path.basename(RAW)} was not exported: the full-size photo could not be prepared. Try again.`);
+    expect((await marks(page, 'export.failed')).map((e) => e.detail)).toEqual(['full_size']);
+    expect(await marks(page, 'export.full_retry'), 'tried once more before giving up').toHaveLength(1);
+    await expect(download(page)).toBeEnabled();
+    await expect(page.locator('.overlay')).toHaveCount(0);
+    expect(downloads).toBe(0);
+
+    // With the RAW back, the next export downloads and the message goes.
+    await page.evaluate(() => new Promise<void>((res, rej) => {
+      const req = indexedDB.open('pes-session');
+      req.onerror = () => rej(req.error);
+      req.onsuccess = () => {
+        const db = req.result;
+        const tx = db.transaction('raw_src', 'readwrite');
+        const { keys, vals } = (window as any).__qaRaw;
+        keys.forEach((k: IDBValidKey, i: number) => tx.objectStore('raw_src').put(vals[i], k));
+        tx.oncomplete = () => { db.close(); res(); };
+        tx.onerror = () => rej(tx.error);
+      };
+    }));
+    const [dl] = await Promise.all([
+      page.waitForEvent('download', { timeout: 180_000 }),
+      download(page).click(),
+    ]);
+    expect(fs.statSync((await dl.path())!).size).toBeGreaterThan(0);
+    await expect(msg).toHaveCount(0);
+    expect(errors.filter((e) => !/favicon/.test(e)), errors.join('\n')).toEqual([]);
+  });
+});

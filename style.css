@@ -732,7 +732,8 @@ button:disabled {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.drive-error { color: #e06c5c; }
+.drive-error, .export-error { color: #e06c5c; }
+.export-error { font-size: 13px; }
 
 .drive-crumbs {
   display: flex;

@@ -1561,6 +1561,12 @@ pub(crate) fn ExportTab(state: AppState) -> impl IntoView {
                 }
             }
         }>"Download this"</button>
+        {move || {
+            state
+                .export_error
+                .get()
+                .map(|msg| view! { <p class="export-error" role="alert">{msg}</p> })
+        }}
         <Show when=is_photo fallback=|| ()>
             <Show
                 when=move || {

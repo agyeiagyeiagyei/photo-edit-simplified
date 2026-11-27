@@ -841,6 +841,8 @@ pub struct AppState {
     pub drive_hover_gen: RwSignal<u32>,
     /// Last Drive error to surface in the panel.
     pub drive_error: RwSignal<Option<String>>,
+    /// Why the last export produced no file, shown on the Export tab (#76).
+    pub export_error: RwSignal<Option<String>>,
     /// Whether the Drive panel is expanded.
     pub drive_open: RwSignal<bool>,
 }
@@ -930,6 +932,7 @@ impl AppState {
             loupe_gen: create_rw_signal(0),
             canvas_loupe_gen: create_rw_signal(0),
             drive_error: create_rw_signal(None),
+            export_error: create_rw_signal(None),
             drive_open: create_rw_signal(false),
         }
     }
