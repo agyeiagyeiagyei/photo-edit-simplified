@@ -349,19 +349,40 @@ fn lasso_fill(mask: &mut [u8], w: usize, h: usize, poly: &[(f32, f32)]) {
         }
         xs.sort_unstable_by(f32::total_cmp);
         let row = &mut mask[y * w..(y + 1) * w];
-        // `k` counts crossings at or left of the pixel centre; the pixel is
-        // inside when the rest (those strictly right of it) are odd in number.
-        let mut k = 0;
-        for (x, px) in row.iter_mut().enumerate() {
-            let nx = (x as f32 + 0.5) / w as f32;
-            while k < xs.len() && xs[k] <= nx {
-                k += 1;
-            }
+        // A crossing counts for every pixel whose centre is at or right of it;
+        // a pixel is inside when the crossings strictly right of its centre
+        // are odd in number. So between the first pixels each pair of
+        // neighbouring crossings counts for, the parity is constant: fill
+        // spans instead of testing pixels (the first stroke on a 3200 px mask
+        // spent most of its time here, #78).
+        let mut from = 0;
+        for k in 0..=xs.len() {
+            let to = if k < xs.len() { first_centre_at(xs[k], w).max(from) } else { w };
             if (xs.len() - k) % 2 == 1 {
-                *px = 255;
+                row[from..to].fill(255);
             }
+            from = to;
         }
     }
+}
+
+/// The first pixel whose centre `(x + 0.5) / w` is at or right of `c`, or
+/// `w` if none is; found with the same float expression the per-pixel test
+/// uses, so the spans pick exactly its pixels. A NaN crossing is never
+/// passed, as `c <= centre` never holds for it.
+fn first_centre_at(c: f32, w: usize) -> usize {
+    let centre = |x: usize| (x as f32 + 0.5) / w as f32;
+    if c.is_nan() {
+        return w;
+    }
+    let mut x = ((c * w as f32 - 0.5).ceil().max(0.0) as usize).min(w);
+    while x > 0 && c <= centre(x - 1) {
+        x -= 1;
+    }
+    while x < w && c > centre(x) {
+        x += 1;
+    }
+    x
 }
 
 /// Reference even-odd test the scanline fill must agree with pixel for pixel.
@@ -715,6 +736,9 @@ mod tests {
             let (w, h) = (37 + case * 11, 23 + case * 5);
             let mut fast = vec![0u8; w * h];
             lasso_fill(&mut fast, w, h, &poly);
+            let mut old = vec![0u8; w * h];
+            lasso_fill_per_pixel(&mut old, w, h, &poly);
+            assert_eq!(fast, old, "case {case}: the span fill differs from the per-pixel fill");
             for y in 0..h {
                 for x in 0..w {
                     let nx = (x as f32 + 0.5) / w as f32;
@@ -724,6 +748,81 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The fill as it was before the span fill (#78): every pixel of a row
+    /// tested against the sorted crossings.
+    fn lasso_fill_per_pixel(mask: &mut [u8], w: usize, h: usize, poly: &[(f32, f32)]) {
+        let n = poly.len();
+        let mut xs: Vec<f32> = Vec::with_capacity(n);
+        for y in 0..h {
+            let ny = (y as f32 + 0.5) / h as f32;
+            xs.clear();
+            let mut j = n - 1;
+            for i in 0..n {
+                let (xi, yi) = poly[i];
+                let (xj, yj) = poly[j];
+                if (yi > ny) != (yj > ny) {
+                    xs.push((xj - xi) * (ny - yi) / (yj - yi) + xi);
+                }
+                j = i;
+            }
+            xs.sort_unstable_by(f32::total_cmp);
+            let mut k = 0;
+            for (x, px) in mask[y * w..(y + 1) * w].iter_mut().enumerate() {
+                let nx = (x as f32 + 0.5) / w as f32;
+                while k < xs.len() && xs[k] <= nx {
+                    k += 1;
+                }
+                if (xs.len() - k) % 2 == 1 {
+                    *px = 255;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scanline_lasso_matches_on_pixel_centres_and_odd_values() {
+        // Edges exactly on pixel centres, just either side of them, past the
+        // frame, and infinite or NaN vertices: the same pixels as the fill
+        // before the span fill, and as the per-pixel test where the polygon
+        // is finite (NaN crossings already split those two).
+        let mut checked = 0;
+        for &(w, h) in &[(1usize, 1usize), (2, 3), (7, 5), (64, 48), (101, 67)] {
+            let c = |x: usize, n: usize| (x as f32 + 0.5) / n as f32;
+            let nudge = |v: f32, by: i32| f32::from_bits((v.to_bits() as i32 + by) as u32);
+            let mut polys: Vec<Vec<(f32, f32)>> = Vec::new();
+            for by in [-1, 0, 1] {
+                let (x0, x1) = (nudge(c(0, w), by), nudge(c(w.saturating_sub(1) / 2, w), by));
+                let (y0, y1) = (c(0, h), c(h / 2, h));
+                polys.push(vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1)]);
+            }
+            polys.push(vec![(-0.5, -0.5), (1.5, 0.2), (0.3, 1.5)]);
+            polys.push(vec![(0.2, 0.2), (f32::INFINITY, 0.5), (0.2, 0.8)]);
+            polys.push(vec![(0.2, 0.2), (f32::NEG_INFINITY, 0.5), (0.8, 0.8)]);
+            polys.push(vec![(0.1, 0.1), (0.9, 0.1), (0.1, 0.9), (0.9, 0.9)]);
+            polys.push(vec![(0.2, 0.2), (f32::NAN, 0.5), (0.8, 0.8), (0.5, 0.9)]);
+            polys.push(vec![(0.2, 0.2), (-f32::NAN, 0.5), (0.8, 0.8), (0.5, 0.9)]);
+            for poly in &polys {
+                let mut fast = vec![0u8; w * h];
+                lasso_fill(&mut fast, w, h, poly);
+                let mut old = vec![0u8; w * h];
+                lasso_fill_per_pixel(&mut old, w, h, poly);
+                assert_eq!(fast, old, "{poly:?} {w}x{h}");
+                // An infinite vertex makes NaN crossings (inf - inf).
+                if poly.iter().any(|p| !p.0.is_finite()) {
+                    continue;
+                }
+                for y in 0..h {
+                    for x in 0..w {
+                        let want = if point_in_polygon(c(x, w), c(y, h), poly) { 255 } else { 0 };
+                        assert_eq!(fast[y * w + x], want, "{poly:?} {w}x{h} pixel ({x},{y})");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 10_000);
     }
 
     /// 10%..90% rise of the mask along the middle row, as a fraction of width.
