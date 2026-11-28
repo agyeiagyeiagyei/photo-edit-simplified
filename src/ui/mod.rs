@@ -5,11 +5,13 @@ use crate::*;
 
 mod canvas;
 mod layers;
+mod pen;
 mod preview;
 mod tabs;
 mod zoom;
 pub(crate) use canvas::*;
 pub(crate) use layers::*;
+pub(crate) use pen::*;
 pub(crate) use preview::*;
 pub(crate) use tabs::*;
 pub(crate) use zoom::*;

@@ -144,19 +144,27 @@ impl Tool {
 pub enum SelectTool {
     Rect,
     Lasso,
+    Pen,
     Wand,
     Subject,
     Brush,
 }
 
 impl SelectTool {
-    pub const ALL: [SelectTool; 5] =
-        [SelectTool::Rect, SelectTool::Lasso, SelectTool::Wand, SelectTool::Subject, SelectTool::Brush];
+    pub const ALL: [SelectTool; 6] = [
+        SelectTool::Rect,
+        SelectTool::Lasso,
+        SelectTool::Pen,
+        SelectTool::Wand,
+        SelectTool::Subject,
+        SelectTool::Brush,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             SelectTool::Rect => "Rect",
             SelectTool::Lasso => "Lasso",
+            SelectTool::Pen => "Pen",
             SelectTool::Wand => "Wand",
             SelectTool::Subject => "Subject",
             SelectTool::Brush => "Brush",
@@ -225,6 +233,59 @@ impl PathPoint {
     pub fn new(x: f32, y: f32) -> Self {
         PathPoint { x, y, in_x: 0.0, in_y: 0.0, out_x: 0.0, out_y: 0.0, smooth: true }
     }
+}
+
+/// A path drawn with the Select tab's Pen: anchors with Bézier handles, in
+/// the photo's normalized coordinates (the frame a lasso uses). Closing it
+/// makes it the photo's selection. `poly` is the outline written then, so a
+/// closed path stays editable only while that outline is still the selection.
+#[derive(Clone, PartialEq, Debug)]
+pub struct PenPath {
+    pub item_id: usize,
+    pub points: Vec<PathPoint>,
+    pub closed: bool,
+    pub poly: Vec<(f32, f32)>,
+}
+
+/// The path as a polygon in the same coordinates, for a lasso selection.
+/// Each curve gets its segment count from Wang's formula, so no chord strays
+/// more than a quarter of a pixel at `w` x `h`; a straight edge (both handles
+/// on their anchors) stays one edge, and every anchor is a vertex. A closed
+/// path does not repeat its first point.
+pub fn flatten_path(points: &[PathPoint], closed: bool, w: f32, h: f32) -> Vec<(f32, f32)> {
+    let (w, h) = (w.max(1.0), h.max(1.0));
+    let Some(first) = points.first() else { return Vec::new() };
+    let mut out = vec![(first.x, first.y)];
+    let n = points.len();
+    for i in 0..if closed { n } else { n - 1 } {
+        let (a, b) = (&points[i], &points[(i + 1) % n]);
+        let p = [
+            (a.x * w, a.y * h),
+            ((a.x + a.out_x) * w, (a.y + a.out_y) * h),
+            ((b.x + b.in_x) * w, (b.y + b.in_y) * h),
+            (b.x * w, b.y * h),
+        ];
+        let dd = |i: usize| (p[i].0 - 2.0 * p[i + 1].0 + p[i + 2].0).hypot(p[i].1 - 2.0 * p[i + 1].1 + p[i + 2].1);
+        // Handles on their anchors make a straight edge, which the bound
+        // would still cut by its length. A NaN count casts to 0: one edge.
+        let k = if [a.out_x, a.out_y, b.in_x, b.in_y] == [0.0; 4] {
+            1
+        } else {
+            ((0.75 * dd(0).max(dd(1)) / 0.25).sqrt().ceil() as usize).clamp(1, 256)
+        };
+        for j in 1..k {
+            let t = j as f32 / k as f32;
+            let u = 1.0 - t;
+            let c = [u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t];
+            let at = |f: fn(&(f32, f32)) -> f32| c.iter().zip(&p).map(|(c, q)| c * f(q)).sum::<f32>();
+            out.push((at(|q| q.0) / w, at(|q| q.1) / h));
+        }
+        out.push((b.x, b.y));
+    }
+    if closed {
+        out.pop();
+    }
+    out
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -745,6 +806,9 @@ pub struct AppState {
     pub brush_remove: RwSignal<bool>,
     /// Dirty-tile undo/redo for brush strokes.
     pub brush_history: RwSignal<crate::render::BrushHistory>,
+    /// The Select tab's Pen path, while it is drawn or its outline is still
+    /// the selection.
+    pub pen_path: RwSignal<Option<PenPath>>,
     /// Spot-heal brush: radius as a fraction of the image diagonal.
     pub heal_radius: RwSignal<f32>,
     pub heal_mode: RwSignal<crate::heal::HealMode>,
@@ -891,6 +955,7 @@ impl AppState {
             brush_softness: create_rw_signal(0.0),
             brush_remove: create_rw_signal(false),
             brush_history: create_rw_signal(crate::render::BrushHistory::default()),
+            pen_path: create_rw_signal(None),
             heal_radius: create_rw_signal(0.02),
             heal_mode: create_rw_signal(crate::heal::HealMode::ContentAware),
             clone_source: create_rw_signal(None),
@@ -1038,5 +1103,75 @@ mod tests {
         v.reset();
         assert_eq!(v, ViewZoom::default());
         assert!(!v.zoomed());
+    }
+
+    fn curved(x: f32, y: f32, out: (f32, f32)) -> PathPoint {
+        PathPoint { out_x: out.0, out_y: out.1, in_x: -out.0, in_y: -out.1, ..PathPoint::new(x, y) }
+    }
+
+    #[test]
+    fn a_pen_path_of_straight_edges_is_its_anchors() {
+        let pts = [PathPoint::new(0.1, 0.2), PathPoint::new(0.7, 0.25), PathPoint::new(0.4, 0.9)];
+        let want = vec![(0.1, 0.2), (0.7, 0.25), (0.4, 0.9)];
+        assert_eq!(flatten_path(&pts, true, 6000.0, 4000.0), want, "closed: no repeated first point");
+        assert_eq!(flatten_path(&pts, false, 6000.0, 4000.0), want);
+        assert!(flatten_path(&[], true, 6000.0, 4000.0).is_empty());
+    }
+
+    #[test]
+    fn a_pen_curve_stays_within_a_quarter_pixel() {
+        let (w, h) = (6000.0f32, 4000.0f32);
+        let pts = [
+            curved(0.2, 0.5, (0.0, -0.3)),
+            curved(0.5, 0.15, (0.25, 0.0)),
+            PathPoint { in_x: 0.05, in_y: -0.2, ..PathPoint::new(0.8, 0.6) },
+        ];
+        let poly = flatten_path(&pts, true, w, h);
+        assert!(poly.len() > 40 && poly.len() <= 3 * 256, "{} vertices", poly.len());
+        for p in &pts {
+            assert!(poly.contains(&(p.x, p.y)), "anchor {:?} is not a vertex", (p.x, p.y));
+        }
+        // Distance in pixels from each densely sampled curve point to the
+        // nearest polygon edge.
+        let px: Vec<(f32, f32)> = poly.iter().map(|&(x, y)| (x * w, y * h)).collect();
+        let to_edge = |q: (f32, f32)| {
+            (0..px.len())
+                .map(|i| {
+                    let (a, b) = (px[i], px[(i + 1) % px.len()]);
+                    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+                    let t = (((q.0 - a.0) * dx + (q.1 - a.1) * dy) / (dx * dx + dy * dy).max(1e-12)).clamp(0.0, 1.0);
+                    (q.0 - a.0 - t * dx).hypot(q.1 - a.1 - t * dy)
+                })
+                .fold(f32::INFINITY, f32::min)
+        };
+        for i in 0..pts.len() {
+            let (a, b) = (&pts[i], &pts[(i + 1) % pts.len()]);
+            let c = [
+                (a.x * w, a.y * h),
+                ((a.x + a.out_x) * w, (a.y + a.out_y) * h),
+                ((b.x + b.in_x) * w, (b.y + b.in_y) * h),
+                (b.x * w, b.y * h),
+            ];
+            for s in 0..=1000 {
+                let t = s as f32 / 1000.0;
+                let u = 1.0 - t;
+                let k = [u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t];
+                let q = (
+                    (0..4).map(|j| k[j] * c[j].0).sum::<f32>(),
+                    (0..4).map(|j| k[j] * c[j].1).sum::<f32>(),
+                );
+                let d = to_edge(q);
+                assert!(d <= 0.26, "edge {i} t={t}: {d} px from the polygon");
+            }
+        }
+    }
+
+    #[test]
+    fn a_pen_path_with_bad_handles_still_flattens() {
+        let pts = [curved(0.2, 0.2, (f32::NAN, 0.1)), curved(0.8, 0.2, (f32::INFINITY, 0.0)), PathPoint::new(0.5, 0.8)];
+        let poly = flatten_path(&pts, true, 6000.0, 4000.0);
+        assert!(poly.len() >= 3 && poly.len() <= 3 * 256);
+        // One anchor: a closed path of a single point is that point.
+        assert_eq!(flatten_path(&[PathPoint::new(0.3, 0.3)], true, 10.0, 10.0), vec![(0.3, 0.3)]);
     }
 }

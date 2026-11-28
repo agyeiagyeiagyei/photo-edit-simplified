@@ -207,7 +207,7 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
                     </div>
                     <p class="dim">
                         "Red shows where the adjustment applies. Brush paints it directly; Rect, \
-                         Lasso, Wand and Subject make a selection to add or remove with the \
+                         Lasso, Pen, Wand and Subject make a selection to add or remove with the \
                          buttons above."
                     </p>
                 </div>
@@ -247,6 +247,7 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
                     class="btn"
                     on:click=move |_| {
                         state.subject_photo.set(None);
+                        state.pen_path.set(None);
                         clear_subject_brush_ops(state);
                         state.update_current(|e| {
                             e.selection = None;
@@ -257,6 +258,25 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
                     "Clear"
                 </button>
             </div>
+            <Show
+                when=move || state.selected_select_tool.get() == SelectTool::Pen
+                fallback=|| ()
+            >
+                <div class="chips">
+                    <button class="chip" disabled=move || pen_open(state) != Some(true) on:click=move |_| close_pen(state)>
+                        "Close path"
+                    </button>
+                    <button class="chip" disabled=move || pen_open(state).is_none() on:click=move |_| pen_undo_point(state)>
+                        "Undo point"
+                    </button>
+                </div>
+                <p class="dim">
+                    "Click to add points, drag to curve. Click the first point (Enter) to make the \
+                     path the selection; drag points and handles to reshape it. Alt-drag: new \
+                     handles, or one handle alone. Double-click: sharp corner. Backspace: undo \
+                     point. Esc: drop path."
+                </p>
+            </Show>
             <Show when=move || !saved.get().is_empty() fallback=|| ()>
                 <div class="saved-selections">
                     <div class="panel-title">"Saved selections"</div>
@@ -503,7 +523,8 @@ pub(crate) fn SelectTab(state: AppState) -> impl IntoView {
                 "Isolate person"
             </button>
             <p class="dim">
-                "Rect/Lasso select a region; Wand selects pixels similar to the one you click. \
+                "Rect/Lasso select a region and Pen outlines one point by point, with curves; \
+                 Wand selects pixels similar to the one you click. \
                  Subject taps a bird or animal and refines with Add/Remove taps or a drag-box; \
                  the model downloads ~15 MB on first use (photo-only). Brush paints into or out \
                  of the selection (or the selected adjustment layer's mask) with Size and \
