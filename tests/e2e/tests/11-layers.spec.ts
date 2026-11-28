@@ -210,6 +210,45 @@ test('Pen and Brush select or create a layer and draw', async ({ page }) => {
 
 // Owner requests (19 Nov): a delete asks first and says what goes with the
 // layer, a masked adjustment reads as one group, and layers can be renamed.
+// Issue #82: a dragged Pen point (or handle) ran ahead of the pointer: every
+// pointermove added the whole drag so far to the current position. A 0.05
+// drag in 10 moves put the point about 0.27 away, at (0.869, 0.564).
+test('a dragged Pen point lands under the pointer (#82)', async ({ page }) => {
+  const errors = trackErrors(page);
+  await openApp(page);
+  await importFiles(page, [PNG_SMALL]);
+  await page.waitForTimeout(1500);
+  await clickTab(page, 'Layers');
+  await page.locator('.toolbar .chip', { hasText: 'Pen' }).click();
+  await page.waitForTimeout(400);
+  const b = (await page.locator('.canvas-wrap').boundingBox())!;
+  const at = (x: number, y: number): [number, number] => [b.x + b.width * x, b.y + b.height * y];
+  for (const [x, y] of [[0.3, 0.3], [0.6, 0.3], [0.45, 0.6]]) {
+    await page.mouse.click(...at(x, y));
+    await page.waitForTimeout(150);
+  }
+  await page.mouse.move(...at(0.6, 0.3));
+  await page.mouse.down();
+  await page.mouse.move(...at(0.65, 0.35), { steps: 10 });
+  await page.mouse.up();
+  // Pixels of a smooth point's blue dot (#0a84ff) within 1% of a spot.
+  const dot = (x: number, y: number) =>
+    canvas(page).evaluate((c: HTMLCanvasElement, [x, y]) => {
+      const r = Math.max(4, Math.round(c.width * 0.01));
+      const [cx, cy] = [Math.round(x * c.width), Math.round(y * c.height)];
+      const d = c.getContext('2d')!.getImageData(cx - r, cy - r, 2 * r + 1, 2 * r + 1).data;
+      let n = 0;
+      for (let i = 0; i < d.length; i += 4) {
+        if (Math.abs(d[i] - 10) < 25 && Math.abs(d[i + 1] - 132) < 30 && d[i + 2] > 230) n++;
+      }
+      return n;
+    }, [x, y]);
+  await expect.poll(() => dot(0.65, 0.35), { timeout: 5_000 }).toBeGreaterThan(20);
+  expect(await dot(0.6, 0.3), 'the point stayed where the drag began').toBe(0);
+  expect(await dot(0.869, 0.564), 'the point ran ahead of the pointer').toBe(0);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
 test('delete asks first, a mask is grouped with its layer, and a rename survives a reload', async ({ page }) => {
   test.setTimeout(120_000);
   const errors = trackErrors(page);
