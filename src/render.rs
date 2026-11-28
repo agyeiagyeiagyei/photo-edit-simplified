@@ -82,6 +82,30 @@ fn apply_pivot_transform(ctx: &web_sys::CanvasRenderingContext2d, kind: &LayerKi
     let _ = ctx.translate(-cx, -cy);
 }
 
+/// Begin a canvas path along the anchors' Bézier segments in a `w` x `h`
+/// frame, back to the first anchor when `closed`.
+pub(crate) fn trace_bezier(ctx: &web_sys::CanvasRenderingContext2d, points: &[PathPoint], closed: bool, w: f64, h: f64) {
+    ctx.begin_path();
+    let Some(first) = points.first() else { return };
+    let (w, h) = (w as f32, h as f32);
+    ctx.move_to((first.x * w) as f64, (first.y * h) as f64);
+    let n = points.len();
+    for i in 1..n + closed as usize {
+        let (a, b) = (&points[i - 1], &points[i % n]);
+        ctx.bezier_curve_to(
+            ((a.x + a.out_x) * w) as f64,
+            ((a.y + a.out_y) * h) as f64,
+            ((b.x + b.in_x) * w) as f64,
+            ((b.y + b.in_y) * h) as f64,
+            (b.x * w) as f64,
+            (b.y * h) as f64,
+        );
+    }
+    if closed {
+        ctx.close_path();
+    }
+}
+
 pub(crate) fn draw_path_layer(ctx: &web_sys::CanvasRenderingContext2d, layer: &state::Layer, w: f64, h: f64) {
     let LayerKind::Path(p) = &layer.kind else { return; };
     if p.points.len() < 2 {
@@ -89,32 +113,7 @@ pub(crate) fn draw_path_layer(ctx: &web_sys::CanvasRenderingContext2d, layer: &s
     }
     ctx.save();
     apply_pivot_transform(ctx, &layer.kind, w, h);
-    ctx.begin_path();
-    let first = &p.points[0];
-    ctx.move_to((first.x * w as f32) as f64, (first.y * h as f32) as f64);
-    for i in 1..p.points.len() {
-        let prev = &p.points[i - 1];
-        let curr = &p.points[i];
-        let c1x = (prev.x + prev.out_x) * w as f32;
-        let c1y = (prev.y + prev.out_y) * h as f32;
-        let c2x = (curr.x + curr.in_x) * w as f32;
-        let c2y = (curr.y + curr.in_y) * h as f32;
-        let x = curr.x * w as f32;
-        let y = curr.y * h as f32;
-        ctx.bezier_curve_to(c1x as f64, c1y as f64, c2x as f64, c2y as f64, x as f64, y as f64);
-    }
-    if p.closed && p.points.len() > 2 {
-        let last = p.points.last().unwrap();
-        let first = &p.points[0];
-        let c1x = (last.x + last.out_x) * w as f32;
-        let c1y = (last.y + last.out_y) * h as f32;
-        let c2x = (first.x + first.in_x) * w as f32;
-        let c2y = (first.y + first.in_y) * h as f32;
-        let x = first.x * w as f32;
-        let y = first.y * h as f32;
-        ctx.bezier_curve_to(c1x as f64, c1y as f64, c2x as f64, c2y as f64, x as f64, y as f64);
-        ctx.close_path();
-    }
+    trace_bezier(ctx, &p.points, p.closed && p.points.len() > 2, w, h);
 
     let stroke_px = (p.stroke_width * h as f32) as f64;
     if !p.fill_color.is_empty() && p.fill_color != "none" {
@@ -2475,6 +2474,10 @@ fn apply_photo_geometry(state: AppState, item: MediaItem, new: EditParams) {
     clear_subject_brush_ops_for(item.id);
     if state.subject_photo.get_untracked() == Some(item.id) {
         state.subject_photo.set(None);
+    }
+    // A path being drawn was placed in the old frame.
+    if state.pen_path.with_untracked(|p| p.as_ref().is_some_and(|p| p.item_id == item.id)) {
+        state.pen_path.set(None);
     }
 }
 

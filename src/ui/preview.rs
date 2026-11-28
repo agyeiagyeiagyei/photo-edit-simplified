@@ -505,9 +505,14 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         let _ = brush_draw.try_set(None);
     });
 
+    // Rect, Lasso and Subject drags, and the Pen's.
     window_event_listener(leptos::ev::pointermove, move |ev| {
-        let Some(Some(drag)) = select_drag.try_get() else { return };
+        let Some(drag) = select_drag.try_get() else { return };
+        if drag.is_none() && !pen_dragging() {
+            return;
+        }
         let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop, state.view_zoom.get_untracked())).flatten() else { return };
+        let Some(drag) = drag else { return pen_move(state, (nx, ny)) };
         match drag {
             SelectDrag::Rect(start, _) => {
                 select_drag.set(Some(SelectDrag::Rect(start, (nx, ny))));
@@ -564,6 +569,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     });
 
     window_event_listener(leptos::ev::pointerup, move |_| {
+        pen_up(state);
         let Some(drag) = select_drag.try_get().flatten() else { return };
         let _ = select_drag.try_set(None);
         let new_sel = match drag {
@@ -649,6 +655,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
         state.clone_radius.track();
         tab.track();
         select_drag.track();
+        state.pen_path.track();
         brush_drag.track();
         brush_hover.track();
         state.brush_size.track();
@@ -1493,9 +1500,19 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                         draw_layer_mask_overlay(&ctx, layer.mask.as_ref(), false, w as f64, h as f64, key);
                     }
                 }
-                if let Some(sel) = &item.edit.selection {
+                // A live pen path draws itself; once closed it is the
+                // selection's outline, ahead of it while being reshaped.
+                let pen = if state.selected_select_tool.get() == SelectTool::Pen {
+                    state.pen_path.get().filter(|p| pen_is_live(p, &item))
+                } else {
+                    None
+                };
+                if let Some(sel) = item.edit.selection.as_ref().filter(|_| !pen.as_ref().is_some_and(|p| p.closed)) {
                     let key = overlay_key(item.id as u64, 0, item.edit.selection_rev);
                     draw_selection_overlay(&ctx, sel, w as f64, h as f64, key, ui);
+                }
+                if let Some(p) = &pen {
+                    draw_pen_path(&ctx, p, w as f64, h as f64, ui);
                 }
             }
             if let Some(drag) = select_drag.get() {
@@ -1634,6 +1651,10 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                     SelectTool::Lasso => {
                                         select_drag.set(Some(SelectDrag::Lasso(vec![(nx, ny)])));
                                     }
+                                    SelectTool::Pen => {
+                                        let r = if ev.pointer_type() == "mouse" { 8.0 } else { 16.0 };
+                                        pen_down(state, &item, (nx, ny), r, ev.alt_key());
+                                    }
                                     SelectTool::Wand => {
                                         wand_select(state, nx, ny);
                                     }
@@ -1711,6 +1732,14 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                             }
                         }
                         on:dblclick=move |ev: web_sys::MouseEvent| {
+                            if tab.get() == Tab::Select && state.selected_select_tool.get() == SelectTool::Pen {
+                                if let Some(item) = state.current() {
+                                    if let Some(at) = layer_norm_pos(&ev, item.edit.crop, state.view_zoom.get_untracked()) {
+                                        pen_sharpen(state, &item, at);
+                                    }
+                                }
+                                return;
+                            }
                             if tab.get() == Tab::Layers && state.selected_tool.get() == Tool::Pen {
                                 let Some(id) = state.selected_layer.get() else { return; };
                                 let Some(item) = state.current() else { return; };

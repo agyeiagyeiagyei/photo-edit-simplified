@@ -294,7 +294,8 @@ pub(crate) fn ZoomControls(state: AppState, tab: RwSignal<Tab>) -> impl IntoView
         }
     });
 
-    // Keyboard: +/− step, 0 = Fit, 1 = 100%, arrows pan while zoomed.
+    // Keyboard: +/− step, 0 = Fit, 1 = 100%, arrows pan while zoomed. The
+    // Select tab's Pen shares this canvas listener for its own keys.
     let key_space = space.clone();
     let kd = window_event_listener(leptos::ev::keydown, move |ev: web_sys::KeyboardEvent| {
         if !zoomable() {
@@ -305,6 +306,10 @@ pub(crate) fn ZoomControls(state: AppState, tab: RwSignal<Tab>) -> impl IntoView
             return;
         }
         if ev.ctrl_key() || ev.meta_key() || ev.alt_key() {
+            return;
+        }
+        if tab.get_untracked() == Tab::Select && pen_key(state, &ev.key()) {
+            ev.prevent_default();
             return;
         }
         let mut view = state.view_zoom.get_untracked();

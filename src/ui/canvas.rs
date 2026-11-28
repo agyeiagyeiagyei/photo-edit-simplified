@@ -673,8 +673,13 @@ pub(crate) fn push_brush_history(layer: &mut state::BrushLayer) {
 }
 
 pub(crate) fn draw_path_edit_handles(ctx: &web_sys::CanvasRenderingContext2d, layer: &state::Layer, w: f64, h: f64, ui: f64) {
-    let LayerKind::Path(p) = &layer.kind else { return };
-    for pt in &p.points {
+    if let LayerKind::Path(p) = &layer.kind {
+        draw_pen_handles(ctx, &p.points, w, h, ui);
+    }
+}
+
+pub(crate) fn draw_pen_handles(ctx: &web_sys::CanvasRenderingContext2d, points: &[PathPoint], w: f64, h: f64, ui: f64) {
+    for pt in points {
         let px = (pt.x * w as f32) as f64;
         let py = (pt.y * h as f32) as f64;
         let ox = ((pt.x + pt.out_x) * w as f32) as f64;

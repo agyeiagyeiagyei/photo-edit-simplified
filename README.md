@@ -24,8 +24,8 @@ uploaded: every pixel is decoded and edited in the browser.
   straighten, brightness/contrast/saturation/warmth, blur, film grain
   (Gaussian or uniform, luma or colour), levels, tone curves, and a bracket
   of social output sizes.
-- **Retouch and compose** — rect/lasso/per-pixel selections with feathering,
-  magic wand, subject masks, heal and clone, plus raster, text and vector-path
+- **Retouch and compose** — rect/lasso/pen (Bézier)/per-pixel selections with
+  feathering, magic wand, subject masks, heal and clone, plus raster, text and vector-path
   layers with opacity and reordering.
 - **Video** — the same crop/rotate/colour controls plus trim and text overlay,
   transcoded locally to MP4 with ffmpeg.wasm.
