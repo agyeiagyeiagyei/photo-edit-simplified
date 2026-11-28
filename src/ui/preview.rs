@@ -293,7 +293,8 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     let working = create_rw_signal((1usize, 1usize));
     let layer_drag = create_rw_signal(None::<(usize, f32, f32, f32, f32)>);
     let xform_drag = create_rw_signal(None::<XformDrag>);
-    let pen_drag = create_rw_signal(None::<(usize, PenDrag, f32, f32)>);
+    // (layer, what is dragged, press position, the point as it was then)
+    let pen_drag = create_rw_signal(None::<(usize, PenDrag, f32, f32, PathPoint)>);
     let brush_draw = create_rw_signal(None::<usize>);
     let select_drag = create_rw_signal(None::<SelectDrag>);
     let brush_drag = create_rw_signal(None::<BrushDrag>);
@@ -444,8 +445,12 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
     });
 
     window_event_listener(leptos::ev::pointermove, move |ev| {
-        let Some(Some((id, drag, nx0, ny0))) = pen_drag.try_get() else { return };
+        let Some(Some((id, drag, nx0, ny0, o))) = pen_drag.try_get() else { return };
         let Some((nx, ny)) = state.with_current(|m| layer_norm_pos(&ev, m.edit.crop, state.view_zoom.get_untracked())).flatten() else { return };
+        // Each move sets the position from the press plus the whole drag
+        // (#82: adding the whole drag to the current position on every move
+        // ran the point ahead of the pointer). Handles are relative to their
+        // point, so they travel with it.
         let dx = nx - nx0;
         let dy = ny - ny0;
         state.update_current_item(|m| {
@@ -454,19 +459,13 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
             match drag {
                 PenDrag::MovePoint(i) => {
                     let Some(pt) = p.points.get_mut(i) else { return };
-                    let new_x = (pt.x + dx).clamp(0.0, 1.0);
-                    let new_y = (pt.y + dy).clamp(0.0, 1.0);
-                    pt.in_x -= new_x - pt.x;
-                    pt.in_y -= new_y - pt.y;
-                    pt.out_x -= new_x - pt.x;
-                    pt.out_y -= new_y - pt.y;
-                    pt.x = new_x;
-                    pt.y = new_y;
+                    pt.x = (o.x + dx).clamp(0.0, 1.0);
+                    pt.y = (o.y + dy).clamp(0.0, 1.0);
                 }
                 PenDrag::MoveOut(i) => {
                     let Some(pt) = p.points.get_mut(i) else { return };
-                    pt.out_x = (pt.out_x + dx).clamp(-1.0, 1.0);
-                    pt.out_y = (pt.out_y + dy).clamp(-1.0, 1.0);
+                    pt.out_x = (o.out_x + dx).clamp(-1.0, 1.0);
+                    pt.out_y = (o.out_y + dy).clamp(-1.0, 1.0);
                     if pt.smooth {
                         pt.in_x = -pt.out_x;
                         pt.in_y = -pt.out_y;
@@ -474,8 +473,8 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                 }
                 PenDrag::MoveIn(i) => {
                     let Some(pt) = p.points.get_mut(i) else { return };
-                    pt.in_x = (pt.in_x + dx).clamp(-1.0, 1.0);
-                    pt.in_y = (pt.in_y + dy).clamp(-1.0, 1.0);
+                    pt.in_x = (o.in_x + dx).clamp(-1.0, 1.0);
+                    pt.in_y = (o.in_y + dy).clamp(-1.0, 1.0);
                     if pt.smooth {
                         pt.out_x = -pt.in_x;
                         pt.out_y = -pt.in_y;
@@ -1704,7 +1703,7 @@ pub(crate) fn Preview(state: AppState, tab: RwSignal<Tab>) -> impl IntoView {
                                                 PenHandle::Out => PenDrag::MoveOut(idx),
                                                 PenHandle::In => PenDrag::MoveIn(idx),
                                             };
-                                            pen_drag.set(Some((id, drag, nx, ny)));
+                                            pen_drag.set(Some((id, drag, nx, ny, p.points[idx].clone())));
                                         }
                                     } else {
                                         state.update_current_item(|m| {
